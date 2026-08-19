@@ -32,6 +32,7 @@ limitations under the License.
 #include <string_view>
 #include <system_error>  // NOLINT
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -39,6 +40,7 @@ limitations under the License.
 #include "absl/base/no_destructor.h"
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/function_ref.h"
@@ -153,10 +155,14 @@ limitations under the License.
 #include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/symmetric_memory.h"
 #include "xla/executable_run_options.h"
+#include "xla/ffi/api/record_api.h"
+#include "xla/ffi/api/record_c_api.h"
 #include "xla/ffi/ffi.h"
+#include "xla/ffi/record_ffi.h"
 #include "xla/ffi/type_registry.h"
 #include "xla/service/gpu/llvm_gpu_backend/nvptx_libdevice_path.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
+#include "xla/status_macros.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_address_allocator.h"
@@ -1655,6 +1661,95 @@ absl::Status MosaicGpuInitialize(
   return absl::OkStatus();
 }
 
+absl::Status MosaicGpuRecord(se::Stream* stream, ffi::RecordContext record_ctx,
+                             ffi::RemainingArgs inputs,
+                             ffi::RemainingRets results,
+                             CustomCallResources* resources,
+                             xla::ffi::Dictionary attributes) {
+  tsl::profiler::TraceMe trace("MosaicGpuRecord");
+  CompiledKernel* kernel = resources->kernel;
+  const int device_ordinal = stream->parent()->device_ordinal();
+  XLA_VLOG_DEVICE(5, device_ordinal)
+      << "MosaicGpuRecord called for " << kernel->kernel_name << " with "
+      << record_ctx.action();
+  absl::Cleanup cleanup = [&] {
+    XLA_VLOG_DEVICE(5, device_ordinal)
+        << "MosaicGpuRecord finished for " << kernel->kernel_name << " with "
+        << record_ctx.action();
+  };
+
+  // Fall back to stream capture for paths the record API can't express as a
+  // single graph node: namely multimem kernels, because they have barriers.
+  // Execute then runs under stream capture.
+  if (ModuleUsesCollectiveMetadata(attributes) || kernel->is_nvshmem_used ||
+      kernel->is_multimem_used) {
+    XLA_VLOG_DEVICE(5, device_ordinal)
+        << "MosaicGpuRecord falling back to stream capture for "
+        << kernel->kernel_name;
+    return record_ctx.RequestStreamCapture();
+  }
+
+  ASSIGN_OR_RETURN(std::vector<ffi::AnyBuffer> buffers,
+                   GetBuffers(inputs, results));
+  std::vector<void*> buffer_ptrs;
+  buffer_ptrs.reserve(buffers.size());
+  for (const ffi::AnyBuffer& buffer : buffers) {
+    buffer_ptrs.push_back(buffer.untyped_data());
+  }
+
+  TF_RET_CHECK(kernel->host_func != nullptr)
+      << "InternalError: build_kernel_spec is null";
+  mosaic::gpu::MosaicKernelSpec cfg;
+  kernel->host_func(&cfg, buffer_ptrs.data());
+
+  // Translate from MosaicKernelSpec to ffi::KernelArg.
+  llvm::SmallVector<ffi::KernelArg, 8> kernel_args;
+  kernel_args.reserve(cfg.args.size());
+  for (const auto& arg : cfg.args) {
+    if (const auto* host =
+            std::get_if<mosaic::gpu::MosaicKernelSpec::HostArg>(&arg)) {
+      kernel_args.push_back(ffi::HostValue{cfg.host_bytes.data() + host->offset,
+                                           static_cast<size_t>(host->size)});
+    } else {
+      kernel_args.push_back(ffi::DevicePointer{
+          std::get<mosaic::gpu::MosaicKernelSpec::DeviceArg>(arg).ptr});
+    }
+  }
+  XLA_FFI_LaunchDims dims{
+      /*grid=*/{static_cast<int32_t>(cfg.grid.x),
+                static_cast<int32_t>(cfg.grid.y),
+                static_cast<int32_t>(cfg.grid.z)},
+      /*block=*/
+      {static_cast<int32_t>(cfg.block.x), static_cast<int32_t>(cfg.block.y),
+       static_cast<int32_t>(cfg.block.z)},
+      /*cluster=*/
+      {static_cast<int32_t>(cfg.cluster.x), static_cast<int32_t>(cfg.cluster.y),
+       static_cast<int32_t>(cfg.cluster.z)}};
+
+  if (record_ctx.action() == ffi::RecordAction::kCreate) {
+    XLA_VLOG_DEVICE(5, device_ordinal)
+        << "MosaicGpuRecord creating launch for " << kernel->kernel_name
+        << " uses_pdl: " << cfg.uses_pdl << " grid: " << cfg.grid.x << ", "
+        << cfg.grid.y << ", " << cfg.grid.z << " cluster: " << cfg.cluster.x
+        << ", " << cfg.cluster.y << ", " << cfg.cluster.z
+        << " block: " << cfg.block.x << ", " << cfg.block.y << ", "
+        << cfg.block.z << " smem_bytes: " << cfg.smem_bytes;
+    return record_ctx
+        .CreateLaunch(kernel->kernel_name.c_str(), kernel->gpu_binary.data(),
+                      kernel->gpu_binary.size(), ffi::SourceFormat::kCubin,
+                      dims, cfg.smem_bytes, /*uses_pdl=*/cfg.uses_pdl,
+                      kernel_args)
+        .status();
+  }
+  TF_RET_CHECK(record_ctx.action() == ffi::RecordAction::kUpdate)
+      << "InternalError: unexpected record action: "
+      << static_cast<int>(record_ctx.action());
+  TF_RET_CHECK(record_ctx.commands().size() == 1)
+      << "InternalError: expected 1 command in record context, got "
+      << record_ctx.commands().size();
+  return record_ctx.UpdateLaunch(record_ctx.commands()[0], kernel_args);
+}
+
 absl::Status MosaicGpuExecute(
     se::Stream* stream, const xla::gpu::CollectiveParams* collective_params,
     const xla::gpu::CollectiveCliques* collective_cliques,
@@ -1771,6 +1866,16 @@ XLA_FFI_DEFINE_HANDLER(
         .Attrs(),
     {ffi::Traits::kCmdBufferCompatible});
 
+XLA_FFI_DEFINE_HANDLER(
+    kMosaicGpuRecord, MosaicGpuRecord,
+    xla::ffi::Ffi::BindRecord()
+        .Ctx<ffi::Stream>()
+        .Ctx<ffi::Extension<ffi::RecordExtension>>()
+        .RemainingArgs()
+        .RemainingRets()
+        .Ctx<xla::ffi::State<mosaic::gpu::CustomCallResources>>()
+        .Attrs());
+
 //  We expect the following attributes:
 // - kernel_hash: a hash of the kernel.
 // - module: the serialized MLIR module.
@@ -1795,6 +1900,7 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                              /*prepare=*/kMosaicGpuPrepare,
                              /*initialize=*/kMosaicGpuInitialize,
                              /*execute=*/kMosaicGpuExecute,
+                             /*record=*/kMosaicGpuRecord,
                          });
 
 }  // namespace
