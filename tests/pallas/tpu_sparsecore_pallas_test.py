@@ -2084,7 +2084,7 @@ class VectorSubcoreTest(PallasSCTest):
   def test_cumsum_2d_not_supported(self, dtype):
     x = jnp.arange(self.sc_info.num_lanes, dtype=dtype)
 
-    with self.assertRaisesRegex(NotImplementedError, r"must be rank 1"):
+    with self.assertRaisesRegex(NotImplementedError, r"must be the minor axis"):
 
       @self.vector_subcore_kernel(out_shape=x)
       def kernel(x_ref, o_ref):
@@ -2766,6 +2766,117 @@ class VectorSubcoreTest(PallasSCTest):
 
     np.testing.assert_array_equal(kernel(x, flag_true), x)
     np.testing.assert_array_equal(kernel(x, flag_false), jnp.zeros_like(x))
+
+  def test_cumsum_2d(self):
+    if not jtu.is_libtpu_at_least("0.0.49"):
+      self.skipTest("Requires libtpu >= 0.0.49")
+    shape = (8, 128) if self.USE_TC_TILING else (2, self.num_lanes * 2)
+    x = jnp.arange(math.prod(shape), dtype=jnp.int32).reshape(shape)
+
+    @self.vector_subcore_kernel(out_shape=x)
+    def kernel(x_ref, cumsum_ref):
+      val = x_ref[...]
+      cumsum_ref[...] = jnp.cumsum(val, axis=-1)
+
+    expected_cs = jnp.cumsum(x, axis=-1)
+    np.testing.assert_array_equal(kernel(x), expected_cs)
+
+  def test_masked_cumsum_layout(self):
+    if not jtu.is_libtpu_at_least("0.0.49"):
+      self.skipTest("Requires libtpu >= 0.0.49")
+    shape = (8, 128) if self.USE_TC_TILING else (2, self.num_lanes * 2)
+    x = jnp.arange(1, math.prod(shape) + 1, dtype=jnp.int32).reshape(shape)
+
+    @self.vector_subcore_kernel(out_shape=(x, x))
+    def kernel(x_ref, o_1d_ref, o_2d_ref):
+      val = x_ref[...]
+      row = val[0]
+      o_1d = plsc.cumsum(row, mask=(row % 2) == 1)
+      o_1d_ref[...] = jnp.broadcast_to(o_1d, shape)
+      o_2d_ref[...] = plsc.cumsum(val, mask=(val % 2) == 1)
+
+    expected_row = x[0]
+    expected_1d = jnp.broadcast_to(
+        np.cumsum(expected_row * (expected_row % 2)), shape
+    )
+    expected_2d = np.cumsum(x * (x % 2), axis=-1)
+    actual_1d, actual_2d = kernel(x)
+    np.testing.assert_array_equal(actual_1d, expected_1d)
+    np.testing.assert_array_equal(actual_2d, expected_2d)
+
+  def test_cummax_layout(self):
+    if not jtu.is_libtpu_at_least("0.0.49"):
+      self.skipTest("Requires libtpu >= 0.0.49")
+    shape = (8, 128) if self.USE_TC_TILING else (2, self.num_lanes * 2)
+    # Include both negative and positive values to exercise signed int32 xori
+    x = np.arange(-math.prod(shape) // 2, math.prod(shape) // 2, dtype=np.int32)
+    np.random.default_rng(42).shuffle(x)
+    x = jnp.asarray(x.reshape(shape))
+
+    @self.vector_subcore_kernel(out_shape=(x, x))
+    def kernel(x_ref, unmasked_ref, masked_ref):
+      val = x_ref[...]
+      unmasked_ref[...] = plsc.cummax(val)
+      masked_ref[...] = plsc.cummax(val, mask=(val % 2) != 0)
+
+    expected_unmasked = np.maximum.accumulate(np.asarray(x), axis=-1)
+    x_np = np.asarray(x)
+    mask_np = (x_np % 2) != 0
+    expected_masked = np.zeros_like(x_np)
+    for r in range(shape[0]):
+      running = None
+      for c in range(shape[1]):
+        if mask_np[r, c]:
+          running = x_np[r, c] if running is None else max(running, x_np[r, c])
+        expected_masked[r, c] = x_np[r, c] if running is None else running
+    actual_unmasked, actual_masked = kernel(x)
+    np.testing.assert_array_equal(actual_unmasked, expected_unmasked)
+    np.testing.assert_array_equal(actual_masked, expected_masked)
+
+  def test_reduce_sum_1d(self):
+    if not jtu.is_libtpu_at_least("0.0.49"):
+      self.skipTest("Requires libtpu >= 0.0.49")
+    shape = (8, 128) if self.USE_TC_TILING else (self.num_lanes,)
+    x = jnp.arange(math.prod(shape), dtype=jnp.int32).reshape(shape)
+
+    @self.vector_subcore_kernel(out_shape=x)
+    def kernel(x_ref, o_ref):
+      val = x_ref[...]
+      row = val[0] if self.USE_TC_TILING else val
+      s = jnp.sum(row)
+      o_ref[...] = jnp.broadcast_to(s, shape)
+
+    expected_row = x[0] if self.USE_TC_TILING else x
+    expected = jnp.broadcast_to(jnp.sum(expected_row), shape)
+    np.testing.assert_array_equal(kernel(x), expected)
+
+  def test_cumsum_and_reduce_sum_1d(self):
+    if not jtu.is_libtpu_at_least("0.0.49"):
+      self.skipTest("Requires libtpu >= 0.0.49")
+    shape = (8, 128) if self.USE_TC_TILING else (self.num_lanes * 2,)
+    x = jnp.arange(math.prod(shape), dtype=jnp.int32).reshape(shape)
+
+    @self.vector_subcore_kernel(out_shape=(x, x, x))
+    def kernel(x_ref, cumsum_ref, sum_keepdims_ref, sum_where_ref):
+      val = x_ref[...]
+      row = val[0] if self.USE_TC_TILING else val
+      cs = jnp.cumsum(row)
+      sk = jnp.sum(row, keepdims=True)
+      sw = jnp.sum(row, where=(row % 2) == 1)
+      cumsum_ref[...] = jnp.broadcast_to(cs, shape)
+      sum_keepdims_ref[...] = jnp.broadcast_to(sk, shape)
+      sum_where_ref[...] = jnp.broadcast_to(sw, shape)
+
+    expected_row = x[0] if self.USE_TC_TILING else x
+    expected_cs = jnp.broadcast_to(jnp.cumsum(expected_row), shape)
+    expected_sk = jnp.broadcast_to(jnp.sum(expected_row, keepdims=True), shape)
+    expected_sw = jnp.broadcast_to(
+        jnp.sum(expected_row, where=(expected_row % 2) == 1), shape
+    )
+    actual_cs, actual_sk, actual_sw = kernel(x)
+    np.testing.assert_array_equal(actual_cs, expected_cs)
+    np.testing.assert_array_equal(actual_sk, expected_sk)
+    np.testing.assert_array_equal(actual_sw, expected_sw)
 
 
 class VectorSubcoreTestWithTCTiling(VectorSubcoreTest):

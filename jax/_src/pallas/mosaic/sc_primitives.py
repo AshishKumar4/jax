@@ -694,8 +694,8 @@ def cummax(x: jax.Array, *, mask: jax.Array | None = None) -> jax.Array:
     mask: An optional array of booleans, which specifies which elements of `x`
       are eligible for the max. If `None`, all elements are eligible.
   """
-  if x.ndim != 1:
-    raise NotImplementedError(f"cummax: x={x.aval} must be rank 1")
+  if x.ndim < 1:
+    raise NotImplementedError(f"cummax: x={x.aval} must have rank >= 1")
   if mask is None:
     mask = lax.full(x.shape, True)
   return masked_cummax_p.bind(x, mask)
@@ -714,8 +714,8 @@ def cummin(x: jax.Array, *, mask: jax.Array | None = None) -> jax.Array:
     mask: An optional array of booleans, which specifies which elements of `x`
       are eligible for the min. If `None`, all elements are eligible.
   """
-  if x.ndim != 1:
-    raise NotImplementedError(f"cummin: x={x.aval} must be rank 1")
+  if x.ndim < 1:
+    raise NotImplementedError(f"cummin: x={x.aval} must have rank >= 1")
   if mask is None:
     mask = lax.full(x.shape, True)
   return masked_cummin_p.bind(x, mask)
@@ -724,10 +724,12 @@ def cummin(x: jax.Array, *, mask: jax.Array | None = None) -> jax.Array:
 @sc_lowering.register_lowering_rule(lax.cumsum_p)
 def _cumsum_lowering_rule(ctx: sc_lowering.LoweringRuleContext, x, axis,
                           reverse):
-  if axis != 0:
-    raise NotImplementedError(f"SC cumsum: axis={axis} must be 0.")
-  if len(ctx.avals_in[0].shape) != 1:
-    raise NotImplementedError(f"SC cumsum: x={ctx.avals_in[0]} must be rank 1")
+  rank = len(ctx.avals_in[0].shape)
+  minor_axis = rank - 1
+  if axis != minor_axis:
+    raise NotImplementedError(
+        f"SC cumsum: axis={axis} must be the minor axis ({minor_axis})."
+    )
   if reverse:
     raise NotImplementedError("SC cumsum: reverse=True is not yet supported")
   i1t = ir.IntegerType.get_signless(1)
@@ -752,8 +754,8 @@ def cumsum(x: jax.Array, *, mask: jax.Array | None = None) -> jax.Array:
     mask: An optional array of booleans, which specifies which elements of `x`
       are eligible for summing. If `None`, all elements are eligible.
   """
-  if x.ndim != 1:
-    raise NotImplementedError(f"cumsum: x={x.aval} must be rank 1")
+  if x.ndim < 1:
+    raise NotImplementedError(f"cumsum: x={x.aval} must have rank >= 1")
   if mask is None:
     mask = lax.full(x.shape, True)
   return masked_cumsum_p.bind(x, mask)
