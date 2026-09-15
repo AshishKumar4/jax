@@ -13,15 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "llvm/ADT/DenseMap.h"
 #include "mlir-c/Dialect/Func.h"
 #include "mlir-c/IR.h"
 #include "mlir-c/Support.h"
 #include "mlir/Bindings/Python/IRCore.h"
 #include "nanobind/nanobind.h"
-#include "jaxlib/mosaic/dialect/tpu/integrations/c/tpu_dialect.h"
+#include "xla/mosaic/dialect/tpu/integrations/c/tpu_dialect.h"
 
 namespace nb = nanobind;
 
@@ -79,6 +82,54 @@ NB_MODULE(_tpu_ext, m) {
     mlirTPUAnalyzePotentialCommunication(op.get(), &has_communication,
                                          &has_custom_barrier);
     return std::make_pair(has_communication, has_custom_barrier);
+  });
+
+  m.def("private_unzip_debug_locations", [](PyOperationBase& op) {
+    MlirOperation root_op = op.getOperation().get();
+    MlirContext ctx = mlirOperationGetContext(root_op);
+    MlirLocation unknown_loc = mlirLocationUnknownGet(ctx);
+
+    struct WalkState {
+      MlirLocation unknown_loc;
+      llvm::DenseMap<const void*, int32_t> loc_ptr_to_idx;
+      std::vector<std::string> locations;
+      std::vector<int32_t> indices;
+    } state;
+    state.unknown_loc = unknown_loc;
+
+    auto walk_fn = [](MlirOperation cur_op, void* user_data) -> MlirWalkResult {
+      auto* s = static_cast<WalkState*>(user_data);
+      MlirLocation loc = mlirOperationGetLocation(cur_op);
+      auto [it, inserted] = s->loc_ptr_to_idx.try_emplace(
+          loc.ptr, static_cast<int32_t>(s->locations.size()));
+      if (inserted) {
+        std::string loc_str;
+        auto print_cb = [](MlirStringRef str, void* data) {
+          static_cast<std::string*>(data)->append(str.data, str.length);
+        };
+        mlirLocationPrint(loc, print_cb, &loc_str);
+        s->locations.push_back(std::move(loc_str));
+      }
+      s->indices.push_back(it->second);
+      mlirOperationSetLocation(cur_op, s->unknown_loc);
+
+      intptr_t num_regions = mlirOperationGetNumRegions(cur_op);
+      for (intptr_t r = 0; r < num_regions; ++r) {
+        MlirRegion region = mlirOperationGetRegion(cur_op, r);
+        for (MlirBlock block = mlirRegionGetFirstBlock(region);
+             !mlirBlockIsNull(block); block = mlirBlockGetNextInRegion(block)) {
+          intptr_t num_args = mlirBlockGetNumArguments(block);
+          for (intptr_t a = 0; a < num_args; ++a) {
+            mlirBlockArgumentSetLocation(mlirBlockGetArgument(block, a),
+                                         s->unknown_loc);
+          }
+        }
+      }
+      return MlirWalkResultAdvance;
+    };
+
+    mlirOperationWalk(root_op, walk_fn, &state, MlirWalkPreOrder);
+    return std::make_pair(std::move(state.locations), std::move(state.indices));
   });
 
   // TODO(apaszke): All of those should be upstreamed to MLIR Python bindings.
