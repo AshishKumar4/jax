@@ -829,7 +829,9 @@ def eval_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[
 def check_avals_context_mesh(avals, prim_name):
   cur_mesh = mesh_lib.get_abstract_mesh()
   for a in avals:
-    if not isinstance(a.memory_space, MemorySpace):
+    if not isinstance(a.memory_space, MemorySpace) and not hasattr(
+        a.memory_space, "memory_kind"
+    ):
       raise TypeError(
           f"Primitive {prim_name} got aval {a} with unknown memory_space type:"
           f" {type(a.memory_space)}")

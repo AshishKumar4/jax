@@ -159,18 +159,15 @@ def _mpmd_map_abstract_eval(
   outin_aliases = {
       out_idx: in_idx for in_idx, out_idx in input_output_aliases.items()
   }
-  out_avals = [
-      in_avals[outin_aliases[out_idx]] if out_idx in outin_aliases else a
-      for out_idx, a in enumerate(out_avals)
-  ]
-  # Avoid returning avals with Pallas memory spaces to the outside world.
   out_avals = tuple(
-      a.update(memory_space=jax_core.MemorySpace.Device)
-      if isinstance(a, jax_core.ShapedArray)
-      and a.memory_space is not None
-      and not isinstance(a.memory_space, jax_core.MemorySpace)
+      state_discharge.discharged_aval(
+          in_avals[outin_aliases[out_idx]],
+          discharge=True,
+          strip_memory_space=False,
+      )
+      if out_idx in outin_aliases
       else a
-      for a in out_avals
+      for out_idx, a in enumerate(out_avals)
   )
   return out_avals, effs
 

@@ -674,6 +674,84 @@ class CoreMapTest(jtu.JaxTestCase):
     self.assertLen(aliased_wmsc, 1)
     self.assertEqual(aliased_wmsc[0].params["memory_space"], pltpu.VMEM)
     self.assertEqual(aliased_wmsc[0].outvars[0].aval.memory_space, pltpu.VMEM)
+    undischarged_mpmd_eqns = [
+        eqn
+        for eqn in closed_jaxpr.jaxpr.eqns
+        if eqn.primitive == mpmd.mpmd_map_p
+    ]
+    self.assertLen(undischarged_mpmd_eqns, 1)
+    self.assertIsInstance(
+        undischarged_mpmd_eqns[0].outvars[0].aval, jax_core.ShapedArray
+    )
+    self.assertEqual(
+        undischarged_mpmd_eqns[0].outvars[0].aval.memory_space,
+        pltpu.VMEM,
+    )
+    self.assertIsInstance(
+        mpmd_map_eqns[0].outvars[0].aval, jax_core.ShapedArray
+    )
+    self.assertEqual(
+        mpmd_map_eqns[0].outvars[0].aval.memory_space,
+        pltpu.VMEM,
+    )
+    self.assertIsInstance(
+        mpmd_map_eqns[0].params["out_avals"][0], jax_core.ShapedArray
+    )
+    self.assertEqual(
+        mpmd_map_eqns[0].params["out_avals"][0].memory_space, pltpu.VMEM
+    )
+
+  def test_mpmd_map_aliased_ref_output_is_shaped_array_with_memory_space(
+      self,
+  ):
+    mesh = pltpu.TensorCoreMesh(axis_name="tc", num_cores=1)
+
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...]
+
+    def f(x):
+      ref = jax.new_ref(x, memory_space=pltpu.VMEM)
+      out = mpmd._mpmd_map(
+          [(mesh, kernel)],
+          out_types=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          input_output_aliases={0: 0},
+      )(ref)
+      return out + 1, ref[...]
+
+    x = jnp.empty((8, 128), dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(f)(x)
+    mpmd_eqn = [
+        eqn
+        for eqn in closed_jaxpr.jaxpr.eqns
+        if eqn.primitive == mpmd.mpmd_map_p
+    ][0]
+    self.assertIsInstance(mpmd_eqn.invars[0].aval, AbstractRef)
+    self.assertIsInstance(mpmd_eqn.outvars[0].aval, jax_core.ShapedArray)
+    self.assertEqual(mpmd_eqn.outvars[0].aval.memory_space, pltpu.VMEM)
+
+  def test_mpmd_map_discharge_preserves_out_avals_memory_space(self):
+    mesh = pltpu.TensorCoreMesh(axis_name="tc", num_cores=1)
+
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...]
+
+    def f(x):
+      ref = jax.new_ref(x)
+      out = pl.kernel(
+          mesh=mesh,
+          out_type=pltpu.VMEM(x.shape, x.dtype),
+      )(kernel)(ref)
+      return out, ref[...]
+
+    x = jnp.empty((8, 128), dtype=jnp.float32)
+    closed_jaxpr = jax.make_jaxpr(f)(x)
+    discharged_jaxpr = discharge_state(closed_jaxpr)
+    mpmd_eqn = [
+        eqn for eqn in discharged_jaxpr.jaxpr.eqns
+        if eqn.primitive == mpmd.mpmd_map_p
+    ][0]
+    self.assertEqual(mpmd_eqn.outvars[0].aval.memory_space, pltpu.VMEM)
+    self.assertEqual(mpmd_eqn.params["out_avals"][0].memory_space, pltpu.VMEM)
 
   def test_mpmd_map_array_input_output_aliases_not_constrained(self):
     mesh = pltpu.TensorCoreMesh(axis_name="tc", num_cores=1)
@@ -713,7 +791,7 @@ class CoreMapTest(jtu.JaxTestCase):
     self.assertEmpty(wmsc_eqns)
     self.assertEqual(
         mpmd_map_eqns[-1].outvars[0].aval.memory_space,
-        jax_core.MemorySpace.Device,
+        pltpu.VMEM,
     )
 
   def test_pallas_call_array_input_output_aliases_not_constrained(self):
