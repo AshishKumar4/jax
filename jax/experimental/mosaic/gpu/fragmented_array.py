@@ -1113,6 +1113,45 @@ def _int_pow(x: ir.Value, n: int) -> ir.Value:
   return result
 
 
+def _is_neutral_element(
+    value: ir.Value, op: str, is_signed: bool | None
+) -> bool:
+  if not isinstance(value, ir.OpResult):
+    return False
+  const = value.owner.opview
+  if not isinstance(const, arith.ConstantOp):
+    return False
+  ty = value.type
+  val = const.literal_value
+  if isinstance(ty, ir.FloatType):
+    match op:
+      case "add":
+        return val == 0.0
+      case "prod":
+        return val == 1.0
+      case "max":
+        return val == float("-inf")
+      case "min":
+        return val == float("inf")
+      case _:
+        return False
+  if isinstance(ty, ir.IntegerType):
+    assert is_signed is not None
+    bitwidth = utils.bitwidth(ty)
+    match op:
+      case "add":
+        return val == 0
+      case "prod":
+        return val == 1
+      case "max":
+        return val == (-(1 << (bitwidth - 1)) if is_signed else 0)
+      case "min":
+        return val == ((1 << (bitwidth - 1)) - 1 if is_signed else -1)
+      case _:
+        return False
+  return False
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass(init=False, frozen=True, slots=True)
 class FragmentedArray:
@@ -1239,10 +1278,13 @@ class FragmentedArray:
     if isinstance(layout, TiledLayout) and layout.has_unreduced_dims:
       # Each unreduced thread holds a partial result, so splatting `value`
       # across them would contribute it once per thread when the reduction is
-      # completed.
-      # TODO(allanrenucci): Allow this when `value` is the neutral element of
-      # the unreduced operation.
-      raise ValueError("Cannot splat a value into a layout with unreduced dims")
+      # completed, unless `value` is the neutral element of the unreduced
+      # operation.
+      assert layout.unreduced_operation is not None
+      if not _is_neutral_element(value, layout.unreduced_operation, is_signed):
+        raise ValueError(
+            "Cannot splat a non-neutral value into a layout with unreduced dims"
+        )
     match layout:
       case WGSplatFragLayout():
         pass

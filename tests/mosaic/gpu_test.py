@@ -6215,6 +6215,75 @@ class FragmentedArrayTest(TestCase):
         smem_scratch_shape=(),
     )
 
+  @parameterized.named_parameters(
+      ("add_i32", "add", jnp.int32, 0, operator.add, np.sum),
+      (
+          "max_i32",
+          "max",
+          jnp.int32,
+          np.iinfo(np.int32).min,
+          lambda a, b: a.max(b),
+          np.max,
+      ),
+      (
+          "min_i32",
+          "min",
+          jnp.int32,
+          np.iinfo(np.int32).max,
+          lambda a, b: a.min(b),
+          np.min,
+      ),
+      ("add_f16", "add", jnp.float16, 0.0, operator.add, np.sum),
+      (
+          "max_f16",
+          "max",
+          jnp.float16,
+          float("-inf"),
+          lambda a, b: a.max(b),
+          np.max,
+      ),
+      (
+          "min_f16",
+          "min",
+          jnp.float16,
+          float("inf"),
+          lambda a, b: a.min(b),
+          np.min,
+      ),
+  )
+  def test_splat_unreduced_layout(self, op, dtype, neutral, combine, np_reduce):
+    shape = (64, 32)
+    out_shape = (32,)
+
+    def kernel(ctx, src, dst, scratch):
+      del ctx
+      layout = mgpu.WGMMA_LAYOUT
+      unreduced_layout = layout.reduce((0,), local_only=True, op=op)
+      is_signed = utils.is_signed(dtype)
+      acc = mgpu.FragmentedArray.splat(
+          utils.c(neutral, utils.dtype_to_ir_type(dtype)),
+          shape=out_shape,
+          is_signed=is_signed,
+      )
+      x = mgpu.FragmentedArray.load_untiled(
+          src, layout=layout, optimized=False, is_signed=is_signed
+      )
+      x = x.reduce(op, axis=0, target_layout=unreduced_layout)
+      acc = combine(acc, x)
+      acc = acc.reduce(op, (), scratch)
+      acc.store_untiled(dst, optimized=False)
+
+    x = (np.arange(math.prod(shape), dtype=dtype) % 17).reshape(shape)
+    kernel = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        jax.ShapeDtypeStruct(shape, dtype),
+        jax.ShapeDtypeStruct(out_shape, dtype),
+        smem_scratch_shape=jax.ShapeDtypeStruct((256,), dtype),
+    )
+    np.testing.assert_array_equal(kernel(x), np_reduce(x, axis=0))
+
   @parameterized.product(
       vec_size=(4, 3, 1),
       dtype=(jnp.float32, jnp.float16, jnp.bfloat16,
