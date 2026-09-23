@@ -1097,7 +1097,11 @@ def parse_indices(
     if isinstance(idx, (ir.Operation, ir.OpView)):
       idx = idx.result
     if isinstance(idx, int):
-      if check_oob and (idx >= bound or (idx < 0 and -idx > bound)):
+      if idx < 0:
+        raise NotImplementedError(
+            f"Index {idx} along axis {axis} has negative bounds"
+          )
+      if check_oob and idx >= bound:
         raise IndexError(
             f"Index {idx} along axis {axis} is out of bounds for shape {shape}"
         )
@@ -1113,15 +1117,13 @@ def parse_indices(
         )
       if idx.step is not None and idx.step != 1:
         raise NotImplementedError("Strided slices not implemented")
+      if any(v is not None and v < 0 for v in (idx.start, idx.stop)):
+        raise NotImplementedError(
+            f"Slice {idx} along axis {axis} has negative bounds"
+        )
       start = idx.start or 0
-      if start < 0:
-        start = bound + start
       stop = idx.stop or bound
-      if stop < 0:
-        stop = bound + stop
-      if check_oob and (
-          start < 0 or start >= bound or stop < 0 or stop > bound
-      ):
+      if check_oob and (start >= bound or stop > bound):
         raise IndexError(
             f"Slice {idx} along axis {axis} is out of bounds for shape {shape}"
         )
