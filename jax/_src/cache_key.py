@@ -259,7 +259,8 @@ def _hash_devices(hash_obj, devices: np.ndarray) -> None:
 
 
 class _TopologyFingerprints:
-  """The topology fingerprints of a distributed job's processes.
+  """What each process of a distributed job compiles for: its topology
+  fingerprint and its accelerators (see `_accelerators`).
 
   Each process publishes its own through the distributed runtime client the
   first time it needs another's, and reads each other process's once.
@@ -269,19 +270,23 @@ class _TopologyFingerprints:
     self.client = client
     self._process_id = process_id
     self._timeout_ms = timeout_ms
-    self._known: dict[int, int] = {}
+    self._known: dict[int, tuple[int, str]] = {}
     self._lock = threading.Lock()
 
-  def of(self, process_ids: list[int], own: int) -> list[int]:
+  def of(self, process_ids: list[int],
+         own: tuple[int, str]) -> dict[int, tuple[int, str]]:
     with self._lock:
       if self._process_id not in self._known:
-        self.client.key_value_set(_fingerprint_key(self._process_id), str(own))
+        fingerprint, accelerators = own
+        self.client.key_value_set(_fingerprint_key(self._process_id),
+                                  f"{fingerprint} {accelerators}")
         self._known[self._process_id] = own
       for process_id in process_ids:
         if process_id not in self._known:
-          self._known[process_id] = int(self.client.blocking_key_value_get(
-              _fingerprint_key(process_id), self._timeout_ms))
-      return [self._known[process_id] for process_id in process_ids]
+          fingerprint, accelerators = self.client.blocking_key_value_get(
+              _fingerprint_key(process_id), self._timeout_ms).split(" ", 1)
+          self._known[process_id] = (int(fingerprint), accelerators)
+      return {process_id: self._known[process_id] for process_id in process_ids}
 
 
 def _fingerprint_key(process_id: int) -> str:
@@ -289,6 +294,47 @@ def _fingerprint_key(process_id: int) -> str:
 
 
 _job_fingerprints: _TopologyFingerprints | None = None
+
+
+def _accelerators(client) -> str:
+  """What a process's executables are built for besides how its devices are
+  linked: its platform and runtime version, and the kind of each local
+  device with the attributes its code is generated for."""
+  kinds = sorted({
+      " ".join(str(getattr(device, name, ""))
+               for name in ("device_kind", "compute_capability", "core_count")
+               ).strip()
+      for device in client.local_devices()})
+  version = client.platform_version.replace("\n", " ")
+  return f"{client.platform} {version}: {', '.join(kinds)}"
+
+
+def _shared_fingerprints(pool: dict[int, tuple[int, str]]) -> list[int]:
+  """The fingerprints a computation over `pool`'s processes hashes, so that
+  every one of them computes one key.
+
+  A process's topology describes its own devices down to their NVLink links,
+  so the processes of one computation can fingerprint apart: on a host where
+  two of four GPUs share NVLink, those two processes and the other two keyed
+  the same computation apart. Only process 0 writes cache entries, so the
+  other two compiled what the first two loaded, and waited for ever for
+  their shares of the compile's sharded autotuning. Links don't change an
+  executable that spans processes, so the key hashes the sorted set of the
+  fingerprints, which is the one fingerprint it hashed before when they
+  agree. Accelerators do: one process would load code built for another's
+  devices. When the processes compile for different accelerators the
+  computation gets no key, and every process compiles it.
+  """
+  processes: dict[str, list[int]] = {}
+  for process_id, (_, accelerators) in sorted(pool.items()):
+    processes.setdefault(accelerators, []).append(process_id)
+  if len(processes) > 1:
+    raise _jax.JaxRuntimeError(
+        "the processes of this computation compile for different "
+        "accelerators, so no one cached executable serves them: " +
+        "; ".join(f"processes {ids}: {accelerators}"
+                  for accelerators, ids in processes.items()))
+  return sorted({fingerprint for fingerprint, _ in pool.values()})
 
 
 def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
@@ -306,15 +352,6 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
                 "devices %s (type %s)", ex, type(ex))
     _hash_devices(hash_obj, accelerators)
     return
-  # A process's topology describes its own devices, down to their NVLink
-  # links, so the processes of one computation can fingerprint apart: on a
-  # host where two of four GPUs share NVLink, those two processes and the
-  # other two keyed the same computation apart. Only process 0 writes cache
-  # entries, so the other two compiled what the first two loaded, and waited
-  # for ever for their shares of the compile's sharded autotuning. A
-  # computation that spans processes hashes all of their fingerprints, so
-  # every process computes one key; one whose processes fingerprint alike
-  # keeps the key it had.
   process_ids = sorted({device.process_index for device in accelerator_devices})
   fingerprints = [fingerprint]
   if len(process_ids) > 1 and distributed.global_state.client is not None:
@@ -325,7 +362,8 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
           distributed.global_state.client,
           distributed.global_state.process_id,
           config.share_binary_between_hosts_timeout_ms.value)
-    fingerprints = sorted(set(_job_fingerprints.of(process_ids, fingerprint)))
+    own = (fingerprint, _accelerators(accelerator_devices[0].client))
+    fingerprints = _shared_fingerprints(_job_fingerprints.of(process_ids, own))
   for fingerprint in fingerprints:
     hash_obj.update(fingerprint.to_bytes(8, byteorder="big"))
 
