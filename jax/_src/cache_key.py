@@ -25,6 +25,7 @@ from typing import cast as type_cast
 
 from jax._src import config
 from jax._src import distributed
+from jax._src.lib import cuda_versions
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
 from jax._src.lib import xla_client
@@ -298,15 +299,30 @@ _job_fingerprints: _TopologyFingerprints | None = None
 
 def _accelerators(client) -> str:
   """What a process's executables are built for besides how its devices are
-  linked: its platform and runtime version, and the kind of each local
-  device with the attributes its code is generated for."""
+  linked: its platform and runtime, the CUDA libraries it loads, and the kind
+  of each local device with the attributes its code is generated for."""
   kinds = sorted({
       " ".join(str(getattr(device, name, ""))
                for name in ("device_kind", "compute_capability", "core_count")
                ).strip()
       for device in client.local_devices()})
   version = client.platform_version.replace("\n", " ")
+  if cuda_versions is not None and "cuda" in client.platform_version:
+    version += "".join(
+        f" {name} {_library_version(get_version)}"
+        for name, get_version in (
+            ("driver", cuda_versions.cuda_driver_get_version),
+            ("cudnn", cuda_versions.cudnn_get_version),
+            ("cublas", cuda_versions.cublas_get_version)))
   return f"{client.platform} {version}: {', '.join(kinds)}"
+
+
+def _library_version(get_version) -> str:
+  try:
+    return str(get_version())
+  except Exception:  # pylint: disable=broad-except
+    # A library that fails to load has no version to share.
+    return "none"
 
 
 def _shared_fingerprints(pool: dict[int, tuple[int, str]]) -> list[int]:
