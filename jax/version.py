@@ -25,7 +25,9 @@ _version = "0.11.2"
 
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
-_release_version: str | None = None
+# A post-release of 0.11.2 with the multi-process cache key fix, built from
+# this branch by URL: it installs beside jaxlib 0.11.2 and satisfies jax>=0.11.2.
+_release_version: str | None = "0.11.2.post1"
 
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
