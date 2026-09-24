@@ -188,10 +188,15 @@ class CacheKeyTest(jtu.JaxTestCase):
           2: (8, "gpu cuda 12090: RTX 3090 8.6 82")})
 
   def test_a_process_names_its_platform_and_devices(self):
-    accelerators = cache_key._accelerators(xla_bridge.get_backend())
-    self.assertStartsWith(accelerators, xla_bridge.get_backend().platform)
+    backend = xla_bridge.get_backend()
+    accelerators = cache_key._accelerators(backend)
+    self.assertStartsWith(accelerators, backend.platform)
     self.assertIn(jax.local_devices()[0].device_kind, accelerators)
     self.assertNotIn("\n", accelerators)
+    if jtu.test_device_matches(["cuda"]):
+      self.assertIn(f" {jax.local_devices()[0].compute_capability} ",
+                    accelerators)
+      self.assertIn(" cudnn ", accelerators)
 
   def test_hash_platform(self):
     hash1 = self.get_hashed_value(
