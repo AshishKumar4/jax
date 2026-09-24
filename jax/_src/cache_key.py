@@ -20,9 +20,11 @@ import json
 import logging
 import os
 import sys
+import threading
 from typing import cast as type_cast
 
 from jax._src import config
+from jax._src import distributed
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
 from jax._src.lib import xla_client
@@ -256,13 +258,46 @@ def _hash_devices(hash_obj, devices: np.ndarray) -> None:
     _hash_string(hash_obj, device.device_kind)
 
 
+class _TopologyFingerprints:
+  """The topology fingerprints of a distributed job's processes.
+
+  Each process publishes its own through the distributed runtime client the
+  first time it needs another's, and reads each other process's once.
+  """
+
+  def __init__(self, client, process_id: int, timeout_ms: int):
+    self.client = client
+    self._process_id = process_id
+    self._timeout_ms = timeout_ms
+    self._known: dict[int, int] = {}
+    self._lock = threading.Lock()
+
+  def of(self, process_ids: list[int], own: int) -> list[int]:
+    with self._lock:
+      if self._process_id not in self._known:
+        self.client.key_value_set(_fingerprint_key(self._process_id), str(own))
+        self._known[self._process_id] = own
+      for process_id in process_ids:
+        if process_id not in self._known:
+          self._known[process_id] = int(self.client.blocking_key_value_get(
+              _fingerprint_key(process_id), self._timeout_ms))
+      return [self._known[process_id] for process_id in process_ids]
+
+
+def _fingerprint_key(process_id: int) -> str:
+  return f"jax/cache_key/topology_fingerprint/{process_id}"
+
+
+_job_fingerprints: _TopologyFingerprints | None = None
+
+
 def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
   accelerator_devices = []
   for accelerator in accelerators.flat:
     accelerator_devices.append(accelerator)
   try:
     topology = xla_client.get_topology_for_devices(accelerator_devices)
-    hash_obj.update(topology.fingerprint().to_bytes(8, byteorder="big"))
+    fingerprint = topology.fingerprint()
   except _jax.JaxRuntimeError as ex:
     # Fall back for those backends that do not support serialized
     # PjRtTopologyDescription as yet.
@@ -270,6 +305,29 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
                 "accelerator config, falling back to hashing "
                 "devices %s (type %s)", ex, type(ex))
     _hash_devices(hash_obj, accelerators)
+    return
+  # A process's topology describes its own devices, down to their NVLink
+  # links, so the processes of one computation can fingerprint apart: on a
+  # host where two of four GPUs share NVLink, those two processes and the
+  # other two keyed the same computation apart. Only process 0 writes cache
+  # entries, so the other two compiled what the first two loaded, and waited
+  # for ever for their shares of the compile's sharded autotuning. A
+  # computation that spans processes hashes all of their fingerprints, so
+  # every process computes one key; one whose processes fingerprint alike
+  # keeps the key it had.
+  process_ids = sorted({device.process_index for device in accelerator_devices})
+  fingerprints = [fingerprint]
+  if len(process_ids) > 1 and distributed.global_state.client is not None:
+    global _job_fingerprints
+    if (_job_fingerprints is None or
+        _job_fingerprints.client is not distributed.global_state.client):
+      _job_fingerprints = _TopologyFingerprints(
+          distributed.global_state.client,
+          distributed.global_state.process_id,
+          config.share_binary_between_hosts_timeout_ms.value)
+    fingerprints = sorted(set(_job_fingerprints.of(process_ids, fingerprint)))
+  for fingerprint in fingerprints:
+    hash_obj.update(fingerprint.to_bytes(8, byteorder="big"))
 
 # LINT.IfChange(xla_flags)
 xla_flags_to_exclude_from_cache_key = [

@@ -16,6 +16,7 @@ import hashlib
 import os
 import re
 import sys
+import threading
 import unittest
 from typing import cast as type_cast
 
@@ -40,6 +41,30 @@ from jax._src.custom_partitioning import custom_partitioning
 
 
 config.parse_flags_with_absl()
+
+
+class _FakeDistributedClient:
+  """The key-value store of a distributed runtime client, shared by the
+  processes a test runs as threads."""
+
+  def __init__(self):
+    self._values: dict[str, str] = {}
+    self._changed = threading.Condition()
+
+  def key_value_set(self, key: str, value: str,
+                    allow_overwrite: bool = False) -> None:
+    with self._changed:
+      if key in self._values and not allow_overwrite:
+        raise ValueError(f"{key} is already set")
+      self._values[key] = value
+      self._changed.notify_all()
+
+  def blocking_key_value_get(self, key: str, timeout_in_ms: int) -> str:
+    with self._changed:
+      if not self._changed.wait_for(lambda: key in self._values,
+                                    timeout_in_ms / 1000):
+        raise TimeoutError(key)
+      return self._values[key]
 
 
 class CacheKeyTest(jtu.JaxTestCase):
@@ -88,6 +113,27 @@ class CacheKeyTest(jtu.JaxTestCase):
     acc_hash2 = self.get_hashed_value(
         cache_key._hash_accelerator_config, devices)
     self.assertEqual(acc_hash1, acc_hash2)
+
+  def test_processes_of_a_computation_read_one_set_of_fingerprints(self):
+    # Two processes whose topologies fingerprint apart, as GPUs with and
+    # without NVLink do on one host, each publish their own fingerprint and
+    # read both, so they hash one accelerator config for a computation they
+    # share.
+    client = _FakeDistributedClient()
+    read = {}
+
+    def process(process_id, fingerprint):
+      fingerprints = cache_key._TopologyFingerprints(
+          client, process_id, timeout_ms=60_000)
+      read[process_id] = fingerprints.of([0, 1], fingerprint)
+
+    threads = [threading.Thread(target=process, args=arguments)
+               for arguments in ((0, 7), (1, 11))]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join()
+    self.assertEqual(read, {0: [7, 11], 1: [7, 11]})
 
   def test_hash_platform(self):
     hash1 = self.get_hashed_value(

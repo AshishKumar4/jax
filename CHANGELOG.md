@@ -50,7 +50,13 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 * Bug fixes
   * Fixed the gradient of {func}`jax.numpy.ldexp` at `x = 0.0`, which previously
     returned `1.0` instead of `2**n`.
-
+  * The persistent compilation cache key of a computation that spans processes
+    now hashes the topology fingerprints of all of them. A process's
+    fingerprint describes its own devices down to their NVLink links, so on a
+    host where only some GPUs share NVLink the processes of one computation
+    keyed it apart: some loaded the executable that process 0 had written while
+    the others compiled it and waited for ever for their peers' shares of its
+    sharded autotuning.
 
 ## JAX 0.11.2 (September 17, 2026)
 
