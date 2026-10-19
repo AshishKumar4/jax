@@ -14,6 +14,9 @@ on:
       publish:
         description: "publish this stack's wheel, e.g. 0.12.0, instead of looking for a new release"
         required: false
+      rehearse:
+        description: "rebase and test onto a release without pushing or publishing, e.g. \"0.11.2 0.12.0\""
+        required: false
 
 permissions:
   contents: write
@@ -39,7 +42,11 @@ jobs:
       - name: The release to carry
         id: next
         if: inputs.publish == ''
-        run: echo "pair=$(python3 dew/dew/patch_stack.py next)" >> "$GITHUB_OUTPUT"
+        env:
+          REHEARSE: ${{ inputs.rehearse }}
+        run: |
+          if [ -n "$REHEARSE" ]; then pair=$REHEARSE; else pair=$(python3 dew/dew/patch_stack.py next); fi
+          echo "pair=$pair" >> "$GITHUB_OUTPUT"
       - name: Rebase the stack onto it
         id: rebase
         if: steps.next.outputs.pair != ''
@@ -70,13 +77,13 @@ jobs:
           ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider tests/cache_key_test.py 2>&1 | tee ../tests.txt
       - name: Push it
         id: pushed
-        if: steps.rebase.outputs.result == 'rebased'
+        if: steps.rebase.outputs.result == 'rebased' && inputs.rehearse == ''
         run: |
           cd jax
           git push origin "v${{ steps.rebase.outputs.new }}-cache-key-pool-fingerprints"
           echo "release=${{ steps.rebase.outputs.new }}" >> "$GITHUB_OUTPUT"
       - name: Open an issue
-        if: failure() || steps.rebase.outputs.result == 'conflict' || steps.rebase.outputs.result == 'upstreamed'
+        if: inputs.rehearse == '' && (failure() || steps.rebase.outputs.result == 'conflict' || steps.rebase.outputs.result == 'upstreamed')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
