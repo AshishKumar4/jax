@@ -21,6 +21,11 @@ permissions:
 
 concurrency: patch-stack
 
+defaults:
+  run:
+    # bash -eo pipefail: a step fails where any command of a pipeline does.
+    shell: bash
+
 jobs:
   carry:
     runs-on: ubuntu-latest
@@ -52,9 +57,11 @@ jobs:
           code=0
           python3 ../dew/dew/patch_stack.py rebase "$1" "$2" > ../rebase.txt 2>&1 || code=$?
           cat ../rebase.txt
-          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # Words, not numbers: an expression compares an empty output with "0" as equal.
+          case $code in 0) result=rebased ;; 2) result=conflict ;; 3) result=upstreamed ;; *) result=failed ;; esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
       - name: Test it
-        if: steps.rebase.outputs.code == '0'
+        if: steps.rebase.outputs.result == 'rebased'
         run: |
           cd jax
           uv venv -q --python 3.12 ../venv
@@ -63,20 +70,20 @@ jobs:
           ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider tests/cache_key_test.py 2>&1 | tee ../tests.txt
       - name: Push it
         id: pushed
-        if: steps.rebase.outputs.code == '0'
+        if: steps.rebase.outputs.result == 'rebased'
         run: |
           cd jax
           git push origin "v${{ steps.rebase.outputs.new }}-cache-key-pool-fingerprints"
           echo "release=${{ steps.rebase.outputs.new }}" >> "$GITHUB_OUTPUT"
       - name: Open an issue
-        if: failure() || steps.rebase.outputs.code == '2' || steps.rebase.outputs.code == '3'
+        if: failure() || steps.rebase.outputs.result == 'conflict' || steps.rebase.outputs.result == 'upstreamed'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           new="${{ steps.rebase.outputs.new }}"
-          case "${{ steps.rebase.outputs.code }}" in
-            2) why="a fix does not apply" ;;
-            3) why="the release holds every fix: Dew can return to it" ;;
+          case "${{ steps.rebase.outputs.result }}" in
+            conflict) why="a fix does not apply" ;;
+            upstreamed) why="the release holds every fix: Dew can return to it" ;;
             *) why="the rebase or its tests failed" ;;
           esac
           {
