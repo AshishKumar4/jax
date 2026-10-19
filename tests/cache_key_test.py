@@ -382,6 +382,12 @@ class CacheKeyTest(jtu.JaxTestCase):
       compiler_params = None
     elif jtu.test_device_matches(["cuda"]):
       compiler_params = pl_triton.CompilerParams()
+      self.enter_context(
+          jtu.ignore_warning(
+              category=DeprecationWarning,
+              message="The Pallas Triton backend is deprecated",
+          )
+      )
     else:
       self.skipTest("Pallas lowers its kernels for TPU and CUDA")
 
