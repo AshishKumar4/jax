@@ -1901,16 +1901,69 @@ def _linear_call_impl(*args, callee, transpose_thunk, num_callee_consts,
 
 def _linear_call_jvp_rule(primals, tangents, callee, transpose_thunk,
                           num_callee_consts, num_res):
-  consts_and_res, primals = split_list(primals, [num_callee_consts + num_res])
-  const_tangents, tangents = split_list(tangents, [num_callee_consts + num_res])
-  assert all(type(t) is Zero for t in const_tangents)
+  num_fixed = num_callee_consts + num_res
+  consts_and_res, primals_lin = split_list(primals, [num_fixed])
+  fixed_tangents, tangents_lin = split_list(tangents, [num_fixed])
   primals_out = linear_call_p.bind(
-      *consts_and_res, *primals, callee=callee, transpose_thunk=transpose_thunk,
-      num_callee_consts=num_callee_consts, num_res=num_res)
-  tangents_out = linear_call_p.bind(
-      *consts_and_res, *tangents, callee=callee, transpose_thunk=transpose_thunk,
-      num_callee_consts=num_callee_consts, num_res=num_res)
+      *consts_and_res, *primals_lin, callee=callee,
+      transpose_thunk=transpose_thunk, num_callee_consts=num_callee_consts,
+      num_res=num_res)
+  # The callee is linear in its linear operands, so its tangent in them is
+  # another call, which keeps the custom transpose.
+  if all(type(t) is Zero for t in tangents_lin):
+    tangents_out = [Zero(aval.to_tangent_aval()) for aval in callee.out_avals]
+  else:
+    tangents_out = linear_call_p.bind(
+        *consts_and_res, *map(ad.instantiate_zeros, tangents_lin),
+        callee=callee, transpose_thunk=transpose_thunk,
+        num_callee_consts=num_callee_consts, num_res=num_res)
+  # It need not be linear in its residuals or in the constants it closes over,
+  # so its tangent in them is the callee's own, at the linear primals.
+  nonzeros = [type(t) is not Zero for t in fixed_tangents]
+  if any(nonzeros):
+    jvp_callee, out_nonzeros = ad.jvp_jaxpr(
+        callee, [*nonzeros, *[False] * len(primals_lin)], instantiate=False)
+    outs = core.jaxpr_as_fun(jvp_callee)(
+        *primals, *[t for t in fixed_tangents if type(t) is not Zero])
+    fixed_tangents_out = iter(outs[len(callee.out_avals):])
+    tangents_out = [ad.add_tangents(t, next(fixed_tangents_out)) if nz else t
+                    for t, nz in zip(tangents_out, out_nonzeros)]
   return primals_out, tangents_out
+
+def _linear_call_batching_rule(axis_data, args, dims, *, callee,
+                               transpose_thunk, num_callee_consts, num_res):
+  num_fixed = num_callee_consts + num_res
+  fixed, operands_lin = split_list(args, [num_fixed])
+  fixed_dims, lin_dims = split_list(dims, [num_fixed])
+  # The linear operands are all batched along axis 0, so the outputs and their
+  # cotangents are too, and the batched transpose takes batched cotangents to
+  # batched linear cotangents.
+  operands_lin = [
+      batching.bdim_at_front(x, d, axis_data.size, axis_data.explicit_mesh_axis)
+      for x, d in zip(operands_lin, lin_dims)]
+  num_out = len(callee.out_avals)
+  lin_axes = [0] * len(operands_lin)
+  batched = batching.batch_jaxpr_axes(
+      callee, axis_data, [*fixed_dims, *lin_axes], [0] * num_out)[0]
+  batched_consts = batched.consts
+  res_dims = fixed_dims[num_callee_consts:]
+
+  @pe._memoize
+  def batched_transpose_thunk():
+    transpose, t_consts = transpose_thunk()
+    batched_t = batching.batch_jaxpr_axes(
+        transpose, axis_data, [*[None] * len(t_consts), *res_dims, *[0] * num_out],
+        lin_axes)[0]
+    return (pe.convert_constvars_jaxpr(batched_t),
+            [*batched_t.consts, *t_consts])
+
+  outs = linear_call_p.bind(
+      *batched_consts, *fixed, *operands_lin,
+      callee=pe.convert_constvars_jaxpr(batched),
+      transpose_thunk=batched_transpose_thunk,
+      num_callee_consts=len(batched_consts) + num_callee_consts,
+      num_res=num_res)
+  return outs, [0] * num_out
 
 def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
                                 num_callee_consts, num_res):
@@ -1945,6 +1998,7 @@ linear_call_p.def_impl(_linear_call_impl)
 linear_call_p.def_abstract_eval(_linear_call_abstract_eval)
 ad.primitive_jvps[linear_call_p] = _linear_call_jvp_rule
 ad.primitive_transposes[linear_call_p] = _linear_call_transpose_rule
+batching.fancy_primitive_batchers[linear_call_p] = _linear_call_batching_rule
 mlir.register_lowering(linear_call_p, mlir.lower_fun(
     _linear_call_impl, multiple_results=True))
 
