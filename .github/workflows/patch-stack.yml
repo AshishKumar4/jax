@@ -1,0 +1,150 @@
+# The fixes Dew carries on JAX (dew/patch_stack.py), moved onto each new JAX release and published to
+# Dew's package index, https://pypi.dewml.dev/simple. Every six hours it looks for a release upstream has
+# tagged that this fork carries no stack for; it rebases the newest stack onto it, dropping the fixes the
+# release already has, runs tests/cache_key_test.py, pushes the branch and publishes its wheel. A conflict,
+# a red test or a release that holds every fix opens an issue here. Run by hand with `publish`, it
+# publishes a stack's wheel again (one already in the index is kept as it is).
+name: patch stack
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "publish this stack's wheel, e.g. 0.12.0, instead of looking for a new release"
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency: patch-stack
+
+jobs:
+  carry:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.pushed.outputs.release || inputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+      - uses: astral-sh/setup-uv@v6
+      - name: The release to carry
+        id: next
+        if: inputs.publish == ''
+        run: echo "pair=$(python3 dew/dew/patch_stack.py next)" >> "$GITHUB_OUTPUT"
+      - name: Rebase the stack onto it
+        id: rebase
+        if: steps.next.outputs.pair != ''
+        run: |
+          set -- ${{ steps.next.outputs.pair }}
+          echo "old=$1" >> "$GITHUB_OUTPUT"
+          echo "new=$2" >> "$GITHUB_OUTPUT"
+          git clone -q --filter=blob:none --no-checkout "https://github.com/${{ github.repository }}.git" jax
+          cd jax
+          git remote add upstream https://github.com/jax-ml/jax.git
+          git fetch -q origin "v$1-cache-key-pool-fingerprints:v$1-cache-key-pool-fingerprints"
+          git fetch -q --no-tags upstream "refs/tags/jax-v$1:refs/tags/jax-v$1" "refs/tags/jax-v$2:refs/tags/jax-v$2"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          code=0
+          python3 ../dew/dew/patch_stack.py rebase "$1" "$2" > ../rebase.txt 2>&1 || code=$?
+          cat ../rebase.txt
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Test it
+        if: steps.rebase.outputs.code == '0'
+        run: |
+          cd jax
+          uv venv -q --python 3.12 ../venv
+          uv pip install -q --python ../venv/bin/python "jaxlib==${{ steps.rebase.outputs.new }}" . absl-py \
+            cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow
+          ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider tests/cache_key_test.py 2>&1 | tee ../tests.txt
+      - name: Push it
+        id: pushed
+        if: steps.rebase.outputs.code == '0'
+        run: |
+          cd jax
+          git push origin "v${{ steps.rebase.outputs.new }}-cache-key-pool-fingerprints"
+          echo "release=${{ steps.rebase.outputs.new }}" >> "$GITHUB_OUTPUT"
+      - name: Open an issue
+        if: failure() || steps.rebase.outputs.code == '2' || steps.rebase.outputs.code == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          new="${{ steps.rebase.outputs.new }}"
+          case "${{ steps.rebase.outputs.code }}" in
+            2) why="a fix does not apply" ;;
+            3) why="the release holds every fix: Dew can return to it" ;;
+            *) why="the rebase or its tests failed" ;;
+          esac
+          {
+            echo "Carrying the patch stack onto jax ${new:-?}: $why."
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            for file in rebase.txt tests.txt; do
+              if [ -f "$file" ]; then printf '\n%s:\n```\n' "$file"; tail -c 60000 "$file"; printf '```\n'; fi
+            done
+          } > issue.md
+          gh issue create --repo "${{ github.repository }}" --title "Patch stack onto jax ${new:-?}: $why" \
+            --body-file issue.md
+
+  publish:
+    needs: carry
+    if: needs.carry.outputs.release != ''
+    runs-on: ubuntu-latest
+    env:
+      RELEASE: ${{ needs.carry.outputs.release }}
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+      - uses: astral-sh/setup-uv@v6
+      - name: The index's storage is configured
+        run: |
+          for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
+          done
+      - name: Build the stack's wheel, and fetch the release's own
+        run: |
+          git clone -q --depth 1 --branch "v$RELEASE-cache-key-pool-fingerprints" \
+            "https://github.com/${{ github.repository }}.git" jax
+          uv build -q --wheel --out-dir dist jax
+          uv venv -q venv
+          uv pip install -q --python venv/bin/python pip
+          venv/bin/python -m pip download -q --no-deps --only-binary :all: --dest dist "jax==$RELEASE"
+          ls dist
+      - name: Index them
+        run: |
+          # The manifest lists what the index holds: absent only before the first publication, and any other
+          # failure to read it stops here, so an index is never written without what it held.
+          if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key packages/jax/manifest.json \
+              > /dev/null 2> head.txt; then
+            aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/jax/manifest.json" manifest.json
+          elif grep -q "(404)" head.txt; then
+            echo '{}' > manifest.json
+          else
+            cat head.txt
+            exit 1
+          fi
+          python3 dew/dew/patch_stack.py index manifest.json site dist/*.whl > new.txt
+          cat new.txt
+      - name: Upload them, the index last
+        run: |
+          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" > /dev/null; }
+          while read -r name; do
+            put "packages/jax/$name" "site/packages/jax/$name" application/octet-stream
+            put "packages/jax/$name.metadata" "site/packages/jax/$name.metadata" text/plain
+          done < new.txt
+          put packages/jax/manifest.json manifest.json application/json
+          # Installers ask for the directories (simple/, simple/jax/); each is stored under both names.
+          for page in simple/ simple/jax/; do
+            put "$page" "site/${page}index.html" text/html
+            put "${page}index.html" "site/${page}index.html" text/html
+          done
