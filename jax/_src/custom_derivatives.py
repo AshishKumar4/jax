@@ -1571,9 +1571,12 @@ def linear_call(fun: Callable,
         fun_transpose,
         ft.pack(((ft.FTPyTree(res_avals, res_tree),
                   ft.FTPyTree(list(out_avals), out_tree)), {})),
-        # TODO(necula): the fun_transpose takes residual and output of fun!
+        # fun_transpose takes the residuals and the cotangents of fun's outputs,
+        # which are named here after those outputs' avals. It is traced while
+        # the call is made, so its names reach the tracing cache's explanations.
         debug_info("linear_call fun_transpose", fun_transpose,
-                   (residual_args, linear_args), {}).with_unknown_names())
+                   (residual_args, tree_unflatten(out_tree, list(out_avals))),
+                   {}))
     if t_out_avals.tree != lin_tree:
       raise TypeError(
           'transpose output pytree structure must match that of linear inputs, '
