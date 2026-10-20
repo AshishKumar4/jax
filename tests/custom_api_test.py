@@ -5633,6 +5633,33 @@ class LinearCallTest(jtu.JaxTestCase):
     ans = jax.grad(lambda r: jax.grad(lambda x: ruled(r, x))(3.))(2.)
     self.assertAllClose(ans, 14.)
 
+  def test_jvp_in_a_value_only_the_transpose_reads(self):
+    def g(c):
+      return jax.custom_derivatives.linear_call(
+          lambda _, x: x, lambda _, ct: c * ct, (), 3.)
+    self.assertAllClose(jax.jvp(g, (2.,), (1.,)), (3., 0.))
+
+  def test_a_transpose_held_in_an_object_whose_equality_is_an_array(self):
+    @dataclasses.dataclass(eq=True)
+    class Scaled:
+      scale: jax.Array
+      def __call__(self, _, ct):
+        return self.scale * ct
+    inner = Scaled(jnp.arange(1., 4.))
+    @dataclasses.dataclass(eq=True)
+    class Outer:
+      scale: jax.Array
+      def __call__(self, _, ct):
+        return jax.custom_derivatives.linear_call(
+            lambda _, z: z, partial(inner), (), self.scale * ct)
+    outer = Outer(jnp.arange(4., 7.))
+    call = lambda x: jax.custom_derivatives.linear_call(
+        lambda _, x: x, partial(outer), (), x)
+    x = jnp.ones(3)
+    self.assertAllClose(call(x), x)
+    self.assertAllClose(jax.linear_transpose(call, x)(x)[0],
+                        jnp.arange(1., 4.) * jnp.arange(4., 7.))
+
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
     x = jnp.arange(2., 26.).reshape(2, 3, 4)
