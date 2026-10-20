@@ -1942,7 +1942,7 @@ def _linear_call_batching_rule(axis_data, args, dims, *, callee,
   # The batched callee takes the transpose's constants as residuals it ignores.
   callee_consts = len(batched.consts) + num_callee_consts
   callee_jaxpr = pe.convert_constvars_jaxpr(batched)
-  ignored = [core.Var(core.get_aval(v)) for v in t_vals]
+  ignored = [core.Var(core.typeof(v)) for v in t_vals]
   dbg = callee_jaxpr.debug_info
   if dbg.arg_names is not None:
     names = tuple(dbg.arg_names)
