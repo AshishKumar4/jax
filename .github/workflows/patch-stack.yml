@@ -1,9 +1,10 @@
 # The fixes Dew carries on JAX (dew/patch_stack.py), moved onto each new JAX release and published to
 # Dew's package index, https://pypi.dewml.dev/simple. Every six hours it looks for a release upstream has
 # tagged that this fork carries no stack for; it rebases the newest stack onto it, dropping the fixes the
-# release already has, runs tests/cache_key_test.py, pushes the branch and publishes its wheel. A conflict,
-# a red test or a release that holds every fix opens an issue here. Run by hand with `publish`, it
-# publishes a stack's wheel again (one already in the index is kept as it is); with `yank`, it marks
+# release already has, runs the stack's tests, pushes the branch and publishes its wheel. A conflict, a red
+# test or a release that holds every fix opens an issue here. Run by hand with `publish`, it publishes a
+# stack's wheel again (one already in the index is kept as it is). A wheel reaches the index only after
+# the stack's tests passed on it, with JAX's checks off and on; with `yank`, it marks
 # wheels the index lists yanked (PEP 592), so an installer resolving a range passes them over.
 name: patch stack
 
@@ -30,6 +31,12 @@ permissions:
   issues: write
 
 concurrency: patch-stack
+
+env:
+  # The stack's tests: its fixes' own (the cache key's, linear_call's) and the API they change. A stack is
+  # pushed, and its wheel published, only where they pass.
+  TESTS: tests/cache_key_test.py tests/api_test.py tests/custom_api_test.py tests/debug_info_test.py
+  TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy
 
 defaults:
   run:
@@ -79,9 +86,11 @@ jobs:
         run: |
           cd jax
           uv venv -q --python 3.12 ../venv
-          uv pip install -q --python ../venv/bin/python "jaxlib==${{ steps.rebase.outputs.new }}" . absl-py \
-            cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow
-          ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider tests/cache_key_test.py 2>&1 | tee ../tests.txt
+          uv pip install -q --python ../venv/bin/python "jaxlib==${{ steps.rebase.outputs.new }}" . $TEST_DEPENDENCIES
+          for checks in 0 1; do
+            JAX_ENABLE_CHECKS=$checks ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $TESTS 2>&1 \
+              | tee -a ../tests.txt
+          done
       - name: Push it
         id: pushed
         if: steps.rebase.outputs.result == 'rebased' && inputs.rehearse == ''
@@ -144,6 +153,19 @@ jobs:
           uv pip install -q --python venv/bin/python pip
           venv/bin/python -m pip download -q --no-deps --only-binary :all: --dest dist "jax==$RELEASE"
           ls dist
+      - name: Test the stack's wheel
+        if: env.RELEASE != ''
+        run: |
+          # The stack's tests, run from the tree the wheel was built from (which they import, as `python -m`
+          # puts it first), with the wheel installed beside its release's jaxlib: a manual publication is
+          # tested as a new release's is.
+          uv venv -q --python 3.12 tested
+          uv pip install -q --python tested/bin/python dist/jax-"$RELEASE".post*-py3-none-any.whl "jaxlib==$RELEASE" \
+            $TEST_DEPENDENCIES
+          cd jax
+          for checks in 0 1; do
+            JAX_ENABLE_CHECKS=$checks ../tested/bin/python -m pytest -q -n auto -p no:cacheprovider $TESTS
+          done
       - name: Index them
         run: |
           # The manifest lists what the index holds: absent only before the first publication, and any other

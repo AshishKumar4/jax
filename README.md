@@ -18,6 +18,6 @@ uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 `.github/workflows/patch-stack.yml` looks for a new JAX release every six hours, rebases the newest
-stack onto it with `dew/patch_stack.py`, runs `tests/cache_key_test.py`, pushes the branch and
+stack onto it with `dew/patch_stack.py`, runs the stack's tests, pushes the branch and
 publishes its wheel; a conflict, a red test, or a release that holds every fix opens an issue here.
 This branch, `dew`, holds only that; `main` follows upstream.
