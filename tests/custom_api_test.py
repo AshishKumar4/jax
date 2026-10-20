@@ -5004,5 +5004,48 @@ class LinearCallTest(jtu.JaxTestCase):
     # the custom transpose: 7 c, summed.
     self.assertAllClose(jax.grad(lambda x: jnp.sum(tangent(x)))(x), 7. * c)
 
+  def test_vmap_of_jvp_and_of_grad_in_a_value_the_transpose_closes_over(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    ans = jax.vmap(lambda c, x: jax.jvp(self.closed, (c, x), (jnp.ones_like(c), jnp.ones_like(x))))(c, x)
+    self.assertAllClose(ans, (c * x, x + c))
+    grad = jax.vmap(jax.grad(lambda c, x: jnp.sum(self.closed(c, x)), argnums=0))
+    self.assertAllClose(grad(c, x), x)
+
+  @parameterized.parameters([jax.jit, jax.checkpoint])
+  def test_vmap_of_a_staged_call_whose_transpose_closes_over_a_value(self, stage):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    self.assertAllClose(jax.vmap(stage(self.closed))(c, x), c * x)
+    loss = lambda x: jnp.sum(jax.vmap(stage(self.closed))(c, x))
+    self.assertAllClose(jax.grad(loss)(x), 7. * c)
+
+  def test_grad_of_vmap_with_a_capture_only_the_transpose_maps(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 5.)
+    def g(c, x):
+      return jax.custom_derivatives.linear_call(
+          lambda _, x: x, lambda _, ct: 7. * c * ct, (), x)
+    loss = lambda x: jnp.sum(jax.vmap(g, in_axes=(0, None))(c, x))
+    self.assertAllClose(jax.grad(loss)(x), 7. * jnp.sum(c, 0))
+
+  def test_nested_vmap_and_jit_of_grad_of_vmap(self):
+    c = jnp.arange(1., 13.).reshape(2, 2, 3)
+    x = jnp.arange(2., 14.).reshape(2, 2, 3)
+    loss = lambda x: jnp.sum(jax.vmap(jax.vmap(self.closed))(c, x))
+    self.assertAllClose(jax.grad(loss)(x), 7. * c)
+    self.assertAllClose(jax.jit(jax.grad(loss))(x), 7. * c)
+    inner = lambda c, x: jax.grad(lambda x: jnp.sum(jax.vmap(self.closed)(c, x)))(x)
+    self.assertAllClose(jax.vmap(inner)(c, x), 7. * c)
+
+  def test_jvp_in_c_of_grad_in_x(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    dc = jnp.full_like(c, .5)
+    grad = lambda c: jax.grad(lambda x: jnp.sum(jax.vmap(self.closed)(c, x) ** 2))(x)
+    # The gradient in x through the 7-fold transpose is 14 x c c, so its
+    # tangent along dc is 28 x c dc.
+    self.assertAllClose(jax.jvp(grad, (c,), (dc,)), (14. * x * c * c, 28. * x * c * dc))
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
