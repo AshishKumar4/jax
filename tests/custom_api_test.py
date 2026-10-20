@@ -5093,6 +5093,17 @@ class LinearCallTest(jtu.JaxTestCase):
     ans = jax.grad(lambda r: jax.grad(lambda x: outer(r, x))(3.))(2.)
     self.assertAllClose(ans, 14.)
 
+    # The same with both transposes one function, specialized by partial.
+    def tp(scale, r, ct):
+      if scale is None:
+        return ct * jax.custom_derivatives.linear_call(
+            lambda _, z: z, partial(tp, r), (), r)
+      return 7. * scale * ct
+    def specialized(r, x):
+      return jax.custom_derivatives.linear_call(lambda r, x: r * x, partial(tp, None), r, x)
+    ans = jax.grad(lambda r: jax.grad(lambda x: specialized(r, x))(3.))(2.)
+    self.assertAllClose(ans, 14.)
+
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
     x = jnp.arange(2., 26.).reshape(2, 3, 4)
