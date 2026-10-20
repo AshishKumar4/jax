@@ -5547,5 +5547,35 @@ class LinearCallTest(jtu.JaxTestCase):
     # tangent along dc is 28 x c dc.
     self.assertAllClose(jax.jvp(grad, (c,), (dc,)), (14. * x * c * c, 28. * x * c * dc))
 
+  def test_grad_of_vmap_of_grad_and_transpose_of_vmap_of_transpose(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    inner = jax.grad(lambda c, x: jnp.sum(self.closed(c, x) ** 2), argnums=1)
+    # The inner gradient is 7 * 2 x c * c through the custom transpose; the
+    # outer one differentiates that linear map in x through the custom
+    # transpose of the transpose, the call itself.
+    ans = jax.grad(lambda x: jnp.sum(jax.vmap(inner)(c, x)))(x)
+    self.assertAllClose(ans, 14. * c * c)
+    ct = jnp.ones_like(c)
+    def transposed(c, ct):
+      return jax.linear_transpose(partial(self.closed, c), jnp.zeros_like(ct))(ct)[0]
+    twice = jax.linear_transpose(lambda ct: jax.vmap(transposed)(c, ct), jnp.zeros_like(c))(ct)[0]
+    self.assertAllClose(twice, c)
+
+  def test_a_transpose_that_calls_itself_traces_when_transposed(self):
+    def f(_, x):
+      return x
+    def t(_, ct):
+      return 7. * jax.custom_derivatives.linear_call(f, t, (), ct)
+    call = lambda x: jax.custom_derivatives.linear_call(f, t, (), x)
+    self.assertAllClose(call(1.), 1.)
+    self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
+
+  def test_grad_of_nested_vmap_of_unequal_sizes(self):
+    c = jnp.arange(1., 25.).reshape(2, 3, 4)
+    x = jnp.arange(2., 26.).reshape(2, 3, 4)
+    loss = lambda x: jnp.sum(jax.vmap(jax.vmap(self.closed))(c, x))
+    self.assertAllClose(jax.grad(loss)(x), 7. * c)
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

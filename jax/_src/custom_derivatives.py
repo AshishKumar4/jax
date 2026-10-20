@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import dataclasses
+import threading
 from functools import update_wrapper, reduce, partial, wraps
 from typing import Any
 
@@ -1844,27 +1845,40 @@ def linear_call(fun: Callable,
   out_avals = f_jaxpr_closed.out_avals
   out_tree = f_out_avals.tree
 
-  # The transpose is traced here, where the values it closes over are live, and
-  # those values become residuals of the call: every transformation of the call
-  # then sees them as operands, where a transpose traced later, once vmap, jvp
-  # or a staging trace has exited, would hold their dead tracers.
-  t_jaxpr, t_out_avals = pe.trace_to_jaxpr(
-      fun_transpose,
-      ft.pack(((ft.FTPyTree(res_avals, res_tree),
-                ft.FTPyTree(list(out_avals), out_tree)), {})),
-      # TODO(necula): the fun_transpose takes residual and output of fun!
-      debug_info("linear_call fun_transpose", fun_transpose,
-                 (residual_args, linear_args), {}).with_unknown_names())
-  if t_out_avals.tree != lin_tree:
-    raise TypeError(
-        'transpose output pytree structure must match that of linear inputs, '
-        f'got output structure {t_out_avals.tree} '
-        f'and input structure {lin_tree}.')
-  transpose, t_consts = pe.separate_consts(t_jaxpr)
-  callee = _ignoring(f_jaxpr_closed, len(f_consts), t_consts)
+  def traced_transpose():
+    t_jaxpr, t_out_avals = pe.trace_to_jaxpr(
+        fun_transpose,
+        ft.pack(((ft.FTPyTree(res_avals, res_tree),
+                  ft.FTPyTree(list(out_avals), out_tree)), {})),
+        # TODO(necula): the fun_transpose takes residual and output of fun!
+        debug_info("linear_call fun_transpose", fun_transpose,
+                   (residual_args, linear_args), {}).with_unknown_names())
+    if t_out_avals.tree != lin_tree:
+      raise TypeError(
+          'transpose output pytree structure must match that of linear inputs, '
+          f'got output structure {t_out_avals.tree} '
+          f'and input structure {lin_tree}.')
+    return pe.separate_consts(t_jaxpr)
 
-  def transpose_thunk():
-    return transpose, ()
+  if fun_transpose in _transposing.active:
+    # A transpose that calls itself again (a self-adjoint call, say) is traced
+    # when the call is transposed, or its tracing would never end.
+    callee, t_consts = f_jaxpr_closed, ()
+    transpose_thunk = pe._memoize(traced_transpose)
+  else:
+    # The transpose is traced here, where the values it closes over are live,
+    # and those values become residuals of the call: every transformation of
+    # the call then sees them as operands, where a transpose traced later, once
+    # vmap, jvp or a staging trace has exited, would hold their dead tracers.
+    _transposing.active.add(fun_transpose)
+    try:
+      transpose, t_consts = traced_transpose()
+    finally:
+      _transposing.active.discard(fun_transpose)
+    callee = _ignoring(f_jaxpr_closed, len(f_consts), t_consts)
+
+    def transpose_thunk():
+      return transpose, ()
 
   out = linear_call_p.bind(*f_consts, *t_consts, *operands_res, *operands_lin,
                            callee=callee,
@@ -1873,6 +1887,14 @@ def linear_call(fun: Callable,
                            num_res=len(t_consts) + len(operands_res))
 
   return tree_unflatten(out_tree, out)
+
+class _Transposing(threading.local):
+  """The transposes this thread is tracing at a linear_call, outermost first."""
+
+  def __init__(self):
+    self.active: set[Callable] = set()
+
+_transposing = _Transposing()
 
 def _ignoring(jaxpr: core.Jaxpr, at: int, values) -> core.Jaxpr:
   """`jaxpr` taking, before its input `at`, one input it ignores for each of
@@ -1969,16 +1991,18 @@ def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
   assert all(ad.is_undefined_primal(x)     for x in operands_lin)
   assert all(not ad.is_undefined_primal(x) for x in operands_res)
 
+  # The call's own constants are residuals of its transpose, as its transpose's
+  # are of it, so the transpose's transpose holds no value of its own.
   def new_transpose_thunk():
-    return callee, f_consts
+    return callee, ()
 
   cts = [zeros_like_aval(a) if type(ct) is Zero else ct
          for ct, a in zip(cts, cts_avals)]
-  cts_out = linear_call_p.bind(*t_consts, *operands_res, *cts,
-                               callee=transpose,
+  cts_out = linear_call_p.bind(*t_consts, *f_consts, *operands_res, *cts,
+                               callee=_ignoring(transpose, len(t_consts), f_consts),
                                transpose_thunk=new_transpose_thunk,
                                num_callee_consts=len(t_consts),
-                               num_res=len(operands_res))
+                               num_res=len(f_consts) + len(operands_res))
 
   return [None] * (num_callee_consts + num_res) + cts_out
 
