@@ -5645,7 +5645,7 @@ class LinearCallTest(jtu.JaxTestCase):
     @dataclasses.dataclass(eq=True)
     class Scaled:
       scale: jax.Array
-      inner: Any = None
+      inner: object = None
       def __call__(self, _, ct):
         if self.inner is None:
           return self.scale * ct
