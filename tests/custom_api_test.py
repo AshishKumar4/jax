@@ -5139,5 +5139,24 @@ class LinearCallTest(jtu.JaxTestCase):
     loss = lambda x: jnp.sum(jax.vmap(jax.vmap(self.closed))(c, x))
     self.assertAllClose(jax.grad(loss)(x), 7. * c)
 
+  def test_grad_of_vmap_with_residuals_captures_unused_outputs_and_a_later_axis(self):
+    # A call with residuals of its own, a transpose that also closes over c,
+    # two outputs of which the loss reads one, and c and x mapped along axis 1.
+    def g(c, r, x):
+      def f(r, x):
+        return x * r, x * 2.
+      def t(r, cts):
+        ct, ct2 = cts
+        return 7. * c * r * ct + 3. * ct2
+      return jax.custom_derivatives.linear_call(f, t, r, x)
+    c = jnp.arange(1., 7.).reshape(3, 2)
+    r = jnp.arange(2., 5.)
+    x = jnp.arange(3., 9.).reshape(3, 2)
+    def loss(x):
+      first, _ = jax.vmap(g, in_axes=(1, None, 1), out_axes=1)(c, r, x)
+      return jnp.sum(first)
+    # The second output's cotangent is a symbolic zero; the first's is one.
+    self.assertAllClose(jax.grad(loss)(x), 7. * c * r[:, None])
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
