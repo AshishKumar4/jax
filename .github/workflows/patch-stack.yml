@@ -160,9 +160,9 @@ jobs:
           # The wheels built here (none where the run only yanks), and the files `yank` names.
           shopt -s nullglob
           wheels=(dist/*.whl)
-          read -ra names <<< "$YANK"
+          read -ra names <<< "$(printf '%s' "$YANK" | tr '\r\n' '  ')"
           yanks=()
-          if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" --reason "$REASON"); fi
+          if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" "--reason=$REASON"); fi
           python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" "${yanks[@]}" > new.txt
           cat new.txt
       - name: Upload them, the index last
