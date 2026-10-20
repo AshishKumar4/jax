@@ -5118,6 +5118,21 @@ class LinearCallTest(jtu.JaxTestCase):
     ans = jax.grad(lambda r: jax.grad(lambda x: wrapped(r, x))(3.))(2.)
     self.assertAllClose(ans, 14.)
 
+    # The same with two partial subclasses that call a rule of their own.
+    class Ruled(partial):
+      def __call__(self, r, ct):
+        return self.rule(r, ct)
+    def ruled(r, x):
+      outer = Ruled(marker)
+      def rule(r, ct):
+        inner = Ruled(marker)
+        inner.rule = lambda _, g: 7. * r * g
+        return ct * jax.custom_derivatives.linear_call(lambda _, z: z, inner, (), r)
+      outer.rule = rule
+      return jax.custom_derivatives.linear_call(lambda r, x: r * x, outer, r, x)
+    ans = jax.grad(lambda r: jax.grad(lambda x: ruled(r, x))(3.))(2.)
+    self.assertAllClose(ans, 14.)
+
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
     x = jnp.arange(2., 26.).reshape(2, 3, 4)
