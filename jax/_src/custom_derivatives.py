@@ -1860,12 +1860,14 @@ def linear_call(fun: Callable,
           f'and input structure {lin_tree}.')
     return pe.separate_consts(t_jaxpr)
 
-  underlying = _unwrapped(fun_transpose)
+  underlying = _transpose_identity(fun_transpose)
   if (underlying in _transposing.active
       or len(_transposing.active) >= _MAX_EAGER_TRANSPOSES):
     # A transpose that calls itself again (a self-adjoint call, say) is traced
-    # when its call is transposed, or its tracing would never end; so is any
-    # past a nesting a transpose that recurses through fresh callables reaches.
+    # when its call is transposed, or its tracing would never end. So is any
+    # past _MAX_EAGER_TRANSPOSES nested ones, a bound on recursion through
+    # fresh callables, where a capture of the transposes it encloses is not
+    # converted.
     callee, t_consts = f_jaxpr_closed, ()
     transpose_thunk = pe._memoize(traced_transpose)
   else:
@@ -1899,15 +1901,22 @@ class _Transposing(threading.local):
 
 _MAX_EAGER_TRANSPOSES = 32
 
-def _unwrapped(fun: Callable) -> Callable:
-  """`fun` without the functools.partial and functools.wraps layers around it."""
+def _transpose_identity(fun: Callable) -> tuple[Any, ...]:
+  """`fun` as the callable under its functools.wraps layers, with the values
+  each functools.partial around it binds, by identity: a partial that binds
+  nothing is the function it wraps, one that binds other values another
+  transpose."""
+  bound = []
   while True:
     if isinstance(fun, partial):
+      if fun.args or fun.keywords:
+        bound.append((tuple(map(id, fun.args)),
+                      tuple(sorted((k, id(v)) for k, v in fun.keywords.items()))))
       fun = fun.func
     elif hasattr(fun, '__wrapped__'):
       fun = fun.__wrapped__
     else:
-      return fun
+      return (fun, *bound)
 
 _transposing = _Transposing()
 
