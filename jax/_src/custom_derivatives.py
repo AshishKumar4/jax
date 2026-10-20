@@ -1904,9 +1904,10 @@ _MAX_EAGER_TRANSPOSES = 32
 def _transpose_identity(fun: Callable) -> tuple[Any, ...]:
   """`fun` as the callable under its functools.partial layers, with the values
   each binds, by identity: a partial that binds nothing is the callable it
-  wraps, one that binds other values another transpose."""
+  wraps, one that binds other values another transpose. A subclass of partial,
+  which may call otherwise, is its own callable."""
   bound = []
-  while isinstance(fun, partial):
+  while type(fun) is partial:
     if fun.args or fun.keywords:
       bound.append((tuple(map(id, fun.args)),
                     tuple(sorted((k, id(v)) for k, v in fun.keywords.items()))))
