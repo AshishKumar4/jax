@@ -5476,7 +5476,8 @@ class LinearCallTest(jtu.JaxTestCase):
     x_in = x if x_axis is not None else x[0]
     loss = lambda x: jnp.sum(jax.vmap(self.closed, in_axes=(c_axis, x_axis))(c_in, x))
     ans = jax.grad(loss)(x_in)
-    expected = 7. * (c_in if x_axis is not None else jnp.sum(c, 0)) * jnp.ones_like(x_in)
+    expected = jnp.broadcast_to(
+        7. * (c_in if x_axis is not None else jnp.sum(c, 0)), x_in.shape)
     self.assertAllClose(ans, expected)
 
   def test_vmap_of_grad_with_a_transpose_closed_over_a_mapped_value(self):
