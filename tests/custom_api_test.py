@@ -5640,19 +5640,19 @@ class LinearCallTest(jtu.JaxTestCase):
     self.assertAllClose(jax.jvp(g, (2.,), (1.,)), (3., 0.))
 
   def test_a_transpose_held_in_an_object_whose_equality_is_an_array(self):
+    # Two instances of one dataclass, whose generated equality compares their
+    # array fields: telling the transposes apart must not call it.
     @dataclasses.dataclass(eq=True)
     class Scaled:
       scale: jax.Array
+      inner: Any = None
       def __call__(self, _, ct):
-        return self.scale * ct
-    inner = Scaled(jnp.arange(1., 4.))
-    @dataclasses.dataclass(eq=True)
-    class Outer:
-      scale: jax.Array
-      def __call__(self, _, ct):
+        if self.inner is None:
+          return self.scale * ct
         return jax.custom_derivatives.linear_call(
-            lambda _, z: z, partial(inner), (), self.scale * ct)
-    outer = Outer(jnp.arange(4., 7.))
+            lambda _, z: z, partial(self.inner), (), self.scale * ct)
+    inner = Scaled(jnp.arange(1., 4.))
+    outer = Scaled(jnp.arange(4., 7.), inner)
     call = lambda x: jax.custom_derivatives.linear_call(
         lambda _, x: x, partial(outer), (), x)
     x = jnp.ones(3)
