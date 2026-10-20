@@ -1897,7 +1897,7 @@ class _Transposing(threading.local):
   """The transposes this thread is tracing at a linear_call, outermost first."""
 
   def __init__(self):
-    self.active: list[Callable] = []
+    self.active: list[tuple[Any, ...]] = []
 
 _MAX_EAGER_TRANSPOSES = 32
 
