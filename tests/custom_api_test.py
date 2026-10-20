@@ -5570,12 +5570,28 @@ class LinearCallTest(jtu.JaxTestCase):
     call = lambda x: jax.custom_derivatives.linear_call(f, t, (), x)
     self.assertAllClose(call(1.), 1.)
     self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
-    # The same through a fresh wrapper at every call.
+    # The same through a fresh partial, or a fresh lambda, at every call.
     def wrapped(_, ct):
       return 7. * jax.custom_derivatives.linear_call(f, partial(wrapped), (), ct)
-    call = lambda x: jax.custom_derivatives.linear_call(f, wrapped, (), x)
-    self.assertAllClose(call(1.), 1.)
-    self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
+    def fresh(_, ct):
+      return 7. * jax.custom_derivatives.linear_call(f, lambda r, g: fresh(r, g), (), ct)
+    for transpose in (wrapped, fresh):
+      call = lambda x: jax.custom_derivatives.linear_call(f, transpose, (), x)
+      self.assertAllClose(call(1.), 1.)
+      self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
+
+  def test_second_order_through_a_call_nested_in_a_transpose(self):
+    # The inner call's transpose closes over the outer transpose's own operand.
+    def outer(r, x):
+      def transposed(r, ct):
+        inner = jax.custom_derivatives.linear_call(
+            lambda _, z: z, lambda _, g: 7. * r * g, (), r)
+        return ct * inner
+      return jax.custom_derivatives.linear_call(lambda r, x: r * x, transposed, r, x)
+    # The gradient in x is r, through the outer transpose; its gradient in r
+    # runs the inner custom transpose on a cotangent of one: 7 r.
+    ans = jax.grad(lambda r: jax.grad(lambda x: outer(r, x))(3.))(2.)
+    self.assertAllClose(ans, 14.)
 
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
