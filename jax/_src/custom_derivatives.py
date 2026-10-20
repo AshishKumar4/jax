@@ -1581,10 +1581,12 @@ def linear_call(fun: Callable,
           f'and input structure {lin_tree}.')
     return pe.separate_consts(t_jaxpr)
 
-  if _transposing.depth:
-    # A call made while a transpose is traced here is traced when it is
-    # transposed itself: a transpose that calls itself again (a self-adjoint
-    # call, say, under any wrapper) would otherwise never finish tracing.
+  underlying = _unwrapped(fun_transpose)
+  if (underlying in _transposing.active
+      or len(_transposing.active) >= _MAX_EAGER_TRANSPOSES):
+    # A transpose that calls itself again (a self-adjoint call, say) is traced
+    # when its call is transposed, or its tracing would never end; so is any
+    # past a nesting a transpose that recurses through fresh callables reaches.
     callee, t_consts = f_jaxpr_closed, ()
     transpose_thunk = pe._memoize(traced_transpose)
   else:
@@ -1592,11 +1594,11 @@ def linear_call(fun: Callable,
     # and those values become residuals of the call: every transformation of
     # the call then sees them as operands, where a transpose traced later, once
     # vmap, jvp or a staging trace has exited, would hold their dead tracers.
-    _transposing.depth += 1
+    _transposing.active.append(underlying)
     try:
       transpose, t_consts = traced_transpose()
     finally:
-      _transposing.depth -= 1
+      _transposing.active.pop()
     callee = _ignoring(f_jaxpr_closed, len(f_consts), t_consts)
 
     def transpose_thunk():
@@ -1611,10 +1613,22 @@ def linear_call(fun: Callable,
   return tree_unflatten(out_tree, out)
 
 class _Transposing(threading.local):
-  """How many transposes this thread is tracing at a linear_call."""
+  """The transposes this thread is tracing at a linear_call, outermost first."""
 
   def __init__(self):
-    self.depth = 0
+    self.active: list[Callable] = []
+
+_MAX_EAGER_TRANSPOSES = 32
+
+def _unwrapped(fun: Callable) -> Callable:
+  """`fun` without the functools.partial and functools.wraps layers around it."""
+  while True:
+    if isinstance(fun, partial):
+      fun = fun.func
+    elif hasattr(fun, '__wrapped__'):
+      fun = fun.__wrapped__
+    else:
+      return fun
 
 _transposing = _Transposing()
 
