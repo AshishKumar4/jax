@@ -18,7 +18,7 @@ import concurrent.futures
 import copy
 import dataclasses
 import functools
-from functools import partial
+from functools import partial, wraps
 import itertools as it
 import re
 import unittest
@@ -5102,6 +5102,20 @@ class LinearCallTest(jtu.JaxTestCase):
     def specialized(r, x):
       return jax.custom_derivatives.linear_call(lambda r, x: r * x, partial(tp, None), r, x)
     ans = jax.grad(lambda r: jax.grad(lambda x: specialized(r, x))(3.))(2.)
+    self.assertAllClose(ans, 14.)
+
+    # The same with two transposes functools.wraps names alike.
+    def marker(_, z):
+      return z
+    @wraps(marker)
+    def named(r, ct):
+      @wraps(marker)
+      def inner(_, g):
+        return 7. * r * g
+      return ct * jax.custom_derivatives.linear_call(lambda _, z: z, inner, (), r)
+    def wrapped(r, x):
+      return jax.custom_derivatives.linear_call(lambda r, x: r * x, named, r, x)
+    ans = jax.grad(lambda r: jax.grad(lambda x: wrapped(r, x))(3.))(2.)
     self.assertAllClose(ans, 14.)
 
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
