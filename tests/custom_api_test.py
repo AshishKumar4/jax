@@ -4957,5 +4957,51 @@ class LinearCallTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected)
 
 
+  @staticmethod
+  def closed(c, x):
+    # Linear in x; its function and its transpose both close over c, which is
+    # mapped when c is. The transpose is 7 times the true one.
+    def f(_, x):
+      return x * c
+    def t(_, ct):
+      return 7. * ct * c
+    return jax.custom_derivatives.linear_call(f, t, (), x)
+
+  @parameterized.parameters([(0, None), (None, 0), (0, 0)])
+  def test_grad_of_vmap_with_a_transpose_closed_over_a_mapped_value(
+      self, c_axis, x_axis):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    c_in = c if c_axis is not None else c[0]
+    x_in = x if x_axis is not None else x[0]
+    loss = lambda x: jnp.sum(jax.vmap(self.closed, in_axes=(c_axis, x_axis))(c_in, x))
+    ans = jax.grad(loss)(x_in)
+    expected = 7. * (c_in if x_axis is not None else jnp.sum(c, 0)) * jnp.ones_like(x_in)
+    self.assertAllClose(ans, expected)
+
+  def test_vmap_of_grad_with_a_transpose_closed_over_a_mapped_value(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    grad = jax.grad(lambda c, x: jnp.sum(self.closed(c, x)), argnums=1)
+    self.assertAllClose(jax.vmap(grad)(c, x), 7. * c)
+
+  def test_jvp_of_grad_with_a_transpose_closed_over_a_mapped_value(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    grad = jax.grad(lambda x: jnp.sum(jax.vmap(self.closed)(c, x) ** 2))
+    ans = jax.jvp(grad, (x,), (jnp.ones_like(x),))
+    # d/dx sum((x c)^2) through the 7-fold transpose is 7 * 2 x c * c, and its
+    # tangent along ones is 7 * 2 c * c.
+    self.assertAllClose(ans, (14. * x * c * c, 14. * c * c))
+
+  def test_grad_of_jvp_with_a_transpose_closed_over_a_mapped_value(self):
+    c = jnp.arange(1., 7.).reshape(2, 3)
+    x = jnp.arange(2., 8.).reshape(2, 3)
+    def tangent(x):
+      return jax.jvp(lambda x: jax.vmap(self.closed)(c, x), (x,), (x,))[1]
+    # The tangent x c is linear in x through the call, so its gradient takes
+    # the custom transpose: 7 c, summed.
+    self.assertAllClose(jax.grad(lambda x: jnp.sum(tangent(x)))(x), 7. * c)
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
