@@ -3,7 +3,8 @@
 # tagged that this fork carries no stack for; it rebases the newest stack onto it, dropping the fixes the
 # release already has, runs tests/cache_key_test.py, pushes the branch and publishes its wheel. A conflict,
 # a red test or a release that holds every fix opens an issue here. Run by hand with `publish`, it
-# publishes a stack's wheel again (one already in the index is kept as it is).
+# publishes a stack's wheel again (one already in the index is kept as it is); with `yank`, it marks
+# wheels the index lists yanked (PEP 592), so an installer resolving a range passes them over.
 name: patch stack
 
 on:
@@ -16,6 +17,12 @@ on:
         required: false
       rehearse:
         description: "rebase and test onto a release without pushing or publishing, e.g. \"0.11.2 0.12.0\""
+        required: false
+      yank:
+        description: "mark these wheels yanked, instead of looking for a new release, e.g. \"jax-0.12.0.post7-py3-none-any.whl\""
+        required: false
+      reason:
+        description: "why the wheels in `yank` are yanked, shown by installers"
         required: false
 
 permissions:
@@ -41,7 +48,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: The release to carry
         id: next
-        if: inputs.publish == ''
+        if: inputs.publish == '' && inputs.yank == ''
         env:
           REHEARSE: ${{ inputs.rehearse }}
         run: |
@@ -106,10 +113,12 @@ jobs:
 
   publish:
     needs: carry
-    if: needs.carry.outputs.release != ''
+    if: needs.carry.outputs.release != '' || inputs.yank != ''
     runs-on: ubuntu-latest
     env:
       RELEASE: ${{ needs.carry.outputs.release }}
+      YANK: ${{ inputs.yank }}
+      REASON: ${{ inputs.reason }}
       BUCKET: ${{ secrets.R2_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -126,6 +135,7 @@ jobs:
             [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
           done
       - name: Build the stack's wheel, and fetch the release's own
+        if: env.RELEASE != ''
         run: |
           git clone -q --depth 1 --branch "v$RELEASE-cache-key-pool-fingerprints" \
             "https://github.com/${{ github.repository }}.git" jax
@@ -147,7 +157,13 @@ jobs:
             cat head.txt
             exit 1
           fi
-          python3 dew/dew/patch_stack.py index manifest.json site dist/*.whl > new.txt
+          # The wheels built here (none where the run only yanks), and the files `yank` names.
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          read -ra names <<< "$YANK"
+          yanks=()
+          if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" --reason "$REASON"); fi
+          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" "${yanks[@]}" > new.txt
           cat new.txt
       - name: Upload them, the index last
         run: |

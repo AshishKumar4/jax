@@ -4,6 +4,7 @@ release to the next.
     python dew/patch_stack.py next              # "OLD NEW": the newest carried release and a newer one
     python dew/patch_stack.py rebase OLD NEW    # in a clone holding jax-vOLD, jax-vNEW and the OLD branch
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
+    python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
 `next` reads the releases upstream has tagged (jax-vX.Y.Z) and the stacks this fork carries
 (vX.Y.Z-cache-key-pool-fingerprints) and prints the newest stack's release and the newest release, where
@@ -146,13 +147,21 @@ def metadata(wheel: Path) -> bytes:
         return archive.read(name)
 
 
-def index(manifest: Path, site: Path, files: list[Path]) -> None:
+def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), reason: str = "") -> None:
     """The package index under `site`, PEP 503's simple API for jax alone: simple/index.html and
     simple/jax/index.html, each file linked with its digest, its Requires-Python and its metadata's digest
     (PEP 658, the metadata beside it as FILE.metadata). `manifest` keeps every file the index has listed, so
     a run adds its own to them; a file it lists already is never replaced, as an installer may hold its
-    digest. Each new FILE is copied, with its metadata, under site/packages/jax and named on stdout."""
+    digest. Each new FILE is copied, with its metadata, under site/packages/jax and named on stdout.
+
+    Each file named in `yank`, one the manifest lists, is marked yanked for `reason` (PEP 592's
+    data-yanked): an installer resolving a range passes it over, and one pinned to exactly it still gets it."""
     listed = json.loads(manifest.read_text()) if manifest.is_file() else {}
+    unlisted = sorted(set(yank) - set(listed))
+    if unlisted:
+        raise SystemExit(f"cannot yank {', '.join(unlisted)}: the index does not list it")
+    for name in yank:
+        listed[name]["yanked"] = reason
     packages = site / "packages" / "jax"
     packages.mkdir(parents=True, exist_ok=True)
     for file in files:
@@ -172,7 +181,9 @@ def index(manifest: Path, site: Path, files: list[Path]) -> None:
         f'<a href="../../packages/jax/{name}#sha256={entry["sha256"]}"'
         f' data-requires-python="{html.escape(entry["requires_python"])}"'
         f' data-dist-info-metadata="sha256={entry["metadata_sha256"]}"'
-        f' data-core-metadata="sha256={entry["metadata_sha256"]}">{name}</a><br>\n'
+        f' data-core-metadata="sha256={entry["metadata_sha256"]}"'
+        + (f' data-yanked="{html.escape(entry["yanked"])}"' if "yanked" in entry else "")
+        + f'>{name}</a><br>\n'
         for name, entry in sorted(listed.items()))
     page = ('<!DOCTYPE html>\n<html><head><meta name="pypi:repository-version" content="1.1">'
             "<title>{title}</title></head>\n<body><h1>{title}</h1>\n{body}</body></html>\n")
@@ -192,12 +203,14 @@ def main() -> int:
     indexing.add_argument("manifest", type=Path)
     indexing.add_argument("site", type=Path)
     indexing.add_argument("files", type=Path, nargs="*")
+    indexing.add_argument("--yank", nargs="+", default=[], metavar="FILE", help="the listed files to mark yanked")
+    indexing.add_argument("--reason", default="", help="why they are yanked, shown by installers")
     args = parser.parse_args()
     if args.command == "next":
         print(following())
         return 0
     if args.command == "index":
-        index(args.manifest, args.site, args.files)
+        index(args.manifest, args.site, args.files, args.yank, args.reason)
         return 0
     return rebase(args.old, args.new)
 
