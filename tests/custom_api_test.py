@@ -5157,8 +5157,8 @@ class LinearCallTest(jtu.JaxTestCase):
         lambda _, x: x, partial(outer), (), x)
     x = jnp.ones(3)
     self.assertAllClose(call(x), x)
-    self.assertAllClose(jax.linear_transpose(call, x)(x)[0],
-                        jnp.arange(1., 4.) * jnp.arange(4., 7.))
+    # The outer transpose calls the inner call forward, the identity.
+    self.assertAllClose(jax.linear_transpose(call, x)(x)[0], jnp.arange(4., 7.))
 
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
