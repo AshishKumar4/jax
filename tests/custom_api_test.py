@@ -18,7 +18,7 @@ import concurrent.futures
 import copy
 import dataclasses
 import functools
-from functools import partial, wraps
+from functools import partial
 import itertools as it
 import re
 import unittest
@@ -5607,9 +5607,9 @@ class LinearCallTest(jtu.JaxTestCase):
     # The same with two transposes functools.wraps names alike.
     def marker(_, z):
       return z
-    @wraps(marker)
+    @functools.wraps(marker)
     def named(r, ct):
-      @wraps(marker)
+      @functools.wraps(marker)
       def inner(_, g):
         return 7. * r * g
       return ct * jax.custom_derivatives.linear_call(lambda _, z: z, inner, (), r)
@@ -5632,6 +5632,33 @@ class LinearCallTest(jtu.JaxTestCase):
       return jax.custom_derivatives.linear_call(lambda r, x: r * x, outer, r, x)
     ans = jax.grad(lambda r: jax.grad(lambda x: ruled(r, x))(3.))(2.)
     self.assertAllClose(ans, 14.)
+
+  def test_jvp_in_a_value_only_the_transpose_reads(self):
+    def g(c):
+      return jax.custom_derivatives.linear_call(
+          lambda _, x: x, lambda _, ct: c * ct, (), 3.)
+    self.assertAllClose(jax.jvp(g, (2.,), (1.,)), (3., 0.))
+
+  def test_a_transpose_held_in_an_object_whose_equality_is_an_array(self):
+    # Two instances of one dataclass, whose generated equality compares their
+    # array fields: telling the transposes apart must not call it.
+    @dataclasses.dataclass(eq=True)
+    class Scaled:
+      scale: jax.Array
+      inner: object = None
+      def __call__(self, _, ct):
+        if self.inner is None:
+          return self.scale * ct
+        return jax.custom_derivatives.linear_call(
+            lambda _, z: z, partial(self.inner), (), self.scale * ct)
+    inner = Scaled(jnp.arange(1., 4.))
+    outer = Scaled(jnp.arange(4., 7.), inner)
+    call = lambda x: jax.custom_derivatives.linear_call(
+        lambda _, x: x, partial(outer), (), x)
+    x = jnp.ones(3)
+    self.assertAllClose(call(x), x)
+    # The outer transpose calls the inner call forward, the identity.
+    self.assertAllClose(jax.linear_transpose(call, x)(x)[0], jnp.arange(4., 7.))
 
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)

@@ -1905,17 +1905,17 @@ class _Transposing(threading.local):
 _MAX_EAGER_TRANSPOSES = 32
 
 def _transpose_identity(fun: Callable) -> tuple[Any, ...]:
-  """`fun` as the callable under its functools.partial layers, with the values
-  each binds, by identity: a partial that binds nothing is the callable it
-  wraps, one that binds other values another transpose. A subclass of partial,
-  which may call otherwise, is its own callable."""
+  """`fun` as the identity of the callable under its functools.partial layers,
+  with the identities of the values each binds: a partial that binds nothing is
+  the callable it wraps, one that binds other values another transpose. A
+  subclass of partial, which may call otherwise, is its own callable."""
   bound = []
   while type(fun) is partial:
     if fun.args or fun.keywords:
       bound.append((tuple(map(id, fun.args)),
                     tuple(sorted((k, id(v)) for k, v in fun.keywords.items()))))
     fun = fun.func
-  return (fun, *bound)
+  return (id(fun), *bound)
 
 _transposing = _Transposing()
 
