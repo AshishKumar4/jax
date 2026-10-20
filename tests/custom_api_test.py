@@ -5570,6 +5570,12 @@ class LinearCallTest(jtu.JaxTestCase):
     call = lambda x: jax.custom_derivatives.linear_call(f, t, (), x)
     self.assertAllClose(call(1.), 1.)
     self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
+    # The same through a fresh wrapper at every call.
+    def wrapped(_, ct):
+      return 7. * jax.custom_derivatives.linear_call(f, partial(wrapped), (), ct)
+    call = lambda x: jax.custom_derivatives.linear_call(f, wrapped, (), x)
+    self.assertAllClose(call(1.), 1.)
+    self.assertAllClose(jax.linear_transpose(call, 1.)(1.)[0], 7.)
 
   def test_grad_of_nested_vmap_of_unequal_sizes(self):
     c = jnp.arange(1., 25.).reshape(2, 3, 4)
