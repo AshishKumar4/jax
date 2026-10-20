@@ -1955,7 +1955,7 @@ def _linear_call_batching_rule(axis_data, args, dims, *, callee,
   outs = linear_call_p.bind(
       *batched.consts, *fixed[:num_callee_consts], *t_vals,
       *fixed[num_callee_consts:], *operands_lin,
-      callee=core.ClosedJaxpr(callee_jaxpr, ()),
+      callee=callee_jaxpr,
       transpose_thunk=batched_transpose_thunk,
       num_callee_consts=callee_consts,
       num_res=len(t_vals) + num_res)
