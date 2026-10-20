@@ -18,7 +18,7 @@ import concurrent.futures
 import copy
 import dataclasses
 import functools
-from functools import partial, wraps
+from functools import partial
 import itertools as it
 import re
 import unittest
@@ -5607,9 +5607,9 @@ class LinearCallTest(jtu.JaxTestCase):
     # The same with two transposes functools.wraps names alike.
     def marker(_, z):
       return z
-    @wraps(marker)
+    @functools.wraps(marker)
     def named(r, ct):
-      @wraps(marker)
+      @functools.wraps(marker)
       def inner(_, g):
         return 7. * r * g
       return ct * jax.custom_derivatives.linear_call(lambda _, z: z, inner, (), r)
