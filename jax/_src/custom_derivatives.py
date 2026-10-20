@@ -1581,9 +1581,10 @@ def linear_call(fun: Callable,
           f'and input structure {lin_tree}.')
     return pe.separate_consts(t_jaxpr)
 
-  if fun_transpose in _transposing.active:
-    # A transpose that calls itself again (a self-adjoint call, say) is traced
-    # when the call is transposed, or its tracing would never end.
+  if _transposing.depth:
+    # A call made while a transpose is traced here is traced when it is
+    # transposed itself: a transpose that calls itself again (a self-adjoint
+    # call, say, under any wrapper) would otherwise never finish tracing.
     callee, t_consts = f_jaxpr_closed, ()
     transpose_thunk = pe._memoize(traced_transpose)
   else:
@@ -1591,11 +1592,11 @@ def linear_call(fun: Callable,
     # and those values become residuals of the call: every transformation of
     # the call then sees them as operands, where a transpose traced later, once
     # vmap, jvp or a staging trace has exited, would hold their dead tracers.
-    _transposing.active.add(fun_transpose)
+    _transposing.depth += 1
     try:
       transpose, t_consts = traced_transpose()
     finally:
-      _transposing.active.discard(fun_transpose)
+      _transposing.depth -= 1
     callee = _ignoring(f_jaxpr_closed, len(f_consts), t_consts)
 
     def transpose_thunk():
@@ -1610,10 +1611,10 @@ def linear_call(fun: Callable,
   return tree_unflatten(out_tree, out)
 
 class _Transposing(threading.local):
-  """The transposes this thread is tracing at a linear_call, outermost first."""
+  """How many transposes this thread is tracing at a linear_call."""
 
   def __init__(self):
-    self.active: set[Callable] = set()
+    self.depth = 0
 
 _transposing = _Transposing()
 
