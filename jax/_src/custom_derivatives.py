@@ -1924,25 +1924,51 @@ def _linear_call_batching_rule(axis_data, args, dims, *, callee,
   lin_axes = [0] * len(operands_lin)
   batched = batching.batch_jaxpr_axes(
       callee, axis_data, [*fixed_dims, *lin_axes], [0] * num_out)[0]
-  batched_consts = batched.consts
   res_dims = fixed_dims[num_callee_consts:]
+  # The transpose is traced now, while the values it closes over are live: one
+  # mapped by this vmap is one of its batch tracers here. Its constants become
+  # residuals of the batched call, mapped as they are, so the batched transpose
+  # reads them as operands rather than as tracers of a trace that has exited.
+  transpose, t_consts = transpose_thunk()
+  t_vals, t_dims = unzip2(_unbatched(c, axis_data) for c in t_consts)
+  batched_t = batching.batch_jaxpr_axes(
+      transpose, axis_data, [*t_dims, *res_dims, *[0] * num_out], lin_axes)[0]
+  batched_t_jaxpr = pe.convert_constvars_jaxpr(batched_t)
+  batched_t_consts = batched_t.consts
 
-  @pe._memoize
   def batched_transpose_thunk():
-    transpose, t_consts = transpose_thunk()
-    batched_t = batching.batch_jaxpr_axes(
-        transpose, axis_data, [*[None] * len(t_consts), *res_dims, *[0] * num_out],
-        lin_axes)[0]
-    return (pe.convert_constvars_jaxpr(batched_t),
-            [*batched_t.consts, *t_consts])
+    return batched_t_jaxpr, batched_t_consts
 
+  # The batched callee takes the transpose's constants as residuals it ignores.
+  callee_consts = len(batched.consts) + num_callee_consts
+  callee_jaxpr = pe.convert_constvars_jaxpr(batched)
+  ignored = [core.Var(core.get_aval(v)) for v in t_vals]
+  dbg = callee_jaxpr.debug_info
+  if dbg.arg_names is not None:
+    names = tuple(dbg.arg_names)
+    dbg = dbg._replace(arg_names=(*names[:callee_consts], *[""] * len(ignored),
+                                  *names[callee_consts:]))
+  callee_jaxpr = callee_jaxpr.replace(
+      invars=[*callee_jaxpr.invars[:callee_consts], *ignored,
+              *callee_jaxpr.invars[callee_consts:]],
+      debug_info=dbg)
   outs = linear_call_p.bind(
-      *batched_consts, *fixed, *operands_lin,
-      callee=pe.convert_constvars_jaxpr(batched),
+      *batched.consts, *fixed[:num_callee_consts], *t_vals,
+      *fixed[num_callee_consts:], *operands_lin,
+      callee=core.ClosedJaxpr(callee_jaxpr, ()),
       transpose_thunk=batched_transpose_thunk,
-      num_callee_consts=len(batched_consts) + num_callee_consts,
-      num_res=num_res)
+      num_callee_consts=callee_consts,
+      num_res=len(t_vals) + num_res)
   return outs, [0] * num_out
+
+def _unbatched(value, axis_data):
+  """`value` and its batch dimension under the vmap `axis_data` names: a batch
+  tracer of that vmap's own trace gives its value and dimension, and anything
+  else is unmapped there."""
+  if (isinstance(value, batching.BatchTracer)
+      and value._trace.axis_data is axis_data):
+    return value.val, value.batch_dim
+  return value, None
 
 def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
                                 num_callee_consts, num_res):
