@@ -34,8 +34,8 @@ concurrency: patch-stack
 
 env:
   # The stack's tests: its fixes' own (the cache key's, linear_call's, the transfer guard's) and the API they
-  # change. A stack is pushed, and its wheel published, only where they pass. JAX's test case turns its checks
-  # on for each test whatever JAX_ENABLE_CHECKS says, so they run once, as JAX runs them.
+  # change. A stack is pushed, and its wheel published, only where they pass. JAX's test cases set their checks
+  # for each test whatever JAX_ENABLE_CHECKS says (on, or off as TransferGuardTest sets them), so they run once.
   TESTS: tests/cache_key_test.py tests/api_test.py tests/custom_api_test.py tests/transfer_guard_test.py
   TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy
 
