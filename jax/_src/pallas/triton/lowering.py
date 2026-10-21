@@ -627,6 +627,9 @@ class _Fallback:
     return self.op(*args)
 
 
+_HALF_FLOATS = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+
+
 def _make_dispatch_table(
     name: str, **tables: Sequence[_Extern | _Fallback]
 ) -> Callable[..., ir.Value]:
@@ -636,12 +639,27 @@ def _make_dispatch_table(
   ) -> ir.Value:
     table = tables[ctx.context.platform]
     h = next((e for e in table if e.matches(ctx.avals_in)), None)
-    if h is None:
-      arg_aval_dtypes = tuple(aval.dtype for aval in ctx.avals_in)
-      raise NotImplementedError(
-          f"unsupported types for {name}: {arg_aval_dtypes}"
+    if h is not None:
+      return h.lower(ctx, *args)
+    if all(aval.dtype in _HALF_FLOATS for aval in (*ctx.avals_in, *ctx.avals_out)):
+      # As XLA computes a 16-bit float operation its target has no 16-bit
+      # form of: in float32, rounded once to the 16-bit type.
+      wide_ctx = ctx.replace(
+          avals_in=[aval.update(dtype=jnp.float32) for aval in ctx.avals_in],
+          avals_out=[aval.update(dtype=jnp.float32) for aval in ctx.avals_out],
       )
-    return h.lower(ctx, *args)
+      h = next((e for e in table if e.matches(wide_ctx.avals_in)), None)
+      if h is not None:
+        wide_args = [
+            _cast(_ensure_ir_value(arg, aval), aval.dtype, jnp.float32)
+            for arg, aval in zip(args, ctx.avals_in)
+        ]
+        [out_aval] = ctx.avals_out
+        return _cast(h.lower(wide_ctx, *wide_args), jnp.float32, out_aval.dtype)
+    arg_aval_dtypes = tuple(aval.dtype for aval in ctx.avals_in)
+    raise NotImplementedError(
+        f"unsupported types for {name}: {arg_aval_dtypes}"
+    )
 
   return inner
 
@@ -1206,7 +1224,20 @@ def _truediv(x: ir.Value, y: ir.Value, *, signed: bool) -> ir.Value:
     y = _int_float_cast(y, x_element_type, signed=signed)
   if isinstance(x_element_type, (ir.F32Type, ir.F64Type)):
     return arith_dialect.divf(x, y)
+  if isinstance(x_element_type, (ir.BF16Type, ir.F16Type)):
+    # As XLA divides 16-bit floats: in float32, rounded once to the 16-bit type.
+    wide = _with_element_type(x.type, ir.F32Type.get())
+    quotient = arith_dialect.divf(
+        _float_float_cast(x, wide), _float_float_cast(y, wide)
+    )
+    return _float_float_cast(quotient, x.type)
   raise NotImplementedError(f"unsupported types: {x.type} and {y.type}")
+
+
+def _with_element_type(t: ir.Type, element_type: ir.Type) -> ir.Type:
+  if isinstance(t, ir.RankedTensorType):
+    return ir.RankedTensorType.get(ir.RankedTensorType(t).shape, element_type)
+  return element_type
 
 
 def _mod(x: ir.Value, y: ir.Value, *, signed: bool) -> ir.Value:
