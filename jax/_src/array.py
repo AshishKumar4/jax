@@ -19,8 +19,10 @@ from collections.abc import Callable, Iterator, Sequence
 import enum
 import functools
 from functools import partial
+import logging
 import math
 import operator as op
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 from jax._src import api
@@ -38,7 +40,7 @@ from jax._src.indexing import dslice
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.layout import AutoLayoutSingleton, Format, Layout
-from jax._src.lib import _jax, ifrt_version, jaxlib_extension_version
+from jax._src.lib import _jax, guard_lib, ifrt_version, jaxlib_extension_version
 from jax._src.lib import xla_client as xc
 from jax._src.mesh import (empty_concrete_mesh, empty_abstract_mesh,
                            use_abstract_mesh)
@@ -55,6 +57,8 @@ from jax._src.util import (
 import numpy as np
 
 zip, unsafe_zip = safe_zip, zip
+
+logger = logging.getLogger(__name__)
 
 Shape = tuple[int, ...]
 Device = xc.Device
@@ -221,6 +225,46 @@ def _iter(x: ArrayImpl, *, reverse: bool = False) -> Iterator[ArrayImpl]:
       # here after uneven partitioning support is added.
       indices = range(x.shape[0])[::-1] if reverse else range(x.shape[0])
       return (api.device_put(x._value[i]) for i in indices)
+
+
+_HOST_MEMORY_KINDS = frozenset({"pinned_host", "unpinned_host"})
+_EXPLICIT_LEVELS = frozenset({guard_lib.TransferGuardLevel.LOG_EXPLICIT,
+                              guard_lib.TransferGuardLevel.DISALLOW_EXPLICIT})
+_LOG_LEVELS = frozenset({guard_lib.TransferGuardLevel.LOG,
+                         guard_lib.TransferGuardLevel.LOG_EXPLICIT})
+
+
+def _guard_host_read(arr: ArrayImpl) -> None:
+  """Applies the device-to-host transfer guard to a host read of a CPU array in
+  device memory, as jaxlib applies it to an accelerator array's copy to host.
+
+  jaxlib applies the guard where a read copies to the host (`CopyToHostAsync`
+  in py_array.cc) and skips a zero-copyable CPU buffer as already there, so
+  under `jax.transfer_guard_device_to_host("disallow")` `float(x)`, `x.item()`
+  and `np.asarray(x)` passed on the CPU where the same code raises on a GPU. A
+  CPU array in its device memory is held to the guard here at every read, as it
+  keeps no host copy for a later read to reuse; one in a host memory kind
+  (`pinned_host`, `unpinned_host`) is on the host, as an accelerator's host
+  buffers are, and is not. An explicit read (`jax.device_get`) is held only at
+  the explicit levels, as jaxlib holds it.
+  """
+  state = guard_lib.thread_local_state()
+  level = state.device_to_host
+  if level is None:
+    level = guard_lib.global_state().device_to_host
+  if level is None or level == guard_lib.TransferGuardLevel.ALLOW:
+    return
+  if state.explicit_device_get and level not in _EXPLICIT_LEVELS:
+    return
+  device = arr.sharding._internal_device_list[0]
+  if device.platform != "cpu" or arr.sharding.memory_kind in _HOST_MEMORY_KINDS:
+    return
+  transfer = f"shape={arr.shape}, dtype={arr.dtype}, device={device}"
+  if level in _LOG_LEVELS:
+    logger.warning("device-to-host transfer: %s", transfer)
+    return
+  raise _jax.JaxRuntimeError(
+      f"INVALID_ARGUMENT: Disallowed device-to-host transfer: {transfer}")
 
 
 @use_cpp_class(xc.ArrayImpl)
@@ -663,6 +707,7 @@ class ArrayImpl(basearray.Array):
   def copy_to_host_async(self):
     self._check_if_deleted()
     if self._npy_value is None:
+      _guard_host_read(self)
       if jaxlib_extension_version >= 495 and ifrt_version >= 71:
         _jax.batched_copy_to_host_async([self])
       else:
@@ -678,6 +723,7 @@ class ArrayImpl(basearray.Array):
     self._check_if_deleted()
 
     if self._npy_value is None:
+      _guard_host_read(self)
       # TODO(yashkatariya): Merge `_process_has_full_value_in_mcjax` with
       # is_fully_addressable.
       # is_fully_addressable return False if addressable_device_list is empty.
@@ -714,6 +760,19 @@ class ArrayImpl(basearray.Array):
         npy_value.flags.writeable = False
         self._npy_value = npy_value
     return self._npy_value
+
+
+if sys.version_info >= (3, 12):
+  _cpp_buffer = ArrayImpl.__buffer__
+
+  def _guarded_buffer(self, flags):
+    # np.asarray takes a CPU array's buffer before its __array__: held to the
+    # guard as `_value` is (`_guard_host_read`).
+    if self._npy_value is None:
+      _guard_host_read(self)
+    return _cpp_buffer(self, flags)
+
+  ArrayImpl.__buffer__ = _guarded_buffer
 
 
 def _get_shape_from_index(slc: Index, shape: Shape) -> Shape:

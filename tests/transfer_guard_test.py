@@ -14,6 +14,7 @@
 
 import contextlib
 import pickle
+import sys
 import threading
 
 from absl.testing import absltest
@@ -57,14 +58,15 @@ def _device_to_device_funcs():
 
 
 def _device_to_host_funcs():
-  """Generates device-to-host transfer functions."""
-  if jax.default_backend() == "cpu":
-    # device-to-host does not incur transfer on the CPU backend.
-    return []
+  """Generates device-to-host transfer functions.
 
+  A CPU array in device memory reaches the host without a copy, and is held to
+  the guard as an accelerator array's copy is (`array._guard_host_read`).
+  """
   with jax.transfer_guard_host_to_device("allow"):
     device_arrays = [jnp.ones(1) for _ in range(6)]
-  return [
+    scalars = [jnp.ones(()) for _ in range(3)]
+  funcs = [
       # (function name, is an explicit transfer?, function)
       ("device_to_host_jax_device_get", True,
        lambda: jax.device_get(device_arrays[0])),
@@ -76,7 +78,17 @@ def _device_to_host_funcs():
       ("device_to_host_str", False, lambda: str(device_arrays[4])),
       ("device_to_host_pickle_dumps", False,
        lambda: pickle.dumps(device_arrays[5])),
+      ("device_to_host_float", False, lambda: float(scalars[0])),
+      ("device_to_host_int", False, lambda: int(scalars[1])),
+      ("device_to_host_item", False, lambda: scalars[2].item()),
   ]
+  if jax.default_backend() == "cpu" and sys.version_info >= (3, 12):
+    # Only a CPU array has a host buffer to export.
+    with jax.transfer_guard_host_to_device("allow"):
+      exported = jnp.ones(1)
+    funcs.append(("device_to_host_memoryview", False,
+                  lambda: memoryview(exported)))
+  return funcs
 
 
 def _all_funcs():
@@ -214,6 +226,9 @@ class TransferGuardTest(jtu.JaxTestCase):
   )
   def test_disallow_ignores_arrays_on_cpu(self, func_generator,
                                           jax_transfer_guard):
+    if jax.default_backend() == "cpu":
+      self.skipTest("A CPU array in device memory keeps no host copy for a "
+                    "later read to reuse; each read is held to the guard.")
     for func_name, _, func in func_generator():
       with jax_transfer_guard("allow"):
         # Transfer the device array to host.
@@ -237,6 +252,19 @@ class TransferGuardTest(jtu.JaxTestCase):
       with jax_transfer_guard("disallow_explicit"):
         with self.assertDisallows(func_name):
           func()
+
+  @jtu.run_on_devices("cpu")
+  def test_disallow_allows_a_cpu_array_in_host_memory(self):
+    with jax.transfer_guard_host_to_device("allow"):
+      x = jnp.arange(4.)
+    with jax.transfer_guard("disallow"):
+      with self.assertDisallows("device_to_host_np_asarray"):
+        np.asarray(x)
+      for kind in ("pinned_host", "unpinned_host"):
+        # An explicit move to host memory, as a checkpoint's copy makes.
+        on_host = jax.device_put(x, x.sharding.with_memory_kind(kind))
+        with self.assertAllows(f"device_to_host_np_asarray_{kind}"):
+          np.testing.assert_array_equal(np.asarray(on_host), np.arange(4.))
 
   @jtu.thread_unsafe_test()  # Mutates global transfer guard config.
   def test_concurrent_global_state_tsan_race(self):
