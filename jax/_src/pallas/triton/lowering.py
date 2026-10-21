@@ -1207,6 +1207,15 @@ def _truediv(x: ir.Value, y: ir.Value, *, signed: bool) -> ir.Value:
     y = _int_float_cast(y, x_element_type, signed=signed)
   if isinstance(x_element_type, (ir.F32Type, ir.F64Type)):
     return arith_dialect.divf(x, y)
+  if isinstance(x_element_type, (ir.BF16Type, ir.F16Type)):
+    # A correctly rounded float32 quotient rounds to the correctly rounded
+    # 16-bit one (float32's 24 bits are at least twice the 16-bit precision
+    # plus two), so this divides as XLA does. arith.divf is approximate.
+    f32 = ir.F32Type.get()
+    quotient = tt_dialect.precise_divf(
+        _ir_cast(x, f32, signed=False), _ir_cast(y, f32, signed=False)
+    )
+    return _ir_cast(quotient, x.type, signed=False)
   raise NotImplementedError(f"unsupported types: {x.type} and {y.type}")
 
 

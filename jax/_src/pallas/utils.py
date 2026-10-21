@@ -354,6 +354,9 @@ def erf_inv_lowering_helper(x):
     return _erf_inv_32_lowering_helper(x)
   if x.dtype == jnp.float64:
     return _erf_inv_64_lowering_helper(x)
+  if x.dtype in (jnp.bfloat16, jnp.float16):
+    # As XLA computes a 16-bit erf_inv: in float32, rounded once.
+    return _erf_inv_32_lowering_helper(x.astype(jnp.float32)).astype(x.dtype)
   raise NotImplementedError(f"erf_inv_lowering_helper not implemented for {x.dtype}")
 
 
