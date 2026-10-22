@@ -44,8 +44,8 @@ VERSION = Path("jax/version.py")
 RELEASE = re.compile(r'^_release_version: str \| None = "[^"]*"$', re.MULTILINE)
 UPSTREAM = "https://github.com/jax-ml/jax.git"
 FORK = "https://github.com/AshishKumar4/jax.git"
-TAG = re.compile(r"refs/tags/jax-v(\d+)\.(\d+)\.(\d+)$")
-STACK = re.compile(r"refs/heads/v(\d+)\.(\d+)\.(\d+)-cache-key-pool-fingerprints$")
+TAG = re.compile(r"refs/tags/jax-v(\d+(?:\.\d+){2,3})$")
+STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints$")
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -124,20 +124,25 @@ def rebase(old: str, new: str) -> int:
     return 0
 
 
-def versions(remote: str, pattern: re.Pattern) -> list[tuple[int, int, int]]:
-    """The X.Y.Z of each ref of `remote` that `pattern` matches, sorted."""
+def ordered(version: str) -> tuple[int, ...]:
+    """A release's place among releases: 0.12.0.1 (a patch release) after 0.12.0 and before 0.12.1."""
+    return tuple(int(part) for part in version.split("."))
+
+
+def versions(remote: str, pattern: re.Pattern) -> list[str]:
+    """The version of each ref of `remote` that `pattern` matches (X.Y.Z, or a patch release's X.Y.Z.W), oldest
+    first."""
     listed = git("ls-remote", remote).split()
-    return sorted(tuple(int(part) for part in found.groups())  # type: ignore[misc]
-                  for found in map(pattern.match, listed[1::2]) if found)
+    return sorted({match.group(1) for match in map(pattern.match, listed[1::2]) if match}, key=ordered)
 
 
 def following() -> str:
     """"OLD NEW" where the newest release NEW has no stack and OLD is the newest stack's release, else ""."""
     releases, stacks = versions(UPSTREAM, TAG), versions(FORK, STACK)
     newest = releases[-1]
-    if not stacks or newest in stacks or newest < stacks[-1]:
+    if not stacks or newest in stacks or ordered(newest) < ordered(stacks[-1]):
         return ""
-    return " ".join(".".join(map(str, version)) for version in (stacks[-1], newest))
+    return f"{stacks[-1]} {newest}"
 
 
 def metadata(wheel: Path) -> bytes:
