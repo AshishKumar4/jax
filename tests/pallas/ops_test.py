@@ -425,6 +425,85 @@ class TritonHalfFloatLoweringTest(jtu.JaxTestCase):
       jax.jit(call).trace(shape, shape).lower(lowering_platforms=("cuda",))
 
 
+@jax.custom_vjp
+def _softcap(x):
+  return 0.5 * jnp.tanh(x / 0.5)
+
+
+def _softcap_fwd(x):
+  # The forward rule calls the function itself, as jax.custom_vjp's documented
+  # pattern does, so its trace holds a custom_vjp_call too.
+  capped = _softcap(x)
+  return capped, capped
+
+
+def _softcap_bwd(capped, cotangent):
+  return (cotangent * (1 - (capped / 0.5) ** 2),)
+
+
+_softcap.defvjp(_softcap_fwd, _softcap_bwd)
+
+
+@jax.custom_jvp
+def _scaled_tanh(x):
+  return 2.0 * jnp.tanh(x)
+
+
+@_scaled_tanh.defjvp
+def _scaled_tanh_jvp(primals, tangents):
+  (x,), (t,) = primals, tangents
+  y = _scaled_tanh(x)
+  return y, t * (2.0 - y * y / 2.0)
+
+
+_CUSTOM = {
+    "custom_vjp": _softcap,
+    "custom_vjp_in_vjp": lambda x: jax.vjp(_softcap, x)[1](x)[0],
+    "custom_jvp": _scaled_tanh,
+}
+"""Kernel bodies calling a custom-derivative function: a custom_vjp one, the
+pullback of one (whose trace keeps the call its forward rule makes), and a
+custom_jvp one."""
+
+
+class TritonCustomDerivativeLoweringTest(jtu.JaxTestCase):
+  """Pallas Triton lowers a custom_vjp or custom_jvp call in a kernel as its
+  primal function, for CUDA on any host."""
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        jtu.ignore_warning(
+            category=DeprecationWarning,
+            message="The Pallas Triton backend is deprecated",
+        )
+    )
+
+  @parameterized.parameters(*_CUSTOM)
+  def test_lowers(self, name):
+    try:
+      from jax.experimental.pallas import triton as pl_triton
+    except ImportError:
+      self.skipTest("Pallas Triton is unavailable")
+
+    def kernel(x_ref, o_ref):
+      o_ref[...] = _CUSTOM[name](x_ref[...])
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        compiler_params=pl_triton.CompilerParams(num_warps=4, num_stages=1),
+    )
+    shape = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    # An abstract A100, so no GPU is needed to lower for one.
+    gpu = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA A100-SXM4-40GB", num_cores=None, platform="cuda"
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=gpu)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(call).trace(shape).lower(lowering_platforms=("cuda",))
+
+
 @jtu.thread_unsafe_test_class(condition=not htu.hypothesis_is_thread_safe())
 class OpsTest(PallasBaseTest):
 
@@ -1982,6 +2061,22 @@ class OpsTest(PallasBaseTest):
         jnp.true_divide(x, y).astype(jnp.float32),
         kernel(x, y).astype(jnp.float32),
         rtol=rtol,
+    )
+
+  @parameterized.parameters(*_CUSTOM)
+  def test_custom_derivative_call_computes_its_primal(self, name):
+    # A kernel takes no derivative of its own body: a custom-derivative call
+    # in it computes the primal function, as XLA does outside it.
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = _CUSTOM[name](x_ref[...])
+
+    x = jax.random.normal(jax.random.key(0), (8, 128), jnp.float32)
+    np.testing.assert_allclose(
+        kernel(x), jax.jit(_CUSTOM[name])(x), rtol=1e-6, atol=1e-6
     )
 
   @parameterized.parameters("bfloat16", "float16")

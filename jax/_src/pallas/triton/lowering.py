@@ -2722,6 +2722,7 @@ def _reshard_lowering_rule(ctx, x, *, dst_sharding, concrete_mesh):
 
 @register_lowering(pe.eval_jaxpr_p)
 @register_lowering(custom_derivatives.custom_jvp_call_p)
+@register_lowering(custom_derivatives.custom_vjp_call_p)
 def _eval_jaxpr_lowering_rule(
     ctx: LoweringRuleContext, *args, call_jaxpr, **_
 ):
