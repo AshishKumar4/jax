@@ -185,14 +185,19 @@ jobs:
           cat new.txt
       - name: Upload them, the index last
         run: |
-          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" > /dev/null; }
+          # put KEY FILE TYPE [CACHE-CONTROL]
+          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" \
+                    ${4:+--cache-control "$4"} > /dev/null; }
           while read -r name; do
             put "packages/jax/$name" "site/packages/jax/$name" application/octet-stream
             put "packages/jax/$name.metadata" "site/packages/jax/$name.metadata" text/plain
           done < new.txt
           put packages/jax/manifest.json manifest.json application/json
-          # Installers ask for the directories (simple/, simple/jax/); each is stored under both names.
+          # Installers ask for the directories (simple/, simple/jax/); each is stored under both names. A page
+          # changes at every publication, so an installer revalidates it each time (no-cache: R2 answers a
+          # conditional request with 304 while it holds), never resolving from a copy older than the index; with
+          # no Cache-Control, uv takes a cached page as fresh for a share of its age and misses a new wheel.
           for page in simple/ simple/jax/; do
-            put "$page" "site/${page}index.html" text/html
-            put "${page}index.html" "site/${page}index.html" text/html
+            put "$page" "site/${page}index.html" text/html no-cache
+            put "${page}index.html" "site/${page}index.html" text/html no-cache
           done
