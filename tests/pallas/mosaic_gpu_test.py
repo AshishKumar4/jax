@@ -270,6 +270,45 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     self.assertEqual(ref.inner_aval.dtype, jnp.float32)
     self.assertEqual(ref.memory_space, gpu_core.MemorySpace.GMEM)
 
+  @parameterized.parameters("custom_vjp", "custom_vjp_in_vjp", "custom_jvp")
+  def test_custom_derivative_call_computes_its_primal(self, name):
+    # A kernel takes no derivative of its own body: a custom-derivative call
+    # in it, however nested, lowers as its primal function.
+    @jax.custom_vjp
+    def softcap(x):
+      return 0.5 * jnp.tanh(x / 0.5)
+
+    def softcap_fwd(x):
+      capped = softcap(x)
+      return capped, capped
+
+    softcap.defvjp(softcap_fwd, lambda capped, g: (g * (1 - (capped / 0.5) ** 2),))
+
+    @jax.custom_jvp
+    def scaled_tanh(x):
+      return 2.0 * jnp.tanh(x)
+
+    scaled_tanh.defjvp(
+        lambda p, t: (scaled_tanh(p[0]), t[0] * (2.0 - scaled_tanh(p[0]) ** 2 / 2.0))
+    )
+    fns = {
+        "custom_vjp": softcap,
+        "custom_vjp_in_vjp": lambda x: jax.vjp(softcap, x)[1](x)[0],
+        "custom_jvp": scaled_tanh,
+    }
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((128,), jnp.float32),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = fns[name](x_ref[...])
+
+    x = jax.random.normal(jax.random.key(0), (128,), jnp.float32)
+    np.testing.assert_allclose(
+        kernel(x), jax.jit(fns[name])(x), rtol=1e-6, atol=1e-6
+    )
+
   def test_barrier_ref_shape(self):
     # A single barrier is referred to by a scalar reference, so that uses of a
     # barrier array can be told apart from uses of a single barrier.
