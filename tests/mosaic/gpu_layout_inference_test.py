@@ -41,6 +41,7 @@ from jax.experimental.mosaic.gpu import layout_inference
 from jax.experimental.mosaic.gpu import layouts
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import test_util as mtu
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.mosaic.gpu.mma import MMALayouts
 import numpy as np
 
@@ -3870,6 +3871,23 @@ class LayoutInferenceTest(parameterized.TestCase):
       v = mgpu.dialect.vector_load(ref)
     mgpu.infer_layout(self.module, arch=arch)
     self.checkOutLayouts(v.owner, [layout])
+
+class ArchInferenceTest(parameterized.TestCase):
+
+  @parameterized.parameters(("8.0", (8, 0)), ("9.0", (9, 0)), ("10.0", (10, 0)))
+  def test_an_abstract_device_states_its_compute_capability(
+      self, capability, arch
+  ):
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA GPU", num_cores=None, platform="cuda",
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("x",), (jax.sharding.AxisType.Explicit,), abstract_device=device
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+      self.assertEqual(mgpu_utils._infer_arch(), arch)
+
 
 if __name__ == "__main__":
   parameterized.absltest.main(testLoader=jtu.JaxTestLoader())

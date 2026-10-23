@@ -2686,13 +2686,16 @@ def _infer_arch() -> tuple[int, int]:
   if device is None:
     device = default_device
   elif (
-      hasattr(default_device, "compute_capability")
+      getattr(device, "compute_capability", None) is None
+      and hasattr(default_device, "compute_capability")
       and device.device_kind == default_device.device_kind
   ):
     device = default_device
-  if not hasattr(device, "compute_capability"):
+  # An abstract device that states its compute capability is lowered for it
+  # whatever device is attached (a compile-only target).
+  arch_name = getattr(device, "compute_capability", None)
+  if arch_name is None:
     return (9, 0)  # TODO(apaszke): Remove this once we figure out the export story.
-  arch_name = device.compute_capability
   # Handle ROCm devices that return architecture strings like "gfxXXX".
   if arch_name.startswith("gfx"):
     raise ValueError(
