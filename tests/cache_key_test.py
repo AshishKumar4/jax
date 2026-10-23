@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import threading
+import types
 import unittest
 from typing import cast as type_cast
 
@@ -211,6 +212,37 @@ class CacheKeyTest(jtu.JaxTestCase):
       cpu_backend = xla_bridge.get_backend("cpu")
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
+
+  def test_a_cpu_program_s_key_names_its_host_s_cpu(self):
+    # XLA:CPU compiles for the features of the host that compiles, so a CPU
+    # executable from a host of another CPU is not this host's to read.
+    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
+    cpu = xla_bridge.get_backend("cpu")
+    devices = np.array([[cpu.local_devices()[0]]])
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    original_host_cpu = cache_key.host_cpu
+    keys = []
+    try:
+      for described in ("vendor_id: AuthenticAMD\ncpu family: 25\nmodel: 17\n"
+                        "flags: avx2 avx512f",
+                        "vendor_id: AuthenticAMD\ncpu family: 25\nmodel: 1\n"
+                        "flags: avx2"):
+        cache_key.host_cpu = lambda described=described: described
+        keys.append(cache_key.get(computation, devices, compile_options, cpu))
+    finally:
+      cache_key.host_cpu = original_host_cpu
+    self.assertNotEqual(keys[0], keys[1])
+    if os.path.exists("/proc/cpuinfo"):
+      self.assertRegex(cache_key.host_cpu(), "flags: |Features: ")
+
+  def test_an_accelerator_program_s_key_leaves_the_host_cpu_out(self):
+    for platform_name in ("gpu", "tpu"):
+      with_cpu, without = hashlib.sha256(), hashlib.sha256()
+      cache_key._hash_host_cpu(
+          with_cpu, types.SimpleNamespace(platform=platform_name))
+      self.assertEqual(with_cpu.digest(), without.digest())
 
   def test_hash_string(self):
     hash1 = self.get_hashed_value(cache_key._hash_string, "foo")

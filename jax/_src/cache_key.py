@@ -14,11 +14,13 @@
 
 import base64
 import copy
+import functools
 import hashlib
 import io
 import json
 import logging
 import os
+import platform
 import sys
 import threading
 from typing import cast as type_cast
@@ -109,6 +111,10 @@ def get(
       (
           "backend version",
           lambda hash_obj: _hash_platform(hash_obj, backend)
+      ),
+      (
+          "host CPU",
+          lambda hash_obj: _hash_host_cpu(hash_obj, backend)
       ),
       (
           "XLA flags",
@@ -529,6 +535,41 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
   _hash_string(hash_obj, backend.platform_version)
+
+
+def _hash_host_cpu(hash_obj, backend):
+  # XLA:CPU compiles a program for the CPU features of the host that compiles
+  # it, so an executable from a host of another CPU need not link or run here
+  # ("Failed to materialize symbols", after which the process compiles nothing
+  # more): on the CPU backend, the key names the host's CPU. Other backends'
+  # keys are unchanged.
+  if backend.platform == "cpu":
+    _hash_string(hash_obj, host_cpu())
+
+
+@functools.cache
+def host_cpu() -> str:
+  """This host's CPU, as XLA:CPU compiles for it.
+
+  On Linux, the first processor's vendor, family, model and feature flags on
+  x86, or its implementer, architecture, part and features on Arm, as
+  /proc/cpuinfo gives them; elsewhere, the platform's system, machine and
+  processor names.
+  """
+  try:
+    with open("/proc/cpuinfo") as f:
+      text = f.read()
+  except OSError:
+    text = ""
+  fields = {}
+  for line in text.splitlines():
+    key, _, value = line.partition(":")
+    fields.setdefault(key.strip(), value.strip())
+  for keys in (("vendor_id", "cpu family", "model", "flags"),
+               ("CPU implementer", "CPU architecture", "CPU part", "Features")):
+    if keys[0] in fields:
+      return "\n".join(f"{key}: {fields.get(key, '')}" for key in keys)
+  return " ".join((platform.system(), platform.machine(), platform.processor()))
 
 
 def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):
