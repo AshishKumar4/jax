@@ -773,6 +773,8 @@ for _op in [
     mlir_math.AbsIOp,
     mlir_math.RoundOp,
     mlir_math.RoundEvenOp,
+    mlir_math.CeilOp,
+    mlir_math.FloorOp,
     mlir_math.CopySignOp,
     mlir_math.CountLeadingZerosOp,
     arith.ShLIOp,
