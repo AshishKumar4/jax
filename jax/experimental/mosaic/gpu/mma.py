@@ -89,6 +89,24 @@ class MMALayouts:
     )
 
 
+def can_relayout_acc_to_lhs(
+    src: fa.FragmentedLayout, dst: fa.FragmentedLayout, bitwidth: int
+) -> bool:
+  """Returns whether `src` -> `dst` takes the accumulator as the next LHS.
+
+  With four warps along M, each warp holds 16 full rows of both layouts, and two
+  adjacent 8-column tiles of the accumulator are one 16-column (k = 16) tile of
+  the 16-bit LHS: every thread already holds the LHS elements it needs, in the
+  same order, so the relayout only renames registers (the m16n8 C fragment as
+  the m16n8k16 A fragment). This is how attention's probabilities feed P @ V
+  from registers.
+  """
+  if bitwidth != 16:
+    return False
+  layouts = MMALayouts(np.float16, m_warps=4)
+  return src == layouts.acc and dst == layouts.lhs
+
+
 def _ptx_dtype_str(dtype: ir.Type, *, is_signed: bool | None = None) -> str:
   if isinstance(dtype, ir.Float8E4M3FNType):
     return "e4m3"
