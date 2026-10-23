@@ -23,6 +23,7 @@ import sys
 import threading
 from typing import cast as type_cast
 
+from jax import version as jax_version_module
 from jax._src import config
 from jax._src import distributed
 from jax._src.lib import cuda_versions
@@ -106,6 +107,7 @@ def get(
               bytes(jaxlib_version_str.encode("utf-8"))
           ),
       ),
+      ("jax version", lambda hash_obj: _hash_string(hash_obj, jax_version())),
       (
           "backend version",
           lambda hash_obj: _hash_platform(hash_obj, backend)
@@ -513,6 +515,18 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
           [replica_count, computation_count])
     )
   return hash_obj.update(compile_options_copy.SerializeAsString())
+
+
+def jax_version() -> str:
+  """This jax's own build, its post-release among it.
+
+  A patch stack's releases over one jaxlib (0.11.2.post10 to post12 over
+  jaxlib 0.11.2) are builds of their own, whose programs need not be one
+  another's, and jaxlib's version alone does not tell them apart: a cache
+  directory one process of each read and wrote failed reads of the other's
+  entries ("Invalid metadata payload id"). The key names jax's version too.
+  """
+  return jax_version_module.__version__
 
 
 def _hash_platform(hash_obj, backend):

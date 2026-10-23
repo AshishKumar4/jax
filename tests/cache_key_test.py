@@ -212,6 +212,27 @@ class CacheKeyTest(jtu.JaxTestCase):
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
 
+  @jtu.thread_unsafe_test()  # patches cache_key.jax_version for the process
+  def test_a_program_s_key_names_its_jax_build(self):
+    # A patch stack's releases over one jaxlib are builds of their own: one's
+    # cache entries are not another's to read.
+    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
+    devices = np.array([[jax.local_devices()[0]]])
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    backend = xla_bridge.get_backend()
+    original_jax_version = cache_key.jax_version
+    keys = []
+    try:
+      for build in ("0.11.2.post12", "0.11.2.post15"):
+        cache_key.jax_version = lambda build=build: build
+        keys.append(cache_key.get(computation, devices, compile_options, backend))
+    finally:
+      cache_key.jax_version = original_jax_version
+    self.assertNotEqual(keys[0], keys[1])
+    self.assertEqual(cache_key.jax_version(), jax.__version__)
+
   def test_hash_string(self):
     hash1 = self.get_hashed_value(cache_key._hash_string, "foo")
     hash2 = self.get_hashed_value(cache_key._hash_string, "bar")
