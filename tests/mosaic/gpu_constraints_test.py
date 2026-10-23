@@ -26,6 +26,7 @@ from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import tcgen05
+import numpy as np
 
 config.parse_flags_with_absl()
 
@@ -130,6 +131,14 @@ class ConstraintSystemTest(parameterized.TestCase):
   def test_strict_relayout_constraint_holds(self, src, tgt, holds):
     self.assertEqual(
         cs.Relayout(RL(src), RL(tgt), 32, strict=True).holds(), holds
+    )
+
+  @parameterized.parameters((16, 4, True), (32, 4, False), (16, 2, False))
+  def test_relayout_from_mma_accumulator_to_lhs(self, bitwidth, m_warps, holds):
+    dtype = np.float16 if bitwidth == 16 else np.float32
+    layouts = mgpu.MMALayouts(dtype, m_warps=m_warps)
+    self.assertEqual(
+        cs.Relayout(RL(layouts.acc), RL(layouts.lhs), bitwidth).holds(), holds
     )
 
   def test_not_of_type_constraint_holds_for_different_types(self):
