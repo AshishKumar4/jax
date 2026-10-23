@@ -4098,6 +4098,79 @@ class Sm80Test(TestCase):
     )
     return self._test_ldmatrix(jnp.int8, 8, 4, transpose=True, layout=layout)
 
+  @parameterized.product(
+      dtype=(jnp.bfloat16, jnp.float16), shape=((64, 64), (128, 32))
+  )
+  def test_mma_accumulator_relayout_to_lhs(self, dtype, shape):
+    def kernel(ctx, src, dst, _):
+      del ctx
+      layouts = mgpu.MMALayouts(utils.dtype_to_ir_type(dtype))
+      acc = mgpu.FragmentedArray.load_untiled(
+          src, layout=layouts.acc, optimized=False
+      )
+      narrow = acc.astype(utils.dtype_to_ir_type(dtype))
+      narrow.to_layout(layouts.lhs).store_untiled(dst, optimized=False)
+
+    x = self.prng.uniform(-1, 1, shape).astype(jnp.float32)
+    out = jax.ShapeDtypeStruct(shape, dtype)
+    result = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, out, ())(x)
+    np.testing.assert_array_equal(result, x.astype(dtype))
+
+  @parameterized.product(dtype=(jnp.bfloat16, jnp.float16))
+  def test_mma_accumulator_feeds_the_next_mma_from_registers(self, dtype):
+    # P = A @ B^T in the accumulator, narrowed and relaid out in registers as
+    # the LHS of P @ C^T, against the same product with P read back from memory.
+    size = 64
+    ir_dtype = lambda: utils.dtype_to_ir_type(dtype)
+
+    def load(ref, layout, transpose=False):
+      ref = utils.memref_transpose(ref, (1, 0)) if transpose else ref
+      return mgpu.FragmentedArray.load_untiled(
+          ref, layout=layout, optimized=False
+      )
+
+    def fused(ctx, a, b, c, zeros, out, _):
+      del ctx
+      layouts = mgpu.MMALayouts(ir_dtype())
+      acc = load(zeros, layouts.acc)
+      p = mgpu.mma(acc, load(a, layouts.lhs), load(b, layouts.rhs, True))
+      p = p.astype(ir_dtype()).to_layout(layouts.lhs)
+      mgpu.mma(acc, p, load(c, layouts.rhs, True)).store_untiled(
+          out, optimized=False
+      )
+
+    def first(ctx, a, b, zeros, p, _):
+      del ctx
+      layouts = mgpu.MMALayouts(ir_dtype())
+      acc = load(zeros, layouts.acc)
+      product = mgpu.mma(acc, load(a, layouts.lhs), load(b, layouts.rhs, True))
+      product.astype(ir_dtype()).store_untiled(p, optimized=False)
+
+    def second(ctx, p, c, zeros, out, _):
+      del ctx
+      layouts = mgpu.MMALayouts(ir_dtype())
+      acc = load(zeros, layouts.acc)
+      product = mgpu.mma(acc, load(p, layouts.lhs), load(c, layouts.rhs, True))
+      product.store_untiled(out, optimized=False)
+
+    a, b, c = (
+        self.prng.uniform(-1, 1, (size, size)).astype(dtype) for _ in range(3)
+    )
+    zeros = np.zeros((size, size), jnp.float32)
+    out = jax.ShapeDtypeStruct((size, size), jnp.float32)
+    grid, block = (1, 1, 1), (128, 1, 1)
+    registers = mgpu.as_gpu_kernel(
+        fused, grid, block, (a, b, c, zeros), out, ()
+    )(a, b, c, zeros)
+    p_shape = jax.ShapeDtypeStruct((size, size), dtype)
+    p = mgpu.as_gpu_kernel(first, grid, block, (a, b, zeros), p_shape, ())(
+        a, b, zeros
+    )
+    memory = mgpu.as_gpu_kernel(second, grid, block, (p, c, zeros), out, ())(
+        p, c, zeros
+    )
+    np.testing.assert_array_equal(registers, memory)
+
 
 class BarrierTest(TestCase):
 
@@ -7129,78 +7202,6 @@ class FragmentedArrayTest(TestCase):
       atol = rtol = 1e-12 if dtype == jnp.float64 else 1e-5
       np.testing.assert_allclose(result, expected, atol=atol, rtol=rtol)
 
-  @parameterized.product(
-      dtype=(jnp.bfloat16, jnp.float16), shape=((64, 64), (128, 32))
-  )
-  def test_mma_accumulator_relayout_to_lhs(self, dtype, shape):
-    def kernel(ctx, src, dst, _):
-      del ctx
-      layouts = mgpu.MMALayouts(utils.dtype_to_ir_type(dtype))
-      acc = mgpu.FragmentedArray.load_untiled(
-          src, layout=layouts.acc, optimized=False
-      )
-      narrow = acc.astype(utils.dtype_to_ir_type(dtype))
-      narrow.to_layout(layouts.lhs).store_untiled(dst, optimized=False)
-
-    x = self.prng.uniform(-1, 1, shape).astype(jnp.float32)
-    out = jax.ShapeDtypeStruct(shape, dtype)
-    result = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, out, ())(x)
-    np.testing.assert_array_equal(result, x.astype(dtype))
-
-  @parameterized.product(dtype=(jnp.bfloat16, jnp.float16))
-  def test_mma_accumulator_feeds_the_next_mma_from_registers(self, dtype):
-    # P = A @ B^T in the accumulator, narrowed and relaid out in registers as
-    # the LHS of P @ C^T, against the same product with P read back from memory.
-    size = 64
-    ir_dtype = lambda: utils.dtype_to_ir_type(dtype)
-
-    def load(ref, layout, transpose=False):
-      ref = utils.memref_transpose(ref, (1, 0)) if transpose else ref
-      return mgpu.FragmentedArray.load_untiled(
-          ref, layout=layout, optimized=False
-      )
-
-    def fused(ctx, a, b, c, zeros, out, _):
-      del ctx
-      layouts = mgpu.MMALayouts(ir_dtype())
-      acc = load(zeros, layouts.acc)
-      p = mgpu.mma(acc, load(a, layouts.lhs), load(b, layouts.rhs, True))
-      p = p.astype(ir_dtype()).to_layout(layouts.lhs)
-      mgpu.mma(acc, p, load(c, layouts.rhs, True)).store_untiled(
-          out, optimized=False
-      )
-
-    def first(ctx, a, b, zeros, p, _):
-      del ctx
-      layouts = mgpu.MMALayouts(ir_dtype())
-      acc = load(zeros, layouts.acc)
-      product = mgpu.mma(acc, load(a, layouts.lhs), load(b, layouts.rhs, True))
-      product.astype(ir_dtype()).store_untiled(p, optimized=False)
-
-    def second(ctx, p, c, zeros, out, _):
-      del ctx
-      layouts = mgpu.MMALayouts(ir_dtype())
-      acc = load(zeros, layouts.acc)
-      product = mgpu.mma(acc, load(p, layouts.lhs), load(c, layouts.rhs, True))
-      product.store_untiled(out, optimized=False)
-
-    a, b, c = (
-        self.prng.uniform(-1, 1, (size, size)).astype(dtype) for _ in range(3)
-    )
-    zeros = np.zeros((size, size), jnp.float32)
-    out = jax.ShapeDtypeStruct((size, size), jnp.float32)
-    grid, block = (1, 1, 1), (128, 1, 1)
-    registers = mgpu.as_gpu_kernel(
-        fused, grid, block, (a, b, c, zeros), out, ()
-    )(a, b, c, zeros)
-    p_shape = jax.ShapeDtypeStruct((size, size), dtype)
-    p = mgpu.as_gpu_kernel(first, grid, block, (a, b, zeros), p_shape, ())(
-        a, b, zeros
-    )
-    memory = mgpu.as_gpu_kernel(second, grid, block, (p, c, zeros), out, ())(
-        p, c, zeros
-    )
-    np.testing.assert_array_equal(registers, memory)
 
   @parameterized.product(
       dtype=(jnp.float16, jnp.int8,),
