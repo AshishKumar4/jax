@@ -258,6 +258,27 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(cache_key._shared_fingerprints(
         {0: (7, described[0]), 1: (7, described[0])}), [7])
 
+  @jtu.thread_unsafe_test()  # patches cache_key.jax_version for the process
+  def test_a_program_s_key_names_its_jax_build(self):
+    # A patch stack's releases over one jaxlib are builds of their own: one's
+    # cache entries are not another's to read.
+    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
+    devices = np.array([[jax.local_devices()[0]]])
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    backend = xla_bridge.get_backend()
+    original_jax_version = cache_key.jax_version
+    keys = []
+    try:
+      for build in ("0.12.0.1.post13", "0.12.0.1.post14"):
+        cache_key.jax_version = lambda build=build: build
+        keys.append(cache_key.get(computation, devices, compile_options, backend))
+    finally:
+      cache_key.jax_version = original_jax_version
+    self.assertNotEqual(keys[0], keys[1])
+    self.assertEqual(cache_key.jax_version(), jax.__version__)
+
   def test_an_accelerator_program_s_key_leaves_the_host_cpu_out(self):
     for platform_name in ("gpu", "tpu"):
       with_cpu, without = hashlib.sha256(), hashlib.sha256()
