@@ -370,7 +370,14 @@ def _accelerators(client) -> str:
             ("driver", cuda_versions.cuda_driver_get_version),
             ("cudnn", cuda_versions.cudnn_get_version),
             ("cublas", cuda_versions.cublas_get_version)))
-  return f"{client.platform} {version}: {', '.join(kinds)}"
+  described = f"{client.platform} {version}: {', '.join(kinds)}"
+  if client.platform == "cpu":
+    # A CPU executable is the host CPU's (`_hash_host_cpu`): processes on
+    # hosts of different CPUs share none, so their computation gets no key,
+    # rather than one process loading another's or waiting under a key no
+    # other process shares.
+    described += f"; host CPU {hashlib.sha256(host_cpu().encode()).hexdigest()[:16]}"
+  return described
 
 
 def _library_version(get_version) -> str:
