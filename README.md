@@ -21,3 +21,13 @@ uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 stack onto it with `dew/patch_stack.py`, runs the stack's tests, pushes the branch and
 publishes its wheel; a conflict, a red test, or a release that holds every fix opens an issue here.
 This branch, `dew`, holds only that; `main` follows upstream.
+
+## How long Pallas Triton runs
+
+JAX deprecates the Pallas Triton backend: since jax 0.11.2 (jax-ml/jax@adccdaa8f), every Pallas call lowered
+to Triton warns `jax-pallas-triton`, "deprecated and will be removed in a future JAX version", pointing to
+the Mosaic GPU backend. No release has removed it yet: jax and jaxlib 0.11.2, 0.12.0 and 0.12.0.1 all run it,
+and upstream `main` at jax-ml/jax@1e3fa0800 still holds both its lowering (`jax/_src/pallas/triton`) and
+jaxlib's Triton bindings (`jaxlib/triton`, `jaxlib/gpu_triton.py`). So the newest release that runs Pallas
+Triton is, for now, the newest release: 0.12.0.1. A rebase onto a release that drops either one updates this
+line with that release, the last before it, and the commit that removed it.
