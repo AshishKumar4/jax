@@ -1464,6 +1464,8 @@ for _op, _unary_impl, _is_signed in [
     (mlir_math.AbsIOp, fa.FragmentedArray.abs, True),
     (mlir_math.RoundOp, fa.FragmentedArray.round, None),
     (mlir_math.RoundEvenOp, fa.FragmentedArray.round_even, None),
+    (mlir_math.CeilOp, fa.FragmentedArray.ceil, None),
+    (mlir_math.FloorOp, fa.FragmentedArray.floor, None),
     (mlir_math.ErfOp, fa.FragmentedArray.erf, None),
     (
         mlir_math.CountLeadingZerosOp,

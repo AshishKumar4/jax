@@ -269,6 +269,26 @@ class LayoutInferenceTest(parameterized.TestCase):
     self.checkInLayouts(add, [layout_attr, layout_attr])
     self.checkOutLayouts(add, [layout_attr])
 
+  @parameterized.product(
+      op=(math_dialect.CeilOp, math_dialect.FloorOp),
+      layout=(
+          mgpu.WGSplatFragLayout(shape=(32, 4)),
+          mgpu.WGStridedFragLayout(shape=(32, 4), vec_size=1),
+      ),
+  )
+  def test_rounding_op_propagates_argument_layouts(self, op, layout):
+
+    with ir.InsertionPoint(self.module.body):
+      ty = ir.VectorType.get(layout.shape, ir.F32Type.get())
+      [x] = undefs(ty)
+      rounded = op(layout_cast(x, layout))
+
+    mgpu.infer_layout(self.module)
+
+    layout_attr = layouts.to_layout_attr(layout)
+    self.checkInLayouts(rounded, [layout_attr])
+    self.checkOutLayouts(rounded, [layout_attr])
+
   def test_vector_load_does_not_allow_splat_result(self):
     shape = (32, 4)
     splat_layout_attr = layouts.to_layout_attr(

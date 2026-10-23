@@ -3024,6 +3024,34 @@ def _round_lowering_rule_wg(ctx: LoweringRuleContext, x, rounding_method):
     case _:
       assert_never(rounding_method)
 
+@register_lowering_rule(lax.ceil_p, mgpu.LoweringSemantics.Lane)
+def _ceil_lowering_rule(ctx: LoweringRuleContext, x):
+  [x_aval] = ctx.avals_in
+  return _ensure_fa(x, x_aval.dtype).ceil()
+
+
+@register_lowering_rule(lax.ceil_p, mgpu.LoweringSemantics.Warpgroup)
+def _ceil_lowering_rule_wg(ctx: LoweringRuleContext, x):
+  [x_aval] = ctx.avals_in
+  if not jnp.issubdtype(x_aval.dtype, jnp.floating):
+    raise NotImplementedError(f"Unsupported dtype for ceil: {x_aval.dtype}")
+  return math_dialect.ceil(_ensure_ir_value(x, x_aval.dtype))
+
+
+@register_lowering_rule(lax.floor_p, mgpu.LoweringSemantics.Lane)
+def _floor_lowering_rule(ctx: LoweringRuleContext, x):
+  [x_aval] = ctx.avals_in
+  return _ensure_fa(x, x_aval.dtype).floor()
+
+
+@register_lowering_rule(lax.floor_p, mgpu.LoweringSemantics.Warpgroup)
+def _floor_lowering_rule_wg(ctx: LoweringRuleContext, x):
+  [x_aval] = ctx.avals_in
+  if not jnp.issubdtype(x_aval.dtype, jnp.floating):
+    raise NotImplementedError(f"Unsupported dtype for floor: {x_aval.dtype}")
+  return math_dialect.floor(_ensure_ir_value(x, x_aval.dtype))
+
+
 _copysign_p = jax_core.Primitive("_copysign")
 
 

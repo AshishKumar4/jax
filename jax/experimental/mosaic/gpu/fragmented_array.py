@@ -1989,6 +1989,18 @@ class FragmentedArray:
       raise NotImplementedError
     return self._pointwise(mlir_math.roundeven)
 
+  def ceil(self) -> FragmentedArray:
+    """Same as `lax.ceil`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.ceil)
+
+  def floor(self) -> FragmentedArray:
+    """Same as `lax.floor`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.floor)
+
   def erf(self) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError(self.mlir_dtype)
