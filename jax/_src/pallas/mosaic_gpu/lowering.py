@@ -2782,10 +2782,13 @@ for op, si_pred, ui_pred, f_pred in [
 @register_lowering_rule(lax.integer_pow_p, mgpu.LoweringSemantics.Warpgroup)
 def _integer_pow_lowering_rule(ctx: LoweringRuleContext, x, y):
   [x_aval] = ctx.avals_in
-  if y == -1:
-    return _lower_fun(lambda x: 1 / x)(ctx, x)
-  if y <= 1:
-    raise NotImplementedError
+  if y < 0:
+    # A reciprocal of the positive power: the derivative of a division takes `x ** -2`.
+    return _lower_fun(lambda x: 1 / lax.integer_pow(x, -y))(ctx, x)
+  if y == 0:
+    return _lower_fun(jnp.ones_like)(ctx, x)
+  if y == 1:
+    return x
 
   mul_op: Callable[[Any, Any], Any]
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
