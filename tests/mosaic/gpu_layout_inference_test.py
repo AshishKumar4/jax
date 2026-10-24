@@ -1032,6 +1032,51 @@ class LayoutInferenceTest(parameterized.TestCase):
     # order in the future.
     self.assertEqual(assignments, {v0: RL(mgpu.TCGEN05_LAYOUT)})
 
+  def test_find_assignments_for_solves_independent_buffers_apart(self):
+    # Two SMEM buffers, each receiving a tile in the MMA accumulator's layout
+    # and read back as a ladder of row slices, each slice its own register
+    # variable: nothing relates one buffer's variables to the other's, so the
+    # search costs the sum of the two buffers' searches, not their product
+    # (the product exhausted 20000 fuel; the sum takes 42).
+    bf16 = ir.BF16Type.get()
+    acc = MMALayouts(jnp.bfloat16).acc
+    unknowns, constraints = [], []
+    with ir.InsertionPoint(self.module.body):
+      for _ in range(2):
+        smem_ty = ir.MemRefType.get(
+            (128, 128), bf16, memory_space=mgpu_utils.smem()
+        )
+        smem = cs.Variable(layout_inference.ValueSite(
+            builtin.UnrealizedConversionCastOp([smem_ty], []),
+            layout_inference.VariableType.RESULT, 0,
+        ))
+        unknowns.append(smem)
+        constraints.append(cs.IsTransferableSmemRegisters(
+            RL(acc), smem, (128, 128), (128, 1), bitwidth=16,
+            optimized=cs.OptimizedTransferKind.DOWNGRADABLE,
+        ))
+        rows = 128
+        while rows:
+          [key] = layout_inference.vector_value_sites(
+              llvm.UndefOp(ir.VectorType.get((rows, 128), bf16))
+          )
+          variable = cs.Variable(key)
+          unknowns.append(variable)
+          constraints.append(cs.NotOfType(variable, fa.WGSplatFragLayout))
+          constraints.append(cs.IsTransferableSmemRegisters(
+              smem, variable, (rows, 128), (128, 1), bitwidth=16,
+              optimized=cs.OptimizedTransferKind.OPTIMIZED,
+          ))
+          rows //= 2
+    assignments, _ = layout_inference.find_assignments_for(
+        unknowns,
+        cs.ConstraintSystem(constraints=constraints),
+        fuel=1000,
+        arch=(8, 0),
+    )
+    self.assertNotIsInstance(assignments, cs.Unsatisfiable)
+    self.assertEqual(set(assignments), set(unknowns))
+
   def test_cannot_find_assignments_for_unsatisfiable_constraint_system(self):
     with ir.InsertionPoint(self.module.body):
       x = llvm.UndefOp(ir.VectorType.get((64,), ir.BF16Type.get()))
