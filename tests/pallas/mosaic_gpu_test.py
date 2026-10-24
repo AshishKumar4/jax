@@ -10080,6 +10080,53 @@ class CoreMapTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(), np.repeat(np.arange(2), 128).reshape(2, 128)
     )
 
+  def test_warpgroups_sum_columns_at_once(self):
+    # Two warpgroups sum the columns of their own tiles at once, a reduction
+    # across warps through shared scratch. Each takes its own scratch, so
+    # neither reads the other's partial sums; integer-valued sums are exact.
+    count, rows, columns = 64, 64, 64
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((2, count, columns), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(x_ref, o_ref):
+      wg = jax.lax.axis_index("wg")
+
+      @pl.loop(0, count)
+      def _(step):
+        tile = plgpu.load(
+            x_ref.at[wg, step], (), layout=plgpu.Layout.WGMMA, optimized=False
+        )
+        o_ref[wg, step, :] = jnp.sum(tile, axis=0)
+
+    x = (jnp.arange(2 * count * rows * columns) % 31 - 15).astype(jnp.float32)
+    x = x.reshape(2, count, rows, columns)
+    np.testing.assert_array_equal(kernel(x), jnp.sum(x, axis=2))
+
+  def test_warpgroups_sum_to_scalars_at_once(self):
+    if not self.is_wg_semantics():
+      self.skipTest("Lane semantics takes no full reduction under threads")
+    # As above, each warpgroup summing its own rows to a scalar at once.
+    count, length = 64, 128
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((2, count), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(x_ref, o_ref):
+      wg = jax.lax.axis_index("wg")
+
+      @pl.loop(0, count)
+      def _(step):
+        o_ref[wg, step] = jnp.sum(x_ref[wg, step])
+
+    x = (jnp.arange(2 * count * length) % 31 - 15).astype(jnp.float32)
+    x = x.reshape(2, count, length)
+    np.testing.assert_array_equal(kernel(x), jnp.sum(x, axis=2))
+
   def test_multiple_wg_with_grid(self):
 
     @self.kernel(
