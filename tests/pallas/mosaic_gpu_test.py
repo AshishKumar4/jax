@@ -1938,6 +1938,18 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     expected = jnp.zeros_like(tokens).at[perm].set(tokens)
     np.testing.assert_array_equal(kernel(tokens, perm), expected)
 
+  def test_linear_transpose_lowers_its_sums(self):
+    # Transposing `x + x` sums the two cotangents with add_any.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], jnp.float32)
+    )
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      [o_ref[...]] = jax.linear_transpose(lambda t: t + t, x)(x)
+
+    x = jnp.arange(128, dtype=jnp.float32)
+    np.testing.assert_array_equal(kernel(x), 2 * x)
+
   @parameterized.product(
       src_transposed=(False, True), shape=((128, 128), (1, 128, 128))
   )

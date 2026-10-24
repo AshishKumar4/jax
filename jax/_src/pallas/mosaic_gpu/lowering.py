@@ -29,6 +29,7 @@ from typing import Any, Protocol, Self, assert_never, cast, overload
 import jax
 from jax import api_util
 from jax import lax
+from jax._src import ad_util
 from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
@@ -2621,6 +2622,8 @@ def _div(x, y):
 for semantics in [gpu_core.LANExWG_SEMANTICS, gpu_core.LANExWARP_SEMANTICS]:
   mosaic_lowering_rules[semantics].update({
     lax.add_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x + y),
+    # The sum transposition and linearization emit (`jax.linear_transpose`, `jax.vjp`'s fan-in).
+    ad_util.add_any_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x + y),
     lax.sub_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x - y),
     lax.mul_p: partial(_binary_op_lowering_rule, impl=lambda x, y: x * y),
     lax.div_p: partial(_binary_op_lowering_rule, impl=_div),
@@ -2676,6 +2679,7 @@ def _binary_op_lowering_rule_wg(
 
 for op, si_impl, ui_impl, f_impl in [
     (lax.add_p, arith_dialect.addi, arith_dialect.addi, arith_dialect.addf),
+    (ad_util.add_any_p, arith_dialect.addi, arith_dialect.addi, arith_dialect.addf),
     (lax.sub_p, arith_dialect.subi, arith_dialect.subi, arith_dialect.subf),
     (lax.mul_p, arith_dialect.muli, arith_dialect.muli, arith_dialect.mulf),
     (
