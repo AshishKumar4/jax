@@ -474,6 +474,21 @@ class ModuleContext:
   # See the documentation of reduction_scratch_bytes in CompilerParams.
   reduction_scratch_bytes: int
   warp_axis_name: jax_core.AxisName | None = None
+  # The warpgroups the block runs, which split the reduction scratch between
+  # them (`warpgroup_reduction_scratch_bytes`).
+  warpgroups: int = 1
+
+  @property
+  def warpgroup_reduction_scratch_bytes(self) -> int:
+    """A warpgroup's share of the reduction scratch: a reduction across warps
+    indexes its scratch by the warp within the warpgroup, so a block's
+    warpgroups, which reduce at once, each take their own, an aligned share of
+    `reduction_scratch_bytes` (all of it for a block of one warpgroup)."""
+    if self.warpgroups == 1:
+      return self.reduction_scratch_bytes
+    # Each share starts on a 16-byte boundary, as the vector stores into it do.
+    share = self.reduction_scratch_bytes // self.warpgroups
+    return share - share % 16
   outer_traceback: xc.Traceback | None = None
   _smem_allocation_counter: int = dataclasses.field(default=0, init=False)
   _tmem_allocation_counter: int = dataclasses.field(default=0, init=False)
@@ -906,6 +921,7 @@ def lower_jaxpr_to_module(
         else None,
         auto_barriers=not params.unsafe_no_auto_barriers,
         reduction_scratch_bytes=params.reduction_scratch_bytes,
+        warpgroups=block[0] // WARPGROUP_SIZE,
         outer_traceback=outer_traceback,
     )
     del runtime_smem, grouped_barriers, runtime_barriers
@@ -3209,12 +3225,27 @@ def _reduce_lowering_rule(op, ctx: LoweringRuleContext, x, *, axes, **kwargs):
         dtype_bitwidth = dtypes.itemsize_bits(x_aval.dtype)
         if dtype_bitwidth % 8:
           raise NotImplementedError("Sub-byte dtypes not supported")
-        scratch_elems = ctx.module_ctx.reduction_scratch_bytes * 8 // dtype_bitwidth
-        scratch_ty = jax.ShapeDtypeStruct(shape=(scratch_elems,), dtype=x_aval.dtype)
+        scratch_elems = (
+            ctx.module_ctx.warpgroup_reduction_scratch_bytes * 8 // dtype_bitwidth
+        )
+        warpgroups = ctx.module_ctx.warpgroups
+        shared = warpgroups > 1 and scratch_elems > 0
+        scratch_ty = jax.ShapeDtypeStruct(
+            shape=(warpgroups, scratch_elems) if shared else (scratch_elems,),
+            dtype=x_aval.dtype,
+        )
         scratch_ctx = ctx.module_ctx.scratch_view(scratch_ty)
       else:
+        shared = False
         scratch_ctx = contextlib.nullcontext(None)
       with scratch_ctx as scratch:
+        if shared:
+          # Each warpgroup takes its own share of the scratch
+          # (`warpgroup_reduction_scratch_bytes`).
+          warpgroup = arith_dialect.index_cast(
+              ir.IndexType.get(), mgpu.warpgroup_idx(sync=True)
+          )
+          scratch = mgpu.memref_slice(scratch, warpgroup)
         return x.reduce(op, axes[0], scratch=scratch)
     case _:
       raise NotImplementedError(f"Unsupported layout {x.layout}")
@@ -3260,7 +3291,12 @@ def _reduce_lowering_rule_wg(
   reduction.attributes["offset"] = i32_attr(ctx.module_ctx.smem_used_bytes)
   # TODO(bchetioui): here, we could just donate all the remaining free SMEM that
   # we have at this point in time.
-  reduction.attributes["scratch_size"] = i32_attr(ctx.module_ctx.reduction_scratch_bytes)
+  # A warpgroup's share of the reserved region, which holds one a warpgroup
+  # (`warpgroup_reduction_scratch_bytes`).
+  reduction.attributes["scratch_size"] = i32_attr(
+      ctx.module_ctx.warpgroup_reduction_scratch_bytes
+  )
+  reduction.attributes["scratch_warpgroups"] = i32_attr(ctx.module_ctx.warpgroups)
   return reduction.result
 
 

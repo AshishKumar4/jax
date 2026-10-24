@@ -844,17 +844,47 @@ def _is_reduction_signed(kind: vector.CombiningKind) -> bool | None:
   return None
 
 
+def _reduction_scratch(
+    op: ir.OpView, element_type: ir.Type, elements: int, smem_size: int
+) -> ir.Value:
+  """The scratch of `elements` a reduction op's warpgroup takes, at the op's
+  `offset`: a block's warpgroups reduce at once and the reduction indexes its
+  scratch by the warp within the warpgroup, so each takes its own share, the
+  region holding `scratch_warpgroups` of them (one where the attribute is
+  absent)."""
+  warpgroups = (
+      ir.IntegerAttr(op.attributes["scratch_warpgroups"]).value
+      if "scratch_warpgroups" in op.attributes
+      else 1
+  )
+  offset = ir.IntegerAttr(op.attributes["offset"]).value
+  # A share of no scratch reaches the reduction's own required-size check.
+  if warpgroups == 1 or elements == 0:
+    return _slice_smem(
+        ir.MemRefType.get([elements], element_type, memory_space=utils.smem()),
+        offset,
+        smem_size,
+    )
+  scratch = _slice_smem(
+      ir.MemRefType.get(
+          [warpgroups, elements], element_type, memory_space=utils.smem()
+      ),
+      offset,
+      smem_size,
+  )
+  warpgroup = arith.index_cast(
+      ir.IndexType.get(), utils.warpgroup_idx(sync=True)
+  )
+  return utils.memref_slice(scratch, warpgroup)
+
+
 @_register_lowering(vector.ReductionOp)
 def _vector_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.ReductionOp
 ) -> Sequence[ir.Value]:
   [layout] = inference_utils.in_layouts(op)
   element_type = op.vector.type.element_type
-  scratch = _slice_smem(
-      ir.MemRefType.get([4], element_type, memory_space=utils.smem()),
-      ir.IntegerAttr(op.attributes["offset"]).value,
-      ctx.smem_requested_bytes,
-  )
+  scratch = _reduction_scratch(op, element_type, 4, ctx.smem_requested_bytes)
   axes = range(op.vector.type.rank)
   op_kind = _combining_kind(op.kind)
   is_signed = _is_reduction_signed(op_kind)
@@ -899,10 +929,8 @@ def _vector_multi_dim_reduction_op_lowering_rule(
     # cross-warp reductions require scratch space.
     dtype = op.source.type.element_type
     allocation_size = ir.IntegerAttr(op.attributes["scratch_size"]).value * 8 // utils.bitwidth(dtype)
-    scratch = _slice_smem(
-        ir.MemRefType.get([allocation_size], dtype, memory_space=utils.smem()),
-        ir.IntegerAttr(op.attributes["offset"]).value,
-        ctx.smem_requested_bytes,
+    scratch = _reduction_scratch(
+        op, dtype, allocation_size, ctx.smem_requested_bytes
     )
   else:
     scratch = None
