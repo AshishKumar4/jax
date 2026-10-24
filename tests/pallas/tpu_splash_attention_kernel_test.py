@@ -836,6 +836,66 @@ class SplashAttentionTest(PallasBaseTest):
 
     np.testing.assert_array_equal(shrink_out, no_shrink_out)
 
+class SplashAttentionDeltaTest(PallasBaseTest):
+  """BlockSizes.delta_from_weights, on a TPU or under the interpreter elsewhere."""
+
+  def setUp(self):
+    self.INTERPRET = not jtu.test_device_matches(["tpu"])
+    super().setUp()
+
+  @parameterized.parameters(jnp.float32, jnp.bfloat16)
+  def test_delta_from_weights_takes_a_one_key_querys_dq_to_zero(self, dtype):
+    # A causal first query reads one key, whose weight is exactly one: the
+    # softmax's derivative there is exactly zero, and so is the dq formed from
+    # sum_k p * dp. The rest agrees with the vanilla reference's gradients.
+    k1, k2, k3, k4 = random.split(random.key(0), 4)
+    heads, seq_len, head_dim = 2, 256, 128
+    q, k, v = (
+        random.normal(key, (heads, seq_len, head_dim), dtype)
+        for key in (k1, k2, k3)
+    )
+    mask = mask_lib.MultiHeadMask(
+        [mask_lib.CausalMask((seq_len, seq_len)) for _ in range(heads)]
+    )
+    block_sizes = splash.BlockSizes(
+        block_q=128, block_kv=128, block_kv_compute=128, block_q_dkv=128,
+        block_kv_dkv=128, block_kv_dkv_compute=128, block_q_dq=128,
+        block_kv_dq=128, delta_from_weights=True,
+    )
+    attn = splash.make_splash_mha_single_device(
+        mask, block_sizes=block_sizes, interpret=self.INTERPRET
+    )
+    o, attn_vjp = jax.vjp(attn, q, k, v)
+    do = random.normal(k4, o.shape, o.dtype)
+    dq, dk, dv = jax.device_get(attn_vjp(do))
+    np.testing.assert_array_equal(np.asarray(dq[:, 0], np.float32), 0.0)
+    attn_ref = splash.make_masked_mha_reference(mask)
+    q32, k32, v32, do32 = (x.astype(jnp.float32) for x in (q, k, v, do))
+    _, ref_vjp = jax.vjp(
+        lambda q, k, v: attn_ref(q, k, v, None), q32, k32, v32
+    )
+    # The tolerances test_splash_attention_bwd holds the custom backward to,
+    # dv's at bf16 the vanilla reference's (its weights narrow to bf16).
+    tolerances = (
+        {"dq": 0.05, "dk": 0.05, "dv": 8e-3}
+        if dtype == jnp.bfloat16
+        else {"dq": 5e-3, "dk": 5e-3, "dv": 3e-3}
+    )
+    for name, got, want in zip(
+        ("dq", "dk", "dv"), (dq, dk, dv), jax.device_get(ref_vjp(do32))
+    ):
+      self._assert_allclose(
+          np.asarray(got, np.float32), want, atol=tolerances[name],
+          rtol=tolerances[name],
+      )
+
+  def test_delta_from_weights_takes_the_dq_kernels_blocks(self):
+    with self.assertRaisesRegex(ValueError, "delta_from_weights"):
+      splash.BlockSizes(
+          block_q=128, block_kv=128, block_q_dkv=128, block_kv_dkv=128,
+          use_fused_bwd_kernel=True, delta_from_weights=True,
+      )
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

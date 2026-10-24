@@ -98,7 +98,7 @@ def get_kernel_name(
     phase: str,
 ) -> str:
   """Returns a unique name for all SplashAttention kernel variants."""
-  assert phase == "dq" or phase == "dkv" or phase == "fwd"
+  assert phase in ("dq", "dkv", "fwd", "delta")
   # Saving residuals is supported only for the fwd phase.
   assert not save_residuals or phase == "fwd"
   residuals = "_residuals" if save_residuals else "_no_residuals"
@@ -508,6 +508,12 @@ class BlockSizes:
   block_kv_dq: int | None = None
 
   use_fused_bwd_kernel: bool = False
+  # Form the backward's delta (D, the row sums the softmax's derivative subtracts) as sum_k p * dp, from
+  # the same weights and products the dq kernel takes, in a pass of its own before it, instead of as
+  # rowsum(o * do). The two are equal in exact arithmetic; only the first cancels exactly where a query's
+  # weight is all on one key (a causal first query, a document of one token), so that query's dq is exactly
+  # zero, as the softmax's derivative has it. It takes the separate dq kernel's blocks.
+  delta_from_weights: bool = False
 
   q_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
   k_layout: QKVLayout = QKVLayout.HEAD_DIM_MINOR
@@ -522,6 +528,11 @@ class BlockSizes:
       if self.block_q_dq is not None or self.block_kv_dq is not None:
         raise ValueError(
             "Block sizes for dq kernel are not needed with a fused kernel."
+        )
+      if self.delta_from_weights:
+        raise ValueError(
+            "delta_from_weights takes the separate dq kernel's blocks, not a"
+            " fused kernel."
         )
 
   @property
@@ -1341,6 +1352,7 @@ def _flash_attention_dq_kernel(
     k_layout: QKVLayout,
     v_layout: QKVLayout,
     mask_function: MaskFunctionType | None,
+    delta: bool = False,
 ):
   del sinks_ref  # potentially fuse dsinks computation into the kernel later
   float32 = jnp.float32
@@ -1362,7 +1374,6 @@ def _flash_attention_dq_kernel(
     v = v_ref[...]
     logsumexp = jnp.expand_dims(logsumexp_ref[0], -1)
     do = do_ref[...]
-    di = jnp.expand_dims(di_ref[0], -1)
 
     qk_dims = NT_DIM_NUMBERS if k_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
     qk_uncapped = lax.dot_general(q, k, qk_dims, preferred_element_type=float32)
@@ -1392,6 +1403,13 @@ def _flash_attention_dq_kernel(
     dp = lax.dot_general(
         do.astype(v.dtype), v, dp_dims, preferred_element_type=jnp.float32,
     )
+    if delta:
+      # The block's share of the query's delta, sum_k p * dp, lane-broadcast.
+      dq_scratch_ref[...] += jnp.broadcast_to(
+          jnp.sum(p * dp, axis=-1, keepdims=True), dq_scratch_ref.shape
+      )
+      return
+    di = jnp.expand_dims(di_ref[0], -1)
     ds = (dp - di) * p
     if attn_logits_soft_cap is not None:
       normalized = qk_uncapped / attn_logits_soft_cap
@@ -1432,7 +1450,10 @@ def _splash_attention_bwd_dq(
     v_layout: QKVLayout,
     mask_function: MaskFunctionType | None,
     interpret: bool,
+    delta: bool = False,
 ):
+  """dq, or with `delta` (`di` None) each query's delta, sum_k p * dp, from the same weights and products
+  (`BlockSizes.delta_from_weights`)."""
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   head_dim_v = v.shape[-1]
   if is_mqa:
@@ -1463,6 +1484,8 @@ def _splash_attention_bwd_dq(
 
   if bkv % NUM_LANES:
     raise ValueError(f"{bkv=} must be a multiple of {NUM_LANES}.")
+  if delta != (di is None):
+    raise ValueError("the delta pass forms di; the dq pass takes it")
 
   # TODO(amagni/sharadmv): when adding block_compute, make sure that is a
   # multiple of NUM_LANES.
@@ -1574,10 +1597,13 @@ def _splash_attention_bwd_dq(
   assert logsumexp_spec.block_shape is not None
   assert logsumexp.ndim == len(logsumexp_spec.block_shape)
 
-  di = jnp.expand_dims(di, axis=-2)
-  di_spec = pl.BlockSpec((None, 1, bq), logsumexp_index_map)
-  assert di_spec.block_shape is not None
-  assert di.ndim == len(di_spec.block_shape)
+  if di is None:
+    di_spec = None
+  else:
+    di = jnp.expand_dims(di, axis=-2)
+    di_spec = pl.BlockSpec((None, 1, bq), logsumexp_index_map)
+    assert di_spec.block_shape is not None
+    assert di.ndim == len(di_spec.block_shape)
 
   in_specs = [
       q_spec,
@@ -1606,13 +1632,17 @@ def _splash_attention_bwd_dq(
     q_sequence = None
     in_specs.append(None)
 
+  # The first output is the block's accumulator, the second the result: dq, or each query's delta
+  # broadcast across the lanes.
+  width = NUM_LANES if delta else head_dim_qk
   out_shapes = [
-      jax.ShapeDtypeStruct((bq, head_dim_qk), jnp.float32),
-      jax.ShapeDtypeStruct.like(q),
+      jax.ShapeDtypeStruct((bq, width), jnp.float32),
+      (jax.ShapeDtypeStruct((num_q_heads, q_seq_len, width), jnp.float32)
+       if delta else jax.ShapeDtypeStruct.like(q)),
   ]
   out_specs = [
-      pl.BlockSpec((bq, head_dim_qk), lambda *_: (0, 0)),
-      pl.BlockSpec((None, bq, head_dim_qk), lambda h, i, *_: (h, i, 0)),
+      pl.BlockSpec((bq, width), lambda *_: (0, 0)),
+      pl.BlockSpec((None, bq, width), lambda h, i, *_: (h, i, 0)),
   ]
 
   kernel = functools.partial(
@@ -1626,6 +1656,7 @@ def _splash_attention_bwd_dq(
       k_layout=k_layout,
       v_layout=v_layout,
       mask_function=mask_function,
+      delta=delta,
   )
   num_scalar_prefetch = 3
 
@@ -1633,7 +1664,7 @@ def _splash_attention_bwd_dq(
       is_mqa=is_mqa,
       save_residuals=False,
       is_segmented=segment_ids is not None,
-      phase="dq",
+      phase="delta" if delta else "dq",
   )
   metadata = {"xprof_metadata": json.dumps(dict(
       block_q_dq=bq,
@@ -1674,7 +1705,7 @@ def _splash_attention_bwd_dq(
         mask_info.partial_mask_blocks,
         q_sequence,
     )
-  return dq
+  return dq[..., 0] if delta else dq
 
 
 def _flash_attention_dkv_kernel(
@@ -2297,7 +2328,36 @@ def _splash_attention_bwd(
   ) = res
 
   # di: [num_heads, q_seq_len]
-  di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))
+  if block_sizes.delta_from_weights:
+    assert bq_dq is not None
+    assert bkv_dq is not None
+    assert dq_mask_info is not None
+    di = _splash_attention_bwd_dq(
+        q,
+        k,
+        v,
+        segment_ids,
+        sinks,
+        logsumexp,
+        do,
+        None,
+        bq=bq_dq,
+        bkv=bkv_dq,
+        is_mqa=is_mqa,
+        mask_info=dq_mask_info,
+        mask_value=mask_value,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+        q_layout=block_sizes.q_layout,
+        k_layout=block_sizes.k_layout,
+        v_layout=block_sizes.v_layout,
+        mask_function=mask_function,
+        interpret=interpret,
+        delta=True,
+    )
+  else:
+    di = jnp.einsum(
+        "hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32)
+    )
   assert bq_dkv is not None
   assert bkv_dkv_memory is not None
   assert bkv_dkv_compute is not None
