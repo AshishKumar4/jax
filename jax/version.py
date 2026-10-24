@@ -27,7 +27,10 @@ _version = "0.12.0.1"
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
 # A post-release of 0.12.0.1 with the multi-process cache key fix, built from
 # this branch by URL: it installs beside jaxlib 0.12.0.1 and satisfies jax>=0.12.0.1.
+<<<<<<< HEAD
 _release_version: str | None = "0.12.0.1.post20"
+=======
+>>>>>>> fork/v0.12.0.1-cache-key-pool-fingerprints
 
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
