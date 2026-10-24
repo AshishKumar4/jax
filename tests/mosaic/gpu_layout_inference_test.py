@@ -1053,7 +1053,7 @@ class LayoutInferenceTest(parameterized.TestCase):
         unknowns.append(smem)
         constraints.append(cs.IsTransferableSmemRegisters(
             RL(acc), smem, (128, 128), (128, 1), bitwidth=16,
-            optimized=cs.OptimizedTransferKind.DOWNGRADABLE,
+            optimized=False,
         ))
         rows = 128
         while rows:
@@ -1065,7 +1065,7 @@ class LayoutInferenceTest(parameterized.TestCase):
           constraints.append(cs.NotOfType(variable, fa.WGSplatFragLayout))
           constraints.append(cs.IsTransferableSmemRegisters(
               smem, variable, (rows, 128), (128, 1), bitwidth=16,
-              optimized=cs.OptimizedTransferKind.OPTIMIZED,
+              optimized=True,
           ))
           rows //= 2
     assignments, _ = layout_inference.find_assignments_for(
