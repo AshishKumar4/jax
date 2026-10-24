@@ -536,6 +536,55 @@ def conjure_assignment(
         assert_never(never)
 
 
+def _independent_components(
+    unknowns: Sequence[cs.Variable],
+    constraint_system: cs.ConstraintSystem,
+) -> list[tuple[list[cs.Variable], list[cs.Constraint]]]:
+  """Splits `unknowns` into groups that no constraint of the system relates.
+
+  Returns each group's unknowns, in the order of `unknowns`, with the
+  constraints that mention any of them. A constraint that mentions no unknown
+  goes with every group.
+  """
+  parent = {u: u for u in unknowns}
+
+  def root(u: cs.Variable) -> cs.Variable:
+    while parent[u] != u:
+      parent[u] = parent[parent[u]]
+      u = parent[u]
+    return u
+
+  mentioned: list[tuple[cs.Constraint, list[cs.Variable]]] = []
+  for constraint in constraint_system.constraints:
+    variables = [
+        v
+        for v in cs.ConstraintSystem(
+            assignments=constraint_system.assignments, constraints=[constraint]
+        ).unknowns()
+        if v in parent
+    ]
+    mentioned.append((constraint, variables))
+    for v in variables[1:]:
+      parent[root(v)] = root(variables[0])
+
+  groups: dict[cs.Variable, list[cs.Variable]] = {}
+  for u in unknowns:
+    groups.setdefault(root(u), []).append(u)
+  free = [constraint for constraint, variables in mentioned if not variables]
+  return [
+      (
+          members,
+          [
+              constraint
+              for constraint, variables in mentioned
+              if variables and root(variables[0]) == group
+          ]
+          + free,
+      )
+      for group, members in groups.items()
+  ]
+
+
 def find_assignments_for(
     unknowns: Sequence[cs.Variable],
     constraint_system: cs.ConstraintSystem,
@@ -579,6 +628,30 @@ def find_assignments_for(
     return {
         v: k for v, k in constraint_system.assignments.items() if v in unknowns
     }, fuel
+
+  # Unknowns that no constraint relates are solved apart: searching them
+  # together would retry every combination of one group's assignments for each
+  # dead end of another's, so a kernel with two independent buffers costs the
+  # product of their searches rather than the sum.
+  components = _independent_components(remaining_unknowns, constraint_system)
+  if len(components) > 1:
+    solution = {
+        v: k for v, k in constraint_system.assignments.items() if v in unknowns
+    }
+    for component_unknowns, component_constraints in components:
+      component_solution, fuel = find_assignments_for(
+          component_unknowns,
+          cs.ConstraintSystem(
+              assignments=constraint_system.assignments,
+              constraints=component_constraints,
+          ),
+          fuel=fuel,
+          arch=arch,
+      )
+      if isinstance(component_solution, cs.Unsatisfiable):
+        return cs.Unsatisfiable(), fuel
+      solution |= component_solution
+    return solution, fuel
 
   # If unknowns remain and we have fully reduced the system, we may still
   # be able to make progress by trying out potential assignments. These
