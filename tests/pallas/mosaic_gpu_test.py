@@ -1104,8 +1104,8 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     x = jnp.arange(256).astype(jnp.float32)
     np.testing.assert_array_equal(kernel(x), x + 1.0)
 
-  @run_on_sm80
   @parameterized.product(dynamic=[False, True], max_concurrent_steps=[1, 2, 3])
+  @run_on_sm80
   def test_emit_pipeline_shared_by_threads(self, dynamic, max_concurrent_steps):
     # Two threads run one pipeline over the same slots (``thread_axis``): each
     # sums every step's whole block, so a share another thread copied must
@@ -1121,7 +1121,9 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       steps = blocks + lax.axis_index("x") if dynamic else blocks
 
       def step(_, x_smem, carry):
-        return carry + x_smem[...]
+        return carry + plgpu.load(
+            x_smem, layout=plgpu.Layout.WGMMA, optimized=False
+        )
 
       total = plgpu.emit_pipeline(
           step,
