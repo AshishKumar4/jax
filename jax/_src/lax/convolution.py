@@ -174,8 +174,8 @@ def conv_general_dilated(
 
   preferred_element_type = (
       None if preferred_element_type is None
-      else dtypes.check_and_canonicalize_user_dtype(
-          preferred_element_type, "conv_general_dilated"
+      else dtypes.check_and_canonicalize_dtype_of(
+          preferred_element_type, "conv_general_dilated", lhs, rhs
       )
   )
   lhs, rhs = core.auto_insert_reshard(lhs, rhs)
