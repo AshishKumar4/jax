@@ -2039,8 +2039,35 @@ def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
 def _linear_call_abstract_eval(*args, **kwargs):
   return kwargs['callee'].out_avals
 
+def _lowered(jaxpr, consts):
+  """`jaxpr` lowered where it is high, the constants its lowering closes over
+  moved to the front of its inputs and of `consts`."""
+  if not jaxpr.is_high:
+    return jaxpr, tuple(consts)
+  closed_lo_jaxpr = pe.lower_jaxpr2(jaxpr)
+  return (pe.convert_constvars_jaxpr(closed_lo_jaxpr),
+          (*closed_lo_jaxpr.consts, *consts))
+
+def _linear_call_to_lojax(*args, callee, transpose_thunk, num_callee_consts,
+                          num_res):
+  # A callee or transpose that binds a hijax primitive (searchsorted is one)
+  # makes the call high wherever a trace requires low primitives (its reverse
+  # pass's, which binds the call transposed). The call stays one linear_call,
+  # its callee and transpose lowered, so its custom transpose still runs.
+  f_consts, rest = split_list(args, [num_callee_consts])
+  lo_callee, f_consts = _lowered(callee, f_consts)
+
+  def lo_transpose_thunk():
+    transpose, t_consts = transpose_thunk()
+    return _lowered(transpose, t_consts)
+
+  return linear_call_p.bind(*f_consts, *rest, callee=lo_callee,
+                            transpose_thunk=lo_transpose_thunk,
+                            num_callee_consts=len(f_consts), num_res=num_res)
+
 linear_call_p = core.Primitive('linear_call')
 linear_call_p.multiple_results = True
+linear_call_p.to_lojax = _linear_call_to_lojax
 linear_call_p.def_impl(_linear_call_impl)
 linear_call_p.def_abstract_eval(_linear_call_abstract_eval)
 ad.primitive_jvps[linear_call_p] = _linear_call_jvp_rule

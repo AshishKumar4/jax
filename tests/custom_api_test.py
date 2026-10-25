@@ -5365,6 +5365,30 @@ class LinearCallTest(jtu.JaxTestCase):
       return 7. * ct * r
     return jax.custom_derivatives.linear_call(f, t, r, x)
 
+  def test_transpose_of_a_callee_with_high_primitives(self):
+    # A callee or transpose that binds a hijax primitive (searchsorted is one)
+    # makes linear_call high; its reverse pass binds linear_call at a trace
+    # that requires low primitives, which lowers it.
+    edges = jnp.asarray([0, 2, 4])
+
+    def grouped(x):
+      groups = jnp.searchsorted(edges, jnp.arange(x.shape[0]), side="right")
+      return groups.astype(x.dtype)
+
+    def f(_, x):
+      return x * grouped(x)
+
+    def t(_, ct):
+      return 7. * ct * grouped(ct)
+
+    def call(x):
+      return jax.custom_derivatives.linear_call(f, t, (), x)
+
+    x = jnp.arange(1., 6.)
+    expected = 7. * jnp.ones(5) * grouped(x)
+    self.assertAllClose(jax.vjp(call, x)[1](jnp.ones(5))[0], expected)
+    self.assertAllClose(jax.jit(jax.grad(lambda x: call(x).sum()))(x), expected)
+
   @parameterized.parameters([(0, None), (None, 0), (0, 0), (1, 0)])
   def test_vmap(self, r_axis, x_axis):
     r = jnp.arange(1., 7.).reshape(2, 3)
