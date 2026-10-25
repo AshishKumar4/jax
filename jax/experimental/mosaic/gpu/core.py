@@ -751,6 +751,28 @@ def _cluster_wait_aligned():
   )
 
 
+def _max_smem_bytes() -> int:
+  """The shared memory a block may use on the device a kernel is lowered for.
+
+  For ahead-of-time compilation purposes, that is when a CUDA device isn't
+  available to query directly, we default to 227 KB, the maximum amount of
+  shared memory per thread block available in compute capabilities 9.0 and
+  10.x:
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
+  A kernel lowered for an abstract device that states another compute
+  capability than the attached device's (a compile-only target) is checked
+  against that default too, not the attached device's limit. We assume all
+  devices have the same amount of shared memory.
+  """
+  device = jax.local_devices()[0]
+  target = getattr(
+      jax.sharding.get_abstract_mesh().abstract_device, "compute_capability", None
+  )
+  if target is not None and target != getattr(device, "compute_capability", None):
+    return 227 * 1024
+  return getattr(device, "shared_memory_per_block_optin", 227 * 1024)
+
+
 # TODO(apaszke): Inline this
 @contextlib.contextmanager
 def _launch(
@@ -792,15 +814,7 @@ def _launch(
     profiler_start = (smem_bytes + align - 1) & ~(align - 1)
     smem_bytes = profiler_start + profiler_spec.smem_bytes(block=block)
 
-  device = jax.local_devices()[0]
-  # For ahead-of-time compilation purposes, that is when a CUDA device
-  # isn't available to query directly, we default to 227 KB, the
-  # maximum amount of shared memory per thread block available in
-  # compute capabilities 9.0 and 10.x:
-  # https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
-  # Note in either case we assume all devices have the same amount of
-  # shared memory.
-  max_smem_bytes = getattr(device, "shared_memory_per_block_optin", 227 * 1024)
+  max_smem_bytes = _max_smem_bytes()
   if _SMEM_SIZE_BOUND is not None:
     max_smem_bytes = min(max_smem_bytes, _SMEM_SIZE_BOUND)
   if smem_bytes > max_smem_bytes:

@@ -39,6 +39,7 @@ from jax.experimental.mosaic.gpu import inference_utils
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import layout_inference
 from jax.experimental.mosaic.gpu import layouts
+from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import test_util as mtu
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
@@ -3952,6 +3953,20 @@ class ArchInferenceTest(parameterized.TestCase):
     )
     with jax.sharding.use_abstract_mesh(mesh):
       self.assertEqual(mgpu_utils._infer_arch(), arch)
+
+  def test_a_compile_only_target_takes_the_default_shared_memory_limit(self):
+    # A target stating a capability no attached device has is not held to the
+    # attached device's shared memory: a kernel for an H100 lowered on an
+    # A100's host (163 KiB) is checked against the 227 KiB default.
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA GPU", num_cores=None, platform="cuda",
+        compute_capability="12.3",
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("x",), (jax.sharding.AxisType.Explicit,), abstract_device=device
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+      self.assertEqual(mgpu_core._max_smem_bytes(), 227 * 1024)
 
 
 if __name__ == "__main__":
