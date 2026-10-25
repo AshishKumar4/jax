@@ -16,6 +16,7 @@
 import concurrent.futures
 from functools import partial
 import time
+import warnings
 
 from absl.testing import absltest
 import numpy as np
@@ -298,6 +299,48 @@ class X64ContextTests(jtu.JaxTestCase):
         res = compiled(x)
         self.assertEqual(res.dtype, jnp.int64)
         self.assertEqual(int(res), 43)
+
+  def test_a_wide_trace_keeps_its_dtypes_under_later_transformations(self):
+    # A float64 product traced in an x64 scope, staged (as a cond's branch, as
+    # `lax.platform_dependent` stages one) and later batched, differentiated in
+    # reverse mode and transposed outside that scope keeps float64: the rules
+    # re-invoke dot_general and convert_element_type with the jaxpr's dtypes,
+    # which canonicalization must not narrow, and no truncation warning fires.
+    rng = np.random.RandomState(0)
+    a = rng.standard_normal((3, 4, 5)).astype(np.float32)
+    b = rng.standard_normal((5, 6)).astype(np.float32)
+
+    def wide(x, y):
+      with jax.enable_x64(True):
+        product = jnp.einsum('ij,jk->ik', x.astype(jnp.float64), y.astype(jnp.float64),
+                             precision=lax.Precision.HIGHEST)
+        return product.astype(jnp.float32)
+
+    def staged(x, y):
+      return lax.cond(True, wide, lambda x, y: jnp.zeros((x.shape[0], y.shape[1]), jnp.float32), x, y)
+
+    expected = np.einsum('bij,jk->bik', a.astype(np.float64), b.astype(np.float64)).astype(np.float32)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      batched = jax.jit(jax.vmap(staged, in_axes=(0, None)))(a, b)
+      gradient = jax.jit(jax.grad(lambda x, y: jnp.sum(jax.vmap(staged, in_axes=(0, None))(x, y)),
+                                  argnums=1))(a, b)
+    np.testing.assert_array_equal(batched, expected)
+    self.assertEqual(batched.dtype, np.float32)
+    expected_gradient = np.einsum('bij,bik->jk', a.astype(np.float64),
+                                  np.ones((3, 4, 6))).astype(np.float32)
+    np.testing.assert_array_equal(gradient, expected_gradient)
+
+  def test_a_user_request_for_a_wide_dtype_still_narrows(self):
+    # A NumPy float64 operand is a user's value, not a wide trace's: with x64
+    # off, converting it or asking a product for float64 still narrows.
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      converted = lax.convert_element_type(np.ones(3, np.float64), np.float64)
+      product = lax.dot_general(np.ones((2, 2), np.float64), np.ones((2, 2), np.float64),
+                                (((1,), (0,)), ((), ())), preferred_element_type=np.float64)
+    self.assertEqual(converted.dtype, np.float32)
+    self.assertEqual(product.dtype, np.float32)
 
 
 if __name__ == "__main__":
