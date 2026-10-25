@@ -280,6 +280,51 @@ def _strip_triton_debug_info(m: ir.Module) -> None:
   m.operation.walk(_strip_kernel)
 
 
+def _strip_mosaic_gpu_debug_info(m: ir.Module) -> None:
+  """Strips debug info from Mosaic GPU kernel bytecode in its custom calls.
+
+  A Mosaic GPU kernel's module is serialized into the `module` of its custom
+  call's `mhlo.backend_config` with its source locations, and `kernel_hash` is
+  that serialization's digest, so the top-level strip-debuginfo pass leaves the
+  kernel's locations in the cache key twice: the same kernel compiled from two
+  checkouts keyed differently. Both are replaced, the module stripped and its
+  digest taken again, as the kernel's producer takes it.
+  """
+
+  def _strip_kernel(op: ir.Operation) -> ir.WalkResult:
+    if (op.name != "stablehlo.custom_call"
+        or op.attributes["call_target_name"].value != "mosaic_gpu_v2"  # type: ignore
+        or "mhlo.backend_config" not in op.attributes):
+      return ir.WalkResult.ADVANCE
+    config = ir.DictAttr(op.attributes["mhlo.backend_config"])
+    if "module" not in config:
+      return ir.WalkResult.ADVANCE
+    ctx = m.context
+    allowed = ctx.allow_unregistered_dialects
+    ctx.allow_unregistered_dialects = True
+    try:
+      with ctx:
+        try:
+          kernel = ir.Module.parse(
+              ir.StringAttr(config["module"]).value_bytes, context=ctx)
+        except ir.MLIRError:
+          return ir.WalkResult.ADVANCE
+        pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
+            kernel.operation)
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        body = out.getvalue()
+        entries = {entry.name: entry.attr for entry in config}
+        entries["module"] = ir.StringAttr.get(body)
+        entries["kernel_hash"] = ir.StringAttr.get(hashlib.sha256(body).digest())
+        op.attributes["mhlo.backend_config"] = ir.DictAttr.get(entries)
+    finally:
+      ctx.allow_unregistered_dialects = allowed
+    return ir.WalkResult.ADVANCE
+
+  m.operation.walk(_strip_kernel)
+
+
 def _serialize_ir(m: ir.Module, ignore_custom_partitioning: bool) -> bytes:
   output = io.BytesIO()
   if ignore_custom_partitioning:
@@ -301,6 +346,7 @@ def _canonicalize_ir(
     passes.run(m.operation)
     _strip_mosaic_debug_info(m)
     _strip_triton_debug_info(m)
+    _strip_mosaic_gpu_debug_info(m)
     return _serialize_ir(m, ignore_custom_partitioning)
 
 
