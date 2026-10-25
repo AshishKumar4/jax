@@ -1146,12 +1146,8 @@ def _cond_lowering(ctx, index, *args, branches, **params):
         assert False, p
 
     if len(branches_kept) == 1:
-      # The lowering's platforms keep one branch: it is the computation, with
-      # no conditional around it. A conditional would compute its index at run
-      # time from a case of constants, and XLA keeps a conditional whose branch
-      # holds collectives, so every platform_dependent around a collective
-      # (the cotangent conditionals AD makes of it included) would reach the
-      # compiled program as a conditional fed by a conditional.
+      # Inline the sole surviving branch: its index cannot affect execution on
+      # the selected platforms.
       return _platform_branch_lowering(ctx, branches_kept[0], args)
 
     # Compute the new index into branches_keep
