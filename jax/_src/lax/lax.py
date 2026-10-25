@@ -1742,8 +1742,8 @@ def convert_element_type(operand: ArrayLike,
   .. _stablehlo.convert: https://openxla.org/stablehlo/spec#convert
   .. _x64 mode: https://docs.jax.dev/en/latest/101/default_dtypes.html
   """
-  new_dtype = dtypes.check_and_canonicalize_user_dtype(
-      new_dtype, 'convert_element_type')
+  new_dtype = dtypes.check_and_canonicalize_dtype_of(
+      new_dtype, 'convert_element_type', operand)
   return _convert_element_type(operand, new_dtype, weak_type=False)
 
 def _convert_element_type(
@@ -2690,7 +2690,7 @@ def dot(lhs: ArrayLike, rhs: ArrayLike, *,
            api_util._ensure_index_tuple(rhs_batch))
   preferred_element_type = (
       None if preferred_element_type is None else
-      dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
+      dtypes.check_and_canonicalize_dtype_of(preferred_element_type, 'dot', lhs, rhs))
   lhs, rhs = core.auto_insert_reshard(lhs, rhs)
   return dot_general_p.bind(lhs, rhs,
                             dimension_numbers=(cdims, bdims),

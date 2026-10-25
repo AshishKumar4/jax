@@ -1128,6 +1128,31 @@ def check_and_canonicalize_user_dtype(
     raise TypeError(msg)
   return _maybe_canonicalize_explicit_dtype(np_dtype, fun_name or "")
 
+def check_and_canonicalize_dtype_of(dtype, fun_name: str, *operands) -> DType:
+  """`check_and_canonicalize_user_dtype` for a dtype an operation states beside its operands, kept
+  as stated where an operand is already of a dtype x64 canonicalization would narrow.
+
+  Such an operand exists only where x64 was enabled when it was traced (a `jax.enable_x64` scope),
+  so the dtype is the trace's, not a user's request: a transformation rule that re-invokes an
+  operation's API with its jaxpr's dtype (a batching or transpose rule, outside the scope that
+  traced it) keeps what the trace holds, rather than truncating a float64 operation to float32.
+  """
+  if any(_is_wide(operand) for operand in operands):
+    if issubdtype(dtype, extended):
+      return dtype
+    return np.dtype(dtype)
+  return check_and_canonicalize_user_dtype(dtype, fun_name)
+
+
+def _is_wide(operand: Any) -> bool:
+  """Whether `operand` is a JAX value (an array or a tracer) of a dtype x64 canonicalization narrows,
+  a 64-bit one with x64 off. A NumPy array or a Python scalar is not: those are 64-bit without x64,
+  and canonicalize as a user's request."""
+  if not isinstance(operand, Array) or issubdtype(operand.dtype, extended):
+    return False
+  return canonicalize_dtype(operand.dtype) != np.dtype(operand.dtype)
+
+
 def safe_to_cast(input_dtype_or_value: Any,
                  output_dtype_or_value: Any) -> bool:
   """Check if a dtype/value is safe to cast to another dtype/value
