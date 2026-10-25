@@ -1104,6 +1104,49 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     x = jnp.arange(256).astype(jnp.float32)
     np.testing.assert_array_equal(kernel(x), x + 1.0)
 
+  @run_on_sm80
+  @parameterized.product(dynamic=[False, True], max_concurrent_steps=[1, 2, 3])
+  def test_emit_pipeline_shared_by_threads(self, dynamic, max_concurrent_steps):
+    # Two threads run one pipeline over the same slots (``thread_axis``): each
+    # sums every step's whole block, so a share another thread copied must
+    # have landed before ``body`` reads it, and no slot may be refilled while
+    # either thread still reads it.
+    blocks, rows, cols = 6, 64, 128
+    x = jax.random.uniform(
+        jax.random.key(0), (blocks * rows, cols), dtype=jnp.float32
+    )
+
+    def body(x_gmem, o_gmem):
+      wg = lax.axis_index("wg")
+      steps = blocks + lax.axis_index("x") if dynamic else blocks
+
+      def step(_, x_smem, carry):
+        return carry + x_smem[...]
+
+      total = plgpu.emit_pipeline(
+          step,
+          grid=(steps,),
+          in_specs=[pl.BlockSpec((rows, cols), lambda i: (i, 0))],
+          max_concurrent_steps=max_concurrent_steps,
+          init_carry=plgpu.layout_cast(
+              jnp.zeros((rows, cols), jnp.float32), plgpu.Layout.WGMMA
+          ),
+          thread_axis="wg",
+      )(x_gmem)
+      plgpu.store(o_gmem.at[wg], total, optimized=False)
+
+    result = self.kernel(
+        body,
+        out_type=jax.ShapeDtypeStruct((2, rows, cols), jnp.float32),
+        grid=(1,),
+        grid_names=("x",),
+        num_threads=2,
+        thread_name="wg",
+    )(x)
+    expected = x.reshape(blocks, rows, cols).sum(axis=0)
+    np.testing.assert_allclose(result[0], expected, rtol=1e-6)
+    np.testing.assert_array_equal(result[0], result[1])
+
   @parameterized.parameters(jnp.bfloat16, jnp.float16, jnp.float32)
   def test_copy_smem_to_gmem_reduction(self, dtype):
 
