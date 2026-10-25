@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import threading
+import io
 import types
 import unittest
 from typing import cast as type_cast
@@ -35,6 +36,7 @@ from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src.lib import _jax
+from jax._src.interpreters import mlir
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.mesh import Mesh
@@ -486,6 +488,39 @@ class CacheKeyTest(jtu.JaxTestCase):
       key1 = cache_key.get(computation1, devices, compile_options, backend)
       key2 = cache_key.get(computation2, devices, compile_options, backend)
     self.assertEqual(include_metadata, key1 != key2)
+
+  def test_identical_mosaic_gpu_kernels_from_two_checkouts_key_alike(self):
+    # A Mosaic GPU kernel's module is serialized into its custom call with its
+    # source locations, and its kernel_hash is that serialization's digest: the
+    # same kernel compiled from two checkouts must key alike.
+    def program(path):
+      with mlir.make_ir_context() as ctx, ir.Location.unknown():
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  func.func @kernel() {\n"
+            f'    return loc("{path}/src/kernels.py":3:5)\n'
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        body = out.getvalue()
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @mosaic_gpu_v2(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get({
+            "kernel_hash": ir.StringAttr.get(hashlib.sha256(body).digest()),
+            "module": ir.StringAttr.get(body),
+        })
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
 
   @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_xla_flags(self):
