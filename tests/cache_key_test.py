@@ -397,6 +397,50 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
                      program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
 
+  def test_triton_kernels_differing_in_a_property_key_apart(self):
+    # Pallas Triton writes its kernels at the default bytecode version, which
+    # keeps an operation's properties (a transpose's order) in a form only
+    # Triton's dialect reads: the key reads them through it, so kernels that
+    # differ only in one key apart, and one kernel from two checkouts alike.
+    try:
+      from jax._src.lib.triton import dialect as tt_dialect  # pytype: disable=import-error
+    except ImportError:
+      self.skipTest("this jaxlib has no Triton dialect")
+
+    def program(order, path):
+      with ir.Context() as kernel_ctx, ir.Location.unknown():
+        tt_dialect.register_dialect(kernel_ctx)
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  tt.func @kernel(%arg0: tensor<4x4x4xf32>) -> tensor<4x4x4xf32> {\n"
+            f"    %0 = tt.trans %arg0 {{order = array<i32: {order}>}} : "
+            "tensor<4x4x4xf32> -> tensor<4x4x4xf32> "
+            f'loc("{path}/src/kernels.py":3:5)\n'
+            "    tt.return %0 : tensor<4x4x4xf32>\n"
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out)
+        body = out.getvalue()
+      with mlir.make_ir_context(), ir.Location.unknown():
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(
+            {"ir": ir.StringAttr.get(body)})
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("1, 0, 2", "/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+    self.assertNotEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                        program("2, 1, 0", "/home/ubuntu/s/trees/caea5dc4fa46-1"))
+
   @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_xla_flags(self):
     if jtu.is_device_tpu(version=4):
