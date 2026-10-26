@@ -33,10 +33,11 @@ permissions:
 concurrency: patch-stack
 
 env:
-  # The stack's tests: its fixes' own (the cache key's, linear_call's, the transfer guard's) and the API they
-  # change. A stack is pushed, and its wheel published, only where they pass. JAX's test cases set their checks
-  # for each test whatever JAX_ENABLE_CHECKS says (on, or off as TransferGuardTest sets them), so they run once.
-  TESTS: tests/cache_key_test.py tests/api_test.py tests/custom_api_test.py tests/transfer_guard_test.py
+  # The stack's tests: the API its fixes change, and each test file the stack adds or changes over its release,
+  # its fixes' own regressions (`patch_stack.py tests`). A stack is pushed, and its wheel published, only where
+  # they pass. JAX's test cases set their checks for each test whatever JAX_ENABLE_CHECKS says (on, or off as
+  # TransferGuardTest sets them), so they run once.
+  TESTS: tests/api_test.py
   TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy
 
 defaults:
@@ -88,7 +89,8 @@ jobs:
           cd jax
           uv venv -q --python 3.12 ../venv
           uv pip install -q --python ../venv/bin/python "jaxlib==${{ steps.rebase.outputs.new }}" . $TEST_DEPENDENCIES
-          ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $TESTS 2>&1 | tee ../tests.txt
+          tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "${{ steps.rebase.outputs.new }}")"
+          ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $tests 2>&1 | tee ../tests.txt
       - name: Push it
         id: pushed
         if: steps.rebase.outputs.result == 'rebased' && inputs.rehearse == ''
@@ -144,8 +146,9 @@ jobs:
       - name: Build the stack's wheel, and fetch the release's own
         if: env.RELEASE != ''
         run: |
-          git clone -q --depth 1 --branch "v$RELEASE-cache-key-pool-fingerprints" \
+          git clone -q --filter=blob:none --branch "v$RELEASE-cache-key-pool-fingerprints" \
             "https://github.com/${{ github.repository }}.git" jax
+          git -C jax fetch -q --no-tags https://github.com/jax-ml/jax.git "refs/tags/jax-v$RELEASE:refs/tags/jax-v$RELEASE"
           uv build -q --wheel --out-dir dist jax
           uv venv -q venv
           uv pip install -q --python venv/bin/python pip
@@ -161,7 +164,8 @@ jobs:
           uv pip install -q --python tested/bin/python dist/jax-"$RELEASE".post*-py3-none-any.whl "jaxlib==$RELEASE" \
             $TEST_DEPENDENCIES
           cd jax
-          ../tested/bin/python -m pytest -q -n auto -p no:cacheprovider $TESTS
+          tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "$RELEASE")"
+          ../tested/bin/python -m pytest -q -n auto -p no:cacheprovider $tests
       - name: Index them
         run: |
           # The manifest lists what the index holds: absent only before the first publication, and any other

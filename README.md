@@ -7,7 +7,6 @@ once a release holds it.
 
 | Fix | Issue | Pull request |
 |---|---|---|
-| A computation that spans processes keys the persistent compilation cache by every process's topology fingerprint, and only across processes with the same accelerators | [#40940](https://github.com/jax-ml/jax/issues/40940) | [#41776](https://github.com/jax-ml/jax/pull/41776) |
 | A Pallas Triton kernel's cache key leaves out its source locations | [#41502](https://github.com/jax-ml/jax/issues/41502) | [#41777](https://github.com/jax-ml/jax/pull/41777) |
 
 Each stack's wheel is published to Dew's package index, beside the release's own:

@@ -3,6 +3,7 @@ release to the next.
 
     python dew/patch_stack.py next              # "OLD NEW": the newest carried release and a newer one
     python dew/patch_stack.py rebase OLD NEW    # in a clone holding jax-vOLD, jax-vNEW and the OLD branch
+    python dew/patch_stack.py tests RELEASE     # the stack's own test files, in a clone holding jax-vRELEASE
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
     python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
@@ -25,6 +26,9 @@ order, onto jax-vNEW as vNEW-cache-key-pool-fingerprints:
 It prints one line a commit (`kept`, `dropped` and why) and exits 0 with the branch made; 2 where a commit
 does not apply, after printing its conflict and leaving no branch; 3 where every fix was dropped, so only
 version commits would remain and the fork has nothing left to carry for NEW.
+
+`tests` prints the test files the stack checked out adds or changes over jax-vRELEASE: each fix's own
+regressions, which the workflow runs, with the API they change, before it pushes or publishes a stack.
 """
 
 from __future__ import annotations
@@ -54,6 +58,11 @@ def git(*args: str, check: bool = True) -> str:
 
 def branch(version: str) -> str:
     return f"v{version}-cache-key-pool-fingerprints"
+
+
+def tests(release: str) -> list[str]:
+    """The test files HEAD adds or changes over jax-vRELEASE: the stack's fixes' own regressions."""
+    return git("diff", "--name-only", "--diff-filter=d", f"jax-v{release}", "HEAD", "--", "tests/*_test.py").split()
 
 
 def upstreamed(old: str, new: str) -> set[str]:
@@ -204,6 +213,7 @@ def main() -> int:
     rebasing = commands.add_parser("rebase")
     rebasing.add_argument("old")
     rebasing.add_argument("new")
+    commands.add_parser("tests").add_argument("release")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
     indexing.add_argument("site", type=Path)
@@ -213,6 +223,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "next":
         print(following())
+        return 0
+    if args.command == "tests":
+        print(" ".join(tests(args.release)))
         return 0
     if args.command == "index":
         index(args.manifest, args.site, args.files, args.yank, args.reason)
