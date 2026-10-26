@@ -342,6 +342,21 @@ class X64ContextTests(jtu.JaxTestCase):
     self.assertEqual(converted.dtype, np.float32)
     self.assertEqual(product.dtype, np.float32)
 
+  def test_a_default_dtype_request_on_a_wide_value_still_narrows(self):
+    # Python's float, int and complex ask for the default dtype of their kind,
+    # which with x64 off is the 32-bit one, whatever the operand holds: only a
+    # dtype the trace itself states (a NumPy dtype, as a jaxpr's params hold
+    # one) is kept for a wide operand.
+    with jax.enable_x64(True):
+      wide = {float: jnp.ones(3, jnp.float64), int: jnp.ones(3, jnp.int64),
+              complex: jnp.ones(3, jnp.complex128)}
+    expected = {float: np.float32, int: np.int32, complex: np.complex64}
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      for kind, operand in wide.items():
+        self.assertEqual(lax.convert_element_type(operand, kind).dtype, expected[kind])
+        self.assertEqual(operand.astype(kind).dtype, expected[kind])
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
