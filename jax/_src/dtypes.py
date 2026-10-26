@@ -1130,14 +1130,17 @@ def check_and_canonicalize_user_dtype(
 
 def check_and_canonicalize_dtype_of(dtype, fun_name: str, *operands) -> DType:
   """`check_and_canonicalize_user_dtype` for a dtype an operation states beside its operands, kept
-  as stated where an operand is already of a dtype x64 canonicalization would narrow.
+  as stated where it is a NumPy dtype and an operand is already of a dtype x64 canonicalization would
+  narrow.
 
   Such an operand exists only where x64 was enabled when it was traced (a `jax.enable_x64` scope),
-  so the dtype is the trace's, not a user's request: a transformation rule that re-invokes an
-  operation's API with its jaxpr's dtype (a batching or transpose rule, outside the scope that
-  traced it) keeps what the trace holds, rather than truncating a float64 operation to float32.
+  and a NumPy dtype is the form a jaxpr's params hold, so the dtype is the trace's, not a user's
+  request: a transformation rule that re-invokes an operation's API with its jaxpr's dtype (a
+  batching or transpose rule, outside the scope that traced it) keeps what the trace holds, rather
+  than truncating a float64 operation to float32. A request for a kind's default (Python's float,
+  int or complex, a scalar type) canonicalizes as a user's does.
   """
-  if any(_is_wide(operand) for operand in operands):
+  if isinstance(dtype, np.dtype) and any(_is_wide(operand) for operand in operands):
     if issubdtype(dtype, extended):
       return dtype
     return np.dtype(dtype)
