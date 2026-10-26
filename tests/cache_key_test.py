@@ -360,10 +360,14 @@ class CacheKeyTest(jtu.JaxTestCase):
       key2 = cache_key.get(computation2, devices, compile_options, backend)
     self.assertEqual(include_metadata, key1 != key2)
 
-  def test_identical_mosaic_gpu_kernels_from_two_checkouts_key_alike(self):
-    # A Mosaic GPU kernel's module is serialized into its custom call with its
-    # source locations, and its kernel_hash is that serialization's digest: the
-    # same kernel compiled from two checkouts must key alike.
+  @parameterized.parameters(("mosaic_gpu_v2", "module", "kernel_hash"),
+                            ("__gpu$xla.gpu.triton", "ir", None))
+  def test_identical_gpu_kernels_from_two_checkouts_key_alike(
+      self, target, field, digest):
+    # A Mosaic GPU or Pallas Triton kernel's module is serialized into its
+    # custom call with its source locations, and a Mosaic GPU kernel's
+    # kernel_hash is that serialization's digest: the same kernel compiled
+    # from two checkouts must key alike.
     def program(path):
       with mlir.make_ir_context() as ctx, ir.Location.unknown():
         kernel = ir.Module.parse(
@@ -378,16 +382,16 @@ class CacheKeyTest(jtu.JaxTestCase):
         module = ir.Module.parse(
             "module {\n"
             "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
-            "    %0 = stablehlo.custom_call @mosaic_gpu_v2(%arg0) "
+            f"    %0 = stablehlo.custom_call @{target}(%arg0) "
             "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
             "    return %0 : tensor<f32>\n"
             "  }\n"
             "}\n")
         call = module.body.operations[0].regions[0].blocks[0].operations[0]
-        call.attributes["mhlo.backend_config"] = ir.DictAttr.get({
-            "kernel_hash": ir.StringAttr.get(hashlib.sha256(body).digest()),
-            "module": ir.StringAttr.get(body),
-        })
+        config = {field: ir.StringAttr.get(body)}
+        if digest is not None:
+          config[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(config)
         return cache_key._canonicalize_ir(module, False)
 
     self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
