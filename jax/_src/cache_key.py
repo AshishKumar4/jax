@@ -22,6 +22,7 @@ import logging
 import os
 import platform
 import sys
+from collections.abc import Callable
 from typing import cast as type_cast
 
 from jax import version as jax_version_module
@@ -240,7 +241,9 @@ def _strip_mosaic_debug_info(m: ir.Module) -> None:
 
 
 def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
-                             digest: str | None = None) -> None:
+                             digest: str | None = None,
+                             dialect: Callable[[ir.Context], bool] | None = None
+                             ) -> None:
   """Strips debug info from the kernel each custom call to `target` serializes
   in its `mhlo.backend_config`'s `field`, and takes the kernel's digest in
   `digest` again, where it has one, as the kernel's producer takes it.
@@ -248,8 +251,11 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
   The top-level strip-debuginfo pass does not reach into a kernel serialized in
   an attribute, so a kernel's source locations leak into the cache key: the
   same kernel compiled from two checkouts keyed differently. The kernel is
-  read with unregistered dialects allowed, as its dialects need not be loaded,
-  and only its key is written.
+  read with unregistered dialects allowed, and only its key is written, at
+  bytecode version 0, which holds every operation's properties as attributes.
+  A kernel written at a later version holds its operations' properties in a
+  form only their dialect reads, so `dialect` registers it first, and a kernel
+  whose dialect cannot be registered keeps its call as it is.
   """
 
   def _strip_kernel(op: ir.Operation) -> ir.WalkResult:
@@ -261,6 +267,8 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
     if field not in config:
       return ir.WalkResult.ADVANCE
     ctx = m.context
+    if dialect is not None and not dialect(ctx):
+      return ir.WalkResult.ADVANCE
     allowed = ctx.allow_unregistered_dialects
     ctx.allow_unregistered_dialects = True
     try:
@@ -286,6 +294,23 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
 
   m.operation.walk(_strip_kernel)
 
+
+def _triton_dialect(ctx: ir.Context) -> bool:
+  """Registers Triton's dialect in `ctx`, where this jaxlib has it.
+
+  Pallas Triton writes its kernels at the default bytecode version, whose
+  operations keep their properties (a transpose's order, say) in a form only
+  Triton's dialect reads: read unregistered, they would leave the key, and
+  kernels that differ only in them would key alike.
+  """
+  try:
+    from jax._src.lib.triton import dialect as tt_dialect  # pytype: disable=import-error
+  except ImportError:
+    return False
+  tt_dialect.register_dialect(ctx)
+  return True
+
+
 def _serialize_ir(m: ir.Module, ignore_custom_partitioning: bool) -> bytes:
   output = io.BytesIO()
   if ignore_custom_partitioning:
@@ -306,7 +331,8 @@ def _canonicalize_ir(
     )
     passes.run(m.operation)
     _strip_mosaic_debug_info(m)
-    _strip_kernel_debug_info(m, "__gpu$xla.gpu.triton", "ir")
+    _strip_kernel_debug_info(m, "__gpu$xla.gpu.triton", "ir",
+                             dialect=_triton_dialect)
     _strip_kernel_debug_info(m, "mosaic_gpu_v2", "module", digest="kernel_hash")
     return _serialize_ir(m, ignore_custom_partitioning)
 
