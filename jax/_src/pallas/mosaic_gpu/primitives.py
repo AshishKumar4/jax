@@ -2484,7 +2484,6 @@ mma_p = jax_core.Primitive("mma")
 
 @mma_p.def_abstract_eval
 def _mma_abstract_eval(acc, a, b, *, m_warps):
-  del m_warps  # The layouts' concern, not the shapes'.
   m, n = acc.shape
   m2, k = a.shape
   k2, n2 = b.shape
@@ -2513,7 +2512,8 @@ def _mma_abstract_eval(acc, a, b, *, m_warps):
   _check_layout_mode()
   if get_layout_mode() == LayoutMode.PALLAS_GPU:
     out_layout = lax_utils.call_layout_rule(
-        mma_p, in_avals=(acc, a, b), out_avals=acc, layout_rule=None
+        mma_p, in_avals=(acc, a, b), out_avals=acc, layout_rule=None,
+        m_warps=m_warps,
     )
     if out_layout != acc.layout:
       raise ValueError(
