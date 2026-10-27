@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import dataclasses
-import threading
 from functools import update_wrapper, reduce, partial, wraps
 from typing import Any
 
@@ -1845,17 +1844,15 @@ def linear_call(fun: Callable,
   out_avals = f_jaxpr_closed.out_avals
   out_tree = f_out_avals.tree
 
-  def traced_transpose():
+  @pe._memoize
+  def transpose_thunk():
     t_jaxpr, t_out_avals = pe.trace_to_jaxpr(
         fun_transpose,
         ft.pack(((ft.FTPyTree(res_avals, res_tree),
                   ft.FTPyTree(list(out_avals), out_tree)), {})),
-        # fun_transpose takes the residuals and the cotangents of fun's outputs,
-        # which are named here after those outputs' avals. It is traced while
-        # the call is made, so its names reach the tracing cache's explanations.
+        # TODO(necula): the fun_transpose takes residual and output of fun!
         debug_info("linear_call fun_transpose", fun_transpose,
-                   (residual_args, tree_unflatten(out_tree, list(out_avals))),
-                   {}))
+                   (residual_args, linear_args), {}).with_unknown_names())
     if t_out_avals.tree != lin_tree:
       raise TypeError(
           'transpose output pytree structure must match that of linear inputs, '
@@ -1863,76 +1860,13 @@ def linear_call(fun: Callable,
           f'and input structure {lin_tree}.')
     return pe.separate_consts(t_jaxpr)
 
-  underlying = _transpose_identity(fun_transpose)
-  if (underlying in _transposing.active
-      or len(_transposing.active) >= _MAX_EAGER_TRANSPOSES):
-    # A transpose that calls itself again (a self-adjoint call, say) is traced
-    # when its call is transposed, or its tracing would never end. So is any
-    # past _MAX_EAGER_TRANSPOSES nested ones, a bound on recursion through
-    # fresh callables, where a capture of the transposes it encloses is not
-    # converted.
-    callee, t_consts = f_jaxpr_closed, ()
-    transpose_thunk = pe._memoize(traced_transpose)
-  else:
-    # The transpose is traced here, where the values it closes over are live,
-    # and those values become residuals of the call: every transformation of
-    # the call then sees them as operands, where a transpose traced later, once
-    # vmap, jvp or a staging trace has exited, would hold their dead tracers.
-    _transposing.active.append(underlying)
-    try:
-      transpose, t_consts = traced_transpose()
-    finally:
-      _transposing.active.pop()
-    callee = _ignoring(f_jaxpr_closed, len(f_consts), t_consts)
-
-    def transpose_thunk():
-      return transpose, ()
-
-  out = linear_call_p.bind(*f_consts, *t_consts, *operands_res, *operands_lin,
-                           callee=callee,
+  out = linear_call_p.bind(*f_consts, *operands_res, *operands_lin,
+                           callee=f_jaxpr_closed,
                            transpose_thunk=transpose_thunk,
                            num_callee_consts=len(f_consts),
-                           num_res=len(t_consts) + len(operands_res))
+                           num_res=len(operands_res))
 
   return tree_unflatten(out_tree, out)
-
-class _Transposing(threading.local):
-  """The transposes this thread is tracing at a linear_call, outermost first."""
-
-  def __init__(self):
-    self.active: list[tuple[Any, ...]] = []
-
-_MAX_EAGER_TRANSPOSES = 32
-
-def _transpose_identity(fun: Callable) -> tuple[Any, ...]:
-  """`fun` as the identity of the callable under its functools.partial layers,
-  with the identities of the values each binds: a partial that binds nothing is
-  the callable it wraps, one that binds other values another transpose. A
-  subclass of partial, which may call otherwise, is its own callable."""
-  bound = []
-  while type(fun) is partial:
-    if fun.args or fun.keywords:
-      bound.append((tuple(map(id, fun.args)),
-                    tuple(sorted((k, id(v)) for k, v in fun.keywords.items()))))
-    fun = fun.func
-  return (id(fun), *bound)
-
-_transposing = _Transposing()
-
-def _ignoring(jaxpr: core.Jaxpr, at: int, values) -> core.Jaxpr:
-  """`jaxpr` taking, before its input `at`, one input it ignores for each of
-  `values`."""
-  if not values:
-    return jaxpr
-  inner = jaxpr.jaxpr
-  ignored = [core.Var(core.typeof(v)) for v in values]
-  dbg = inner.debug_info
-  if dbg.arg_names is not None:
-    names = tuple(dbg.arg_names)
-    dbg = dbg._replace(arg_names=(*names[:at], *[""] * len(ignored), *names[at:]))
-  inner = inner.replace(invars=[*inner.invars[:at], *ignored, *inner.invars[at:]],
-                        debug_info=dbg)
-  return inner
 
 def _linear_call_impl(*args, callee, transpose_thunk, num_callee_consts,
                       num_res):
@@ -1941,74 +1875,16 @@ def _linear_call_impl(*args, callee, transpose_thunk, num_callee_consts,
 
 def _linear_call_jvp_rule(primals, tangents, callee, transpose_thunk,
                           num_callee_consts, num_res):
-  num_fixed = num_callee_consts + num_res
-  consts_and_res, primals_lin = split_list(primals, [num_fixed])
-  fixed_tangents, tangents_lin = split_list(tangents, [num_fixed])
+  consts_and_res, primals = split_list(primals, [num_callee_consts + num_res])
+  const_tangents, tangents = split_list(tangents, [num_callee_consts + num_res])
+  assert all(type(t) is Zero for t in const_tangents)
   primals_out = linear_call_p.bind(
-      *consts_and_res, *primals_lin, callee=callee,
-      transpose_thunk=transpose_thunk, num_callee_consts=num_callee_consts,
-      num_res=num_res)
-  # The callee is linear in its linear operands, so its tangent in them is
-  # another call, which keeps the custom transpose.
-  if all(type(t) is Zero for t in tangents_lin):
-    tangents_out = [Zero(aval.to_tangent_aval()) for aval in callee.out_avals]
-  else:
-    tangents_out = linear_call_p.bind(
-        *consts_and_res, *map(ad.instantiate_zeros, tangents_lin),
-        callee=callee, transpose_thunk=transpose_thunk,
-        num_callee_consts=num_callee_consts, num_res=num_res)
-  # It need not be linear in its residuals or in the constants it closes over,
-  # so its tangent in them is the callee's own, at the linear primals.
-  nonzeros = [type(t) is not Zero for t in fixed_tangents]
-  if any(nonzeros):
-    jvp_callee, out_nonzeros = ad.jvp_jaxpr(
-        callee, [*nonzeros, *[False] * len(primals_lin)], instantiate=False)
-    outs = core.jaxpr_as_fun(jvp_callee)(
-        *primals, *[t for t in fixed_tangents if type(t) is not Zero])
-    fixed_tangents_out = iter(outs[len(callee.out_avals):])
-    tangents_out = [ad.add_tangents(t, next(fixed_tangents_out)) if nz else t
-                    for t, nz in zip(tangents_out, out_nonzeros)]
+      *consts_and_res, *primals, callee=callee, transpose_thunk=transpose_thunk,
+      num_callee_consts=num_callee_consts, num_res=num_res)
+  tangents_out = linear_call_p.bind(
+      *consts_and_res, *tangents, callee=callee, transpose_thunk=transpose_thunk,
+      num_callee_consts=num_callee_consts, num_res=num_res)
   return primals_out, tangents_out
-
-def _linear_call_batching_rule(axis_data, args, dims, *, callee,
-                               transpose_thunk, num_callee_consts, num_res):
-  if all(d is None for d in dims):
-    outs = linear_call_p.bind(
-        *args, callee=callee, transpose_thunk=transpose_thunk,
-        num_callee_consts=num_callee_consts, num_res=num_res)
-    return outs, [None] * len(outs)
-  num_fixed = num_callee_consts + num_res
-  fixed, operands_lin = split_list(args, [num_fixed])
-  fixed_dims, lin_dims = split_list(dims, [num_fixed])
-  # The linear operands are all batched along axis 0, so the outputs and their
-  # cotangents are too, and the batched transpose takes batched cotangents to
-  # batched linear cotangents.
-  operands_lin = [
-      batching.bdim_at_front(x, d, axis_data.size, axis_data.explicit_mesh_axis)
-      for x, d in zip(operands_lin, lin_dims)]
-  num_out = len(callee.out_avals)
-  lin_axes = [0] * len(operands_lin)
-  batched = batching.batch_jaxpr_axes(
-      callee, axis_data, [*fixed_dims, *lin_axes], [0] * num_out)[0]
-  batched_consts = batched.consts
-  res_dims = fixed_dims[num_callee_consts:]
-
-  @pe._memoize
-  def batched_transpose_thunk():
-    transpose, t_consts = transpose_thunk()
-    batched_t = batching.batch_jaxpr_axes(
-        transpose, axis_data, [*[None] * len(t_consts), *res_dims, *[0] * num_out],
-        lin_axes)[0]
-    return (pe.convert_constvars_jaxpr(batched_t),
-            [*batched_t.consts, *t_consts])
-
-  outs = linear_call_p.bind(
-      *batched_consts, *fixed, *operands_lin,
-      callee=pe.convert_constvars_jaxpr(batched),
-      transpose_thunk=batched_transpose_thunk,
-      num_callee_consts=len(batched_consts) + num_callee_consts,
-      num_res=num_res)
-  return outs, [0] * num_out
 
 def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
                                 num_callee_consts, num_res):
@@ -2021,58 +1897,28 @@ def _linear_call_transpose_rule(cts, *args, callee, transpose_thunk,
   assert all(ad.is_undefined_primal(x)     for x in operands_lin)
   assert all(not ad.is_undefined_primal(x) for x in operands_res)
 
-  # The call's own constants are residuals of its transpose, as its transpose's
-  # are of it, so the transpose's transpose holds no value of its own.
   def new_transpose_thunk():
-    return callee, ()
+    return callee, f_consts
 
   cts = [zeros_like_aval(a) if type(ct) is Zero else ct
          for ct, a in zip(cts, cts_avals)]
-  cts_out = linear_call_p.bind(*t_consts, *f_consts, *operands_res, *cts,
-                               callee=_ignoring(transpose, len(t_consts), f_consts),
+  cts_out = linear_call_p.bind(*t_consts, *operands_res, *cts,
+                               callee=transpose,
                                transpose_thunk=new_transpose_thunk,
                                num_callee_consts=len(t_consts),
-                               num_res=len(f_consts) + len(operands_res))
+                               num_res=len(operands_res))
 
   return [None] * (num_callee_consts + num_res) + cts_out
 
 def _linear_call_abstract_eval(*args, **kwargs):
   return kwargs['callee'].out_avals
 
-def _lowered(jaxpr, consts):
-  """`jaxpr` lowered where it is high, the constants its lowering closes over
-  moved to the front of its inputs and of `consts`."""
-  if not jaxpr.is_high:
-    return jaxpr, tuple(consts)
-  closed_lo_jaxpr = pe.lower_jaxpr2(jaxpr)
-  return (pe.convert_constvars_jaxpr(closed_lo_jaxpr),
-          (*closed_lo_jaxpr.consts, *consts))
-
-def _linear_call_to_lojax(*args, callee, transpose_thunk, num_callee_consts,
-                          num_res):
-  # A callee or transpose that binds a hijax primitive (searchsorted is one)
-  # makes the call high wherever a trace requires low primitives (its reverse
-  # pass's, which binds the call transposed). The call stays one linear_call,
-  # its callee and transpose lowered, so its custom transpose still runs.
-  f_consts, rest = split_list(args, [num_callee_consts])
-  lo_callee, f_consts = _lowered(callee, f_consts)
-
-  def lo_transpose_thunk():
-    transpose, t_consts = transpose_thunk()
-    return _lowered(transpose, t_consts)
-
-  return linear_call_p.bind(*f_consts, *rest, callee=lo_callee,
-                            transpose_thunk=lo_transpose_thunk,
-                            num_callee_consts=len(f_consts), num_res=num_res)
-
 linear_call_p = core.Primitive('linear_call')
 linear_call_p.multiple_results = True
-linear_call_p.to_lojax = _linear_call_to_lojax
 linear_call_p.def_impl(_linear_call_impl)
 linear_call_p.def_abstract_eval(_linear_call_abstract_eval)
 ad.primitive_jvps[linear_call_p] = _linear_call_jvp_rule
 ad.primitive_transposes[linear_call_p] = _linear_call_transpose_rule
-batching.fancy_primitive_batchers[linear_call_p] = _linear_call_batching_rule
 mlir.register_lowering(linear_call_p, mlir.lower_fun(
     _linear_call_impl, multiple_results=True))
 
