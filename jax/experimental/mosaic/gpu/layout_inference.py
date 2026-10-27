@@ -34,7 +34,7 @@ from jax._src.lib.mlir.dialects import memref
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax._src.pallas.mosaic import error_handling as error
-from jax.experimental.mosaic.gpu.mma import MMALayouts
+from jax.experimental.mosaic.gpu import mma as mma_lib
 import numpy as np
 
 from . import constraints as cs
@@ -1267,7 +1267,7 @@ def _mma_constraint_system(
   del ctx
   element_type = op.a.type.element_type
   m, n = op.accumulator.type.shape
-  layouts = MMALayouts.for_shape(element_type, m, n)
+  layouts = mma_lib.layouts_for_op(op, element_type, m, n)
 
   assignments: dict[cs.Variable, cs.Constant] = {}
   value_sites_for_variable: ValueSitesForVariable = {}

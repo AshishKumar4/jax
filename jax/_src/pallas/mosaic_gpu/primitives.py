@@ -55,6 +55,7 @@ from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import layouts as mgpu_layouts
+from jax.experimental.mosaic.gpu import mma as mgpu_mma
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.mosaic.gpu.launch_context import AsyncCopyImplementation
@@ -2464,16 +2465,26 @@ def _wgmma_effectful_abstract_eval(acc, lhs_ref, *args, **kwargs):
   }
 
 
-def mma(acc: jax.Array, a: jax.Array, b: jax.Array, /) -> jax.Array:
-  """Computes ``acc + a @ b`` synchronously using Ampere MMA instructions."""
-  return mma_p.bind(acc, a, b)
+def mma(
+    acc: jax.Array, a: jax.Array, b: jax.Array, /, *, m_warps: int | None = None
+) -> jax.Array:
+  """Computes ``acc + a @ b`` synchronously using Ampere MMA instructions.
+
+  ``m_warps`` (1, 2 or 4) is how many of the warpgroup's four warps split the
+  accumulator's rows, the rest its columns (``MMALayouts``); by default the most
+  whose tile divides the accumulator. The operands' layouts must be that split's.
+  """
+  if m_warps not in (None, 1, 2, 4):
+    raise ValueError(f"m_warps must be 1, 2 or 4, got {m_warps}")
+  return mma_p.bind(acc, a, b, m_warps=m_warps)
 
 
 mma_p = jax_core.Primitive("mma")
 
 
 @mma_p.def_abstract_eval
-def _mma_abstract_eval(acc, a, b):
+def _mma_abstract_eval(acc, a, b, *, m_warps):
+  del m_warps  # The layouts' concern, not the shapes'.
   m, n = acc.shape
   m2, k = a.shape
   k2, n2 = b.shape
@@ -2513,15 +2524,23 @@ def _mma_abstract_eval(acc, a, b):
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Lane)
-def _mma_lowering(ctx: lowering.LoweringRuleContext, acc, a, b):
-  del ctx  # Unused.
+def _mma_lowering(ctx: lowering.LoweringRuleContext, acc, a, b, *, m_warps):
+  # The operands' layouts carry their split, which `mgpu.mma` reads.
+  del ctx, m_warps
   return mgpu.mma(acc, a, b)
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Warpgroup)
-def _mma_warpgroup_lowering(ctx: lowering.LoweringRuleContext, acc, a, b):
+def _mma_warpgroup_lowering(
+    ctx: lowering.LoweringRuleContext, acc, a, b, *, m_warps
+):
   del ctx  # Unused.
-  return mgpu.dialect.mma(acc, a, b)
+  result = mgpu.dialect.mma(acc, a, b)
+  if m_warps is not None:
+    result.owner.attributes[mgpu_mma.M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+        ir.IntegerType.get_signless(32), m_warps
+    )
+  return result
 
 
 wgmma_wait_p = jax_core.Primitive("wgmma_wait")

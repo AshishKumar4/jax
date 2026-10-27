@@ -35,6 +35,7 @@ from jax._src.lib.mlir.dialects import vector
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
+from jax.experimental.mosaic.gpu import mma as mma_lib
 from jax.experimental.mosaic.gpu import inference_utils
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import layout_inference
@@ -1252,6 +1253,39 @@ class LayoutInferenceTest(parameterized.TestCase):
         ValueError, "cannot relayout from register layout WGMMA to WGMMA_ROW"
     ):
       mgpu.infer_layout(self.module)
+
+  @parameterized.parameters(1, 2, 4)
+  def test_mma_op_takes_the_warp_split_it_states(self, m_warps):
+    bf16, f32 = ir.BF16Type.get(), ir.F32Type.get()
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get((128, 128), f32),
+          ir.VectorType.get((128, 32), bf16),
+          ir.VectorType.get((32, 128), bf16),
+      )
+      op = mgpu.dialect.mma(acc, a, b).owner
+      op.attributes[mma_lib.M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+          ir.IntegerType.get_signless(32), m_warps
+      )
+
+    mgpu.infer_layout(self.module)
+    layouts = mma_lib.MMALayouts(bf16, m_warps=m_warps)
+    self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
+    self.checkOutLayouts(op, [layouts.acc])
+
+  def test_mma_op_without_a_split_takes_the_most_warps_along_its_rows(self):
+    bf16, f32 = ir.BF16Type.get(), ir.F32Type.get()
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get((128, 128), f32),
+          ir.VectorType.get((128, 32), bf16),
+          ir.VectorType.get((32, 128), bf16),
+      )
+      op = mgpu.dialect.mma(acc, a, b).owner
+
+    mgpu.infer_layout(self.module)
+    layouts = mma_lib.MMALayouts(bf16, m_warps=4)
+    self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
 
   def test_diagnoses_unsupported_strict_relayout(self):
     shape = (64, 64)
