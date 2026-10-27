@@ -55,7 +55,7 @@ from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import layouts as mgpu_layouts
-from jax.experimental.mosaic.gpu import mma as mgpu_mma
+from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.mosaic.gpu.launch_context import AsyncCopyImplementation
@@ -2537,7 +2537,7 @@ def _mma_warpgroup_lowering(
   del ctx  # Unused.
   result = mgpu.dialect.mma(acc, a, b)
   if m_warps is not None:
-    result.owner.attributes[mgpu_mma.M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+    result.owner.attributes[MMA_M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
         ir.IntegerType.get_signless(32), m_warps
     )
   return result

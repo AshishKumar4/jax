@@ -36,7 +36,7 @@ from jax._src.lib.mlir.dialects import memref
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax.experimental.mosaic.gpu.mma import mma as do_mma
-from jax.experimental.mosaic.gpu import mma as mma_lib
+from jax.experimental.mosaic.gpu.mma import layouts_for_op as mma_layouts_for_op
 import numpy as np
 
 from . import constraints as cs
@@ -1708,7 +1708,7 @@ def _mgpu_mma_op_lowering_rule(
 
   a_element_type = mma_op.a.type.element_type
   m, n = mma_op.accumulator.type.shape
-  mma_layouts = mma_lib.layouts_for_op(mma_op, a_element_type, m, n)
+  mma_layouts = mma_layouts_for_op(mma_op, a_element_type, m, n)
   expected_acc_layout = layouts_lib.to_layout_attr(mma_layouts.acc)
   assert acc_layout == expected_acc_layout
   assert out_layout == expected_acc_layout

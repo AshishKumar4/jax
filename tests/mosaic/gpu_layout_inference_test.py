@@ -35,7 +35,7 @@ from jax._src.lib.mlir.dialects import vector
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
-from jax.experimental.mosaic.gpu import mma as mma_lib
+from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import inference_utils
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import layout_inference
@@ -1264,12 +1264,12 @@ class LayoutInferenceTest(parameterized.TestCase):
           ir.VectorType.get((32, 128), bf16),
       )
       op = mgpu.dialect.mma(acc, a, b).owner
-      op.attributes[mma_lib.M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+      op.attributes[MMA_M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
           ir.IntegerType.get_signless(32), m_warps
       )
 
     mgpu.infer_layout(self.module)
-    layouts = mma_lib.MMALayouts(bf16, m_warps=m_warps)
+    layouts = MMALayouts(bf16, m_warps=m_warps)
     self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
     self.checkOutLayouts(op, [layouts.acc])
 
@@ -1284,7 +1284,7 @@ class LayoutInferenceTest(parameterized.TestCase):
       op = mgpu.dialect.mma(acc, a, b).owner
 
     mgpu.infer_layout(self.module)
-    layouts = mma_lib.MMALayouts(bf16, m_warps=4)
+    layouts = MMALayouts(bf16, m_warps=4)
     self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
 
   def test_diagnoses_unsupported_strict_relayout(self):
