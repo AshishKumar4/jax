@@ -2992,22 +2992,39 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     kept = "cpu" if jtu.device_under_test() == "cpu" else "default"
     self.assertEqual(log, ["before", kept, "after"])
 
-  @parameterized.parameters(False, True)
-  def test_platform_dependent_kept_branch_reads_a_captured_array(
-      self, simplified_constants):
-    # The kept branch's captured array lowers as a conditional's branch's
-    # does, under either treatment of a jaxpr's constants.
+  def test_platform_dependent_kept_branch_reads_its_hoisted_constants(self):
+    # A custom JVP that captures an array brings it into the kept branch of
+    # the conditional AD makes. The lowering hoists the array, as an argument
+    # or as one constant, and the kept branch reads it, as a conditional's
+    # branch does, rather than embedding the array a second time.
     c = jnp.arange(3, dtype=np.float32)
 
-    def f(x):
-      return lax.platform_dependent(x, cpu=lambda x: x + c,
-                                    default=lambda x: x - c)
+    @jax.custom_jvp
+    def square(x):
+      return x * x
+
+    @square.defjvp
+    def square_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      return square(x), c * t
+
+    def f(x, t):
+      return jax.jvp(
+          lambda x: lax.platform_dependent(x, cpu=square, default=jnp.cos),
+          (x,), (t,))
 
     x = np.ones(3, dtype=np.float32)
-    with config.use_simplified_jaxpr_constants(simplified_constants):
-      self.assertNotIn("stablehlo.case", jax.jit(f).lower(x).as_text())
-      self.assertArraysEqual(
-          jax.jit(f)(x), x + c if jtu.device_under_test() == "cpu" else x - c)
+    with (config.use_simplified_jaxpr_constants(True),
+          config.embedded_constants_max_bytes(0)):
+      text = jax.jit(f).lower(x, x).as_text()
+      self.assertNotIn("stablehlo.case", text)
+      hoisted = mlir.LoweringParameters().hoist_constants_as_args
+      self.assertEqual(
+          text.count("dense<[0.000000e+00, 1.000000e+00, 2.000000e+00]>"),
+          0 if hoisted else 1)
+      if jtu.device_under_test() == "cpu":
+        self.assertArraysEqual(jax.jit(f)(x, x)[1], c * x)
 
   def test_platform_dependent_with_non_existent_custom_call(self):
     if not jtu.test_device_matches(["cpu"]):
