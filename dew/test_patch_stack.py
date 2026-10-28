@@ -22,3 +22,32 @@ def test_a_patch_release_is_carried_onto_and_one_with_a_stack_is_not(monkeypatch
     assert patch_stack.following() == ""
     remotes[patch_stack.UPSTREAM] += listing("refs/tags/jax-v0.12.1")
     assert patch_stack.following() == "0.12.0.1 0.12.1"
+
+
+def wheel(directory, name: str, version: str):
+    """A wheel of `name` at `version` holding its metadata alone, as `index` reads it."""
+    import zipfile
+
+    path = directory / f"{name}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(f"{name}-{version}.dist-info/METADATA",
+                         f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\nRequires-Python: >=3.10\n")
+    return path
+
+
+def test_each_package_has_its_own_pages_and_the_root_lists_every_one(tmp_path):
+    """The index holds Dew's builds of several packages (JAX's, Qwix's): each package's files and pages are its
+    own (packages/<name>/, simple/<name>/), and the root page lists every package the index holds, so one's
+    publish never drops another's (Main, 2026-10-28: qwix 0.1.8.post1 joins jax)."""
+    site = tmp_path / "site"
+    jax = wheel(tmp_path, "jax", "0.12.0.1.post31")
+    patch_stack.index(tmp_path / "jax.json", site, [jax])
+    qwix = wheel(tmp_path, "qwix", "0.1.8.post1")
+    patch_stack.index(tmp_path / "qwix.json", site, [qwix], package="qwix", projects=["jax"])
+    assert (site / "packages" / "qwix" / qwix.name).read_bytes() == qwix.read_bytes()
+    assert f'href="../../packages/qwix/{qwix.name}#sha256=' in (site / "simple" / "qwix" / "index.html").read_text()
+    assert "qwix" not in (site / "simple" / "jax" / "index.html").read_text()
+    root = (site / "simple" / "index.html").read_text()
+    assert '<a href="jax/">jax</a>' in root and '<a href="qwix/">qwix</a>' in root
+    patch_stack.index(tmp_path / "jax.json", site, [], projects=["qwix"])
+    assert '<a href="qwix/">qwix</a>' in (site / "simple" / "index.html").read_text()
