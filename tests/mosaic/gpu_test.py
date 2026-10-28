@@ -5588,6 +5588,46 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     self._test_cp_async(shape, dtype, use_barrier=use_barrier)
 
   @parameterized.product(
+      swizzle=(32, 128),
+      dtype=(jnp.float32, jnp.bfloat16),
+  )
+  def test_cp_async_tiled_squeezed_middle_dim(self, swizzle, dtype):
+    # A head's [S, D] block of a [B, S, H, D] array, its head index squeezed
+    # between the sequence and the features (an attention program's operand).
+    bw = bitwidth(dtype_to_ir_type(dtype))
+    tiling = (8, 8 * swizzle // bw)
+    full_shape = (2, 64, 3, 128)
+    row, head = 1, 2
+    slice_shape = (64, 128)
+
+    def kernel(ctx, src, dst, scratch):
+      tmp, barrier = scratch
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          gmem_slice=(row, slice(None), head),
+          swizzle=swizzle,
+          gmem_transform=mgpu.TileTransform(tiling),
+          implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          barrier=barrier,
+      )
+      barrier.wait()
+      mgpu.copy_tiled(tmp, dst, swizzle=swizzle)
+
+    x = np.arange(np.prod(full_shape), dtype=np.float32).reshape(full_shape)
+    x = x.astype(dtype)
+    smem = jax.ShapeDtypeStruct(mgpu.tile_shape(slice_shape, tiling), dtype)
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        jax.ShapeDtypeStruct(slice_shape, dtype),
+        (smem, mgpu.Barrier(arrival_count=1)),
+    )(x)
+    np.testing.assert_array_equal(y, x[row, :, head])
+
+  @parameterized.product(
       slice=[(1,), (1, 1)],
       use_barrier=(False, True),
   )
