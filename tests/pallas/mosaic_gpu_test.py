@@ -921,7 +921,7 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         x = x >= 100
       elif operation == "multiply":
         x = x * 2
-      plgpu.store(o_ref, x.astype(jnp.float32) + q, optimized=False)
+      plgpu.store(o_ref, x.astype(jnp.float32) + q.astype(jnp.float32), optimized=False)
 
     q = np.arange(64 * 64, dtype=np.int32).reshape(64, 64)
     x = q[offset:offset + 1, :] if axis == 0 else q[:, offset:offset + 1]
@@ -931,7 +931,7 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       x = x >= 100
     elif operation == "multiply":
       x = x * 2
-    np.testing.assert_array_equal(kernel(), x.astype(np.float32) + q)
+    np.testing.assert_array_equal(kernel(), x.astype(np.float32) + q.astype(np.float32))
 
   @parameterized.product(
       axis=(0, 1),
