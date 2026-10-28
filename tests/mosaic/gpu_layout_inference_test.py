@@ -34,6 +34,7 @@ from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
+from jax.experimental.mosaic.gpu import dialect_lowering
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import inference_utils
@@ -107,6 +108,30 @@ def _undef_constraint_system(
 
 
 class LayoutInferenceTest(parameterized.TestCase):
+  @parameterized.parameters(16, 32)
+  def test_reduction_scratch_uses_reserved_byte_stride(self, bitwidth):
+    with ir.InsertionPoint(self.module.body):
+      i32 = ir.IntegerType.get_signless(32)
+      for name, value in (("arch_major", 9), ("arch_minor", 0)):
+        self.module.operation.attributes[f"mosaic_gpu.{name}"] = ir.IntegerAttr.get(
+            i32, value
+        )
+      op = arith.ConstantOp(i32, ir.IntegerAttr.get(i32, 0))
+      for name, value in (
+          ("offset", 0), ("scratch_size", 1024), ("scratch_warpgroups", 2)
+      ):
+        op.attributes[name] = ir.IntegerAttr.get(i32, value)
+      dtype = ir.IntegerType.get_signless(bitwidth)
+      for elements in (4, 1024 * 8 // bitwidth):
+        scratch = dialect_lowering._reduction_scratch(op, dtype, elements, 2048)
+        source_type = ir.MemRefType(scratch.owner.opview.source.type)
+        stride = source_type.get_strides_and_offset()[0][0]
+        self.assertEqual(stride * bitwidth // 8, 1024)
+        self.assertEqual(ir.MemRefType(scratch.type).shape, [elements])
+      del op.attributes["scratch_size"]
+      with self.assertRaisesRegex(ValueError, "scratch_size"):
+        dialect_lowering._reduction_scratch(op, dtype, 4, 2048)
+
   @classmethod
   def setUpClass(cls):
     super().setUpClass()
