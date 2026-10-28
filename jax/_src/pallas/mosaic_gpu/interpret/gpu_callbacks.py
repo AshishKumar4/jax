@@ -1106,14 +1106,14 @@ def call_named_barrier(
 
 
 @fail_on_exception
-def _assert_no_barriers_allocated(token, device: memory.Device):
-  _get_shared_memory().assert_no_barriers_allocated(device)
+def _assert_no_barriers_allocated(token):
+  _get_shared_memory().assert_no_barriers_allocated()
   return token
 
 
-def call_assert_no_barriers_allocated(token, device: memory.Device):
+def call_assert_no_barriers_allocated(token):
   return callback.io_callback(
-      _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token, device
+      _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token
   )
 
 
