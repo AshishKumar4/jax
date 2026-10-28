@@ -9736,6 +9736,49 @@ class WarpSpecializedPipelineTest(PallasTest):
     z = jax.random.uniform(jax.random.key(3), (m, n), dtype=jnp.float32)
     np.testing.assert_allclose(kernel(x, y, z), x + y + z)
 
+  @parameterized.parameters(3, 5)
+  def test_different_delay_release_over_a_ring_of_odd_stages(self, stages):
+    # The ring's slots are carried across steps rather than recomputed as a
+    # remainder: with a stage count that is not a power of two, every delay
+    # level's fetch slot wraps several times, and each step reads its own block.
+    m, n = 32 * 9, 64
+    blk_m, blk_n = 32, 32
+    in_specs = [
+        plgpu.BlockSpec(
+            block_shape=(blk_m, blk_n),
+            index_map=lambda i, j: (i, j),
+            delay_release=delay,
+        )
+        for delay in range(3)
+    ]
+    out_spec = pl.BlockSpec(
+        block_shape=(blk_m, blk_n),
+        index_map=lambda i, j: (i, j),
+    )
+
+    def tiled_add_kernel(_, x_smem, y_smem, z_smem, o_smem):
+      o_smem[...] = x_smem[...] + y_smem[...] + z_smem[...]
+
+    def pipeline(*gmem_refs):
+      grid = (m // blk_m, n // blk_n)
+      return mgpu_pipeline.emit_pipeline(
+          tiled_add_kernel,
+          grid=grid,
+          max_concurrent_steps=stages,
+          in_specs=in_specs,
+          out_specs=[out_spec],
+      )(*gmem_refs)
+
+    kernel = self.kernel(
+        pipeline,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+    )
+    x, y, z = (
+        jnp.arange(m * n, dtype=jnp.float32).reshape(m, n) * scale
+        for scale in (1.0, 1e-3, 1e-6)
+    )
+    np.testing.assert_array_equal(kernel(x, y, z), x + y + z)
+
   @parameterized.product(
       delay_release=[0, 1],
   )
