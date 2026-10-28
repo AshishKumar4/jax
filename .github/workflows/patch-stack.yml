@@ -181,7 +181,12 @@ jobs:
           read -ra names <<< "$(printf '%s' "$YANK" | tr '\r\n' '  ')"
           yanks=()
           if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" "--reason=$REASON"); fi
-          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" "${yanks[@]}" > new.txt
+          # The index's other packages, which its root page keeps listing.
+          projects=$(aws s3api list-objects-v2 --endpoint-url "$R2" --bucket "$BUCKET" --prefix packages/ \
+                       --delimiter / --query 'CommonPrefixes[].Prefix' --output text \
+                     | tr '\t' '\n' | sed -n 's|^packages/\(.*\)/$|\1|p')
+          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" "${yanks[@]}" \
+            --projects $projects > new.txt
           cat new.txt
       - name: Upload them, the index last
         run: |

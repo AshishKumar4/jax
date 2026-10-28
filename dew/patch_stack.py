@@ -152,12 +152,14 @@ def metadata(wheel: Path) -> bytes:
         return archive.read(name)
 
 
-def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), reason: str = "") -> None:
-    """The package index under `site`, PEP 503's simple API for jax alone: simple/index.html and
-    simple/jax/index.html, each file linked with its digest, its Requires-Python and its metadata's digest
-    (PEP 658, the metadata beside it as FILE.metadata). `manifest` keeps every file the index has listed, so
+def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), reason: str = "",
+          package: str = "jax", projects: list[str] = ()) -> None:
+    """The index's pages under `site` for `package`, PEP 503's simple API: simple/<package>/index.html, each
+    file linked with its digest, its Requires-Python and its metadata's digest (PEP 658, the metadata beside it
+    as FILE.metadata), and simple/index.html, which lists `package` and the index's other `projects`, so one
+    package's publish keeps the others listed. `manifest` keeps every file of `package` the index has listed, so
     a run adds its own to them; a file it lists already is never replaced, as an installer may hold its
-    digest. Each new FILE is copied, with its metadata, under site/packages/jax and named on stdout.
+    digest. Each new FILE is copied, with its metadata, under site/packages/<package> and named on stdout.
 
     Each file named in `yank`, one the manifest lists, is marked yanked for `reason` (PEP 592's
     data-yanked): an installer resolving a range passes it over, and one pinned to exactly it still gets it."""
@@ -167,7 +169,7 @@ def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), r
         raise SystemExit(f"cannot yank {', '.join(unlisted)}: the index does not list it")
     for name in yank:
         listed[name]["yanked"] = reason
-    packages = site / "packages" / "jax"
+    packages = site / "packages" / package
     packages.mkdir(parents=True, exist_ok=True)
     for file in files:
         if file.name in listed:
@@ -183,7 +185,7 @@ def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), r
                              "metadata_sha256": hashlib.sha256(core).hexdigest(), "requires_python": python}
     manifest.write_text(json.dumps(listed, indent=1, sort_keys=True) + "\n")
     links = "".join(
-        f'<a href="../../packages/jax/{name}#sha256={entry["sha256"]}"'
+        f'<a href="../../packages/{package}/{name}#sha256={entry["sha256"]}"'
         f' data-requires-python="{html.escape(entry["requires_python"])}"'
         f' data-dist-info-metadata="sha256={entry["metadata_sha256"]}"'
         f' data-core-metadata="sha256={entry["metadata_sha256"]}"'
@@ -192,9 +194,10 @@ def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), r
         for name, entry in sorted(listed.items()))
     page = ('<!DOCTYPE html>\n<html><head><meta name="pypi:repository-version" content="1.1">'
             "<title>{title}</title></head>\n<body><h1>{title}</h1>\n{body}</body></html>\n")
-    (site / "simple" / "jax").mkdir(parents=True, exist_ok=True)
-    (site / "simple" / "index.html").write_text(page.format(title="Simple index", body='<a href="jax/">jax</a><br>\n'))
-    (site / "simple" / "jax" / "index.html").write_text(page.format(title="Links for jax", body=links))
+    (site / "simple" / package).mkdir(parents=True, exist_ok=True)
+    listing = "".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted({package, *projects}))
+    (site / "simple" / "index.html").write_text(page.format(title="Simple index", body=listing))
+    (site / "simple" / package / "index.html").write_text(page.format(title=f"Links for {package}", body=links))
 
 
 def main() -> int:
@@ -210,12 +213,14 @@ def main() -> int:
     indexing.add_argument("files", type=Path, nargs="*")
     indexing.add_argument("--yank", nargs="+", default=[], metavar="FILE", help="the listed files to mark yanked")
     indexing.add_argument("--reason", default="", help="why they are yanked, shown by installers")
+    indexing.add_argument("--package", default="jax", help="the package the files and the manifest are of")
+    indexing.add_argument("--projects", nargs="*", default=[], help="the index's other packages, for its root")
     args = parser.parse_args()
     if args.command == "next":
         print(following())
         return 0
     if args.command == "index":
-        index(args.manifest, args.site, args.files, args.yank, args.reason)
+        index(args.manifest, args.site, args.files, args.yank, args.reason, args.package, args.projects)
         return 0
     return rebase(args.old, args.new)
 

@@ -1,0 +1,104 @@
+# A package Dew carries a build of beside JAX's (Qwix's), published to Dew's package index,
+# https://pypi.dewml.dev/simple: the wheel of a fork's release commit, whose own version names it
+# (0.1.8.post1), built from `repository` at `ref`, its `tests` run on it, then indexed beside the packages the
+# index holds already. A file the index lists already is kept as it is.
+name: publish package
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "the fork to build, e.g. AshishKumar4/qwix"
+        required: true
+      ref:
+        description: "its release commit or branch, e.g. dew/0.1.8.post1"
+        required: true
+      tests:
+        description: "pytest's arguments, run in the clone against the built wheel"
+        required: true
+      dependencies:
+        description: "what the tests install beside the wheel, e.g. \"jax flax pytest absl-py\""
+        required: true
+
+permissions:
+  contents: read
+
+concurrency: patch-stack
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      REPOSITORY: ${{ inputs.repository }}
+      REF: ${{ inputs.ref }}
+      TESTS: ${{ inputs.tests }}
+      DEPENDENCIES: ${{ inputs.dependencies }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+      - uses: astral-sh/setup-uv@v6
+      - name: The index's storage is configured
+        run: |
+          for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
+          done
+      - name: Build the wheel
+        run: |
+          git clone -q "https://github.com/$REPOSITORY.git" source
+          git -C source checkout -q "$REF"
+          uv build -q --wheel --out-dir dist source
+          ls dist
+      - name: Test the wheel
+        run: |
+          uv venv -q --python 3.12 tested
+          read -ra dependencies <<< "$DEPENDENCIES"
+          uv pip install -q --python tested/bin/python dist/*.whl "${dependencies[@]}"
+          read -ra tests <<< "$TESTS"
+          cd source
+          ../tested/bin/python -m pytest -q -p no:cacheprovider "${tests[@]}"
+      - name: Index it
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::the build made ${#wheels[@]} wheels"; exit 1; }
+          package=$(basename "${wheels[0]}" | cut -d- -f1)
+          echo "PACKAGE=$package" >> "$GITHUB_ENV"
+          if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key "packages/$package/manifest.json" \
+              > /dev/null 2> head.txt; then
+            aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$package/manifest.json" manifest.json
+          elif grep -q "(404)" head.txt; then
+            echo '{}' > manifest.json
+          else
+            cat head.txt
+            exit 1
+          fi
+          projects=$(aws s3api list-objects-v2 --endpoint-url "$R2" --bucket "$BUCKET" --prefix packages/ \
+                       --delimiter / --query 'CommonPrefixes[].Prefix' --output text \
+                     | tr '\t' '\n' | sed -n 's|^packages/\(.*\)/$|\1|p')
+          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" --package "$package" \
+            --projects $projects > new.txt
+          cat new.txt
+      - name: Upload it, the index last
+        run: |
+          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" \
+                    ${4:+--cache-control "$4"} > /dev/null; }
+          while read -r name; do
+            put "packages/$PACKAGE/$name" "site/packages/$PACKAGE/$name" application/octet-stream
+            put "packages/$PACKAGE/$name.metadata" "site/packages/$PACKAGE/$name.metadata" text/plain
+          done < new.txt
+          put "packages/$PACKAGE/manifest.json" manifest.json application/json
+          # Each page under both names installers ask for, revalidated at every request (patch-stack.yml's).
+          for page in simple/ "simple/$PACKAGE/"; do
+            put "$page" "site/${page}index.html" text/html no-cache
+            put "${page}index.html" "site/${page}index.html" text/html no-cache
+          done
