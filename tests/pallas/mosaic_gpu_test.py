@@ -1016,6 +1016,41 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     for _ in range(8):
       np.testing.assert_array_equal(kernel(), expected)
 
+  @parameterized.parameters(jnp.int16, jnp.bfloat16)
+  def test_unit_axis_row_of_16_bits_fits_four_warpgroups_scratch(self, dtype):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for the 16-bit selection's scratch.")
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((256, 64), jnp.float32),
+        num_threads=4,
+        thread_name="wg",
+    )
+    def kernel(o_ref):
+      wg = lax.axis_index("wg")
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = (rows * 64 + cols + wg * 7).astype(dtype)
+      selected = q[5:6, :].astype(jnp.float32)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(selected, (64, 64)), plgpu.Layout.WGMMA
+      )
+      plgpu.store(o_ref.at[pl.ds(wg * 64, 64)], result, optimized=False)
+
+    cols = np.arange(64, dtype=np.int32)
+    expected = np.concatenate([
+        np.broadcast_to(
+            (5 * 64 + cols + wg * 7).astype(dtype).astype(np.float32), (64, 64)
+        )
+        for wg in range(4)
+    ])
+    np.testing.assert_array_equal(kernel(), expected)
+
   def test_leading_unit_reshape_preserves_lane_layout(self):
     if self.is_wg_semantics():
       self.skipTest("Regression for the existing Lane reshape path.")

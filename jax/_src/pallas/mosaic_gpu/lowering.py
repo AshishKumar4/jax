@@ -2319,11 +2319,13 @@ def _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices, axis):
       x if element_type == pattern_type
       else arith_dialect.bitcast(pattern_vector_type, x)
   )
-  # Narrow selects and cross-warp reductions are not all supported. Widen
-  # unsigned bit patterns, not signed values, so truncation restores every bit.
-  int_type = ir.IntegerType.get_signless(max(32, bitwidth))
+  # Selects and cross-warp reductions below 16 bits are not all supported.
+  # Widen their unsigned bit patterns, not signed values, so truncation
+  # restores every bit; 16 and 32 bits keep their width and scratch.
+  widened = 32 if bitwidth < 16 else bitwidth
+  int_type = ir.IntegerType.get_signless(widened)
   int_vector_type = ir.VectorType.get(x.type.shape, int_type)
-  if bitwidth < 32:
+  if widened != bitwidth:
     bits = arith_dialect.extui(int_vector_type, bits)
   i32 = ir.IntegerType.get_signless(32)
   indices = mgpu.dialect.broadcasted_iota(
@@ -2361,7 +2363,7 @@ def _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices, axis):
         result,
         vector_dialect.broadcast(result.type, zero),
     )
-  if bitwidth < 32:
+  if widened != bitwidth:
     result = arith_dialect.trunci(
         ir.VectorType.get(shape, pattern_type), result
     )
