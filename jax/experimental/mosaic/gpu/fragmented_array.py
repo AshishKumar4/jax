@@ -1142,6 +1142,41 @@ def _can_splat_unreduced(value: ir.Value, op: str) -> bool:
 
 
 @jax.tree_util.register_pytree_node_class
+def reshape_unit_axis_layout(layout, source_shape, target_shape):
+  """Returns a tiled layout for inserting/removing one unit axis, or None."""
+  if (
+      len(source_shape) == 2 and len(target_shape) == 1
+      and source_shape.count(1) == 1
+      and len(layout.base_tile_shape) == 2
+  ):
+    return layout.reduce((source_shape.index(1),))
+  if (
+      len(source_shape) != 1 or len(target_shape) != 2
+      or target_shape.count(1) != 1
+      or any(len(t) != 1 for t in layout.tiling.tiles)
+      or layout.unreduced_operation is not None
+  ):
+    return None
+  axis = target_shape.index(1)
+  tiles = tuple(
+      (1, t[0]) if axis == 0 else (t[0], 1)
+      for t in layout.tiling.tiles
+  )
+
+  def remap(d):
+    if isinstance(d, int):
+      return 2 * d + (1 if axis == 0 else 0)
+    return d
+
+  return TiledLayout(
+      Tiling(tiles),
+      tuple(map(remap, layout.warp_dims)),
+      tuple(map(remap, layout.lane_dims)),
+      remap(layout.vector_dim),
+      _check_canonical=False,
+  ).canonicalize()
+
+
 @dataclasses.dataclass(init=False, frozen=True, slots=True)
 class FragmentedArray:
   # An array of ir.Value, see checks in init for shapes.
@@ -3822,6 +3857,15 @@ class FragmentedArray:
             _is_signed=self.is_signed,
         )
       case TiledLayout():
+        unit_layout = reshape_unit_axis_layout(self.layout, self.shape, shape)
+        if unit_layout is not None:
+          return FragmentedArray(
+              _registers=self.registers.reshape(
+                  unit_layout.registers_shape(shape)
+              ),
+              _layout=unit_layout,
+              _is_signed=self.is_signed,
+          )
         base_tile_shape = self.layout.base_tile_shape
         assert base_tile_shape
         old_shape_suffix = self.shape[-len(base_tile_shape):]
@@ -3909,6 +3953,16 @@ class FragmentedArray:
       )
     if not isinstance(self.layout, TiledLayout) or not isinstance(layout, TiledLayout):
       raise NotImplementedError(self.layout, layout)
+    if len(self.shape) == 2 and self.shape.count(1) == 1:
+      axis = self.shape.index(1)
+      squeezed = self.reshape(
+          tuple(s for i, s in enumerate(self.shape) if i != axis)
+      )
+      return squeezed.broadcast_in_dim(
+          shape,
+          tuple(d for i, d in enumerate(source_dimensions) if i != axis),
+          layout,
+      )
     if len(layout.base_tile_shape) != len(shape):
       raise NotImplementedError(
           "Tiling rank different than broadcast result rank, "

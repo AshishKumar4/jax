@@ -893,6 +893,46 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(), jax.lax.broadcasted_iota(dtype, (128, 128), dimension)
     )
 
+  @parameterized.product(
+      axis=(0, 1),
+      operation=("direct", "cast", "compare", "multiply"),
+      offset=(0, 5),
+  )
+  def test_unit_axis_slice_pointwise_broadcast(self, axis, operation, offset):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup layout inference.")
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+    )
+    def kernel(o_ref):
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = rows * 64 + cols
+      x = q[offset:offset + 1, :] if axis == 0 else q[:, offset:offset + 1]
+      if operation == "cast":
+        x = x.astype(jnp.float32)
+      elif operation == "compare":
+        x = x >= 100
+      elif operation == "multiply":
+        x = x * 2
+      plgpu.store(o_ref, x.astype(jnp.float32) + q, optimized=False)
+
+    q = np.arange(64 * 64, dtype=np.int32).reshape(64, 64)
+    x = q[offset:offset + 1, :] if axis == 0 else q[:, offset:offset + 1]
+    if operation == "cast":
+      x = x.astype(np.float32)
+    elif operation == "compare":
+      x = x >= 100
+    elif operation == "multiply":
+      x = x * 2
+    np.testing.assert_array_equal(kernel(), x.astype(np.float32) + q)
+
   @parameterized.parameters(jnp.bfloat16, jnp.int16, jnp.uint16)
   def test_inline_mgpu(self, jnp_type):
     dtype = jnp.dtype(jnp_type)

@@ -2276,6 +2276,73 @@ def _eval_jaxpr_lowering_rule(
   )
 
 
+@_register_resource_estimator(lax.slice_p)
+def _unit_axis_slice_resource_estimator(
+    ctx, x_aval, *, limit_indices, start_indices, strides
+):
+  del strides
+  shape = tuple(e - b for b, e in zip(start_indices, limit_indices))
+  if (
+      ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup
+      and len(shape) == 2 and shape.count(1) == 1
+      and tuple(x_aval.shape) != shape
+  ):
+    other = 1 - shape.index(1)
+    if shape[other] == x_aval.shape[other] and start_indices[other] == 0:
+      return Resources(smem_scratch_bytes=ctx.reduction_scratch_bytes)
+  return Resources()
+
+
+def _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices):
+  """Select a row/column without requiring a sub-tile strided slice.
+
+  Mask integer bit patterns, then take unsigned max with zero: exactly one
+  element contributes to each output. Unlike summing floats, this preserves
+  NaN payloads, infinities, negative zero, and negative integers bit-for-bit.
+  """
+  axis = shape.index(1)
+  other = 1 - axis
+  element_type = x.type.element_type
+  int_type = ir.IntegerType.get_signless(mgpu_utils.bitwidth(element_type))
+  int_vector_type = ir.VectorType.get(x.type.shape, int_type)
+  bits = (
+      x if element_type == int_type
+      else arith_dialect.bitcast(int_vector_type, x)
+  )
+  i32 = ir.IntegerType.get_signless(32)
+  indices = mgpu.dialect.broadcasted_iota(
+      ir.VectorType.get(x.type.shape, i32), axis
+  )
+  offset = vector_dialect.broadcast(
+      indices.type, arith_dialect.constant(i32, start_indices[axis])
+  )
+  mask = arith_dialect.cmpi(arith_dialect.CmpIPredicate.eq, indices, offset)
+  zero = arith_dialect.constant(int_type, 0)
+  bits = arith_dialect.select(
+      mask, bits, vector_dialect.broadcast(int_vector_type, zero)
+  )
+  reduced_type = ir.VectorType.get((shape[other],), int_type)
+  reduction = vector_dialect.MultiDimReductionOp(
+      vector_dialect.CombiningKind.MAXUI,
+      bits,
+      vector_dialect.broadcast(reduced_type, zero),
+      [axis],
+  )
+  for key, value in (
+      ("offset", ctx.module_ctx.smem_used_bytes),
+      ("scratch_size", ctx.module_ctx.warpgroup_reduction_scratch_bytes),
+      ("scratch_warpgroups", ctx.module_ctx.warpgroups),
+  ):
+    reduction.attributes[key] = ir.IntegerAttr.get(i32, value)
+  result = vector_dialect.shape_cast(
+      ir.VectorType.get(shape, int_type), reduction.result
+  )
+  return (
+      result if element_type == int_type
+      else arith_dialect.bitcast(ir.VectorType.get(shape, element_type), result)
+  )
+
+
 @register_lowering_rule(lax.slice_p, mgpu.LoweringSemantics.Lane)
 def _slice_lowering_rule(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
@@ -2290,10 +2357,18 @@ def _slice_lowering_rule(
 def _slice_lowering_rule_wg(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
 ):
-  del limit_indices
   assert isinstance(x.type, ir.VectorType)
   if strides is not None:
     raise NotImplementedError("Strides are not supported.")
+  shape = tuple(ctx.avals_out[0].shape)
+  if len(shape) == 2 and shape.count(1) == 1:
+    other = 1 - shape.index(1)
+    if (
+        tuple(x.type.shape) != shape
+        and shape[other] == x.type.shape[other]
+        and start_indices[other] == 0
+    ):
+      return _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices)
   out_ty = ir.VectorType.get(
       ctx.avals_out[0].shape, ir.VectorType(x.type).element_type
   )
