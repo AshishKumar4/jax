@@ -812,7 +812,8 @@ def _reduction_scratch(
   `offset`: a block's warpgroups reduce at once and the reduction indexes its
   scratch by the warp within the warpgroup, so each takes its own share, the
   region holding `scratch_warpgroups` of them (one where the attribute is
-  absent)."""
+  absent). `scratch_size` is the byte stride between warpgroup shares, not
+  the amount this particular reduction happens to use."""
   warpgroups = (
       ir.IntegerAttr(op.attributes["scratch_warpgroups"]).value
       if "scratch_warpgroups" in op.attributes
@@ -826,9 +827,17 @@ def _reduction_scratch(
         offset,
         smem_size,
     )
+  if "scratch_size" not in op.attributes:
+    raise ValueError("Multi-warpgroup reductions require a scratch_size byte stride.")
+  stride_bytes = ir.IntegerAttr(op.attributes["scratch_size"]).value
+  stride_elements, remainder = divmod(
+      stride_bytes * 8, utils.bitwidth(element_type)
+  )
+  if remainder or stride_elements < elements:
+    raise ValueError("Reduction scratch share is smaller than its required size.")
   scratch = _slice_smem(
       ir.MemRefType.get(
-          [warpgroups, elements], element_type, memory_space=utils.smem()
+          [warpgroups, stride_elements], element_type, memory_space=utils.smem()
       ),
       offset,
       smem_size,
@@ -836,7 +845,7 @@ def _reduction_scratch(
   warpgroup = arith.index_cast(
       ir.IndexType.get(), utils.warpgroup_idx(sync=True)
   )
-  return utils.memref_slice(scratch, warpgroup)
+  return utils.memref_slice(scratch, (warpgroup, slice(0, elements)))
 
 
 @_register_lowering(vector.ReductionOp)

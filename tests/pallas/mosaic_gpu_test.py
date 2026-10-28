@@ -933,6 +933,104 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       x = x * 2
     np.testing.assert_array_equal(kernel(), x.astype(np.float32) + q)
 
+  @parameterized.product(
+      axis=(0, 1),
+      dtype=(
+          jnp.bool_, jnp.int8, jnp.uint8, jnp.int16, jnp.uint16,
+          jnp.float16, jnp.bfloat16, jnp.int32,
+      ),
+  )
+  def test_unit_axis_slice_bit_patterns(self, axis, dtype):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup layout inference.")
+    shape = (64, 64)
+    storage_dtype = jnp.int32 if dtype == jnp.bool_ else dtype
+
+    @functools.partial(
+        self.kernel, out_type=jax.ShapeDtypeStruct(shape, storage_dtype)
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      if dtype == jnp.bool_:
+        x = x > 0
+      x = x[5:6, :] if axis == 0 else x[:, 5:6]
+      if dtype == jnp.bool_:
+        x = x.astype(jnp.int32)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(x, shape), plgpu.Layout.WGMMA
+      )
+      plgpu.store(o_ref, result, optimized=False)
+
+    # Integer patterns include negative values. For the 16-bit floating types,
+    # use all-bit patterns including NaNs and signed zeros, without arithmetic.
+    bits = (np.arange(4096, dtype=np.uint16) * 37).reshape(shape)
+    bits.flat[:4] = [0, 0x8000, 0x7e01, 0xffff]
+    bits[5, :4] = bits[:4, 5] = [0, 0x8000, 0x7e01, 0xffff]
+    if jnp.dtype(dtype).itemsize == 2:
+      x = bits.view(jnp.dtype(dtype))
+    else:
+      x = (bits.astype(np.int32) - 32768).astype(jnp.dtype(storage_dtype))
+    values = (x > 0).astype(np.int32) if dtype == jnp.bool_ else x
+    expected = values[5:6, :] if axis == 0 else values[:, 5:6]
+    result = np.asarray(kernel(x))
+    expected = np.broadcast_to(expected, shape)
+    np.testing.assert_array_equal(
+        result.view(np.uint8), expected.copy().view(np.uint8)
+    )
+
+  def test_unit_axis_slice_mixed_multi_warpgroup_reductions(self):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup reduction scratch partitioning.")
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((128, 64), jnp.int32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(o_ref):
+      wg = lax.axis_index("wg")
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = rows * 64 + cols + wg * 4096
+      selected = q[5:6, :]
+      values = plgpu.broadcasted_iota(
+          jnp.int32, (128,), 0,
+          layout=plgpu.Layout.WG_STRIDED((128,), vec_size=1),
+      )
+      total = jnp.sum(values + wg)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(selected, (64, 64)), plgpu.Layout.WGMMA
+      ) + total
+      plgpu.store(o_ref.at[pl.ds(wg * 64, 64)], result, optimized=False)
+
+    cols = np.arange(64, dtype=np.int32)
+    expected = np.concatenate([
+        np.broadcast_to(5 * 64 + cols + wg * 4096 + 8128 + wg * 128, (64, 64))
+        for wg in range(2)
+    ])
+    for _ in range(8):
+      np.testing.assert_array_equal(kernel(), expected)
+
+  def test_leading_unit_reshape_preserves_lane_layout(self):
+    if self.is_wg_semantics():
+      self.skipTest("Regression for the existing Lane reshape path.")
+    layout = plgpu.Layout.WGMMA.reduce(0)
+
+    @functools.partial(
+        self.kernel, out_type=jax.ShapeDtypeStruct((1, 64), jnp.int32)
+    )
+    def kernel(o_ref):
+      a = plgpu.broadcasted_iota(jnp.int32, (64,), 0, layout=layout)
+      b = plgpu.broadcasted_iota(jnp.int32, (1, 64), 1, layout=layout)
+      plgpu.store(o_ref, a.reshape((1, 64)) + b, optimized=False)
+
+    np.testing.assert_array_equal(kernel(), 2 * np.arange(64)[None, :])
+
   @parameterized.parameters(jnp.bfloat16, jnp.int16, jnp.uint16)
   def test_inline_mgpu(self, jnp_type):
     dtype = jnp.dtype(jnp_type)

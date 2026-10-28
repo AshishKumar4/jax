@@ -312,10 +312,14 @@ def reduce_reduce_expression(
             expr.rank == 2 and len(expr.axes) == 1
             and len(layout.base_tile_shape) == 2
         ):
-          # Only the position of the inserted singleton matters for the layout.
-          target_shape = (1, 2) if expr.axes == (0,) else (2, 1)
+          reduced_layout = layout.reduce(expr.axes)
+          # Use a tileable shape so the reshape preserves an existing legal
+          # layout when inserting a leading unit axis.
+          source_shape = reduced_layout.base_tile_shape
+          target_shape = list(source_shape)
+          target_shape.insert(expr.axes[0], 1)
           result = fa.reshape_unit_axis_layout(
-              layout.reduce(expr.axes), (2,), target_shape
+              reduced_layout, source_shape, tuple(target_shape)
           )
           if result is not None:
             return RegisterLayout(result)

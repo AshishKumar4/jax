@@ -1141,9 +1141,16 @@ def _can_splat_unreduced(value: ir.Value, op: str) -> bool:
   return False
 
 
-@jax.tree_util.register_pytree_node_class
 def reshape_unit_axis_layout(layout, source_shape, target_shape):
-  """Returns a tiled layout for inserting/removing one unit axis, or None."""
+  """Preserves existing tiled reshapes, then handles a single unit axis."""
+  tile = layout.base_tile_shape
+  if (
+      tile and len(source_shape) >= len(tile) and len(target_shape) >= len(tile)
+      and all(s % t == 0 for s, t in zip(source_shape[-len(tile):], tile))
+      and source_shape[-len(tile):][1:] == target_shape[-len(tile):][1:]
+      and target_shape[-len(tile)] % tile[0] == 0
+  ):
+    return layout
   if (
       len(source_shape) == 2 and len(target_shape) == 1
       and source_shape.count(1) == 1
@@ -1177,6 +1184,7 @@ def reshape_unit_axis_layout(layout, source_shape, target_shape):
   ).canonicalize()
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass(init=False, frozen=True, slots=True)
 class FragmentedArray:
   # An array of ir.Value, see checks in init for shapes.
