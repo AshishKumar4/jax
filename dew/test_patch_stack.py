@@ -44,9 +44,10 @@ def test_each_package_has_its_own_pages_and_the_root_lists_every_one(tmp_path):
     publish never drops another's (Main, 2026-10-28: qwix 0.1.8.post1 joins jax)."""
     site = tmp_path / "site"
     jax = wheel(tmp_path, "jax", "0.12.0.1.post31")
-    patch_stack.index(tmp_path / "jax.json", site, [jax])
+    patch_stack.index(tmp_path / "jax.json", site, [wheel(tmp_path, "jax", "0.12.0.1"), jax])
     qwix = wheel(tmp_path, "qwix", "0.1.8.post1")
-    patch_stack.index(tmp_path / "qwix.json", site, [qwix], package="qwix", projects=["jax"])
+    patch_stack.index(tmp_path / "qwix.json", site, [wheel(tmp_path, "qwix", "0.1.8"), qwix], package="qwix",
+                      projects=["jax"])
     assert (site / "packages" / "qwix" / qwix.name).read_bytes() == qwix.read_bytes()
     assert f'href="../../packages/qwix/{qwix.name}#sha256=' in (site / "simple" / "qwix" / "index.html").read_text()
     assert "qwix" not in (site / "simple" / "jax" / "index.html").read_text()
@@ -82,3 +83,21 @@ def test_the_stacks_tests_are_the_test_files_it_adds_or_changes_over_its_release
     monkeypatch.chdir(tmp_path)
     assert patch_stack.tests("0.12.0.1") == ["tests/changed_test.py", "tests/mosaic/gpu_test.py",
                                              "tests/new_test.py"]
+
+
+def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
+    """A fork's build (0.1.8.post1) is indexed only beside its base release's own wheel (0.1.8), listed already or
+    indexed with it: an installer that finds the package on this index looks for every version here (uv's
+    first-index rule), so a lock pinning the base would stop resolving (Main, 2026-10-28: qwix 0.1.8.post1 alone
+    broke every environment main's lock built)."""
+    site = tmp_path / "site"
+    qwix = wheel(tmp_path, "qwix", "0.1.8.post1")
+    try:
+        patch_stack.index(tmp_path / "qwix.json", site, [qwix], package="qwix")
+    except SystemExit as refused:
+        assert "0.1.8" in str(refused) and not (tmp_path / "qwix.json").exists()
+    else:
+        raise AssertionError("a build without its base release was indexed")
+    patch_stack.index(tmp_path / "qwix.json", site, [wheel(tmp_path, "qwix", "0.1.8")], package="qwix")
+    patch_stack.index(tmp_path / "qwix.json", site, [qwix], package="qwix")
+    assert qwix.name in (site / "simple" / "qwix" / "index.html").read_text()
