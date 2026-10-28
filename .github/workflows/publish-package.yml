@@ -1,7 +1,9 @@
 # A package Dew carries a build of beside JAX's (Qwix's), published to Dew's package index,
 # https://pypi.dewml.dev/simple: the wheel of a fork's release commit, whose own version names it
 # (0.1.8.post1), built from `repository` at `ref`, its `tests` run on it, then indexed beside the packages the
-# index holds already. A file the index lists already is kept as it is.
+# index holds already; and `upstream`, PyPI's own wheels of the package's releases, which the index serves
+# too, as an installer that finds a package on this index looks for its every version here (uv's first-index
+# rule). A file the index lists already is kept as it is.
 name: publish package
 
 on:
@@ -11,14 +13,17 @@ on:
         description: "the fork to build, e.g. AshishKumar4/qwix"
         required: true
       ref:
-        description: "its release commit or branch, e.g. dew/0.1.8.post1"
-        required: true
+        description: "its release commit or branch, e.g. dew/0.1.8.post1; none indexes `upstream` alone"
+        required: false
       tests:
         description: "pytest's arguments, run in the clone against the built wheel"
-        required: true
+        required: false
       dependencies:
         description: "what the tests install beside the wheel, e.g. \"jax flax pytest absl-py\""
-        required: true
+        required: false
+      upstream:
+        description: "PyPI releases whose own wheels the index serves too, e.g. \"qwix==0.1.8\""
+        required: false
 
 permissions:
   contents: read
@@ -42,6 +47,7 @@ jobs:
       REF: ${{ inputs.ref }}
       TESTS: ${{ inputs.tests }}
       DEPENDENCIES: ${{ inputs.dependencies }}
+      UPSTREAM: ${{ inputs.upstream }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,17 +58,29 @@ jobs:
           for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
             [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
           done
+      - name: Fetch PyPI's own wheels
+        if: inputs.upstream != ''
+        run: |
+          uv venv -q fetching
+          uv pip install -q --python fetching/bin/python pip
+          read -ra releases <<< "$UPSTREAM"
+          fetching/bin/python -m pip download -q --no-deps --only-binary :all: --index-url https://pypi.org/simple \
+            --dest dist "${releases[@]}"
+          ls dist
       - name: Build the wheel
+        if: inputs.ref != ''
         run: |
           git clone -q "https://github.com/$REPOSITORY.git" source
           git -C source checkout -q "$REF"
-          uv build -q --wheel --out-dir dist source
+          uv build -q --wheel --out-dir source-dist source
+          cp source-dist/*.whl dist/ 2>/dev/null || { mkdir -p dist && cp source-dist/*.whl dist/; }
           ls dist
       - name: Test the wheel
+        if: inputs.ref != ''
         run: |
           uv venv -q --python 3.12 tested
           read -ra dependencies <<< "$DEPENDENCIES"
-          uv pip install -q --python tested/bin/python dist/*.whl "${dependencies[@]}"
+          uv pip install -q --python tested/bin/python source-dist/*.whl "${dependencies[@]}"
           read -ra tests <<< "$TESTS"
           cd source
           ../tested/bin/python -m pytest -q -p no:cacheprovider "${tests[@]}"
@@ -70,8 +88,11 @@ jobs:
         run: |
           shopt -s nullglob
           wheels=(dist/*.whl)
-          [ ${#wheels[@]} -eq 1 ] || { echo "::error::the build made ${#wheels[@]} wheels"; exit 1; }
+          [ ${#wheels[@]} -gt 0 ] || { echo "::error::no wheel to index"; exit 1; }
           package=$(basename "${wheels[0]}" | cut -d- -f1)
+          for wheel in "${wheels[@]}"; do
+            [ "$(basename "$wheel" | cut -d- -f1)" = "$package" ] || { echo "::error::$wheel is not $package's"; exit 1; }
+          done
           echo "PACKAGE=$package" >> "$GITHUB_ENV"
           if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key "packages/$package/manifest.json" \
               > /dev/null 2> head.txt; then
