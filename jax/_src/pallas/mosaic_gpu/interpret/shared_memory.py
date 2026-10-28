@@ -910,16 +910,8 @@ class GPUSharedMemory(
           )
         self.mem.pop(key)
 
-  def assert_no_barriers_allocated(self, device: Device):
-    """Asserts that no barrier of `device` remains allocated.
-
-    Only the given device's allocations are checked: the device barrier before
-    this check joins clocks without waiting, so another device of the mesh may
-    still be running its grid, its barriers rightly allocated.
-    """
+  def assert_no_barriers_allocated(self):
     for key, alloc in self.mem.items():
-      if key.device_id != device.device_id:
-        continue
       assert not isinstance(
           alloc, Barrier
       ), f"Barrier remains allocated at key `{key}`."
