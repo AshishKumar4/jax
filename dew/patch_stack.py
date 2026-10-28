@@ -178,6 +178,15 @@ def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), r
         raise SystemExit(f"cannot yank {', '.join(unlisted)}: the index does not list it")
     for name in yank:
         listed[name]["yanked"] = reason
+    # A build (X.postN) beside its base release's own wheel (X): an installer that finds the package here looks
+    # for every version here (uv's first-index rule), so a lock pinning X stops resolving without it (Main,
+    # 2026-10-28: qwix 0.1.8.post1 alone broke every environment main's lock built).
+    versions = {name.split("-")[1] for name in [*listed, *(file.name for file in files)]}
+    bare = sorted({version.split(".post")[0] for version in versions if ".post" in version} - versions)
+    if bare:
+        raise SystemExit(f"cannot index {package}'s builds of {', '.join(bare)}: the index lacks those releases' "
+                         "own wheels, which an installer finding the package here then cannot resolve; index "
+                         "them with it")
     packages = site / "packages" / package
     packages.mkdir(parents=True, exist_ok=True)
     for file in files:
