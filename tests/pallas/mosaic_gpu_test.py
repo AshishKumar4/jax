@@ -11241,6 +11241,38 @@ class ExamplesSm90AWGTest(
   ...
 
 
+class PlanarSnakeTest(jtu.JaxTestCase):
+
+  @parameterized.product(
+      dimensions=[(3, 45, 16), (8, 48, 16), (1, 5, 4), (5, 7, 1), (4, 3, 8)],
+      minor_dim=[0, 1],
+      dynamic_shape=[False, True],
+  )
+  def test_full_and_partial_bands_under_jit(
+      self, dimensions, minor_dim, dynamic_shape
+  ):
+    major_size, minor_size, width = dimensions
+    shape = (minor_size, major_size) if minor_dim == 0 else (major_size, minor_size)
+    expected = []
+    for band in range(pl.cdiv(minor_size, width)):
+      for major_index in range(major_size):
+        major = major_index if band % 2 == 0 else major_size - 1 - major_index
+        for offset in range(min(width, minor_size - band * width)):
+          minor = band * width + offset
+          expected.append((minor, major) if minor_dim == 0 else (major, minor))
+
+    def coordinates(indices, m, n):
+      grid = (m, n) if dynamic_shape else shape
+      return jax.vmap(
+          lambda i: _plgpu.planar_snake(i, grid, minor_dim, width)
+      )(indices)
+
+    actual = jax.jit(coordinates)(
+        jnp.arange(major_size * minor_size, dtype=jnp.int32), *shape
+    )
+    np.testing.assert_array_equal(np.stack(actual, axis=1), np.asarray(expected))
+
+
 class HelpersTest(PallasTest):
 
   @parameterized.product(
