@@ -26,7 +26,7 @@ in brackets.
 | Mosaic GPU: each warpgroup's own reduction scratch (5878c8ccf) | no | upstream's reductions do |
 | Pallas Mosaic GPU: a unit row or column of a tiled array (876c57aa3 and its fixes) [1428] | no | upstream resolves `constraints.py:304`'s TODO |
 | Mosaic GPU WGMMA: shared-operand descriptors formed at their instructions (5226f132d) | no | a release forms them at use, or Dew's D128 attention backward shows no loss without it |
-| Mosaic GPU TMA: load coordinates ptxas cannot fold (4de45c521) [2254] | no; jax-ml/jax@ec456bfe3 rewrites the same region (a rebase conflict) | the ptxas Dew ships no longer miscompiles a literal-0 TMA coordinate (2254's repro, patch removed) |
+| Mosaic GPU TMA: load coordinates ptxas cannot fold (4de45c521) [2254]; im2col loads build theirs the same way, unfixed, as Dew makes none | no; jax-ml/jax@ec456bfe3 renames the condition the fix sits under (`untransformed_gmem_ref is src_ref`), and the fix applies there unchanged | the ptxas Dew ships no longer miscompiles a literal-0 TMA coordinate (2254's repro, patch removed) |
 | Mosaic GPU CP_ASYNC: a squeezed dimension between sliced ones under a tile transform (4f7868935) [2078] | no | upstream squeezes before the tile transform |
 | Pallas Mosaic GPU `emit_pipeline`: ring slots carried (84547ea19) | no | a release carries them |
 | Pallas Mosaic GPU interpreter: a thread map's constants and inputs moved once (2e522efea) [1850] | no | upstream's `thread_map.py` does |
