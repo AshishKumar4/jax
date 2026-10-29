@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import tempfile
+import threading
 import time
 
 from absl.testing import absltest
@@ -182,6 +183,23 @@ class LRUCacheTest(LRUCacheTestCase):
   # Check that we don't write access time file when the eviction policy is
   # disabled. Writing this file can be extremely unperformant and cause
   # problems on large-scale network storage.
+  def test_a_reader_beside_a_writer_sees_a_whole_entry_or_none(self):
+    # Readers of an unbounded cache take no lock: an entry another process is
+    # writing must never be read in part.
+    cache = LRUCache(self.name, max_size=-1)
+    value = bytes(range(256)) * (1 << 17)
+    seen = []
+    for index in range(16):
+      key = f"entry{index}"
+      writer = threading.Thread(target=cache.put, args=(key, value))
+      writer.start()
+      while writer.is_alive():
+        if (read := cache.get(key)) is not None:
+          seen.append(len(read))
+      writer.join()
+    self.assertEqual(set(seen) - {len(value)}, set())
+    self.assertEmpty([path for path in self.path.iterdir() if not path.name.endswith(_CACHE_SUFFIX)])
+
   def test_no_atime_file(self):
     cache = LRUCache(self.name, max_size=-1)
 
