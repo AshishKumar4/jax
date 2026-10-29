@@ -707,6 +707,30 @@ class OOBFillMode(enum.IntEnum):
   ZEROS = 2
 
 
+def _opaque_coordinate(index: ir.Value) -> ir.Value:
+  """A TMA load coordinate that reaches ptxas as a value it cannot fold.
+
+  ptxas has miscompiled a TMA load whose coordinate is a literal: it filled
+  the coordinate's uniform register from another uniform register before that
+  register's last write, so the load read another coordinate, misaligned, and
+  the kernel died with CUDA_ERROR_ILLEGAL_INSTRUCTION (an H100 attention
+  forward, its innermost coordinate 0 read as 1). LLVM folds a coordinate
+  computed from constants into a literal, so every coordinate adds the lane id
+  less the warp's `elect.sync` leader's: 0 on the leader, the thread a copy's
+  single-thread predicate selects (`utils.single_thread_predicate`, which
+  elects over the same converged warp), and a value ptxas cannot fold.
+  """
+  i32 = ir.IntegerType.get_signless(32)
+  zero = llvm.inline_asm(
+      i32, [],
+      "{ .reg .b32 leader; .reg .pred elected; "
+      "elect.sync leader|elected, 0xffffffff; "
+      "mov.u32 $0, %laneid; sub.u32 $0, $0, leader; }",
+      "=r", has_side_effects=True,
+  )
+  return arith.addi(index, zero)
+
+
 @dataclasses.dataclass()
 class LaunchContext:
   module: ir.Module
@@ -1954,6 +1978,9 @@ class LaunchContext:
       assert barrier is not None
       barrier_ptr = barrier.get_ptr()
       assert reduction_op is None
+      rev_dyn_base_indices = [
+          _opaque_coordinate(idx) for idx in rev_dyn_base_indices
+      ]
       rank = len(slice_shape)
       idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
       if collective_size > 1 and leader_tracked is not None:
