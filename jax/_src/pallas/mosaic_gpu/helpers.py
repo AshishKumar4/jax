@@ -286,6 +286,7 @@ def planar_snake(
       isinstance(shape[1 - minor_dim], int)
       and shape[1 - minor_dim] & (shape[1 - minor_dim] - 1) == 0
   )
+  tile_shift = tile_width.bit_length() - 1
   tile_width = jnp.int32(tile_width)  # pyrefly: ignore[bad-assignment]
   major_size = jnp.int32(shape[1 - minor_dim])
   minor_size = jnp.int32(shape[minor_dim])
@@ -299,9 +300,15 @@ def planar_snake(
   # to be significantly faster. Otherwise, branchless is better.
   if tile_width_is_power_of_2:
     tile_idx, lin_idx_within_tile = lax_divmod(lin_idx, tile_size)
+    # Keep the full-band operations distinct from the tail's division. With
+    # two divmods, LLVM can select their divisors before dividing, turning a
+    # constant power-of-two divide into a variable divide for every tile.
     major, minor_within_tile = lax.cond(
         is_full_tile,
-        lambda: lax_divmod(lin_idx_within_tile, tile_width),
+        lambda: (
+            lax.shift_right_logical(lin_idx_within_tile, jnp.int32(tile_shift)),
+            lax.bitwise_and(lin_idx_within_tile, tile_width - jnp.int32(1)),
+        ),
         lambda: lax_divmod(lin_idx_within_tile, last_tile_width),
     )
   else:
