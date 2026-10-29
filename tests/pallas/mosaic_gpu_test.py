@@ -11175,7 +11175,7 @@ class PlanarSnakeTest(jtu.JaxTestCase):
     def coordinates(indices, m, n):
       grid = (m, n) if dynamic_shape else shape
       return jax.vmap(
-          lambda i: _plgpu.planar_snake(i, grid, minor_dim, width)
+          lambda i: plgpu.planar_snake(i, grid, minor_dim, width)
       )(indices)
 
     actual = jax.jit(coordinates)(
