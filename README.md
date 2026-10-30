@@ -5,7 +5,7 @@ has them, one branch a release: `vX.Y.Z-cache-key-pool-fingerprints`, the releas
 the fixes on top, versioned `X.Y.Z.postN`. Each fix is also sent upstream, and is dropped from the stack
 once a release holds it.
 
-Each family of fixes the stack carries, at 0.12.0.1.post39 (`release/0.12.0.1.post39`, f1ff6f1f6), with what upstream holds
+Each family of fixes the stack carries, at 0.12.0.1.post40 (`release/0.12.0.1.post40`, 0142c02ce), with what upstream holds
 (jax-ml/jax `main` at b2fbcb706, 2026-10-29) and when it leaves the stack. Dew's ledger row, where one names it,
 in brackets.
 
@@ -17,7 +17,8 @@ in brackets.
 | A platform-dependent conditional keeping one branch lowers it inline (31cd9c409, 950416715) [1732] | 31cd9c409 is jax-ml/jax@f9cf4a609 | 31cd9c409 at the next rebase; 950416715 once upstream's lowering passes `test_platform_dependent_kept_branch_threads_ordered_effects` |
 | x64: a wide dtype a trace holds is kept under transforms (6bb44f4f7, e3e2a5cfd; a max's or min's derivative weights, a pad's transposed zero and reduce_max's or reduce_min's derivative mask, d5c23d4d5, 8ee4af285) [1688, 2690] | no | a release keeps it in `dot_general`, `conv_general_dilated` and `convert_element_type` outside `enable_x64` |
 | A variadic reduce's symbolic zero tangents instantiated before its JVP reshapes them (c05d7fa8c) [2690] | no | upstream instantiates zeros in `_reduce_jvp` |
-| Transfer guard on a CPU array's host read (1fbd2dd81) | no (jaxlib unchecked) | jaxlib applies the device-to-host guard to zero-copy CPU reads |
+| Transfer guard on a CPU array's host read, until one reaches the host as a GPU array's cached copy does (1fbd2dd81, e8a8363fd) | no (jaxlib unchecked) | jaxlib applies the device-to-host guard to zero-copy CPU reads |
+| `ragged_dot`'s adjoints in every mode: ragged transposes legalized natively on GPU, one batch prefix and one rounding at the declared accumulation type, sharded masks, layout boundaries kept through GPU input fusion (f1ff6f1f6..4905a0e44) [2650] | no | upstream's ragged_dot transposes natively and rounds once |
 | Pallas Triton: 16-bit divide and `erf_inv` through float32 (d074c9a85) | no | upstream rounds f16 and bf16 division once |
 | Pallas Triton: `custom_vjp_call` lowered as its primal (35b362f2e) | no | upstream registers `custom_vjp_call_p` for Triton |
 | Mosaic GPU: `ceil`, `floor`, `add_any`, `integer_pow` of any integer exponent (3b54f2bd7, aec02c1e3, c1c68b1b9) | no | upstream lowers them |
