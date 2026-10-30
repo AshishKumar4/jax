@@ -1,7 +1,9 @@
 """The patch stack's choice of the release to carry next, over remotes' refs as git ls-remote lists them, and
 the test files it runs, over a repository of its own."""
 
+import json
 import subprocess
+from pathlib import Path
 
 import patch_stack
 
@@ -101,3 +103,115 @@ def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
     patch_stack.index(tmp_path / "qwix.json", site, [wheel(tmp_path, "qwix", "0.1.8")], package="qwix")
     patch_stack.index(tmp_path / "qwix.json", site, [qwix], package="qwix")
     assert qwix.name in (site / "simple" / "qwix" / "index.html").read_text()
+
+
+
+GH = """#!/usr/bin/env python3
+# gh as release.sh calls it: a dispatch recorded with its token, and the run named for it listed (gh having
+# applied the caller's --jq) from the second listing after it, unless the fork says its runs never appear.
+import json, os, sys
+from pathlib import Path
+state = Path(__file__).with_name("gh.json")
+calls = json.loads(state.read_text()) if state.exists() else []
+calls.append(sys.argv[1:])
+state.write_text(json.dumps(calls))
+if sys.argv[1:3] == ["run", "list"] and not os.environ.get("RUNS_NEVER_APPEAR"):
+    query = sys.argv[sys.argv.index("--jq") + 1]
+    dispatched = [call for call in calls if call[:2] == ["workflow", "run"]]
+    listings = sum(call[:2] == ["run", "list"] for call in calls)
+    if dispatched and listings >= 2 and dispatched[-1][-1].removeprefix("token=") in query:
+        print(7)
+"""
+
+
+def isolated(tmp_path) -> dict:
+    """An environment whose git reads no configuration but its own and installs no hooks or templates, and
+    finds gh and sleep in tmp_path/bin first."""
+    (tmp_path / "templates").mkdir()
+    return {"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TEMPLATE_DIR": str(tmp_path / "templates"),
+            **{f"GIT_{who}_{what}": value for who in ("AUTHOR", "COMMITTER")
+               for what, value in (("NAME", "t"), ("EMAIL", "t@example.com"))}}
+
+
+def fork(tmp_path, environment):
+    """A fork whose release/0.12.0.1.post39 and stack branch hold one commit, a clone of it, and branches of
+    the clone's: a fix to carry, two that conflict with each other, and one that sets a near-miss version."""
+    def run(cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], env=environment, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    origin, checkout = tmp_path / "origin.git", tmp_path / "checkout"
+    run(tmp_path, "init", "-q", "--bare", str(origin))
+    run(tmp_path, "init", "-q", "-b", "main", str(checkout))
+    (checkout / "jax").mkdir()
+    (checkout / "jax" / "version.py").write_text('_release_version: str | None = "0.12.0.1.post39"\n')
+    (checkout / "lax.py").write_text("one\n")
+    run(checkout, "add", "-A")
+    run(checkout, "commit", "-qm", "post39")
+    run(checkout, "remote", "add", "origin", str(origin))
+    run(checkout, "push", "-q", "origin", "HEAD:refs/heads/release/0.12.0.1.post39",
+        "HEAD:refs/heads/v0.12.0.1-cache-key-pool-fingerprints")
+    commits = {}
+    for name, path, text in (("fix", "fix.py", "fixed\n"), ("other", "lax.py", "two\n"),
+                             ("conflicting", "lax.py", "three\n"),
+                             ("near", "jax/version.py", '_release_version: str | None = "0.12.0.1+post40"\n')):
+        run(checkout, "checkout", "-q", "-b", name, "main")
+        (checkout / path).write_text(text)
+        run(checkout, "add", "-A")
+        run(checkout, "commit", "-qm", name)
+        commits[name] = run(checkout, "rev-parse", "HEAD")
+    return origin, checkout, commits, run
+
+
+def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_held(tmp_path):
+    """release.sh pushes the release branch and the stack branch together, asks patch-stack.yml to publish and
+    watches the run its dispatch's token names, only once every commit it carries has applied and the version
+    reads exactly the new release: a cherry-pick that conflicts, a version that only nearly matches, or a stack
+    branch moved off the release it grows from, ends the run with nothing pushed and nothing asked; a
+    dispatched run that never appears ends it within its bound, the branches left at the composed release."""
+    environment = isolated(tmp_path)
+    origin, checkout, commits, run = fork(tmp_path, environment)
+    (tmp_path / "bin").mkdir()
+    for name, text in (("gh", GH), ("sleep", "#!/bin/sh\n")):
+        (tmp_path / "bin" / name).write_text(text)
+        (tmp_path / "bin" / name).chmod(0o755)
+    calls = tmp_path / "bin" / "gh.json"
+    script = Path(patch_stack.__file__).with_name("release.sh")
+
+    def released(new, *picked, **extra):
+        return subprocess.run(["bash", str(script), str(checkout), "0.12.0.1.post39", new, f"Release {new}",
+                               *picked], env={**environment, **extra}, capture_output=True, text=True,
+                              check=False)
+
+    def branches():
+        return run(origin, "for-each-ref", "--format=%(refname) %(objectname)")
+
+    before = branches()
+    # Each of these runs as the clean one below does but for the commits it carries.
+    for picked in ((commits["other"], commits["conflicting"]), (commits["near"],)):
+        assert released("0.12.0.1.post40", *picked).returncode != 0
+        assert branches() == before and not calls.exists()
+    done = released("0.12.0.1.post40", commits["fix"])
+    assert done.returncode == 0
+    stack = run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints")
+    assert run(origin, "rev-parse", "release/0.12.0.1.post40") == stack
+    assert run(origin, "show", f"{stack}:jax/version.py") == '_release_version: str | None = "0.12.0.1.post40"'
+    assert run(origin, "show", f"{stack}:fix.py") == "fixed"
+    asked = json.loads(calls.read_text())
+    dispatch, = [call for call in asked if call[:2] == ["workflow", "run"]]
+    assert dispatch[:9] == ["workflow", "run", "patch-stack.yml", "-R", "AshishKumar4/jax", "--ref", "dew", "-f",
+                            "publish=0.12.0.1"]
+    assert ["run", "watch", "7", "-R", "AshishKumar4/jax", "--exit-status"] in asked
+    # The stack branch has moved off post39: a release grown from post39 again is refused, unasked.
+    before, count = branches(), len(asked)
+    assert released("0.12.0.1.post41", commits["fix"]).returncode != 0
+    assert branches() == before and len(json.loads(calls.read_text())) == count
+    # A run that never appears: the branches stay at the release they were pushed to, and the script ends.
+    run(origin, "update-ref", "refs/heads/v0.12.0.1-cache-key-pool-fingerprints",
+        run(origin, "rev-parse", "release/0.12.0.1.post39"))
+    lost = released("0.12.0.1.post41", commits["fix"], RUNS_NEVER_APPEAR="1")
+    assert lost.returncode != 0
+    assert run(origin, "rev-parse", "release/0.12.0.1.post41") == run(origin, "rev-parse",
+                                                                     "v0.12.0.1-cache-key-pool-fingerprints")
+    assert not any(call[:2] == ["run", "watch"] for call in json.loads(calls.read_text())[count:])

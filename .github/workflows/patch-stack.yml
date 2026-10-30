@@ -25,6 +25,11 @@ on:
       reason:
         description: "why the wheels in `yank` are yanked, shown by installers"
         required: false
+      token:
+        description: "a token the run's name carries, by which a dispatcher (dew/release.sh) finds its own run"
+        required: false
+
+run-name: ${{ inputs.token && format('patch stack {0}', inputs.token) || 'patch stack' }}
 
 permissions:
   contents: write

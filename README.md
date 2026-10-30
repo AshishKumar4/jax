@@ -55,6 +55,13 @@ pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
+A post release between JAX releases, `X.postN` from `X.post(N-1)` and the reviewed, green commits it gains, is
+`dew/release.sh CHECKOUT BASE NEW MESSAGE COMMIT...`: one run that applies them in order, bumps the version,
+pushes the release branch and the stack branch together, asks `patch-stack.yml` to publish and watches that run
+to its end. A step that fails before the push ends the run with the fork as it was; one after it (the publish
+red, or its run never started) leaves both branches at the composed release, unpublished, which
+`gh workflow run patch-stack.yml --ref dew -f publish=X` publishes again once its run's log is read.
+
 `.github/workflows/patch-stack.yml` looks for a new JAX release every six hours, rebases the newest
 stack onto it with `dew/patch_stack.py`, runs the stack's tests, pushes the branch and
 publishes its wheel; a conflict, a red test, or a release that holds every fix opens an issue here.
