@@ -686,7 +686,7 @@ class JaxprInterpreter:
       token, _out = jaxpr_interpreter.interpret(jaxpr, token, *get_invals())
       return token
 
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         gpu_callbacks.sync_warps_with_warpgroup,
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
@@ -699,7 +699,7 @@ class JaxprInterpreter:
         on_exception= gpu_callbacks.fail,
     )
 
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         gpu_callbacks.sync_warpgroup_with_warps,
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
@@ -871,7 +871,7 @@ class JaxprInterpreter:
     args = lambda: get_invals()[:num_args]
 
     def thread_callback(callback_fn):
-      return callback.io_callback(
+      return callback.io_callback_numpy_inputs(
           functools.partial(callback_fn, source_info=eqn.source_info),
           gpu_callbacks.TOKEN_SHAPE_DTYPE,
           token=token,
@@ -977,7 +977,7 @@ class JaxprInterpreter:
         eqn.invars[1].aval, dst, jax.tree.unflatten(
             eqn.params["dst_transforms_treedef"], dst_transforms_flat))
 
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.copy_gmem_to_smem,
                           source_info=eqn.source_info),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
@@ -1018,7 +1018,7 @@ class JaxprInterpreter:
     src, src_transforms = resolve_ref(eqn.invars[0].aval, src, src_transforms)
     dst, dst_transforms = resolve_ref(eqn.invars[1].aval, dst, dst_transforms)
 
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.copy_smem_to_gmem,
                           source_info=eqn.source_info, **params),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
@@ -1050,7 +1050,7 @@ class JaxprInterpreter:
         eqn.invars[0].aval, acc, acc_transforms)
     a, a_transforms = resolve_ref(eqn.invars[1].aval, a, a_transforms)
     b, b_transforms = resolve_ref(eqn.invars[2].aval, b, b_transforms)
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.wgmma,
                           source_info=eqn.source_info),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
@@ -1069,7 +1069,7 @@ class JaxprInterpreter:
       self, eqn, token: jax.Array, get_invals: Callable[[], Sequence[Any]]):
     assert eqn.primitive is gpu_primitives.wgmma_accumulator_deref_p
     acc, = get_invals()
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.wgmma_accumulator_deref, source_info=eqn.source_info
         ),
@@ -1120,7 +1120,7 @@ class JaxprInterpreter:
     a, a_transforms = resolve_ref(eqn.invars[1].aval, a, a_transforms)
     b, b_transforms = resolve_ref(eqn.invars[2].aval, b, b_transforms)
 
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.tcgen05_mma,
             collective_axis=eqn.params["collective_axis"],
@@ -1171,7 +1171,7 @@ class JaxprInterpreter:
         eqn.invars[1].aval, tmem, tmem_transforms)
 
     return (
-        callback.io_callback(
+        callback.io_callback_numpy_inputs(
             functools.partial(
                 gpu_callbacks.async_copy_smem_to_tmem,
                 source_info=eqn.source_info,
@@ -1199,7 +1199,7 @@ class JaxprInterpreter:
         invals[0],
         jax.tree.unflatten(eqn.params["tree"], invals[1:]),
     )
-    token, out = callback.io_callback(
+    token, out = callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.async_load_tmem, source_info=eqn.source_info),
         (gpu_callbacks.TOKEN_SHAPE_DTYPE, eqn.outvars[0].aval),
@@ -1217,7 +1217,7 @@ class JaxprInterpreter:
     assert eqn.primitive is gpu_primitives.async_store_tmem_p
     ref, dst_transforms = resolve_ref(
         eqn.invars[0].aval, ref, jax.tree.unflatten(tree, dst_transform_vals))
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.async_store_tmem, source_info=eqn.source_info),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
@@ -1231,7 +1231,7 @@ class JaxprInterpreter:
 
   def _interpret_commit_tmem_p(self, eqn, token: jax.Array, _invals):
     assert eqn.primitive is gpu_primitives.commit_tmem_p
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.commit_tmem, source_info=eqn.source_info
         ),
@@ -1243,7 +1243,7 @@ class JaxprInterpreter:
 
   def _interpret_wait_load_tmem_p(self, eqn, token: jax.Array, _invals):
     assert eqn.primitive is gpu_primitives.wait_load_tmem_p
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.wait_load_tmem, source_info=eqn.source_info
         ),
@@ -1275,7 +1275,7 @@ class JaxprInterpreter:
         flat_args,
     )
     call_commit_arrive = functools.partial(
-        callback.io_callback,
+        callback.io_callback_numpy_inputs,
         functools.partial(
             gpu_callbacks.tcgen05_commit_arrive,
             source_info=eqn.source_info,
@@ -1304,7 +1304,7 @@ class JaxprInterpreter:
     del get_invals  # Unused.
     n = eqn.params["n"]
     wait_read_only = eqn.params["wait_read_only"]
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.wait_smem_to_gmem, source_info=eqn.source_info
         ),
@@ -1320,7 +1320,7 @@ class JaxprInterpreter:
       self, eqn, token: jax.Array, _get_invals: Callable[[], Sequence[Any]]
   ):
     assert eqn.primitive is gpu_primitives.commit_smem_p
-    return callback.io_callback(
+    return callback.io_callback_numpy_inputs(
         functools.partial(
             gpu_callbacks.commit_smem, source_info=eqn.source_info
         ),
