@@ -31,11 +31,13 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
+#include "jaxlib/mosaic/gpu/target.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_pjrt_client.h"
+#include "xla/stream_executor/cuda/compilation_provider.h"
 #include "xla/stream_executor/cuda/cuda_platform.h"  // IWYU pragma: keep
 #include "xla/tsl/platform/env.h"
 
@@ -45,6 +47,7 @@ using ::absl_testing::IsOk;
 using ::testing::_;
 using ::testing::AllOf;
 using ::testing::HasSubstr;
+using ::testing::Not;
 using ::testing::SizeIs;
 
 absl::Status ExecuteSync(xla::PjRtLoadedExecutable* executable) {
@@ -683,5 +686,11 @@ TEST_P(CollectiveCommandBufferTest,
 
 INSTANTIATE_TEST_SUITE_P(CollectiveCommandBufferTests,
                          CollectiveCommandBufferTest, ::testing::Bool());
+
+TEST_F(CustomCallTest, AssemblyToBinaryCompilationProviderDisablesNvJitLink) {
+  ASSERT_OK_AND_ASSIGN(stream_executor::cuda::CompilationProvider * provider,
+                       mosaic::gpu::GetAssemblyToBinaryCompilationProvider());
+  EXPECT_THAT(provider->name(), Not(HasSubstr("NvJitLinkCompilationProvider")));
+}
 
 }  // namespace
