@@ -4171,6 +4171,196 @@ class Sm80Test(TestCase):
     )
     np.testing.assert_array_equal(registers, memory)
 
+  @parameterized.parameters(
+      ((64, 256), (slice(0, 64), slice(128, 256)), jnp.float32),
+      ((64, 256), (slice(0, 64), slice(128, 256)), jnp.bfloat16),
+      # Physically contiguous, its singleton dimension strided.
+      ((2, 2048, 1), (slice(0, 1), slice(0, 1024), slice(None)), jnp.float32),
+      # A trailing singleton: the 2D column block's addresses.
+      ((64, 256, 1), (slice(0, 64), slice(128, 256), slice(None)), jnp.float32),
+      # A contiguous suffix of two minor dimensions.
+      ((64, 256, 2), (slice(0, 64), slice(128, 256), slice(None)),
+       jnp.bfloat16),
+      # An odd row pitch: each row's start only 4-byte aligned.
+      ((64, 257), (slice(0, 64), slice(0, 128)), jnp.float32),
+  )
+  def test_cp_async_untiled_slice(self, full_shape, slices, dtype):
+    # A slice copied untiled: a column block of a wider array reads each row
+    # past the first at the row's stride, not the block's width, each
+    # transfer aligned to its size.
+    slice_shape = tuple(
+        (s.stop if s.stop is not None else n) - (s.start or 0)
+        for s, n in zip(slices, full_shape)
+    )
+
+    def kernel(ctx, src, dst, scratch):
+      tmp, barrier = scratch
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          gmem_slice=slices,
+          implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          barrier=barrier,
+      )
+      barrier.wait()
+      copy(tmp, dst)
+
+    x = np.arange(np.prod(full_shape), dtype=np.float32)
+    x = x.reshape(full_shape).astype(dtype)
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        jax.ShapeDtypeStruct(slice_shape, dtype),
+        (jax.ShapeDtypeStruct(slice_shape, dtype),
+         mgpu.Barrier(arrival_count=1)),
+    )(x)
+    np.testing.assert_array_equal(y, x[slices])
+
+  def _copied_untiled(self, x, slice_shape, slices_of):
+    # `x`'s slice `slices_of(ctx, src, extra)` copied untiled by CP_ASYNC into
+    # SMEM and back out, `extra` an int32 the kernel reads.
+    def kernel(ctx, src, extra, dst, scratch):
+      tmp, barrier = scratch
+      src, slices = slices_of(ctx, src, memref.load(extra, []))
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          gmem_slice=slices,
+          implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          barrier=barrier,
+      )
+      barrier.wait()
+      copy(tmp, dst)
+
+    def run(extra):
+      return mgpu.as_gpu_kernel(
+          kernel,
+          (1, 1, 1),
+          (128, 1, 1),
+          (x, jax.ShapeDtypeStruct((), jnp.int32)),
+          jax.ShapeDtypeStruct(slice_shape, x.dtype),
+          (jax.ShapeDtypeStruct(slice_shape, x.dtype),
+           mgpu.Barrier(arrival_count=1)),
+      )(x, np.int32(extra))
+
+    return run
+
+  def test_cp_async_untiled_slice_sums_its_base(self):
+    # Row 1 at column 3 of a (2, 1025) bf16 array: each part of the base alone
+    # is odd, their sum, 1028 elements, aligned to 8 bytes.
+    x = np.arange(2 * 1025, dtype=np.float32).reshape(2, 1025)
+    x = x.astype(jnp.bfloat16)
+    run = self._copied_untiled(
+        x, (512,), lambda ctx, src, extra: (src, (1, ds(3, 512)))
+    )
+    np.testing.assert_array_equal(run(0), x[1, 3:515])
+
+  def test_cp_async_untiled_slice_of_a_subview(self):
+    # A subview at element 1 sliced at element 3: the base, 4 elements, aligned.
+    x = np.arange(1025, dtype=np.float32)
+
+    def slices_of(ctx, src, extra):
+      del ctx, extra
+      return memref_slice(src, ds(1, 1024)), (ds(3, 512),)
+
+    run = self._copied_untiled(x, (512,), slices_of)
+    np.testing.assert_array_equal(run(0), x[4:516])
+
+  def test_cp_async_untiled_slice_at_a_loaded_offset(self):
+    # A column offset loaded from memory: known only as a multiple of 1, so f32
+    # copies 4 bytes a transfer, at any offset.
+    x = np.arange(64 * 256, dtype=np.float32).reshape(64, 256)
+
+    def slices_of(ctx, src, extra):
+      del ctx
+      offset = arith.index_cast(ir.IndexType.get(), extra)
+      return src, (ds(0, 64), ds(offset, 128))
+
+    run = self._copied_untiled(x, (64, 128), slices_of)
+    for offset in (0, 1, 3):
+      np.testing.assert_array_equal(run(offset), x[:, offset:offset + 128])
+
+  def test_cp_async_untiled_slice_at_a_loop_index(self):
+    # A column offset from a loop's index, a block argument: known only as a
+    # multiple of 1, so f32 copies 4 bytes a transfer.
+    x = np.arange(64 * 256, dtype=np.float32).reshape(64, 256)
+    index = ir.IndexType.get()
+
+    def kernel(ctx, src, dst, scratch):
+      tmp, barrier = scratch
+
+      @fori(c(1, index), ())
+      def _(step, _):
+        ctx.async_copy(
+            src_ref=src,
+            dst_ref=tmp,
+            gmem_slice=(ds(0, 64), ds(arith.addi(step, c(1, index)), 128)),
+            implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+            barrier=barrier,
+        )
+        barrier.wait()
+        return ()
+
+      copy(tmp, dst)
+
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        jax.ShapeDtypeStruct((64, 128), x.dtype),
+        (jax.ShapeDtypeStruct((64, 128), x.dtype),
+         mgpu.Barrier(arrival_count=1)),
+    )(x)
+    np.testing.assert_array_equal(y, x[:, 1:129])
+
+  def test_cp_async_untiled_slice_refuses_a_loaded_bf16_offset(self):
+    # bf16 at a loaded column offset is known to be only 2-byte aligned: no
+    # transfer of 4 bytes or more is safe at every offset.
+    x = np.zeros((64, 256), jnp.bfloat16)
+
+    def slices_of(ctx, src, extra):
+      del ctx
+      offset = arith.index_cast(ir.IndexType.get(), extra)
+      return src, (ds(0, 64), ds(offset, 128))
+
+    run = self._copied_untiled(x, (64, 128), slices_of)
+    with self.assertRaisesRegex(NotImplementedError, "aligned to at least 4"):
+      run(0)
+
+  def test_cp_async_untiled_slice_refuses_misaligned_rows(self):
+    # bf16 rows of an odd pitch start 2-byte aligned: no transfer of 4 bytes
+    # or more keeps every address aligned.
+    full_shape, slices = (64, 257), (slice(0, 64), slice(0, 128))
+    dtype = jnp.bfloat16
+
+    def kernel(ctx, src, dst, scratch):
+      tmp, barrier = scratch
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          gmem_slice=slices,
+          implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          barrier=barrier,
+      )
+      barrier.wait()
+      copy(tmp, dst)
+
+    x = np.zeros(full_shape, dtype)
+    with self.assertRaisesRegex(NotImplementedError, "aligned to at least 4"):
+      mgpu.as_gpu_kernel(
+          kernel,
+          (1, 1, 1),
+          (128, 1, 1),
+          x,
+          jax.ShapeDtypeStruct((64, 128), dtype),
+          (jax.ShapeDtypeStruct((64, 128), dtype),
+           mgpu.Barrier(arrival_count=1)),
+      )
+
+
 
 class BarrierTest(TestCase):
 
