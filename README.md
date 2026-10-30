@@ -5,7 +5,7 @@ has them, one branch a release: `vX.Y.Z-cache-key-pool-fingerprints`, the releas
 the fixes on top, versioned `X.Y.Z.postN`. Each fix is also sent upstream, and is dropped from the stack
 once a release holds it.
 
-Each family of fixes the stack carries, at 0.12.0.1.post34 (`gs/post34`, 68459a6fc), with what upstream holds
+Each family of fixes the stack carries, at 0.12.0.1.post36 (`gs/post36`, b0824fe52), with what upstream holds
 (jax-ml/jax `main` at b2fbcb706, 2026-10-29) and when it leaves the stack. Dew's ledger row, where one names it,
 in brackets.
 
@@ -30,6 +30,9 @@ in brackets.
 | Mosaic GPU CP_ASYNC: a squeezed dimension between sliced ones under a tile transform (4f7868935) [2078] | no | upstream squeezes before the tile transform |
 | Pallas Mosaic GPU `emit_pipeline`: ring slots carried (84547ea19) | no | a release carries them |
 | Pallas Mosaic GPU interpreter: a thread map's constants and inputs moved once (2e522efea) [1850] | no | upstream's `thread_map.py` does |
+| Pallas Mosaic GPU interpreter: its own callbacks take the host's NumPy arrays, no `device_put` a call (6c25cdff3); the public `io_callback` unchanged | no | upstream's interpreter skips the placement |
+| Persistent cache: an entry written aside and renamed into place, so a reader beside its writer sees it whole or not at all (7c6ce00e8) | no | upstream's `LRUCache.put` writes atomically |
+| `JAX_EXPLAIN_CACHE_MISSES` reads a trace keyed by keyword, as Pallas Triton's reductions trace their bodies (360a29dc6) [2302] | no | upstream's explainer reads keyword keys |
 
 Fixes the stack carried and dropped, net zero at post34: the multi-process topology fingerprint exchange
 [1731, 1689] (dropped in f30bea7b8), the `linear_call` patches [1690] (d302b6449), Splash's
