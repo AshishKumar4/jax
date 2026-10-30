@@ -7458,6 +7458,17 @@ def _ragged_dot_general_lower(
     shaped = core.ShapedArray(shape, aval.dtype)
     return mlir.reshape(ctx, operand, shaped), shaped
 
+  if sizes_aval.ndim == 1 and mode == RaggedDotMode.RAGGED_NONCONTRACTING:
+    prefix = _ragged_dot_prefix_dims(
+        mode, lhs_aval.ndim, ragged_dim, lhs_batch, lhs_contracting)
+    if prefix:
+      # The native noncontracting rewrite leaves batch axes in place when
+      # inserting the group axis, so materialize its declared prefix first.
+      sizes_aval = core.ShapedArray(
+          (*[lhs_aval.shape[dim] for dim in prefix], *sizes_aval.shape), sizes_aval.dtype)
+      group_sizes = mlir.broadcast_in_dim(
+          ctx, group_sizes, sizes_aval, broadcast_dimensions=(len(prefix),))
+
   if sizes_aval.ndim > 1:
     # CHLO and XLA's ragged mask expansion broadcast group_sizes' prefix on
     # physically leading axes. Preserve its declared prefix order there;
