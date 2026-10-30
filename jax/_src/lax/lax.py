@@ -8580,7 +8580,9 @@ def _pad_transpose(t, operand, padding_value, *, padding_config):
     def t_op():
       unpad_config = safe_zip(np.negative(lo), np.negative(hi),
                               np.zeros_like(interior))
-      unpadded = pad(t, np.array(0., t.dtype), unpad_config)
+      # The cotangent's own zero, a wide one too (a float64 pad traced under jax.enable_x64,
+      # transposed outside it), which a NumPy constant of its dtype would narrow.
+      unpadded = pad(t, _zero(t), unpad_config)
       return slicing.slice(unpadded, list(np.zeros_like(lo)), unpadded.shape,
                            list(np.add(interior, 1)))
 
@@ -10993,13 +10995,17 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
 
 
 def _balanced_cmp(x, y):
-  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN
+  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN, in x's dtype: a wide one (a float64 max traced
+  # under jax.enable_x64, differentiated outside it) is the trace's, kept as stated, from constants
+  # exact in the narrow one.
   gt_mask = gt(x, y)
   eq_mask = eq(x, y)
-  ones = full_like(gt_mask, 1, dtype=x.dtype)
-  zeros = full_like(gt_mask, 0, dtype=x.dtype)
-  half = full_like(gt_mask, 0.5, dtype=x.dtype)
-  return select(gt_mask, ones, select(eq_mask, half, zeros))
+  dtype = dtypes.check_and_canonicalize_dtype_of(np.dtype(x.dtype), 'max', x, y)
+  narrow = dtypes.canonicalize_dtype(dtype)
+  def filled(value):
+    constant = full_like(gt_mask, value, dtype=narrow)
+    return constant if dtype == narrow else _convert_element_type(constant, dtype)
+  return select(gt_mask, filled(1), select(eq_mask, filled(0.5), filled(0)))
 
 
 def _eq_meet(a, b):
