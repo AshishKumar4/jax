@@ -1563,12 +1563,40 @@ class LaunchContext:
             if bytes_per_transfer == 16
             else nvvm.LoadCacheModifierKind.CA
         )
+        # A slice of a wider array is strided in GMEM: the element at each
+        # transfer's row-major position in SMEM is at that position's offset by
+        # the slice's strides. Singleton dimensions take no part in contiguity.
+        shape = tuple(smem_ref.type.shape)
+        strided = any(
+            size != 1 and stride != contiguous
+            for size, stride, contiguous in zip(
+                shape, gmem_strides, utils.get_contiguous_strides(shape),
+                strict=True,
+            )
+        )
+        if strided and (gmem_strides[-1] != 1 or shape[-1] % layout.vec_size):
+          raise NotImplementedError(
+              "Untiled CP_ASYNC copies of a strided slice need its minor"
+              " dimension contiguous and a multiple of a transfer's vector"
+          )
         for linear_idx in layout.linear_thread_idxs():
           idx = arith.index_castui(i32, linear_idx)
+          gmem_idx = idx
+          if strided:
+            gmem_idx, remaining = c(0, i64), arith.index_castui(i64, linear_idx)
+            for size, stride in reversed(
+                list(zip(shape, gmem_strides, strict=True))
+            ):
+              coordinate = arith.remui(remaining, c(size, i64))
+              remaining = arith.divui(remaining, c(size, i64))
+              gmem_idx = arith.addi(
+                  gmem_idx, arith.muli(coordinate, c(stride, i64))
+              )
           if offset_scale > 1:
             idx = arith.divui(idx, c(offset_scale, i32))
+            gmem_idx = arith.divui(gmem_idx, c(offset_scale, gmem_idx.type))
           smem_ptr = utils.getelementptr(smem_base_ptr, [idx], gep_type)
-          gmem_ptr = utils.getelementptr(gmem_base_ptr, [idx], gep_type)
+          gmem_ptr = utils.getelementptr(gmem_base_ptr, [gmem_idx], gep_type)
           nvvm.cp_async_shared_global(
               smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
           )
