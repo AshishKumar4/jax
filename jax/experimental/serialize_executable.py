@@ -19,6 +19,7 @@ import pickle
 import io
 
 import jax
+from jax._src import compilation_cache
 from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 from collections.abc import Sequence
@@ -74,9 +75,10 @@ def deserialize_and_load(serialized,
           'execution devices client: '
           f'{(device_backend.platform, device_backend.platform_version)}')
 
-  (unloaded_executable, args_info_flat,
-   no_kwargs) = _JaxPjrtUnpickler(
-       io.BytesIO(serialized), backend, execution_devices).load()
+  unpickler = _JaxPjrtUnpickler(
+      io.BytesIO(serialized), backend, execution_devices)
+  unloaded_executable, args_info_flat, no_kwargs = unpickler.load()
+  unloaded_executable.compilation_metadata = unpickler.compilation_metadata
 
   args_info = in_tree.unflatten(args_info_flat)
 
@@ -106,6 +108,7 @@ class _JaxPjrtUnpickler(pickle.Unpickler):
   def __init__(self, file, backend, execution_devices=None):
     super().__init__(file)
     self.backend = backend
+    self.compilation_metadata = compilation_cache.ExecutableMetadata()
     if execution_devices is None:
       execution_devices = backend.devices()
     else:
@@ -121,8 +124,10 @@ class _JaxPjrtUnpickler(pickle.Unpickler):
 
   def persistent_load(self, pid):
     if pid[0] == 'exec':
-      return self.backend.deserialize_executable(
+      executable = self.backend.deserialize_executable(
           pid[1], executable_devices=self.execution_devices)
+      self.compilation_metadata.record(pid[1])
+      return executable
     if pid[0] == 'device':
       return self.devices_by_id[pid[1]]
     if pid[0] == 'client':

@@ -441,6 +441,7 @@ def compile_or_get_cached(
     host_callbacks: Sequence[Any],
     executable_devices: xc.DeviceList,
     pgle_profiler: profiler.PGLEProfiler | None = None,
+    *, artifact: compilation_cache.ExecutableMetadata | None = None,
 ) -> xc.LoadedExecutable:
   sym_name = computation.operation.attributes['sym_name']
   module_name = ir.StringAttr(sym_name).value
@@ -477,7 +478,7 @@ def compile_or_get_cached(
   cache_retrieval_start = time.monotonic()
   retrieved_executable, retrieved_compile_time = _cache_read(
       module_name, cache_key, compile_options, backend, executable_devices,
-      host_callbacks)
+      host_callbacks, artifact=artifact)
   cache_retrieval_time = time.monotonic() - cache_retrieval_start
 
   if retrieved_executable is not None:
@@ -509,7 +510,8 @@ def compile_or_get_cached(
         distributed.global_state.client,
         module_name,
         cache_key,
-        min_device_process_id
+        min_device_process_id,
+        artifact=artifact,
     )
   else:
     log_persistent_cache_miss(module_name, cache_key)
@@ -521,6 +523,7 @@ def compile_or_get_cached(
         host_callbacks,
         module_name,
         cache_key,
+        artifact=artifact,
     )
 
 
@@ -724,12 +727,18 @@ def _compile_and_share_module(
     global_client: lib._jax.DistributedRuntimeClient,
     module_name: str,
     cache_key: str,
-    first_process_id: int
+    first_process_id: int,
+    *, artifact: compilation_cache.ExecutableMetadata | None = None,
 ) -> xc.LoadedExecutable:
   share_timeout = config.share_binary_between_hosts_timeout_ms.value
 
   if cache_key in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
-    return _compile_and_share_module.modules_cache[cache_key]  # pyrefly: ignore[missing-attribute]
+    executable, digest = _compile_and_share_module.modules_cache[cache_key]  # pyrefly: ignore[missing-attribute]
+    if artifact is not None:
+      artifact.serialized_digest = digest
+    return executable
+
+  artifact = artifact if artifact is not None else compilation_cache.ExecutableMetadata()
 
   if distributed.global_state.process_id == first_process_id:
     logger.debug("Process %d compiling and sharing module: %s",
@@ -742,8 +751,11 @@ def _compile_and_share_module(
         host_callbacks,
         module_name,
         cache_key,
+        artifact=artifact,
     )
     serialized_executable = backend.serialize_executable(executable)
+    if artifact.serialized_digest is None:
+      artifact.record(serialized_executable)
     serialized_executable = compilation_cache.compress_executable(
         serialized_executable
     )
@@ -760,8 +772,10 @@ def _compile_and_share_module(
     executable = backend.deserialize_executable(
         serialized_executable, executable_devices, compile_options,
         host_callbacks)
+    artifact.record(serialized_executable)
 
-  _compile_and_share_module.modules_cache[cache_key] = executable  # pyrefly: ignore[missing-attribute]
+  _compile_and_share_module.modules_cache[cache_key] = (  # pyrefly: ignore[missing-attribute]
+      executable, artifact.serialized_digest)
   return executable
 
 
@@ -776,13 +790,14 @@ def _compile_and_write_cache(
     host_callbacks: Sequence[Any],
     module_name: str,
     cache_key: str,
+    *, artifact: compilation_cache.ExecutableMetadata | None = None,
 ) -> xc.LoadedExecutable:
   start_time = time.monotonic()
   executable = backend_compile_and_load(
       backend, computation, executable_devices, compile_options, host_callbacks
   )
   compile_time = time.monotonic() - start_time
-  _cache_write(cache_key, compile_time, module_name, backend, executable)
+  _cache_write(cache_key, compile_time, module_name, backend, executable, artifact=artifact)
   return executable
 
 
@@ -812,6 +827,7 @@ def _cache_read(
     module_name: str, cache_key: str, compile_options: xc.CompileOptions,
     backend: xc.Client, executable_devices: xc.DeviceList,
     host_callbacks: Sequence[Any],
+    *, artifact: compilation_cache.ExecutableMetadata | None = None,
 ) -> tuple[xc.LoadedExecutable | None, int | None]:
   """Looks up the `computation` and it's compilation time in the persistent
   compilation cache repository.
@@ -819,7 +835,7 @@ def _cache_read(
   try:
     return compilation_cache.get_executable_and_time(
         cache_key, compile_options, backend, executable_devices,
-        host_callbacks)
+        host_callbacks, artifact=artifact)
   except Exception as ex:
     if _should_raise_persistent_cache_error(ex):
       raise
@@ -833,7 +849,8 @@ def _cache_write(cache_key: str,
                  compile_time_secs: float,
                  module_name: str,
                  backend: xc.Client,
-                 executable: xc.LoadedExecutable) -> None:
+                 executable: xc.LoadedExecutable, *,
+                 artifact: compilation_cache.ExecutableMetadata | None = None) -> None:
   """Writes the `serialized_computation` and its compilation time to the
   persistent compilation cache repository.
   """
@@ -863,7 +880,7 @@ def _cache_write(cache_key: str,
 
   try:
     compilation_cache.put_executable_and_time(
-        cache_key, module_name, executable, backend, int(compile_time_secs))
+        cache_key, module_name, executable, backend, int(compile_time_secs), artifact=artifact)
   except Exception as ex:
     if _should_raise_persistent_cache_error(ex):
       raise

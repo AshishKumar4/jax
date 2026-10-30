@@ -220,6 +220,9 @@ class Executable:
     """
     return self.xla_extension_executable()
 
+  def _executable_digest(self) -> bytes:
+    raise NotImplementedError("Native executable identity is unavailable")
+
 
 class Lowering:
 
@@ -846,6 +849,14 @@ class Compiled(Stage):
     runtime.
     """
     return self._executable.runtime_executable()
+
+  def _executable_digest(self) -> bytes:
+    """SHA-256 of the serialized native executable, not its input IR.
+
+    Cache loads retain the digest of the exact bytes that were loaded. Without
+    a cache artifact, the executable is serialized once on first access.
+    """
+    return self._executable._executable_digest()
 
   def _input_shardings_flat(self):
     nr_const_args = len(self._params.const_args)
