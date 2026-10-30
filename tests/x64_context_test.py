@@ -332,15 +332,17 @@ class X64ContextTests(jtu.JaxTestCase):
     np.testing.assert_array_equal(gradient, expected_gradient)
 
   def test_a_wide_max_and_pad_keep_their_dtypes_under_later_derivatives(self):
-    # A float64 maximum and pad traced in an x64 scope, staged (as `lax.platform_dependent` stages
-    # one) and differentiated outside that scope, forward and in reverse twice: max's derivative
-    # weights and pad's transposed zero keep float64, and no truncation warning fires.
+    # A float64 maximum, row maximum and pad traced in an x64 scope, staged (as
+    # `lax.platform_dependent` stages one) and differentiated outside that scope, forward and in
+    # reverse twice: max's and reduce_max's derivative weights and pad's transposed zero keep float64,
+    # and no truncation warning fires.
     a = np.array([1., 2., 3.], np.float32)
     b = np.array([3., 2., 1.], np.float32)
 
     def wide(x, y):
       with jax.enable_x64(True):
         larger = jnp.maximum(x.astype(jnp.float64), y.astype(jnp.float64))
+        larger = larger + jnp.max(larger) - jnp.max(larger)
         return lax.pad(larger, jnp.zeros((), jnp.float64), [(1, 1, 0)]).astype(jnp.float32)
 
     def staged(x):
