@@ -7763,14 +7763,17 @@ def _ragged_dot_general_lower(
 
   lhs, rhs, accumulation_aval, _ = _handle_dot_precision(
       ctx.replace(avals_in=(lhs_aval, rhs_aval, sizes_aval)), lhs, rhs, precision, platform)
-  if (summed_axes and not isinstance(precision, (DotAlgorithm, DotAlgorithmPreset))
-      and dtypes.issubdtype(accumulation_aval.dtype, np.floating)
-      and _bit_width(accumulation_aval.dtype) < 32):
-    # Tensor-core products accumulate in fp32. Keep the partials and their sum
-    # there too, so a 16-bit result rounds once, not once per prefix slice.
-    accumulation_aval = aval_out.update(dtype=np.dtype(np.float32))
-  else:
-    accumulation_aval = aval_out.update(dtype=accumulation_aval.dtype)
+  partial_dtype = accumulation_aval.dtype
+  if summed_axes:
+    declared = (precision.accumulation_type
+                if isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) else None)
+    if declared is not None:
+      partial_dtype = np.dtype(declared)
+    elif dtypes.issubdtype(partial_dtype, np.floating) and _bit_width(partial_dtype) < 32:
+      partial_dtype = np.dtype(np.float32)
+    # Keep partials and their sum in the accumulator's type, including a named
+    # fp32-accumulating preset with a 16-bit output. Round only after summing.
+  accumulation_aval = aval_out.update(dtype=partial_dtype)
 
   ragged_dot_dnums = chlo.RaggedDotDimensionNumbers.get(
       lhs_batching_dimensions=list(lhs_batch),

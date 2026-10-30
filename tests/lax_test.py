@@ -5711,11 +5711,21 @@ class RaggedTest(jtu.JaxTestCase):
             self.assertEqual(gradient.sharding, sharding)
         actual_loss, expected_loss = along(actual_grad), along(expected_grad)
 
-  @parameterized.product(dtype=(jnp.float16, jnp.bfloat16), shardy=(False, True))
+  @parameterized.product(
+      case=((jnp.float16, None), (jnp.bfloat16, None),
+            (jnp.float16, lax.DotAlgorithmPreset.DEFAULT),
+            (jnp.bfloat16, lax.DotAlgorithmPreset.DEFAULT),
+            (jnp.float16, lax.DotAlgorithmPreset.F16_F16_F32),
+            (jnp.bfloat16, lax.DotAlgorithmPreset.BF16_BF16_F32)),
+      shardy=(False, True))
   @jtu.with_explicit_mesh((1,), ("d",))
-  def test_ragged_dot_prefix_rounds_once(self, dtype, shardy, mesh):
+  def test_ragged_dot_prefix_rounds_once(self, case, shardy, mesh):
     # Rounding each prefix's partial sum first would lose the residual in
     # (1 + residual) + (-1). The final result is exactly representable.
+    dtype, precision = case
+    if (precision in (lax.DotAlgorithmPreset.F16_F16_F32, lax.DotAlgorithmPreset.BF16_BF16_F32)
+        and jtu.test_device_matches(["cpu"])):
+      self.skipTest("CPU does not support these named algorithms with 16-bit results")
     residual = 2.0 ** (-jnp.finfo(dtype).nmant - 1)
     with config.use_shardy_partitioner(shardy):
       x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
@@ -5723,7 +5733,7 @@ class RaggedTest(jtu.JaxTestCase):
       sizes = jnp.full((1, 2, 1), 2, jnp.int32)
       dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
       actual = jax.jit(lambda a, b: lax.ragged_dot_general(
-          a, b, sizes, dims, out_sharding=jax.P()))(x, y)
+          a, b, sizes, dims, precision=precision, out_sharding=jax.P()))(x, y)
       self.assertArraysEqual(actual, jnp.full((1, 1, 1, 1), residual, dtype))
 
   def check_wsc_in_lowered(self, text):
