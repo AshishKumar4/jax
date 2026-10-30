@@ -7060,6 +7060,7 @@ def _ragged_dot_general_jvp_rule(
       ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
       precision=precision,
       preferred_element_type=preferred_element_type,
+      out_sharding=out_sharding,
   )
 
   # tangent
@@ -7071,6 +7072,7 @@ def _ragged_dot_general_jvp_rule(
           ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
           precision=precision,
           preferred_element_type=preferred_element_type,
+          out_sharding=out_sharding,
       )
       if type(dx) is not ad_util.Zero
       else _zeros(primal_out)
@@ -7083,6 +7085,7 @@ def _ragged_dot_general_jvp_rule(
           ragged_dot_dimension_numbers=ragged_dot_dimension_numbers,
           precision=precision,
           preferred_element_type=preferred_element_type,
+          out_sharding=out_sharding,
       )
       if type(dy) is not ad_util.Zero
       else _zeros(primal_out)
@@ -7117,33 +7120,36 @@ def _ragged_dot_general_transpose_rule(
       x_ndim, ragged_dot_dimension_numbers
   )
 
-  unimplemented = lambda fn_name, ragged_dot_mode: NotImplementedError(
-      f'Unimplemented {fn_name} for ragged dot general in mode '
-      f'{ragged_dot_mode.name}.'
-  )
-
   def grad_x_dims():
     match mode:
-      case RaggedDotMode.RAGGED_NONCONTRACTING:
+      case RaggedDotMode.RAGGED_NONCONTRACTING | RaggedDotMode.RAGGED_BATCH:
         ans_batch, _, ans_y = ranges_like(x_batch, x_kept, y_kept)
+        ragged_dim = (len(x_batch) + x_kept.index(lhs_ragged_dim)
+                      if mode == RaggedDotMode.RAGGED_NONCONTRACTING
+                      else x_batch.index(lhs_ragged_dim))
         dims = RaggedDotDimensionNumbers(
             dot_dimension_numbers=((ans_y, y_kept), (ans_batch, y_batch)),
-            lhs_ragged_dimensions=[
-                len(x_batch) + x_kept.index(lhs_ragged_dim)
-            ],
+            lhs_ragged_dimensions=[ragged_dim],
             rhs_group_dimensions=y_group,
         )
         x_contract_sorted_by_y = list(
             np.take(x_contract, np.argsort(y_contract))
         )
         unsorted_axes = list(x_batch) + x_kept + x_contract_sorted_by_y
-      case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH | _:
-        raise unimplemented('grad_x_dims', mode)
+      case RaggedDotMode.RAGGED_CONTRACTING:
+        lhs_batch, _, lhs_kept = ranges_like(y_batch, y_contract, y_kept)
+        _, ans_batch, _, ans_y = ranges_like((0,), x_batch, x_kept, y_kept)
+        dims = RaggedDotDimensionNumbers(
+            dot_dimension_numbers=((lhs_kept, ans_y), (lhs_batch, ans_batch)),
+            lhs_ragged_dimensions=[len(y_batch) + x_contract.index(lhs_ragged_dim)],
+            rhs_group_dimensions=[0],
+        )
+        unsorted_axes = list(x_batch) + list(x_contract) + x_kept
     return dims, unsorted_axes
 
   def grad_y_dims():
     match mode:
-      case RaggedDotMode.RAGGED_NONCONTRACTING:
+      case RaggedDotMode.RAGGED_NONCONTRACTING | RaggedDotMode.RAGGED_BATCH:
         ans_batch, ans_x, _ = ranges_like(x_batch, x_kept, y_kept)
         dims = RaggedDotDimensionNumbers(
             dot_dimension_numbers=((x_kept, ans_x), (x_batch, ans_batch)),
@@ -7156,30 +7162,50 @@ def _ragged_dot_general_transpose_rule(
         unsorted_axes = (
             list(y_group) + list(y_batch) + y_contract_sorted_by_x + y_kept
         )
-      case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH | _:
-        raise unimplemented('grad_y_dims', mode)
+      case RaggedDotMode.RAGGED_CONTRACTING:
+        lhs_batch, _, lhs_kept = ranges_like(x_batch, x_contract, x_kept)
+        _, ans_batch, ans_x, _ = ranges_like((0,), x_batch, x_kept, y_kept)
+        dims = RaggedDotDimensionNumbers(
+            dot_dimension_numbers=((lhs_kept, ans_x), (lhs_batch, ans_batch)),
+            lhs_ragged_dimensions=[len(x_batch) + x_contract.index(lhs_ragged_dim)],
+            rhs_group_dimensions=[0],
+        )
+        unsorted_axes = list(y_batch) + list(y_contract) + y_kept
     return dims, unsorted_axes
 
-  def _ragged_dot_grad(lhs, rhs, dims_fn, aval):
+  def _ragged_dot_grad(lhs, rhs, dims_fn, aval, lhs_permutation=None):
     dims, unsorted_axes = dims_fn()
+    if lhs_permutation is not None:
+      # Contracting-mode adjoints route the primal's ragged dimension against
+      # the cotangent's leading group axis. Keep the original contracting-pair
+      # order so group_sizes retains its batch/contract-prefix interpretation.
+      lhs = transpose(lhs, tuple(lhs_permutation))
+    sharding = _transpose_sharding_rule(aval, permutation=tuple(unsorted_axes))
+    if sharding.mesh.empty:
+      sharding = core.get_cur_mesh_sharding(P(*[None] * aval.ndim))
     ragged_dot_general_out = ragged_dot_general(
           lhs, rhs, group_sizes, dims, precision=precision,
           preferred_element_type=preferred_element_type,
-          group_offset=group_offset, out_sharding=aval.sharding)
+          group_offset=group_offset, out_sharding=sharding)
     result = transpose(ragged_dot_general_out, tuple(np.argsort(unsorted_axes)))
     if result.dtype != aval.dtype:
       result = _convert_element_type(result, aval.dtype, aval.weak_type)
     return result
 
+  contracting = mode == RaggedDotMode.RAGGED_CONTRACTING
   x_bar = (
       None
       if ad.is_undefined_primal(y)
-      else _ragged_dot_grad(ct, y, grad_x_dims, x.aval)
+      else _ragged_dot_grad(
+          y if contracting else ct, ct if contracting else y, grad_x_dims, x.aval,
+          list(y_batch) + list(y_contract) + y_kept if contracting else None)
   )
   y_bar = (
       None
       if ad.is_undefined_primal(x)
-      else _ragged_dot_grad(x, ct, grad_y_dims, y.aval)
+      else _ragged_dot_grad(
+          x, ct, grad_y_dims, y.aval,
+          list(x_batch) + list(x_contract) + x_kept if contracting else None)
   )
   return x_bar, y_bar, None
 
