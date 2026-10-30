@@ -53,6 +53,7 @@ from jax._src import array
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
+from jax._src import flattree as ft
 from jax._src import state
 from jax._src import linear_util as lu
 from jax._src import test_util as jtu
@@ -5176,6 +5177,22 @@ class APITest(jtu.JaxTestCase):
     self.assertIn("TRACING CACHE MISS", msg)
     self.assertIn("never seen function", msg)
     self.assertNotIn("explanation unavailable!", msg)
+
+  @jtu.thread_unsafe_test()  # logging is not thread-safe
+  def test_cache_miss_explanations_of_a_trace_given_its_debug_info_by_keyword(self):
+    # Pallas Triton's reduction lowering traces its combine body this way; an
+    # earlier trace of the same body, keyed with debug_info among its
+    # keywords, is explained, not failed on.
+    def body(x):
+      return x + 1
+
+    debug = api_util.debug_info("test", body, (1.,), {})
+    for dtype in (np.float32, np.int32):
+      avals = ft.flatten(((core.ShapedArray((), dtype),), {}))
+      with config.explain_cache_misses(True):
+        with self.assertLogs(level="WARNING") as cm:
+          pe.trace_to_jaxpr(body, avals, debug_info=debug)
+    self.assertIn("all previously seen cache keys differ", cm.output[0])
 
   @jtu.thread_unsafe_test()  # logging is not thread-safe
   def test_cache_miss_explanations_other_in_tree(self):
