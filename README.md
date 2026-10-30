@@ -5,7 +5,7 @@ has them, one branch a release: `vX.Y.Z-cache-key-pool-fingerprints`, the releas
 the fixes on top, versioned `X.Y.Z.postN`. Each fix is also sent upstream, and is dropped from the stack
 once a release holds it.
 
-Each family of fixes the stack carries, at 0.12.0.1.post38 (`gs/post38`, 394bb9701), with what upstream holds
+Each family of fixes the stack carries, at 0.12.0.1.post38 (`release/0.12.0.1.post38`, 394bb9701), with what upstream holds
 (jax-ml/jax `main` at b2fbcb706, 2026-10-29) and when it leaves the stack. Dew's ledger row, where one names it,
 in brackets.
 
