@@ -5392,7 +5392,8 @@ class CompositeTest(jtu.JaxTestCase):
 class RaggedTest(jtu.JaxTestCase):
 
   @parameterized.product(
-      mode=("noncontracting", "contracting", "contracting_permuted", "batch", "batch_permuted"),
+      mode=("noncontracting", "noncontracting_permuted", "contracting", "contracting_permuted",
+            "batch", "batch_permuted"),
       explicit_sharding=(False, True))
   def test_ragged_dot_higher_order(self, mode, explicit_sharding):
     if explicit_sharding and jax.device_count() < 2:
@@ -5409,6 +5410,16 @@ class RaggedTest(jtu.JaxTestCase):
                 (rows[:, None] < ends[None, :])).astype(x.dtype)
         dims = lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
         reference = lambda a, b: jnp.einsum("rg,rk,gkn->rn", mask, a, b)
+      elif mode == "noncontracting_permuted":
+        x = jnp.asarray(rng.normal(size=(2, 2, 2, 6, 3)) / 4)
+        y = jnp.asarray(rng.normal(size=(4, 3, 2, 2)) / 4)
+        sizes = jnp.array([[[2, 0, 3], [1, 2, 2]],
+                           [[0, 4, 1], [3, 1, 1]]], jnp.int32)
+        ends = jnp.cumsum(sizes, axis=-1, dtype=sizes.dtype)
+        rows = jnp.arange(6, dtype=sizes.dtype)[None, None, None, :]
+        mask = ((rows >= (ends - sizes)[..., None]) & (rows < ends[..., None])).astype(x.dtype)
+        dims = lax.RaggedDotDimensionNumbers((((0,), (2,)), ((2,), (3,))), (3,), (1,))
+        reference = lambda a, b: jnp.einsum("kpbrm,ngkb,bpgr->bprmn", a, b, mask)
       elif mode.startswith("contracting"):
         x = jnp.asarray(rng.normal(size=(2, 3, 2, 6)) / 4)
         y = jnp.asarray(rng.normal(size=(2, 6, 4, 2)) / 4)
