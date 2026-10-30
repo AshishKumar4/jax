@@ -737,6 +737,36 @@ def _opaque_zero(predicate: ir.Value) -> ir.Value:
   )
 
 
+def _known_multiple(value) -> int:
+  """The largest power of two an index `value` is known to be a multiple of.
+
+  It is read from the operations that define `value`: a constant's, a
+  product's of its operands', a sum's or a difference's common one; 0 where
+  `value` is a multiple of any (a zero). A value whose definition says nothing
+  (a loop's index, an offset loaded from memory) is taken as a multiple of
+  any, as the copy took every base before: a misaligned one faults.
+  """
+  if isinstance(value, int):
+    return value & -value
+  owner = value.owner
+  if not isinstance(owner, ir.Operation):
+    owner = getattr(owner, "operation", None)
+  if owner is None:
+    return 0
+  name = owner.name
+  operands = owner.operands
+  if name == "arith.constant":
+    known = ir.IntegerAttr(owner.attributes["value"]).value
+    return known & -known
+  if name in ("arith.index_cast", "arith.index_castui"):
+    return _known_multiple(operands[0])
+  if name == "arith.muli":
+    return _known_multiple(operands[0]) * _known_multiple(operands[1])
+  if name in ("arith.addi", "arith.subi"):
+    return math.gcd(_known_multiple(operands[0]), _known_multiple(operands[1]))
+  return 0
+
+
 @dataclasses.dataclass()
 class LaunchContext:
   module: ir.Module
@@ -1503,6 +1533,16 @@ class LaunchContext:
       gmem_offset = utils.dyn_dot(
           dyn_base_indices, [c(s, index) for s in transformed_strides]
       )
+      # The elements the slice's base offset is known to be a multiple of (0:
+      # of any).
+      base_multiple = functools.reduce(
+          math.gcd,
+          [
+              _known_multiple(i) * s
+              for i, s in zip(dyn_base_indices, transformed_strides)
+          ],
+          0,
+      )
       if offset_scale > 1:
         gmem_offset = arith.divui(gmem_offset, c(offset_scale, index))
       gmem_offset = arith.index_castui(i64, gmem_offset)
@@ -1549,6 +1589,35 @@ class LaunchContext:
           raise ValueError(
               "CP_ASYNC requires at least 4 bytes per transfer"
           )
+        # Each transfer's GMEM address must be aligned to its size: the vector
+        # divides the slice's contiguous suffix (singleton dimensions dropped,
+        # contiguous dimensions folded), every other dimension's GMEM stride,
+        # and the slice's base offset.
+        shape = tuple(smem_ref.type.shape)
+        _, ref_offset = ir.MemRefType(gmem_ref.type).get_strides_and_offset()
+        if ref_offset == ir.ShapedType.get_dynamic_stride_or_offset():
+          ref_offset = 1
+        suffix, folding = 1, True
+        multiple = math.gcd(base_multiple, ref_offset)
+        for size, stride in reversed(list(zip(shape, gmem_strides))):
+          if size == 1:
+            continue
+          if folding and stride == suffix:
+            suffix *= size
+          else:
+            folding = False
+            multiple = math.gcd(multiple, stride)
+        vec_size = layout.vec_size
+        while vec_size > 1 and (suffix % vec_size or multiple % vec_size):
+          vec_size //= 2
+        if vec_size * element_bitwidth < 32:
+          raise NotImplementedError(
+              "Untiled CP_ASYNC copies need every transfer's GMEM address"
+              " aligned to at least 4 bytes, but this slice's strides and base"
+              f" offset align only {vec_size * element_bitwidth // 8} bytes"
+          )
+        if vec_size != layout.vec_size:
+          layout = fa.WGStridedFragLayout(shape=shape, vec_size=vec_size)
         gmem_base_ptr = utils.memref_ptr(gmem_ref)
         gmem_base_ptr = llvm.addrspacecast(
             llvm.PointerType.get(address_space=1), gmem_base_ptr
@@ -1563,12 +1632,34 @@ class LaunchContext:
             if bytes_per_transfer == 16
             else nvvm.LoadCacheModifierKind.CA
         )
+        # A slice of a wider array is strided in GMEM: the element at each
+        # transfer's row-major position in SMEM is at that position's offset by
+        # the slice's strides. Singleton dimensions take no part in contiguity.
+        strided = any(
+            size != 1 and stride != contiguous
+            for size, stride, contiguous in zip(
+                shape, gmem_strides, utils.get_contiguous_strides(shape),
+                strict=True,
+            )
+        )
         for linear_idx in layout.linear_thread_idxs():
           idx = arith.index_castui(i32, linear_idx)
+          gmem_idx = idx
+          if strided:
+            gmem_idx, remaining = c(0, i64), arith.index_castui(i64, linear_idx)
+            for size, stride in reversed(
+                list(zip(shape, gmem_strides, strict=True))
+            ):
+              coordinate = arith.remui(remaining, c(size, i64))
+              remaining = arith.divui(remaining, c(size, i64))
+              gmem_idx = arith.addi(
+                  gmem_idx, arith.muli(coordinate, c(stride, i64))
+              )
           if offset_scale > 1:
             idx = arith.divui(idx, c(offset_scale, i32))
+            gmem_idx = arith.divui(gmem_idx, c(offset_scale, gmem_idx.type))
           smem_ptr = utils.getelementptr(smem_base_ptr, [idx], gep_type)
-          gmem_ptr = utils.getelementptr(gmem_base_ptr, [idx], gep_type)
+          gmem_ptr = utils.getelementptr(gmem_base_ptr, [gmem_idx], gep_type)
           nvvm.cp_async_shared_global(
               smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
           )
