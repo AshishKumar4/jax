@@ -296,20 +296,18 @@ def planar_snake(
   num_full_tiles, last_tile_width = lax_divmod(minor_size, tile_width)
   is_full_tile = lin_idx < num_full_tiles * tile_size
 
-  # If `tile_width` is a power of 2, we branch, as we expect the first branch
-  # to be significantly faster. Otherwise, branchless is better.
   if tile_width_is_power_of_2:
     tile_idx, lin_idx_within_tile = lax_divmod(lin_idx, tile_size)
     # Keep the full-band operations distinct from the tail's division. With
     # two divmods, LLVM can select their divisors before dividing, turning a
     # constant power-of-two divide into a variable divide for every tile.
-    major, minor_within_tile = lax.cond(
-        is_full_tile,
-        lambda: (
+    major, minor_within_tile = jax.tree.map(
+        functools.partial(lax.select, is_full_tile),
+        (
             lax.shift_right_logical(lin_idx_within_tile, jnp.int32(tile_shift)),
             lax.bitwise_and(lin_idx_within_tile, tile_width - jnp.int32(1)),
         ),
-        lambda: lax_divmod(lin_idx_within_tile, last_tile_width),
+        lax_divmod(lin_idx_within_tile, lax.max(last_tile_width, jnp.int32(1))),
     )
   else:
 
