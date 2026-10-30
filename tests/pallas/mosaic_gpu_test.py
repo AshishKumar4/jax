@@ -10270,7 +10270,7 @@ class CoreMapTest(PallasTest, jtu.CudaArchSpecificTest):
       @pl.loop(0, count)
       def _(step):
         tile = plgpu.load(
-            x_ref.at[wg, step], (), layout=plgpu.Layout.WGMMA, optimized=False
+            x_ref.at[wg, step], layout=plgpu.Layout.WGMMA, optimized=False
         )
         o_ref[wg, step, :] = jnp.sum(tile, axis=0)
 
