@@ -5,7 +5,7 @@ has them, one branch a release: `vX.Y.Z-cache-key-pool-fingerprints`, the releas
 the fixes on top, versioned `X.Y.Z.postN`. Each fix is also sent upstream, and is dropped from the stack
 once a release holds it.
 
-Each family of fixes the stack carries, at 0.12.0.1.post37 (`gs/post37`, 65403b696), with what upstream holds
+Each family of fixes the stack carries, at 0.12.0.1.post38 (`gs/post38`, 394bb9701), with what upstream holds
 (jax-ml/jax `main` at b2fbcb706, 2026-10-29) and when it leaves the stack. Dew's ledger row, where one names it,
 in brackets.
 
@@ -32,6 +32,7 @@ in brackets.
 | Pallas Mosaic GPU interpreter: a thread map's constants and inputs moved once (2e522efea) [1850] | no | upstream's `thread_map.py` does |
 | Pallas Mosaic GPU interpreter: its own callbacks take the host's NumPy arrays, no `device_put` a call (6c25cdff3); the public `io_callback` unchanged | no | upstream's interpreter skips the placement |
 | Pallas Mosaic GPU snake traversal: a full power-of-two band as shift and mask, coordinates selected without branching (44eda26b6, d170290af, cd1f7681a) [2295] | no | upstream's `planar_snake` forms no runtime division |
+| Compiled executables keep the SHA-256 of their exact serialized bytes, taken at the persistent cache's write or read (`Compiled._executable_digest`; 44b18d1b1, 818d509de) [2600] | no | upstream exposes an executable's serialized digest |
 | Persistent cache: an entry written aside and renamed into place, so a reader beside its writer sees it whole or not at all (7c6ce00e8) | no | upstream's `LRUCache.put` writes atomically |
 | `JAX_EXPLAIN_CACHE_MISSES` reads a trace keyed by keyword, as Pallas Triton's reductions trace their bodies (360a29dc6) [2302] | no | upstream's explainer reads keyword keys |
 
