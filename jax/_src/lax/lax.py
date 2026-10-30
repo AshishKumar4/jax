@@ -7611,7 +7611,10 @@ def _ragged_dot_general_impl(
   )
   # TODO(pravnar): Permit other broadcastable shapes.
   if group_sizes.ndim == 1:
-    group_sizes = broadcast(group_sizes, [lhs.shape[i] for i in l_prefix])
+    prefix_spec = tuple(core.typeof(lhs).sharding.spec.partitions[i] for i in l_prefix)
+    group_sizes = broadcast(
+        group_sizes, [lhs.shape[i] for i in l_prefix],
+        out_sharding=core.typeof(lhs).sharding.update(spec=P(*prefix_spec, None)))
 
   match mode:
     case RaggedDotMode.RAGGED_NONCONTRACTING:
@@ -7676,39 +7679,83 @@ def _ragged_dot_general_lower(
     )
 
   del preferred_element_type  # Implied by the output aval
-  lhs, rhs, accumulation_aval, _ = _handle_dot_precision(
-      ctx, lhs, rhs, precision, platform
-  )
+  lhs_aval, rhs_aval, sizes_aval = ctx.avals_in
+  (aval_out,) = ctx.avals_out
   (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = (
       ragged_dot_dimension_numbers.dot_dimension_numbers
   )
   rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
   lhs_ragged_dims = ragged_dot_dimension_numbers.lhs_ragged_dimensions
+  mode, ragged_dim = _ragged_dot_mode_and_dim(
+      lhs_aval.ndim, ragged_dot_dimension_numbers)
 
-  def prefix_first(operand, prefix, dimensions):
-    rank = ir.RankedTensorType(operand.type).rank
-    permutation = tuple(prefix) + tuple(remaining(range(rank), prefix))
-    if permutation != tuple(range(rank)):
+  def prefix_first(operand, aval, prefix, dimensions):
+    permutation = tuple(prefix) + tuple(remaining(range(aval.ndim), prefix))
+    if permutation != tuple(range(aval.ndim)):
       operand = hlo.transpose(operand, mlir.dense_int_array(permutation))
-    return operand, tuple(tuple(permutation.index(dim) for dim in dims) for dims in dimensions)
+    aval = core.ShapedArray(tuple(aval.shape[dim] for dim in permutation), aval.dtype)
+    return operand, aval, tuple(tuple(permutation.index(dim) for dim in dims) for dims in dimensions)
 
-  if ctx.avals_in[2].ndim > 1:
+  def reshaped(operand, aval, shape):
+    shaped = core.ShapedArray(shape, aval.dtype)
+    return mlir.reshape(ctx, operand, shaped), shaped
+
+  if sizes_aval.ndim > 1:
     # CHLO and XLA's ragged mask expansion broadcast group_sizes' prefix on
     # physically leading axes. Preserve its declared prefix order there;
     # the relative order of kept dimensions, and hence the output, is unchanged.
-    mode, ragged_dim = _ragged_dot_mode_and_dim(
-        ctx.avals_in[0].ndim, ragged_dot_dimension_numbers)
     if mode == RaggedDotMode.RAGGED_CONTRACTING:
       rhs_ragged_dim = rhs_contracting[lhs_contracting.index(ragged_dim)]
       rhs_prefix = _ragged_dot_prefix_dims(
-          mode, ctx.avals_in[1].ndim, rhs_ragged_dim, rhs_batch, rhs_contracting)
-      rhs, (rhs_batch, rhs_contracting) = prefix_first(
-          rhs, rhs_prefix, (rhs_batch, rhs_contracting))
+          mode, rhs_aval.ndim, rhs_ragged_dim, rhs_batch, rhs_contracting)
+      rhs, rhs_aval, (rhs_batch, rhs_contracting) = prefix_first(
+          rhs, rhs_aval, rhs_prefix, (rhs_batch, rhs_contracting))
     if mode != RaggedDotMode.RAGGED_BATCH:
       lhs_prefix = _ragged_dot_prefix_dims(
-          mode, ctx.avals_in[0].ndim, ragged_dim, lhs_batch, lhs_contracting)
-      lhs, (lhs_batch, lhs_contracting, lhs_ragged_dims) = prefix_first(
-          lhs, lhs_prefix, (lhs_batch, lhs_contracting, lhs_ragged_dims))
+          mode, lhs_aval.ndim, ragged_dim, lhs_batch, lhs_contracting)
+      lhs, lhs_aval, (lhs_batch, lhs_contracting, lhs_ragged_dims) = prefix_first(
+          lhs, lhs_aval, lhs_prefix, (lhs_batch, lhs_contracting, lhs_ragged_dims))
+
+  result_shape = aval_out.shape
+  expanded_shape = None
+  summed_axes = ()
+  if platform == 'gpu' and mode == RaggedDotMode.RAGGED_CONTRACTING:
+    if sizes_aval.ndim == 1:
+      # The GPU rewriter finds the RHS ragged dimension correctly only when
+      # its contracting pair is first. Global group sizes permit reordering.
+      ragged_at = lhs_contracting.index(lhs_ragged_dims[0])
+      order = (ragged_at, *remaining(range(len(lhs_contracting)), (ragged_at,)))
+      lhs_contracting = tuple(lhs_contracting[i] for i in order)
+      rhs_contracting = tuple(rhs_contracting[i] for i in order)
+    else:
+      # Prefix-dependent groups cannot reorder their contracting prefix. Make
+      # it batch instead, then sum those partial products. One flattened batch
+      # also avoids the rewriter swapping, rather than rotating, the group axis.
+      prefix = sizes_aval.shape[:-1]
+      count, batches = len(prefix), len(lhs_batch)
+      flat = math.prod(prefix)
+      suffix = aval_out.shape[1 + batches:]
+      result_shape = (sizes_aval.shape[-1], flat, *suffix)
+      expanded_shape = (sizes_aval.shape[-1], *prefix, *suffix)
+      summed_axes = tuple(range(1 + batches, 1 + count))
+      lhs, lhs_aval = reshaped(lhs, lhs_aval, (flat, *lhs_aval.shape[count:]))
+      rhs, rhs_aval = reshaped(rhs, rhs_aval, (flat, *rhs_aval.shape[count:]))
+      group_sizes, sizes_aval = reshaped(group_sizes, sizes_aval, (flat, sizes_aval.shape[-1]))
+      lhs_contracting = tuple(dim - count + 1 for dim in lhs_contracting if dim >= count)
+      rhs_contracting = tuple(dim - count + 1 for dim in rhs_contracting if dim >= count)
+      lhs_ragged_dims = (lhs_ragged_dims[0] - count + 1,)
+      lhs_batch = rhs_batch = (0,)
+
+  lhs, rhs, accumulation_aval, _ = _handle_dot_precision(
+      ctx.replace(avals_in=(lhs_aval, rhs_aval, sizes_aval)), lhs, rhs, precision, platform)
+  if (summed_axes and not isinstance(precision, (DotAlgorithm, DotAlgorithmPreset))
+      and dtypes.issubdtype(accumulation_aval.dtype, np.floating)
+      and _bit_width(accumulation_aval.dtype) < 32):
+    # Tensor-core products accumulate in fp32. Keep the partials and their sum
+    # there too, so a 16-bit result rounds once, not once per prefix slice.
+    accumulation_aval = aval_out.update(dtype=np.dtype(np.float32))
+  else:
+    accumulation_aval = aval_out.update(dtype=accumulation_aval.dtype)
 
   ragged_dot_dnums = chlo.RaggedDotDimensionNumbers.get(
       lhs_batching_dimensions=list(lhs_batch),
@@ -7718,7 +7765,8 @@ def _ragged_dot_general_lower(
       lhs_ragged_dimensions=list(lhs_ragged_dims),
       rhs_group_dimensions=list(rhs_group_dims),
   )
-  acc_type = mlir.aval_to_ir_type(ctx.module_context, accumulation_aval)
+  acc_type = mlir.aval_to_ir_type(
+      ctx.module_context, core.ShapedArray(result_shape, accumulation_aval.dtype))
   result = chlo.ragged_dot(
       acc_type,
       lhs,
@@ -7727,7 +7775,14 @@ def _ragged_dot_general_lower(
       ragged_dot_dnums,
       precision_config=chlo_precision_attr(precision),
   )
-  (aval_out,) = ctx.avals_out
+  if expanded_shape is not None:
+    expanded_aval = core.ShapedArray(expanded_shape, accumulation_aval.dtype)
+    result = mlir.reshape(ctx, result, expanded_aval)
+    if summed_axes:
+      result, = _unary_reduce_lower(
+          hlo.AddOp, _get_sum_identity,
+          ctx.replace(avals_in=(expanded_aval,), avals_out=(accumulation_aval,)),
+          result, axes=summed_axes)
   result = mlir.lower_with_sharding_in_types(ctx, result, aval_out)
   if accumulation_aval.dtype != aval_out.dtype:
     result = mlir.convert_hlo(ctx, result, accumulation_aval, aval_out)
