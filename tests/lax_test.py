@@ -5594,9 +5594,12 @@ class CompositeTest(jtu.JaxTestCase):
 
 class RaggedTest(jtu.JaxTestCase):
 
-  @parameterized.parameters("noncontracting", "contracting", "contracting_permuted",
-                            "batch", "batch_permuted")
-  def test_ragged_dot_higher_order(self, mode):
+  @parameterized.product(
+      mode=("noncontracting", "contracting", "contracting_permuted", "batch", "batch_permuted"),
+      explicit_sharding=(False, True))
+  def test_ragged_dot_higher_order(self, mode, explicit_sharding):
+    if explicit_sharding and jax.device_count() < 2:
+      self.skipTest("Explicit sharding needs two devices")
     with jax.enable_x64():
       rng = self.rng()
       sizes = jnp.array([2, 0, 3], jnp.int32)
@@ -5637,10 +5640,33 @@ class RaggedTest(jtu.JaxTestCase):
           dims = lax.RaggedDotDimensionNumbers((((2,), (3,)), ((3, 1), (1, 2))), (1,), ())
           reference = lambda a, b: jnp.einsum("mrkb,nbrk->brmn", a, b)
 
-      def actual(a, b):
-        return lax.ragged_dot_general(a, b, sizes, dims, precision=lax.Precision.HIGHEST)
+      values = (x, y)
+      mesh, out_sharding = None, None
+      if explicit_sharding:
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("d",),
+                                 axis_types=(jax.sharding.AxisType.Explicit,))
+        _, (x_batch, y_batch) = dims.dot_dimension_numbers
+        axes = (x_batch[0], y_batch[0]) if x_batch else (0, None)
+        shardings = []
+        for value, axis in zip(values, axes):
+          spec = [None] * value.ndim
+          if axis is not None:
+            spec[axis] = "d"
+          shardings.append(jax.NamedSharding(mesh, jax.P(*spec)))
+        values = tuple(jax.device_put(value, sharding) for value, sharding in zip(values, shardings))
+        spec = [None] * reference(x, y).ndim
+        spec[1 if mode.startswith("contracting") else 0] = "d"
+        out_sharding = jax.NamedSharding(mesh, jax.P(*spec))
 
-      self.assertAllClose(jax.jit(actual)(x, y), jax.jit(reference)(x, y),
+      def actual(a, b):
+        return lax.ragged_dot_general(a, b, sizes, dims, precision=lax.Precision.HIGHEST,
+                                     out_sharding=out_sharding)
+
+      def evaluated(function):
+        with jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext():
+          return jax.jit(function)(*values)
+
+      self.assertAllClose(evaluated(actual), jax.jit(reference)(x, y),
                           atol=1e-12, rtol=1e-12)
       direction = tuple(jnp.asarray(rng.normal(size=value.shape)) for value in (x, y))
 
@@ -5648,14 +5674,18 @@ class RaggedTest(jtu.JaxTestCase):
         return lambda a, b: jnp.sin(product(a, b)).sum()
 
       def along(gradient):
-        return lambda a, b: sum(jnp.vdot(g, d) for g, d in zip(gradient(a, b), direction))
+        return lambda a, b: sum(jnp.sum(g * d) for g, d in zip(gradient(a, b), direction))
 
       actual_loss, expected_loss = loss(actual), loss(reference)
       for _ in range(3):
         actual_grad = jax.grad(actual_loss, argnums=(0, 1))
         expected_grad = jax.grad(expected_loss, argnums=(0, 1))
-        self.assertAllClose(jax.jit(actual_grad)(x, y), jax.jit(expected_grad)(x, y),
+        actual_result = evaluated(actual_grad)
+        self.assertAllClose(actual_result, jax.jit(expected_grad)(x, y),
                             atol=1e-10, rtol=1e-10)
+        if explicit_sharding:
+          for gradient, sharding in zip(actual_result, shardings):
+            self.assertEqual(gradient.sharding, sharding)
         actual_loss, expected_loss = along(actual_grad), along(expected_grad)
 
   def check_wsc_in_lowered(self, text):
