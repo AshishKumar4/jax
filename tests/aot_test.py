@@ -50,8 +50,9 @@ class JaxAotTest(jtu.JaxTestCase):
   def test_serialized_executable_digest(self):
     compiled = jax.jit(lambda x: 2 * x + 1).lower(np.int32(3)).compile()
     serialized, in_tree, out_tree = serialize(compiled)
-    loaded = deserialize_and_load(serialized, in_tree, out_tree)
-    loaded_again = deserialize_and_load(serialized, in_tree, out_tree)
+    devices = compiled.runtime_executable().local_devices()
+    loaded = deserialize_and_load(serialized, in_tree, out_tree, execution_devices=devices)
+    loaded_again = deserialize_and_load(serialized, in_tree, out_tree, execution_devices=devices)
     self.assertEqual(loaded(np.int32(3)), 7)
     self.assertEqual(loaded_again(np.int32(4)), 9)
     self.assertEqual(loaded._executable_digest(), loaded_again._executable_digest())
