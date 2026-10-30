@@ -5393,7 +5393,7 @@ class RaggedTest(jtu.JaxTestCase):
 
   @parameterized.product(
       mode=("noncontracting", "noncontracting_permuted", "contracting", "contracting_permuted",
-            "batch", "batch_permuted"),
+            "contracting_sizes1d", "batch", "batch_permuted"),
       explicit_sharding=(False, True))
   def test_ragged_dot_higher_order(self, mode, explicit_sharding):
     if explicit_sharding and jax.device_count() < 2:
@@ -5429,7 +5429,14 @@ class RaggedTest(jtu.JaxTestCase):
         rows = jnp.arange(6, dtype=sizes.dtype)
         mask = ((rows[None, None, None, :] >= (ends - sizes)[..., None]) &
                 (rows[None, None, None, :] < ends[..., None])).astype(x.dtype)
-        if mode == "contracting":
+        if mode == "contracting_sizes1d":
+          sizes = jnp.array([2, 0, 3], jnp.int32)
+          ends = jnp.cumsum(sizes, dtype=sizes.dtype)
+          rows = jnp.arange(6, dtype=sizes.dtype)[None, :]
+          mask = ((rows >= (ends - sizes)[:, None]) & (rows < ends[:, None])).astype(x.dtype)
+          dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+          reference = lambda a, b: jnp.einsum("bmpr,brnp,gr->gbmn", a, b, mask)
+        elif mode == "contracting":
           dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
           reference = lambda a, b: jnp.einsum("bmpr,brnp,bpgr->gbmn", a, b, mask)
         else:
@@ -5454,7 +5461,7 @@ class RaggedTest(jtu.JaxTestCase):
         mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("d",),
                                  axis_types=(jax.sharding.AxisType.Explicit,))
         _, (x_batch, y_batch) = dims.dot_dimension_numbers
-        if x_batch:
+        if x_batch and sizes.ndim > 1:
           sizes = jax.device_put(sizes, jax.NamedSharding(
               mesh, jax.P("d", *[None] * (sizes.ndim - 1))))
         axes = (x_batch[0], y_batch[0]) if x_batch else (0, None)
@@ -5498,6 +5505,17 @@ class RaggedTest(jtu.JaxTestCase):
           for gradient, sharding in zip(actual_result, shardings):
             self.assertEqual(gradient.sharding, sharding)
         actual_loss, expected_loss = along(actual_grad), along(expected_grad)
+
+  @parameterized.parameters((jnp.float16, 2.0**-11), (jnp.bfloat16, 2.0**-8))
+  def test_ragged_dot_prefix_rounds_once(self, dtype, residual):
+    # Rounding each prefix's partial sum first would lose the residual in
+    # (1 + residual) + (-1). The final result is exactly representable.
+    x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
+    y = jnp.ones((1, 2, 1, 2), dtype)
+    sizes = jnp.full((1, 2, 1), 2, jnp.int32)
+    dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+    actual = jax.jit(lambda a, b: lax.ragged_dot_general(a, b, sizes, dims))(x, y)
+    self.assertArraysEqual(actual, jnp.full((1, 1, 1, 1), residual, dtype))
 
   def check_wsc_in_lowered(self, text):
     if config.use_shardy_partitioner.value:
