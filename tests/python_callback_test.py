@@ -25,6 +25,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import lax
+from jax._src import callback as callback_lib
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
@@ -1278,6 +1279,25 @@ class IOCallbackTest(jtu.JaxTestCase):
     f()
     jax.effects_barrier()
     self.assertEqual(x, 2)
+
+  @parameterized.parameters(True, False)
+  def test_only_jaxs_own_callbacks_take_numpy_inputs(self, jitted):
+    # The public io_callback hands its callback jax.Arrays; JAX's own callbacks
+    # routed through io_callback_numpy_inputs (the Mosaic GPU interpreter's)
+    # take the host's NumPy arrays, with no device_put a call.
+    seen = []
+    def cb(x):
+      seen.append(type(x))
+      return x
+
+    shape = jax.ShapeDtypeStruct((2,), jnp.float32)
+    for route in (io_callback, callback_lib.io_callback_numpy_inputs):
+      f = lambda x: route(cb, shape, x)
+      out = (jax.jit(f) if jitted else f)(jnp.arange(2.))
+      self.assertAllClose(out, jnp.arange(2.))
+    jax.effects_barrier()
+    self.assertTrue(issubclass(seen[0], jax.Array))
+    self.assertIs(seen[1], np.ndarray)
 
   def test_io_callback_can_be_batched_if_unordered(self):
     _mut = 0
