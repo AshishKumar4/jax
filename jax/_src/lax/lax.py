@@ -7352,6 +7352,10 @@ def _ragged_dot_general_transpose_rule(
   if group_offset is not None:
     raise NotImplementedError('Unimplemented group_offset support.')
 
+  # Keep nonlinear cotangent producers outside the adjoint's layout-changing
+  # input fusions: GPU bitcast hoisting through copies can lose their permutation.
+  ct = optimization_barrier(ct)
+
   (x_contract, y_contract), (x_batch, y_batch) = ragged_dot_dimension_numbers.dot_dimension_numbers
   x_ndim = x.aval.ndim if ad.is_undefined_primal(x) else np.ndim(x)
   y_ndim = y.aval.ndim if ad.is_undefined_primal(y) else np.ndim(y)
