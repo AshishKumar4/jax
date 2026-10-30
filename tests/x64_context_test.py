@@ -331,6 +331,34 @@ class X64ContextTests(jtu.JaxTestCase):
                                   np.ones((3, 4, 6))).astype(np.float32)
     np.testing.assert_array_equal(gradient, expected_gradient)
 
+  def test_a_wide_max_and_pad_keep_their_dtypes_under_later_derivatives(self):
+    # A float64 maximum and pad traced in an x64 scope, staged (as `lax.platform_dependent` stages
+    # one) and differentiated outside that scope, forward and in reverse twice: max's derivative
+    # weights and pad's transposed zero keep float64, and no truncation warning fires.
+    a = np.array([1., 2., 3.], np.float32)
+    b = np.array([3., 2., 1.], np.float32)
+
+    def wide(x, y):
+      with jax.enable_x64(True):
+        larger = jnp.maximum(x.astype(jnp.float64), y.astype(jnp.float64))
+        return lax.pad(larger, jnp.zeros((), jnp.float64), [(1, 1, 0)]).astype(jnp.float32)
+
+    def staged(x):
+      return lax.cond(True, wide, lambda x, y: jnp.zeros((x.shape[0] + 2,), jnp.float32), x, b)
+
+    def squares(x):
+      return jnp.sum(staged(x) ** 2)
+
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      tangent = jax.jvp(staged, (a,), (np.ones(3, np.float32),))[1]
+      gradient = jax.grad(squares)(a)
+      second = jax.grad(lambda x: jnp.sum(jax.grad(squares)(x)))(a)
+    # x wins the last entry, ties the middle one (half its weight) and loses the first.
+    np.testing.assert_array_equal(tangent, [0., 0., 0.5, 1., 0.])
+    np.testing.assert_array_equal(gradient, [0., 2., 6.])
+    np.testing.assert_array_equal(second, [0., 0.5, 2.])
+
   def test_a_user_request_for_a_wide_dtype_still_narrows(self):
     # A NumPy float64 operand is a user's value, not a wide trace's: with x64
     # off, converting it or asking a product for float64 still narrows.
