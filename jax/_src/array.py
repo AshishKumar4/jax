@@ -242,12 +242,37 @@ def _guard_host_read(arr: ArrayImpl) -> None:
   in py_array.cc) and skips a zero-copyable CPU buffer as already there, so
   under `jax.transfer_guard_device_to_host("disallow")` `float(x)`, `x.item()`
   and `np.asarray(x)` passed on the CPU where the same code raises on a GPU. A
-  CPU array in its device memory is held to the guard here at every read, as it
-  keeps no host copy for a later read to reuse; one in a host memory kind
-  (`pinned_host`, `unpinned_host`) is on the host, as an accelerator's host
-  buffers are, and is not. An explicit read (`jax.device_get`) is held only at
-  the explicit levels, as jaxlib holds it.
+  CPU array in its device memory is held to the guard here until a read of it
+  has reached the host (`_read_on_host`), as an accelerator array is until its
+  first read has cached its host copy: a later read passes, as a jit closing
+  over the array reads it again to lower it (jax-ml/jax#19334). One in a host
+  memory kind (`pinned_host`, `unpinned_host`) is on the host, as an
+  accelerator's host buffers are, and is not held. An explicit read
+  (`jax.device_get`) is held only at the explicit levels, as jaxlib holds it.
   """
+  if arr.__dict__.get(_READ):
+    return
+  device = arr.sharding._internal_device_list[0]
+  if device.platform != "cpu" or arr.sharding.memory_kind in _HOST_MEMORY_KINDS:
+    return
+  _held(arr, device)
+
+
+_READ = "_cpu_host_read"
+"""The attribute a CPU array keeps once a read of it has reached the host
+(`_read_on_host`), as an accelerator array keeps its cached host copy, and
+loses with it when its buffer is replaced (`_replace_with`)."""
+
+
+def _read_on_host(arr: ArrayImpl) -> None:
+  """Records that a read of `arr` reached the host, once it has: later reads
+  pass the guard (`_guard_host_read`)."""
+  arr.__dict__[_READ] = True
+
+
+def _held(arr: ArrayImpl, device) -> None:
+  """Raises or logs as the device-to-host guard's level says for a read of CPU
+  array `arr` on `device` (`_guard_host_read`)."""
   state = guard_lib.thread_local_state()
   level = state.device_to_host
   if level is None:
@@ -255,9 +280,6 @@ def _guard_host_read(arr: ArrayImpl) -> None:
   if level is None or level == guard_lib.TransferGuardLevel.ALLOW:
     return
   if state.explicit_device_get and level not in _EXPLICIT_LEVELS:
-    return
-  device = arr.sharding._internal_device_list[0]
-  if device.platform != "cpu" or arr.sharding.memory_kind in _HOST_MEMORY_KINDS:
     return
   transfer = f"shape={arr.shape}, dtype={arr.dtype}, device={device}"
   if level in _LOG_LEVELS:
@@ -713,9 +735,11 @@ class ArrayImpl(basearray.Array):
       else:
         if self.is_fully_replicated and self.sharding.has_addressable_devices:
           self._copy_single_device_array_to_host_async()
+          _read_on_host(self)
           return
         for i, _ in _cached_index_calc(self.sharding, self.shape):
           self._arrays[i]._copy_single_device_array_to_host_async()
+      _read_on_host(self)
 
   @property
   @functools.partial(profiler.annotate_function, name="np.asarray(jax.Array)")
@@ -742,12 +766,14 @@ class ArrayImpl(basearray.Array):
         npy_value, did_copy = self._to_np_array_did_copy()
         if did_copy:
           self._npy_value = npy_value
+        _read_on_host(self)
         return npy_value
       else:
         if self.is_fully_replicated and self.sharding.has_addressable_devices:
           npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
           if did_copy:
             self._npy_value = npy_value
+          _read_on_host(self)
           return npy_value
 
         # Copy each unique shard to host.
@@ -759,6 +785,7 @@ class ArrayImpl(basearray.Array):
           npy_value[ind], _ = self._arrays[i]._single_device_array_to_np_array_did_copy()
         npy_value.flags.writeable = False
         self._npy_value = npy_value
+    _read_on_host(self)
     return self._npy_value
 
 
@@ -770,9 +797,28 @@ if sys.version_info >= (3, 12):
     # guard as `_value` is (`_guard_host_read`).
     if self._npy_value is None:
       _guard_host_read(self)
-    return _cpp_buffer(self, flags)
+    exported = _cpp_buffer(self, flags)
+    _read_on_host(self)
+    return exported
 
   ArrayImpl.__buffer__ = _guarded_buffer
+
+_cpp_replace_with = ArrayImpl._replace_with
+
+
+def _replace_with(self, other):
+  # Its buffer replaced, an array takes the replacement's read history, as an
+  # accelerator array takes its cached host copy (`ReplaceWithAlias`); one the
+  # replacement refuses keeps its own.
+  replaced = _cpp_replace_with(self, other)
+  if other.__dict__.get(_READ):
+    self.__dict__[_READ] = True
+  else:
+    self.__dict__.pop(_READ, None)
+  return replaced
+
+
+ArrayImpl._replace_with = _replace_with
 
 
 def _get_shape_from_index(slc: Index, shape: Shape) -> Shape:
