@@ -9319,8 +9319,11 @@ def _reduce_chooser_jvp_rule(g, ans, operand, *, axes, out_sharding):
   # locations in a single pass (rather than comparing equality) and use a
   # gather, and/or even push along the chosen elements of g (b/112040122)
   shape = [1 if i in axes else d for i, d in enumerate(operand.shape)]
-  location_indicators = convert_element_type(
-      _eq_meet(operand, reshape(ans, shape)), g.dtype)
+  # In the tangent's dtype, a wide one too (a float64 reduction traced under jax.enable_x64,
+  # differentiated outside it), which the mask beside it would narrow.
+  dtype = dtypes.check_and_canonicalize_dtype_of(np.dtype(g.dtype), 'convert_element_type', g)
+  location_indicators = _convert_element_type(
+      _eq_meet(operand, reshape(ans, shape)), dtype)
   counts = reduce_sum(location_indicators, axes)
   return div(reduce_sum(mul(g, location_indicators), axes), counts)
 
