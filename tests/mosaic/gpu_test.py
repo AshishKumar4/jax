@@ -4171,6 +4171,46 @@ class Sm80Test(TestCase):
     )
     np.testing.assert_array_equal(registers, memory)
 
+  @parameterized.parameters(
+      ((64, 256), (slice(0, 64), slice(128, 256)), jnp.float32),
+      ((64, 256), (slice(0, 64), slice(128, 256)), jnp.bfloat16),
+      # Physically contiguous, its singleton dimension strided.
+      ((2, 2048, 1), (slice(0, 1), slice(0, 1024), slice(None)), jnp.float32),
+  )
+  def test_cp_async_untiled_slice(self, full_shape, slices, dtype):
+    # A slice copied untiled: a column block of a wider array reads each row
+    # past the first at the row's stride, not the block's width.
+    slice_shape = tuple(
+        (s.stop if s.stop is not None else n) - (s.start or 0)
+        for s, n in zip(slices, full_shape)
+    )
+
+    def kernel(ctx, src, dst, scratch):
+      tmp, barrier = scratch
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          gmem_slice=slices,
+          implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          barrier=barrier,
+      )
+      barrier.wait()
+      copy(tmp, dst)
+
+    x = np.arange(np.prod(full_shape), dtype=np.float32)
+    x = x.reshape(full_shape).astype(dtype)
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        jax.ShapeDtypeStruct(slice_shape, dtype),
+        (jax.ShapeDtypeStruct(slice_shape, dtype),
+         mgpu.Barrier(arrival_count=1)),
+    )(x)
+    np.testing.assert_array_equal(y, x[slices])
+
+
 
 class BarrierTest(TestCase):
 
