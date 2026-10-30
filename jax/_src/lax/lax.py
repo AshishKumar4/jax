@@ -7683,14 +7683,39 @@ def _ragged_dot_general_lower(
       ragged_dot_dimension_numbers.dot_dimension_numbers
   )
   rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
+  lhs_ragged_dims = ragged_dot_dimension_numbers.lhs_ragged_dimensions
+
+  def prefix_first(operand, prefix, dimensions):
+    rank = ir.RankedTensorType(operand.type).rank
+    permutation = tuple(prefix) + tuple(remaining(range(rank), prefix))
+    if permutation != tuple(range(rank)):
+      operand = hlo.transpose(operand, mlir.dense_int_array(permutation))
+    return operand, tuple(tuple(permutation.index(dim) for dim in dims) for dims in dimensions)
+
+  if ctx.avals_in[2].ndim > 1:
+    # CHLO and XLA's ragged mask expansion broadcast group_sizes' prefix on
+    # physically leading axes. Preserve its declared prefix order there;
+    # the relative order of kept dimensions, and hence the output, is unchanged.
+    mode, ragged_dim = _ragged_dot_mode_and_dim(
+        ctx.avals_in[0].ndim, ragged_dot_dimension_numbers)
+    if mode == RaggedDotMode.RAGGED_CONTRACTING:
+      rhs_ragged_dim = rhs_contracting[lhs_contracting.index(ragged_dim)]
+      rhs_prefix = _ragged_dot_prefix_dims(
+          mode, ctx.avals_in[1].ndim, rhs_ragged_dim, rhs_batch, rhs_contracting)
+      rhs, (rhs_batch, rhs_contracting) = prefix_first(
+          rhs, rhs_prefix, (rhs_batch, rhs_contracting))
+    if mode != RaggedDotMode.RAGGED_BATCH:
+      lhs_prefix = _ragged_dot_prefix_dims(
+          mode, ctx.avals_in[0].ndim, ragged_dim, lhs_batch, lhs_contracting)
+      lhs, (lhs_batch, lhs_contracting, lhs_ragged_dims) = prefix_first(
+          lhs, lhs_prefix, (lhs_batch, lhs_contracting, lhs_ragged_dims))
+
   ragged_dot_dnums = chlo.RaggedDotDimensionNumbers.get(
       lhs_batching_dimensions=list(lhs_batch),
       rhs_batching_dimensions=list(rhs_batch),
       lhs_contracting_dimensions=list(lhs_contracting),
       rhs_contracting_dimensions=list(rhs_contracting),
-      lhs_ragged_dimensions=list(
-          ragged_dot_dimension_numbers.lhs_ragged_dimensions
-      ),
+      lhs_ragged_dimensions=list(lhs_ragged_dims),
       rhs_group_dimensions=list(rhs_group_dims),
   )
   acc_type = mlir.aval_to_ir_type(ctx.module_context, accumulation_aval)
