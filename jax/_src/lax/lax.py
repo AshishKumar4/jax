@@ -7552,7 +7552,7 @@ def _ragged_dot_general_lower(
           hlo.AddOp, _get_sum_identity,
           ctx.replace(avals_in=(expanded_aval,), avals_out=(accumulation_aval,)),
           result, axes=summed_axes)
-  result = mlir.lower_with_sharding_in_types(ctx, result, aval_out)
+  result = mlir.lower_with_sharding_in_types(ctx, result, accumulation_aval)
   if accumulation_aval.dtype != aval_out.dtype:
     result = mlir.convert_hlo(ctx, result, accumulation_aval, aval_out)
   return [result]

@@ -5495,27 +5495,32 @@ class RaggedTest(jtu.JaxTestCase):
         return lambda a, b: sum(jnp.sum(g * d) for g, d in zip(gradient(a, b), direction))
 
       actual_loss, expected_loss = loss(actual), loss(reference)
-      for _ in range(3):
+      for order in range(3):
         actual_grad = jax.grad(actual_loss, argnums=(0, 1))
         expected_grad = jax.grad(expected_loss, argnums=(0, 1))
         actual_result = evaluated(actual_grad)
         self.assertAllClose(actual_result, jax.jit(expected_grad)(x, y),
-                            atol=1e-10, rtol=1e-10)
+                            atol=1e-10, rtol=1e-10,
+                            err_msg=f"{mode}, reverse derivative {order + 1}")
         if explicit_sharding:
           for gradient, sharding in zip(actual_result, shardings):
             self.assertEqual(gradient.sharding, sharding)
         actual_loss, expected_loss = along(actual_grad), along(expected_grad)
 
-  @parameterized.parameters((jnp.float16, 2.0**-11), (jnp.bfloat16, 2.0**-8))
-  def test_ragged_dot_prefix_rounds_once(self, dtype, residual):
+  @parameterized.product(dtype=(jnp.float16, jnp.bfloat16), shardy=(False, True))
+  @jtu.with_explicit_mesh((1,), ("d",))
+  def test_ragged_dot_prefix_rounds_once(self, dtype, shardy, mesh):
     # Rounding each prefix's partial sum first would lose the residual in
     # (1 + residual) + (-1). The final result is exactly representable.
-    x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
-    y = jnp.ones((1, 2, 1, 2), dtype)
-    sizes = jnp.full((1, 2, 1), 2, jnp.int32)
-    dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
-    actual = jax.jit(lambda a, b: lax.ragged_dot_general(a, b, sizes, dims))(x, y)
-    self.assertArraysEqual(actual, jnp.full((1, 1, 1, 1), residual, dtype))
+    residual = 2.0 ** (-jnp.finfo(dtype).nmant - 1)
+    with config.use_shardy_partitioner(shardy):
+      x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
+      y = jnp.ones((1, 2, 1, 2), dtype)
+      sizes = jnp.full((1, 2, 1), 2, jnp.int32)
+      dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+      actual = jax.jit(lambda a, b: lax.ragged_dot_general(
+          a, b, sizes, dims, out_sharding=jax.P()))(x, y)
+      self.assertArraysEqual(actual, jnp.full((1, 1, 1, 1), residual, dtype))
 
   def check_wsc_in_lowered(self, text):
     if config.use_shardy_partitioner.value:
