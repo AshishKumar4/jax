@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import contextlib
 from functools import partial
 import itertools
 import math
@@ -5646,6 +5647,9 @@ class RaggedTest(jtu.JaxTestCase):
         mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("d",),
                                  axis_types=(jax.sharding.AxisType.Explicit,))
         _, (x_batch, y_batch) = dims.dot_dimension_numbers
+        if x_batch:
+          sizes = jax.device_put(sizes, jax.NamedSharding(
+              mesh, jax.P("d", *[None] * (sizes.ndim - 1))))
         axes = (x_batch[0], y_batch[0]) if x_batch else (0, None)
         shardings = []
         for value, axis in zip(values, axes):
