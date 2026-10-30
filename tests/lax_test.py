@@ -5404,8 +5404,8 @@ class RaggedTest(jtu.JaxTestCase):
         y = jnp.asarray(rng.normal(size=(3, 3, 4)) / 4)
         ends = jnp.cumsum(sizes, dtype=sizes.dtype)
         rows = jnp.arange(6, dtype=sizes.dtype)
-        mask = ((rows[:, None] >= (ends - sizes)) &
-                (rows[:, None] < ends)).astype(x.dtype)
+        mask = ((rows[:, None] >= (ends - sizes)[None, :]) &
+                (rows[:, None] < ends[None, :])).astype(x.dtype)
         dims = lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
         reference = lambda a, b: jnp.einsum("rg,rk,gkn->rn", mask, a, b)
       elif mode.startswith("contracting"):
@@ -5415,8 +5415,8 @@ class RaggedTest(jtu.JaxTestCase):
                            [[0, 4, 1], [3, 1, 1]]], jnp.int32)
         ends = jnp.cumsum(sizes, axis=-1, dtype=sizes.dtype)
         rows = jnp.arange(6, dtype=sizes.dtype)
-        mask = ((rows >= (ends - sizes)[..., None]) &
-                (rows < ends[..., None])).astype(x.dtype)
+        mask = ((rows[None, None, None, :] >= (ends - sizes)[..., None]) &
+                (rows[None, None, None, :] < ends[..., None])).astype(x.dtype)
         if mode == "contracting":
           dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
           reference = lambda a, b: jnp.einsum("bmpr,brnp,bpgr->gbmn", a, b, mask)
