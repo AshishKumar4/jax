@@ -72,6 +72,22 @@ class _FlatCallback:
     return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _NumpyInputs:
+  """A callback of JAX's own that takes its inputs as the host's NumPy arrays.
+
+  `io_callback_impl` places a callback's inputs on the CPU device before it
+  calls it, as the public callbacks promise `jax.Array` inputs; that is one
+  `device_put` a call, which dominates a callback that does little, such as each
+  step of the Mosaic GPU interpreter. Wrapped in this, a callback is handed the
+  arrays as XLA gave them (`io_callback_numpy_inputs`).
+  """
+  func: Callable[..., Any]
+
+  def __call__(self, *args, **kwargs):
+    return self.func(*args, **kwargs)
+
+
 def pure_callback_impl(
     *args,
     result_avals,
@@ -427,7 +443,10 @@ def io_callback_impl(
         " inputs on. Make sure \"cpu\" is listed in --jax_platforms or the"
         " JAX_PLATFORMS environment variable."
     ) from e
-  args = api.device_put(args, cpu_device)
+  if isinstance(callback.callback_func, _NumpyInputs):
+    args = tree_util.tree_map(np.asarray, args)
+  else:
+    args = api.device_put(args, cpu_device)
   # The callback may run on the dispatching thread; ignore that thread's mesh.
   with (
       config.default_device(cpu_device),
@@ -585,6 +604,19 @@ def io_callback(
       ordered=ordered,
   )
   return tree_util.tree_unflatten(out_tree, out_flat)
+
+
+def io_callback_numpy_inputs(
+    callback: Callable[..., Any], result_shape_dtypes: Any, *args: Any,
+    **kwargs: Any,
+):
+  """`io_callback`, its callback handed NumPy arrays rather than `jax.Array`s.
+
+  For JAX's own callbacks only (`_NumpyInputs`): the public callbacks' inputs
+  stay `jax.Array`s.
+  """
+  return io_callback(_NumpyInputs(callback), result_shape_dtypes, *args,
+                     **kwargs)
 
 
 def is_empty_shape(s: core.Shape) -> bool:
