@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import dataclasses
+import hashlib
 import logging
 import threading
 from typing import Any
@@ -22,6 +24,7 @@ import warnings
 import zlib
 
 import numpy as np
+
 
 # If zstandard is installed, we use zstd compression, otherwise we use zlib.
 try:
@@ -46,6 +49,30 @@ from jax._src.compilation_cache_interface import CacheInterface
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lru_cache import LRUCache
+
+
+_artifact_digest_lock = threading.Lock()
+
+
+@dataclasses.dataclass
+class ExecutableMetadata:
+  """The native serialization used to create or load this executable.
+
+  A deserialized executable need not serialize to identical bytes. Cache reads
+  therefore retain the digest of the original bytes, rather than serializing the
+  loaded executable again. No executable or serialized buffer is retained here.
+  """
+  serialized_digest: bytes | None = None
+
+  def record(self, serialized_executable: bytes) -> None:
+    self.serialized_digest = hashlib.sha256(serialized_executable).digest()
+
+  def digest(self, executable) -> bytes:
+    """Identify the artifact, serializing once if there was no cache artifact."""
+    with _artifact_digest_lock:
+      if self.serialized_digest is None:
+        self.record(executable.serialize())
+      return self.serialized_digest
 
 
 logger = logging.getLogger(__name__)
@@ -326,6 +353,7 @@ def is_executable_in_cache(backend, cache_key: str) -> bool:
 def get_executable_and_time(
     cache_key: str, compile_options, backend, executable_devices,
     host_callbacks: Sequence[Any] = (),
+    *, artifact: ExecutableMetadata | None = None,
 ) -> tuple[xla_client.LoadedExecutable | None, int | None]:
   """Returns the cached executable and its compilation time if present, or None
   otherwise.
@@ -352,6 +380,8 @@ def get_executable_and_time(
     xla_executable_deserialized = backend.deserialize_executable(
         serialized_executable, executable_devices, compile_options
     )
+  if artifact is not None:
+    artifact.record(serialized_executable)
   return xla_executable_deserialized, compile_time
 
 
@@ -360,7 +390,8 @@ def put_executable_and_time(
     module_name: str,
     executable: xla_client.LoadedExecutable,
     backend,
-    compile_time: int
+    compile_time: int,
+    *, artifact: ExecutableMetadata | None = None,
 ) -> None:
   """Adds the 'executable' and its compilation time to the cache, possibly
   evicting older entries.
@@ -377,6 +408,8 @@ def put_executable_and_time(
     return
 
   serialized_executable = executable.serialize()
+  if artifact is not None:
+    artifact.record(serialized_executable)
   executable_and_time = combine_executable_and_time(
       serialized_executable, compile_time)
   executable_and_time = compress_executable(executable_and_time)

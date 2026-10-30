@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import Counter
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -200,10 +201,17 @@ class CompilationCacheTest(CompilationCacheTestCase):
     executable = backend.compile_and_load(
         str(computation), executable_devices, compile_options)
     key = cc.get_cache_key(computation, devices, compile_options, backend)
+    written = cc.ExecutableMetadata()
+    loaded = cc.ExecutableMetadata()
     cc.put_executable_and_time(
-        key, "alambda", executable, backend, FAKE_COMPILE_TIME)
+        key, "alambda", executable, backend, FAKE_COMPILE_TIME, artifact=written)
     executable_retrieved, compile_time_retrieved = cc.get_executable_and_time(
-        key, compile_options, backend, executable_devices)
+        key, compile_options, backend, executable_devices, artifact=loaded)
+    stored, _ = cc.extract_executable_and_time(
+        cc.decompress_executable(cc._cache.get(key)))
+    expected_digest = hashlib.sha256(stored).digest()
+    self.assertEqual(written.digest(executable), expected_digest)
+    self.assertEqual(loaded.digest(executable_retrieved), expected_digest)
     inputs_to_executable = (
         jnp.array(1, dtype=np.int32),
         jnp.array(2, dtype=np.int32),
@@ -212,6 +220,30 @@ class CompilationCacheTest(CompilationCacheTestCase):
     actual = executable_retrieved.execute(inputs_to_executable)
     self.assertEqual(expected, actual)
     self.assertEqual(FAKE_COMPILE_TIME, compile_time_retrieved)
+
+  def test_compiled_artifact_digest(self):
+    f = jit(lambda x: x * 3 + 2)
+    compiled = f.lower(np.int32(4)).compile()
+    digest = compiled._executable_digest()
+    self.assertEqual(compiled(np.int32(4)), 14)
+    jax.clear_caches()
+    with jtu.count_compilation_after_persistent_cache_miss() as misses:
+      loaded = f.lower(np.int32(4)).compile()
+    self.assertEqual(misses(), 0)
+    self.assertEqual(loaded._executable_digest(), digest)
+    self.assertEqual(loaded(np.int32(5)), 17)
+
+    changed = jit(lambda x: x * 3 + 3).lower(np.int32(4)).compile()
+    self.assertEqual(changed(np.int32(4)), 15)
+    self.assertNotEqual(changed._executable_digest(), digest)
+
+  def test_uncached_artifact_digest(self):
+    with config.enable_compilation_cache(False):
+      compiled = jit(lambda x: x * 7).lower(np.int32(3)).compile()
+    self.assertEqual(compiled(np.int32(3)), 21)
+    expected = hashlib.sha256(compiled.runtime_executable().serialize()).digest()
+    self.assertEqual(compiled._executable_digest(), expected)
+    self.assertEqual(compiled._executable_digest(), expected)
 
   def test_pmap(self):
     f = pmap(lambda x: x - lax.psum(x, "i"), axis_name="i")
