@@ -9495,7 +9495,9 @@ def _reduce_jvp(reducer, init_values, primals, tangents, axes):
   permutation = axes + tuple(non_axes)
   new_shape = (n,) + tuple(input_shape[non_axes])
   primals = tuple(reshape(x, new_shape, permutation) for x in primals)
-  tangents = tuple(reshape(t, new_shape, permutation) for t in tangents)
+  # An operand with a symbolic zero tangent (a constant operand, such as a count of ones or a mask
+  # reduced beside the input) still rides the tree below, which reads every operand's tangent.
+  tangents = tuple(reshape(ad.instantiate_zeros(t), new_shape, permutation) for t in tangents)
 
   for d in range(len(non_axes) + 1):
     reducer = api.vmap(reducer)
