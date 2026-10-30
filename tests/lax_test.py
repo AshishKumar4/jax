@@ -5390,6 +5390,68 @@ class CompositeTest(jtu.JaxTestCase):
 
 class RaggedTest(jtu.JaxTestCase):
 
+  @parameterized.parameters("noncontracting", "contracting", "contracting_permuted",
+                            "batch", "batch_permuted")
+  def test_ragged_dot_higher_order(self, mode):
+    with jax.enable_x64():
+      rng = self.rng()
+      sizes = jnp.array([2, 0, 3], jnp.int32)
+      if mode == "noncontracting":
+        x = jnp.asarray(rng.normal(size=(6, 3)) / 4)
+        y = jnp.asarray(rng.normal(size=(3, 3, 4)) / 4)
+        ends = jnp.cumsum(sizes)
+        mask = ((jnp.arange(6)[:, None] >= (ends - sizes)) &
+                (jnp.arange(6)[:, None] < ends)).astype(x.dtype)
+        dims = lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
+        reference = lambda a, b: jnp.einsum("rg,rk,gkn->rn", mask, a, b)
+      elif mode.startswith("contracting"):
+        x = jnp.asarray(rng.normal(size=(2, 3, 2, 6)) / 4)
+        y = jnp.asarray(rng.normal(size=(2, 6, 4, 2)) / 4)
+        sizes = jnp.array([[[2, 0, 3], [1, 2, 2]],
+                           [[0, 4, 1], [3, 1, 1]]], jnp.int32)
+        ends = jnp.cumsum(sizes, axis=-1)
+        mask = ((jnp.arange(6) >= (ends - sizes)[..., None]) &
+                (jnp.arange(6) < ends[..., None])).astype(x.dtype)
+        if mode == "contracting":
+          dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+          reference = lambda a, b: jnp.einsum("bmpr,brnp,bpgr->gbmn", a, b, mask)
+        else:
+          x, y = x.transpose(3, 1, 0, 2), y.transpose(3, 2, 1, 0)
+          dims = lax.RaggedDotDimensionNumbers((((3, 0), (0, 2)), ((2,), (3,))), (0,), ())
+          reference = lambda a, b: jnp.einsum("rmbp,pnrb,bpgr->gbmn", a, b, mask)
+      else:
+        x = jnp.asarray(rng.normal(size=(2, 6, 3, 2)) / 4)
+        y = jnp.asarray(rng.normal(size=(2, 2, 6, 4)) / 4)
+        sizes = jnp.array([[2, 0, 4], [1, 3, 2]], jnp.int32)
+        if mode == "batch":
+          dims = lax.RaggedDotDimensionNumbers((((3,), (1,)), ((0, 1), (0, 2))), (1,), ())
+          reference = lambda a, b: jnp.einsum("brmk,bkrn->brmn", a, b)
+        else:
+          x, y = x.transpose(2, 1, 3, 0), y.transpose(3, 0, 2, 1)
+          dims = lax.RaggedDotDimensionNumbers((((2,), (3,)), ((3, 1), (1, 2))), (1,), ())
+          reference = lambda a, b: jnp.einsum("mrkb,nbrk->brmn", a, b)
+
+      def actual(a, b):
+        return lax.ragged_dot_general(a, b, sizes, dims, precision=lax.Precision.HIGHEST)
+
+      self.assertAllClose(jax.jit(actual)(x, y), jax.jit(reference)(x, y),
+                          atol=1e-12, rtol=1e-12)
+      direction = tuple(jnp.asarray(rng.normal(size=value.shape)) for value in (x, y))
+
+      def loss(product):
+        return lambda a, b: jnp.sin(product(a, b)).sum()
+
+      def along(gradient):
+        return lambda a, b: sum(jnp.vdot(g, d) for g, d in zip(gradient(a, b), direction))
+
+      actual_loss, expected_loss = loss(actual), loss(reference)
+      for _ in range(3):
+        actual_grad = jax.grad(actual_loss, argnums=(0, 1))
+        expected_grad = jax.grad(expected_loss, argnums=(0, 1))
+        self.assertAllClose(jax.jit(actual_grad)(x, y), jax.jit(expected_grad)(x, y),
+                            atol=1e-10, rtol=1e-10)
+        actual_loss, expected_loss = along(actual_grad), along(expected_grad)
+
   def check_wsc_in_lowered(self, text):
     if config.use_shardy_partitioner.value:
       self.assertIn('sdy.sharding_constraint', text)
