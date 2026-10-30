@@ -7320,7 +7320,8 @@ def _ragged_dot_general_impl(
     assert gs.ndim == 1
     shape = gs.shape + x.shape
     x = broadcast_in_dim(x, shape, list(range(1, len(shape))))
-    iota = broadcasted_iota(gs.dtype, shape, dim+1)
+    iota = broadcasted_iota(gs.dtype, shape, dim+1,
+                            out_sharding=core.typeof(x).sharding)
     group_ends = control_flow.cumsum(gs)
     group_starts = group_ends - gs
     group_ends = broadcast_in_dim(group_ends, shape, (0,))
