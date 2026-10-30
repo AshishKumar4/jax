@@ -324,6 +324,8 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(include_metadata, key1 != key2)
 
   @parameterized.parameters([False, True])
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="The Pallas Triton backend is deprecated")
   def test_identical_pallas_kernels_different_metadata(self, include_metadata):
     if jtu.test_device_matches(["tpu"]):
       compiler_params = None
