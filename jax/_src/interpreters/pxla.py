@@ -27,7 +27,6 @@ from typing import Any, NamedTuple
 
 from jax._src import api
 from jax._src import array
-from jax._src import compilation_cache
 from jax._src import compiler
 from jax._src import config
 from jax._src import core
@@ -1534,11 +1533,10 @@ def _cached_compilation(computation, name,
   with dispatch.log_elapsed_time(
       "Finished XLA compilation of {fun_name} in {elapsed_time:.9f} sec",
       fun_name=name, event=dispatch.BACKEND_COMPILE_EVENT):
-    artifact = compilation_cache.ExecutableMetadata()
     xla_executable = compiler.compile_or_get_cached(
         backend, computation, dev, compile_options, host_callbacks,
-        da, pgle_profiler, artifact=artifact)
-  return xla_executable, artifact
+        da, pgle_profiler)
+  return xla_executable
 
 
 def _maybe_get_and_check_in_shardings(
@@ -1684,8 +1682,6 @@ class UnloadedMeshExecutable:
   xla_out_layouts: Sequence[Layout | None]
   all_args_info: AllArgsInfo | None
   pgle_profiler: profiler.PGLEProfiler | None
-  compilation_metadata: compilation_cache.ExecutableMetadata = dataclasses.field(
-      default_factory=compilation_cache.ExecutableMetadata)
 
   def build_unsafe_call(self):
     handle_args = InputsHandler(self.input_shardings, self.dispatch_in_layouts)
@@ -1705,8 +1701,7 @@ class UnloadedMeshExecutable:
                           self.input_shardings, self.output_shardings,
                           self.kept_var_idx, self.xla_in_layouts,
                           self.dispatch_in_layouts, self.xla_out_layouts,
-                          self.mut, self.all_args_info, self,
-                          compilation_metadata=self.compilation_metadata)
+                          self.mut, self.all_args_info, self)
 
   @staticmethod
   def from_hlo(name: str,
@@ -1758,7 +1753,7 @@ class UnloadedMeshExecutable:
         in_shardings, out_shardings, len(ordered_effects))
 
     util.test_event("pxla_cached_compilation")
-    xla_executable, artifact = _cached_compilation(
+    xla_executable = _cached_compilation(
         hlo, name, tuple_args, allow_prop_to_inputs, allow_prop_to_outputs,
         tuple(host_callbacks), backend, device_list, compiler_options_kvs,
         pgle_profiler)
@@ -1809,7 +1804,7 @@ class UnloadedMeshExecutable:
         dispatch_in_layouts=dispatch_in_layouts,
         xla_out_layouts=xla_out_layouts,
         all_args_info=all_args_info,
-        pgle_profiler=pgle_profiler, compilation_metadata=artifact).load()
+        pgle_profiler=pgle_profiler).load()
 
 
 class MeshExecutableFastpathData(NamedTuple):
@@ -1876,14 +1871,13 @@ class MeshExecutable(stages.Executable):
       "out_avals", "_in_shardings", "_out_shardings",
       "_kept_var_idx", "_xla_in_layouts", "_dispatch_in_layouts",
       "_xla_out_layouts", "_mut", "_all_args_info", "_unloaded_executable",
-      "_compilation_metadata",
   ]
 
   def __init__(self, xla_executable, build_unsafe_call, in_avals, out_avals,
                in_shardings, out_shardings, kept_var_idx,
                xla_in_layouts, dispatch_in_layouts, xla_out_layouts, mut,
                all_args_info: AllArgsInfo | None = None,
-               unloaded_executable=None, *, compilation_metadata=None):
+               unloaded_executable=None):
     self.xla_executable = xla_executable
     self.build_unsafe_call = build_unsafe_call
     # in_avals is a list of global and local avals. Aval is global if input
@@ -1901,9 +1895,6 @@ class MeshExecutable(stages.Executable):
     self._mut = mut
     self._all_args_info = all_args_info  # has const_args and also dead args
     self._unloaded_executable = unloaded_executable
-    self._compilation_metadata = (
-        compilation_metadata if compilation_metadata is not None
-        else compilation_cache.ExecutableMetadata())
 
   @property
   def unsafe_call(self) -> Callable[..., Any]:
@@ -1915,9 +1906,6 @@ class MeshExecutable(stages.Executable):
 
   def xla_extension_executable(self):
     return self.xla_executable
-
-  def _executable_digest(self) -> bytes:
-    return self._compilation_metadata.digest(self.xla_executable)
 
   def call(self, *args):
     args_after_dce = tuple(a for i, a in enumerate(args) if i in self._kept_var_idx)
