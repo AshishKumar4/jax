@@ -719,6 +719,36 @@ class OOBFillMode(enum.IntEnum):
   ZEROS = 2
 
 
+def _opaque_zero(predicate: ir.Value) -> ir.Value:
+  """Zero on a TMA load's issuing thread, as a value ptxas cannot fold.
+
+  ptxas has miscompiled a TMA load whose coordinate is a literal: it filled
+  the coordinate's uniform register from another uniform register before that
+  register's last write, so the load read another coordinate, misaligned, and
+  the kernel died with CUDA_ERROR_ILLEGAL_INSTRUCTION (an H100 attention
+  forward, its innermost coordinate 0 read as 1). LLVM folds a coordinate
+  computed from constants into a literal, so every coordinate of the load adds
+  this value: the lane id less the lowest lane of the warp's active threads
+  whose `predicate` holds (a ballot over `activemask`, which a partial warp,
+  such as a single-thread branch, takes too). It is zero on the one thread of
+  a warp that issues the copy, and unknown to ptxas.
+  """
+  i32 = ir.IntegerType.get_signless(32)
+  return utils.inline_ptx(
+      "{ .reg .b32 active, issuing, reversed, first;"
+      " activemask.b32 active;"
+      " vote.sync.ballot.b32 issuing, $1, active;"
+      " brev.b32 reversed, issuing;"
+      " bfind.shiftamt.u32 first, reversed;"
+      " mov.u32 $0, %laneid;"
+      " sub.u32 $0, $0, first; }",
+      predicate,
+      result_types=i32,
+      has_side_effects=True,
+      convergent=True,
+  )
+
+
 @dataclasses.dataclass()
 class LaunchContext:
   module: ir.Module
@@ -2026,6 +2056,10 @@ class LaunchContext:
       assert barrier is not None
       barrier_ptr = barrier.get_ptr()
       assert reduction_op is None
+      zero = _opaque_zero(predicate)
+      rev_dyn_base_indices = [
+          arith.addi(idx, zero) for idx in rev_dyn_base_indices
+      ]
       rank = len(slice_shape)
       idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
       if collective_size > 1 and leader_tracked is not None:
