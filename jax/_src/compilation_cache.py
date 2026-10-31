@@ -478,10 +478,12 @@ def reset_cache() -> None:
   global _cache_initialized
   global _cache_checked
   global _cache_used
-  logger.info("Resetting cache at %s.",
-               _cache._path if _cache is not None else "<empty>")
-  _cache = None
+  # The cache is cleared under the mutex `_initialize_cache` holds while it builds one, so a reset
+  # during an initialization already under way does not leave the cache that initialization assigns.
   with _cache_initialized_mutex:
+    logger.info("Resetting cache at %s.",
+                 _cache._path if _cache is not None else "<empty>")
+    _cache = None
     _cache_initialized = False
     _cache_checked = False
     _cache_used = False
