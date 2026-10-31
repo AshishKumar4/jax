@@ -5,7 +5,8 @@
 # too, as an installer that finds a package on this index looks for its every version here (uv's first-index
 # rule). A file the index lists already is kept as it is. `release` indexes instead the wheels attached to a
 # GitHub release, the artifact that release's own CI built and tested (Dew's python-publish.yml attaches its
-# sdist and wheel), so nothing is rebuilt between a test and the index.
+# sdist and wheel), so nothing is rebuilt between a test and the index; `package` picks one project of a release
+# whose wheels are several projects' (a fork's jax and its CUDA plugins), one publish a project.
 name: publish package
 
 on:
@@ -27,7 +28,10 @@ on:
         description: "what the tests install beside the wheel, e.g. \"jax flax pytest absl-py\""
         required: false
       upstream:
-        description: "PyPI releases whose own wheels the index serves too, e.g. \"qwix==0.1.8\""
+        description: "PyPI releases whose own wheels the index serves too, every Python's and platform's, e.g. \"qwix==0.1.8\""
+        required: false
+      package:
+        description: "the project of `release`'s wheels to index, e.g. jax-cuda12-plugin; none: its wheels are one project's"
         required: false
 
 permissions:
@@ -54,6 +58,7 @@ jobs:
       DEPENDENCIES: ${{ inputs.dependencies }}
       UPSTREAM: ${{ inputs.upstream }}
       RELEASE: ${{ inputs.release }}
+      PACKAGE_WANTED: ${{ inputs.package }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -67,18 +72,32 @@ jobs:
           done
       - name: Fetch PyPI's own wheels
         if: inputs.upstream != ''
+        # Every wheel of each release, whatever its Python or platform, checked against PyPI's digest: an installer
+        # that finds the package here looks for each of its versions here alone (uv's first-index rule).
         run: |
-          uv venv -q fetching
-          uv pip install -q --python fetching/bin/python pip
+          mkdir -p dist
           read -ra releases <<< "$UPSTREAM"
-          fetching/bin/python -m pip download -q --no-deps --only-binary :all: --index-url https://pypi.org/simple \
-            --dest dist "${releases[@]}"
+          for release in "${releases[@]}"; do
+            curl -fsS "https://pypi.org/pypi/${release%%==*}/${release##*==}/json" > release.json
+            python3 - <<'EOF'
+          import hashlib, json, urllib.request
+          from pathlib import Path
+          for file in json.load(open("release.json"))["urls"]:
+              if file["packagetype"] == "bdist_wheel":
+                  data = urllib.request.urlopen(file["url"]).read()
+                  if hashlib.sha256(data).hexdigest() != file["digests"]["sha256"]:
+                      raise SystemExit(f"{file['filename']}: its download differs from PyPI's digest")
+                  Path("dist", file["filename"]).write_bytes(data)
+          EOF
+          done
           ls dist
       - name: Fetch the release's wheels
         if: inputs.release != ''
         run: |
           [ -z "$REF" ] || { echo "::error::release and ref name two artifacts: give one"; exit 1; }
-          gh release download "$RELEASE" --repo "$REPOSITORY" --pattern "*.whl" --dir dist
+          # A wheel's file name holds its project's name with - as _ (PEP 427).
+          gh release download "$RELEASE" --repo "$REPOSITORY" --dir dist \
+            --pattern "${PACKAGE_WANTED:+${PACKAGE_WANTED//-/_}-}*.whl"
           ls dist
       - name: Build the wheel
         if: inputs.ref != ''
@@ -102,9 +121,11 @@ jobs:
           shopt -s nullglob
           wheels=(dist/*.whl)
           [ ${#wheels[@]} -gt 0 ] || { echo "::error::no wheel to index"; exit 1; }
-          package=$(basename "${wheels[0]}" | cut -d- -f1)
+          # A project's name as PEP 503 serves it, from a wheel's file name (PEP 427: its - written _).
+          project() { basename "$1" | cut -d- -f1 | tr '_.A-Z' '--a-z'; }
+          package=$(project "${wheels[0]}")
           for wheel in "${wheels[@]}"; do
-            [ "$(basename "$wheel" | cut -d- -f1)" = "$package" ] || { echo "::error::$wheel is not $package's"; exit 1; }
+            [ "$(project "$wheel")" = "$package" ] || { echo "::error::$wheel is not $package's"; exit 1; }
           done
           echo "PACKAGE=$package" >> "$GITHUB_ENV"
           if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key "packages/$package/manifest.json" \
