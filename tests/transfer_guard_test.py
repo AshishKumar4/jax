@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 import pickle
+import sys
 import threading
 
 from absl.testing import absltest
@@ -57,14 +59,15 @@ def _device_to_device_funcs():
 
 
 def _device_to_host_funcs():
-  """Generates device-to-host transfer functions."""
-  if jax.default_backend() == "cpu":
-    # device-to-host does not incur transfer on the CPU backend.
-    return []
+  """Generates device-to-host transfer functions.
 
+  A CPU array in device memory reaches the host without a copy, and is held to
+  the guard as an accelerator array's copy is (`array._guard_host_read`).
+  """
   with jax.transfer_guard_host_to_device("allow"):
     device_arrays = [jnp.ones(1) for _ in range(6)]
-  return [
+    scalars = [jnp.ones(()) for _ in range(3)]
+  funcs = [
       # (function name, is an explicit transfer?, function)
       ("device_to_host_jax_device_get", True,
        lambda: jax.device_get(device_arrays[0])),
@@ -76,7 +79,17 @@ def _device_to_host_funcs():
       ("device_to_host_str", False, lambda: str(device_arrays[4])),
       ("device_to_host_pickle_dumps", False,
        lambda: pickle.dumps(device_arrays[5])),
+      ("device_to_host_float", False, lambda: float(scalars[0])),
+      ("device_to_host_int", False, lambda: int(scalars[1])),
+      ("device_to_host_item", False, lambda: scalars[2].item()),
   ]
+  if jax.default_backend() == "cpu" and sys.version_info >= (3, 12):
+    # Only a CPU array has a host buffer to export.
+    with jax.transfer_guard_host_to_device("allow"):
+      exported = jnp.ones(1)
+    funcs.append(("device_to_host_memoryview", False,
+                  lambda: memoryview(exported)))
+  return funcs
 
 
 def _all_funcs():
@@ -237,6 +250,55 @@ class TransferGuardTest(jtu.JaxTestCase):
       with jax_transfer_guard("disallow_explicit"):
         with self.assertDisallows(func_name):
           func()
+
+  @jtu.run_on_devices("cpu")
+  def test_disallow_allows_a_cpu_array_in_host_memory(self):
+    with jax.transfer_guard_host_to_device("allow"):
+      x = jnp.arange(4.)
+    with jax.transfer_guard("disallow"):
+      with self.assertDisallows("device_to_host_np_asarray"):
+        np.asarray(x)
+      for kind in ("pinned_host", "unpinned_host"):
+        # An explicit move to host memory, as a checkpoint's copy makes.
+        on_host = jax.device_put(x, x.sharding.with_memory_kind(kind))
+        with self.assertAllows(f"device_to_host_np_asarray_{kind}"):
+          np.testing.assert_array_equal(np.asarray(on_host), np.arange(4.))
+
+  @jtu.run_on_devices("cpu")
+  def test_a_cpu_array_is_held_until_a_read_of_it_reaches_the_host(self):
+    # As an accelerator array is held until its first read caches a host copy.
+    with jax.transfer_guard_host_to_device("allow"):
+      x = jnp.arange(4.)
+      y = jnp.arange(4.) + 1
+      shorter = jnp.arange(3.)
+    if sys.version_info >= (3, 12):
+      # A writable export fails, and no value reaches the host.
+      with self.assertRaises(BufferError):
+        x.__buffer__(inspect.BufferFlags.WRITABLE)
+    with jax.transfer_guard("disallow"):
+      with self.assertDisallows("device_to_host_np_asarray"):
+        np.asarray(x)
+    with jax.transfer_guard("log"):
+      with self.assertLogs("device_to_host_np_asarray"):
+        np.asarray(x)
+    with jax.transfer_guard("disallow"):
+      with self.assertAllows("device_to_host_np_asarray_again"):
+        np.testing.assert_array_equal(np.asarray(x), np.arange(4.))
+      # A replacement refused leaves its buffer, and its read, as they were.
+      with self.assertRaises(jax.errors.JaxRuntimeError):
+        x._replace_with(shorter)
+      with self.assertAllows("device_to_host_np_asarray_unreplaced"):
+        np.asarray(x)
+      # Its buffer replaced, it holds a value no read has reached the host for.
+      x._replace_with(y)
+      with self.assertDisallows("device_to_host_np_asarray_replaced"):
+        np.asarray(x)
+    # Replaced by an array read before, it takes that read.
+    np.asarray(y)
+    x._replace_with(y)
+    with jax.transfer_guard("disallow"):
+      with self.assertAllows("device_to_host_np_asarray_replaced_by_read"):
+        np.testing.assert_array_equal(np.asarray(x), np.arange(4.) + 1)
 
   @jtu.thread_unsafe_test()  # Mutates global transfer guard config.
   def test_concurrent_global_state_tsan_race(self):
