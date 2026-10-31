@@ -24,6 +24,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from unittest import SkipTest
@@ -149,6 +150,31 @@ class CompilationCacheTest(CompilationCacheTestCase):
       raise SkipTest(
           "serialize executable only works on " + ",".join(supported_platforms)
       )
+
+  def test_reset_during_initialization_leaves_no_cache(self):
+    # A reset that runs while another thread builds the cache waits for it and then clears it, so the
+    # next compile initializes the cache again rather than keep the one the reset was meant to drop.
+    entered, proceed = threading.Event(), threading.Event()
+    real = cc.get_file_cache
+
+    def slow(path):
+      entered.set()
+      proceed.wait()
+      return real(path)
+
+    cc.reset_cache()
+    with (config.compilation_cache_dir(self.create_tempdir().full_path),
+          mock.patch.object(cc, "get_file_cache", side_effect=slow)):
+      initializing = threading.Thread(target=cc._initialize_cache)
+      initializing.start()
+      entered.wait()
+      resetting = threading.Thread(target=cc.reset_cache)
+      resetting.start()
+      resetting.join(timeout=0.2)
+      proceed.set()
+      initializing.join()
+      resetting.join()
+    self.assertIsNone(cc._cache)
 
   def test_get_no_executable(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
