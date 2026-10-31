@@ -3,15 +3,20 @@
 # (0.1.8.post1), built from `repository` at `ref`, its `tests` run on it, then indexed beside the packages the
 # index holds already; and `upstream`, PyPI's own wheels of the package's releases, which the index serves
 # too, as an installer that finds a package on this index looks for its every version here (uv's first-index
-# rule). A file the index lists already is kept as it is.
+# rule). A file the index lists already is kept as it is. `release` indexes instead the wheels attached to a
+# GitHub release, the artifact that release's own CI built and tested (Dew's python-publish.yml attaches its
+# sdist and wheel), so nothing is rebuilt between a test and the index.
 name: publish package
 
 on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "the fork to build, e.g. AshishKumar4/qwix"
+        description: "the fork to build, e.g. AshishKumar4/qwix, or the repository of `release`"
         required: true
+      release:
+        description: "a release's tag whose attached wheels are indexed as they are, e.g. v0.2.0 (no build, no tests)"
+        required: false
       ref:
         description: "its release commit or branch, e.g. dew/0.1.8.post1; none indexes `upstream` alone"
         required: false
@@ -48,6 +53,8 @@ jobs:
       TESTS: ${{ inputs.tests }}
       DEPENDENCIES: ${{ inputs.dependencies }}
       UPSTREAM: ${{ inputs.upstream }}
+      RELEASE: ${{ inputs.release }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +73,12 @@ jobs:
           read -ra releases <<< "$UPSTREAM"
           fetching/bin/python -m pip download -q --no-deps --only-binary :all: --index-url https://pypi.org/simple \
             --dest dist "${releases[@]}"
+          ls dist
+      - name: Fetch the release's wheels
+        if: inputs.release != ''
+        run: |
+          [ -z "$REF" ] || { echo "::error::release and ref name two artifacts: give one"; exit 1; }
+          gh release download "$RELEASE" --repo "$REPOSITORY" --pattern "*.whl" --dir dist
           ls dist
       - name: Build the wheel
         if: inputs.ref != ''
