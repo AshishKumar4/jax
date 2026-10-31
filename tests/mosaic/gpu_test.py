@@ -179,6 +179,12 @@ def copy(src: ir.Value, dst: ir.Value, swizzle: int | None = None):
   nvvm.fence_proxy(nvvm.ProxyKind.async_)
 
 
+def _copied_out(src: ir.Value, dst: ir.Value):
+  """SMEM `src` to GMEM `dst` through registers: `copy` fences the async proxy,
+  which an sm80 GPU has none of."""
+  mgpu.FragmentedArray.load_strided(src).store_untiled(dst, optimized=False)
+
+
 def iota_tensor(m, n, dtype, layout=mgpu.WGMMA_LAYOUT):
   """A tensor with given layout where arr[i, j] = i * N + j."""
   index = ir.IndexType.get()
@@ -4203,7 +4209,7 @@ class Sm80Test(TestCase):
           barrier=barrier,
       )
       barrier.wait()
-      copy(tmp, dst)
+      _copied_out(tmp, dst)
 
     x = np.arange(np.prod(full_shape), dtype=np.float32)
     x = x.reshape(full_shape).astype(dtype)
@@ -4232,7 +4238,7 @@ class Sm80Test(TestCase):
           barrier=barrier,
       )
       barrier.wait()
-      copy(tmp, dst)
+      _copied_out(tmp, dst)
 
     def run(extra):
       return mgpu.as_gpu_kernel(
@@ -4303,7 +4309,7 @@ class Sm80Test(TestCase):
         barrier.wait()
         return ()
 
-      copy(tmp, dst)
+      _copied_out(tmp, dst)
 
     y = mgpu.as_gpu_kernel(
         kernel,
@@ -4346,7 +4352,7 @@ class Sm80Test(TestCase):
           barrier=barrier,
       )
       barrier.wait()
-      copy(tmp, dst)
+      _copied_out(tmp, dst)
 
     x = np.zeros(full_shape, dtype)
     with self.assertRaisesRegex(NotImplementedError, "aligned to at least 4"):
