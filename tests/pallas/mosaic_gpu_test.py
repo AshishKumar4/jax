@@ -9079,6 +9079,43 @@ class PipelineTest(PallasTest):
     x = jax.random.uniform(jax.random.key(0), (m, n)).astype(dtype)
     np.testing.assert_allclose(kernel(x), x.sum(0, keepdims=True), rtol=1e-6)
 
+  @parameterized.parameters(3, 5)
+  @run_on_sm80
+  def test_emit_over_a_ring_of_odd_stages(self, max_concurrent_steps):
+    # The ring's slots are carried across steps rather than recomputed as a
+    # remainder: with a stage count that is not a power of two the slots wrap
+    # several times, and each step reads its own block (input-only, as cp.async
+    # pipelines take it).
+    m, n = 13, 128
+    dtype = jnp.float32
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((1, n), dtype),
+        scratch_types=[plgpu.SMEM((1, n), dtype=jnp.float32)],
+    )
+    def kernel(x_gmem, o_gmem, acc_ref):
+      acc_ref[...] = jnp.zeros_like(acc_ref)
+
+      def body(_, x_smem):
+        acc_ref[...] = acc_ref[...] * 2 + x_smem[...]
+
+      plgpu.emit_pipeline(
+          body,
+          in_specs=[plgpu.BlockSpec((1, n), lambda i: (i, 0))],
+          grid=(m,),
+          max_concurrent_steps=max_concurrent_steps,
+      )(x_gmem)
+
+      o_gmem[...] = acc_ref[...]
+
+    x = jnp.tile(jnp.arange(m, dtype=dtype)[:, None] % 2, (1, n))
+    # The rows read in order: each step doubles the running value and adds
+    # its row, so any row read out of order changes the result.
+    expected = jnp.zeros((1, n), dtype)
+    for row in range(m):
+      expected = expected * 2 + x[row:row + 1]
+    np.testing.assert_array_equal(kernel(x), expected)
+
   @run_on_sm80
   def test_emit_in_specs_only_requires_in_bounds(self):
     if jtu.is_cuda_compute_capability_at_least("9.0"):
@@ -9735,6 +9772,49 @@ class WarpSpecializedPipelineTest(PallasTest):
     y = jax.random.uniform(jax.random.key(1), (m, n), dtype=jnp.float32)
     z = jax.random.uniform(jax.random.key(3), (m, n), dtype=jnp.float32)
     np.testing.assert_allclose(kernel(x, y, z), x + y + z)
+
+  @parameterized.parameters(3, 5)
+  def test_different_delay_release_over_a_ring_of_odd_stages(self, stages):
+    # The ring's slots are carried across steps rather than recomputed as a
+    # remainder: with a stage count that is not a power of two, every delay
+    # level's fetch slot wraps several times, and each step reads its own block.
+    m, n = 32 * 9, 64
+    blk_m, blk_n = 32, 32
+    in_specs = [
+        plgpu.BlockSpec(
+            block_shape=(blk_m, blk_n),
+            index_map=lambda i, j: (i, j),
+            delay_release=delay,
+        )
+        for delay in range(3)
+    ]
+    out_spec = pl.BlockSpec(
+        block_shape=(blk_m, blk_n),
+        index_map=lambda i, j: (i, j),
+    )
+
+    def tiled_add_kernel(_, x_smem, y_smem, z_smem, o_smem):
+      o_smem[...] = x_smem[...] + y_smem[...] + z_smem[...]
+
+    def pipeline(*gmem_refs):
+      grid = (m // blk_m, n // blk_n)
+      return mgpu_pipeline.emit_pipeline(
+          tiled_add_kernel,
+          grid=grid,
+          max_concurrent_steps=stages,
+          in_specs=in_specs,
+          out_specs=[out_spec],
+      )(*gmem_refs)
+
+    kernel = self.kernel(
+        pipeline,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+    )
+    x, y, z = (
+        jnp.arange(m * n, dtype=jnp.float32).reshape(m, n) * scale
+        for scale in (1.0, 1e-3, 1e-6)
+    )
+    np.testing.assert_array_equal(kernel(x, y, z), x + y + z)
 
   @parameterized.product(
       delay_release=[0, 1],
