@@ -994,7 +994,12 @@ def _lower_as_gpu_kernel(
     base_loc: ir.Location | None = None,
     uses_pdl: bool = False,
     is_multi_process: bool = False,
+    min_blocks_per_sm: int = 1,
 ):
+  if min_blocks_per_sm < 1:
+    raise ValueError(
+        f"min_blocks_per_sm must be positive, got {min_blocks_per_sm}"
+    )
   ptr_ty = llvm.PointerType.get()
   token_ty = gpu.AsyncTokenType.get()
   i8 = ir.IntegerType.get_signless(8)
@@ -1020,6 +1025,10 @@ def _lower_as_gpu_kernel(
   module = ir.Module.create(loc=base_loc)
   dialect.register_dialect(module.context)
   attrs = module.operation.attributes
+  # Read by the LLVM attribute insertion pass, which sets nvvm.minctasm.
+  attrs["mosaic_gpu.min_blocks_per_sm"] = ir.IntegerAttr.get(
+      i32, min_blocks_per_sm
+  )
   attrs["sym_name"] = ir.StringAttr.get(module_name)
   arch_major, arch_minor = utils._infer_arch()
   attrs["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch_major)
