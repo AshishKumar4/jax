@@ -5,7 +5,7 @@ has them, one branch a release: `vX.Y.Z-cache-key-pool-fingerprints`, the releas
 the fixes on top, versioned `X.Y.Z.postN`. Each fix is also sent upstream, and is dropped from the stack
 once a release holds it.
 
-Each family of fixes the stack carries, at 0.12.0.1.post40 (`release/0.12.0.1.post40`, 0142c02ce), with what upstream holds
+Each family of fixes the stack carries, at 0.12.0.1.post41 (`release/0.12.0.1.post41`, da2a640da), with what upstream holds
 (jax-ml/jax `main` at b2fbcb706, 2026-10-29) and when it leaves the stack. Dew's ledger row, where one names it,
 in brackets.
 
@@ -36,6 +36,7 @@ in brackets.
 | Pallas Mosaic GPU snake traversal: a full power-of-two band as shift and mask, coordinates selected without branching (44eda26b6, d170290af, cd1f7681a) [2295] | no | upstream's `planar_snake` forms no runtime division |
 | Compiled executables keep the SHA-256 of their exact serialized bytes, taken at the persistent cache's write or read (`Compiled._executable_digest`; 44b18d1b1, 818d509de) [2600] | no | upstream exposes an executable's serialized digest |
 | Persistent cache: an entry written aside and renamed into place, so a reader beside its writer sees it whole or not at all (7c6ce00e8) | no | upstream's `LRUCache.put` writes atomically |
+| Persistent cache: `reset_cache` clears the cache under the lock its initialization holds, so a compile settling the cache while a reset runs is waited for (7fa298b4c, 0dff5de71) [2836] | no | upstream's `reset_cache` takes `_cache_initialized_mutex` before clearing `_cache` |
 | `JAX_EXPLAIN_CACHE_MISSES` reads a trace keyed by keyword, as Pallas Triton's reductions trace their bodies (360a29dc6) [2302] | no | upstream's explainer reads keyword keys |
 
 Fixes the stack carried and dropped, net zero at post34: the multi-process topology fingerprint exchange
