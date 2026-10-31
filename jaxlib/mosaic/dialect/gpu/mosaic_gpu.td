@@ -1278,7 +1278,7 @@ def MosaicGPU_PrintLayoutOp : Op<MosaicGPU_Dialect, "print_layout", []> {
   let hasVerifier = 1;
 }
 
-def MosaicGPU_BroadcastedIotaOp : Op<MosaicGPU_Dialect, "broadcasted_iota", []> {
+def MosaicGPU_BroadcastedIotaOp : Op<MosaicGPU_Dialect, "broadcasted_iota", [Pure]> {
   let summary = "Create a broadcasted iota vector.";
   let description = [{
     Creates an array that has the specified shape and holds values starting at

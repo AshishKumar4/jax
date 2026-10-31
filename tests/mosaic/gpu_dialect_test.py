@@ -2112,6 +2112,23 @@ ir.MLIRError,
     ):
       self.module.operation.verify()
 
+  def test_broadcasted_iota_op_with_no_use_is_canonicalized_away(self):
+    # An iota nothing reads must not survive canonicalization: layout inference
+    # finds no constraint for it and fails ("Failed to infer a possible set of
+    # layouts") once the layout casts that read it are dropped.
+    with ir.InsertionPoint(self.module.body):
+      fn = func.FuncOp("test_fn", ir.FunctionType.get([], []))
+      block = fn.add_entry_block()
+      with ir.InsertionPoint(block):
+        ty = ir.VectorType.get((128, 128), ir.F32Type.get())
+        mgpu.dialect.broadcasted_iota(ty, dimension=0)
+        func.ReturnOp([])
+    pm = mlir_interpreter.passmanager.PassManager.parse(
+        "builtin.module(canonicalize)", self.module.context
+    )
+    pm.run(self.module.operation)
+    self.assertEmpty(self.find_ops(mgpu.dialect.BroadcastedIotaOp))
+
   def test_print_layout_op_smem_ref(self):
     with ir.InsertionPoint(self.module.body):
       ref_ty = ir.MemRefType.get(
