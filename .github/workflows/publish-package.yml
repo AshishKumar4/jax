@@ -6,7 +6,11 @@
 # rule). A file the index lists already is kept as it is. `release` indexes instead the wheels attached to a
 # GitHub release, the artifact that release's own CI built and tested (Dew's python-publish.yml attaches its
 # sdist and wheel), so nothing is rebuilt between a test and the index; `package` picks one project of a release
-# whose wheels are several projects' (a fork's jax and its CUDA plugins), one publish a project.
+# whose wheels are several projects' (a fork's jax and its CUDA plugins), one publish a project. A project new to
+# the index is indexed only where `new_project` names it: once here, an installer that lists this index first
+# resolves it from here alone, so Dew's lock, which resolves it from PyPI until a pin head maps it here
+# explicitly, would find only what this index holds (ledger 3116: the CUDA plugins' first publish broke every
+# lane's lock gate).
 name: publish package
 
 on:
@@ -32,6 +36,9 @@ on:
         required: false
       package:
         description: "the project of `release`'s wheels to index, e.g. jax-cuda12-plugin; none: its wheels are one project's"
+        required: false
+      new_project:
+        description: "the project this publish adds to the index, where it holds none of it yet, e.g. jax-cuda12-plugin: named only once Dew's pyproject maps it to this index explicitly"
         required: false
 
 permissions:
@@ -59,6 +66,7 @@ jobs:
       UPSTREAM: ${{ inputs.upstream }}
       RELEASE: ${{ inputs.release }}
       PACKAGE_WANTED: ${{ inputs.package }}
+      NEW_PROJECT: ${{ inputs.new_project }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +140,11 @@ jobs:
               > /dev/null 2> head.txt; then
             aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$package/manifest.json" manifest.json
           elif grep -q "(404)" head.txt; then
+            # New to the index: from now on it shadows PyPI's project for an installer listing this index first.
+            [ "$NEW_PROJECT" = "$package" ] || {
+              echo "::error::$package is new to the index, which would serve it in place of PyPI's to every installer that lists the index first (Dew's lock among them); publish it with new_project=$package once Dew's pyproject maps $package to this index explicitly"
+              exit 1
+            }
             echo '{}' > manifest.json
           else
             cat head.txt
