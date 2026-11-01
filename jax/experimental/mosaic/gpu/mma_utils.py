@@ -245,7 +245,10 @@ def encode_descriptor(
     swizzle_encoding = 3
   else:
     raise NotImplementedError(swizzle)
-  encoded_base_addr = llvm.lshr(llvm.and_(ptr_val, c(0x3FFFF)), c(4))
+  # A descriptor's address field is the address's bits 4 to 17: an MMA reads
+  # shared memory below 2**18 only (its window), so the address is its own
+  # 18-bit mask, and a 16-byte aligned one shifts exactly.
+  encoded_base_addr = llvm.lshr(ptr_val, c(4))
   # We ignore the offset
   desc_const = (
       const_init
@@ -265,4 +268,10 @@ def encode_descriptor(
       desc_val = llvm.or_(desc_val, arith.shli(c(desc_const >> 32), c(32)))
     else:
       desc_val = c(desc_const)
-    return llvm.or_(encoded_base_addr, desc_val)
+    # The encoded address (below 2**14) and the constant's fields (from bit
+    # 16, and `const_init`'s, which shares no bit with an address below 2**14
+    # where it is used) are disjoint: their sum is their union, which an
+    # address's own sums (a ring slot's, a group's offset) then fold into.
+    if const_init & 0x3FFF:
+      return llvm.or_(encoded_base_addr, desc_val)
+    return llvm.add(encoded_base_addr, desc_val, overflow_flags=llvm.IntegerOverflowFlags.nuw)
