@@ -9,7 +9,9 @@
 #   test_wheel.sh PYTHON WHEEL CHECKOUT TEST...    PYTHON: the environment's interpreter, the wheel installed;
 #                                                 PYTEST_ARGS: pytest's own arguments (-n auto, say)
 set -euo pipefail
-python=$(realpath "$1") wheel=$(realpath "$2") checkout=$(realpath "$3")
+# The interpreter absolute but its own link kept: a virtual environment's python is a link to its base
+# interpreter, and only the link's path finds the environment (its pyvenv.cfg).
+python="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")" wheel=$(realpath "$2") checkout=$(realpath "$3")
 shift 3
 apart=$(mktemp -d)
 trap 'rm -rf "$apart"' EXIT

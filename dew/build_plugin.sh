@@ -68,7 +68,13 @@ for python in $pythons; do
     [ "$code" = 0 ] || { tail -40 "$out/plugin-cp${python/./}-cuda$cuda.log"; exit "$code"; }
   done
 done
+# Every wheel carries VERSION, or none is published: an OUT reused with an older build's wheels fails here,
+# before anything is summed or attached.
+for wheel in "$out"/dist/*.whl; do
+  case $(basename "$wheel") in
+    *-"$version"-*) ;;
+    *) echo "build_plugin: $(basename "$wheel") is not $version's; OUT holds another build's wheels" >&2; exit 1 ;;
+  esac
+done
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
-# Every wheel carries VERSION, or none is published.
-! ls "$out/dist" | grep '\.whl$' | grep -v -- "-$version-"
 column -t -s $'\t' "$out/builds.tsv"
