@@ -2,10 +2,10 @@
 # Dew's JAX CUDA plugin wheels (jax-cuda12-plugin, jax-cuda13-plugin), built from a commit of this fork: the plugin
 # is the one native package Dew patches (its Mosaic GPU compile path and passes); jax is this fork's Python and
 # jaxlib and jax-cuda-pjrt stay the stock release the commit posts. Bazel builds them with JAX's hermetic C++,
-# CUDA and Python toolchains (ci_linux_x86_64_cudaN, as JAX's CI builds its own) and reads and writes Dew's remote
+# CUDA and Python toolchains (ci_linux_<machine>_cudaN, as JAX's CI builds its own) and reads and writes Dew's remote
 # cache, so a JAX version's cold build is paid once and a patch change rebuilds in minutes.
 #
-#   build_plugin.sh REF VERSION OUT [PYTHONS] [CUDAS]     on a Linux x86_64 host
+#   build_plugin.sh REF VERSION OUT [PYTHONS] [CUDAS]     on a Linux x86_64 or aarch64 host (its wheels' platform)
 #   e.g. build_plugin.sh plugin-post42 0.12.0.1.post42.dev1 "$OUT" "3.12 3.14" "12 13"
 #
 # VERSION is every wheel's version: the commit's jax release (`_version`) and a suffix Bazel and the wheel
@@ -49,7 +49,7 @@ for python in $pythons; do
   for cuda in $cudas; do
     started=$(date +%s) code=0
     python3 build/build.py build --wheels=jax-cuda-plugin --cuda_major_version="$cuda" --python_version="$python" \
-      --bazel_options=--config=ci_linux_x86_64_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
+      --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
