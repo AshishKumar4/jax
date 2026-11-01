@@ -808,10 +808,6 @@ class JaxprInterpreter:
         gpu_primitives.barrier_arrive_and_wait_p,
     )
     invals = get_invals()
-    if eqn.params.get("has_parity", False):
-      *invals, parity = invals
-    else:
-      parity = None
     allocation_key_as_array = _get_barrier_allocation_key_from_inval(
         invals[0], eqn.params["transforms_treedef"], invals[1:]
     )
@@ -821,7 +817,6 @@ class JaxprInterpreter:
         self.thread,
         allocation_key_as_array,
         eqn.source_info,
-        parity=parity,
     )
     assert eqn.primitive.multiple_results
     return token, []

@@ -409,31 +409,17 @@ def emit_pipeline[T](
         )
     ]
     copies_per_step = sum(_in_smem(bref.spec) for bref in in_brefs)
-    # Pre-Hopper, a step's fetch overwrites a slot every thread may still be
-    # reading until a warpgroup barrier, and each cp.async copy takes one
-    # (its auto barrier). Fetching at the step's start, after the barrier its
-    # wait ends with, into the slot the previous step read leaves that barrier
-    # the guard and the copies' own barriers no skew to wait out: CUTLASS's
-    # multistage order. The steps in flight beside a step's body are the same
-    # (``max_concurrent_steps - 1``), one fewer fetched before the loop. On an
-    # A100 the fetch after the body left warps waiting at three warpgroup
-    # barriers a step, 13.5% of a dense GEMM's stall samples (Dew 2152).
-    lead = int(
-        is_cp_async and copies_per_step > 0 and max_concurrent_steps > 1
-        and delay_release_levels == [0]
-    )
 
     # Initialize the pipeline.
     indices = (jnp.asarray(0, dtype=jnp.int32),) * len(grid)
     if has_dynamic_grid:
       assert isinstance(num_steps, jax.Array)
       prologue_steps = lax.min(
-          jnp.asarray(max_concurrent_steps - lead, dtype=num_steps.dtype),
-          num_steps,
+          jnp.asarray(max_concurrent_steps, dtype=num_steps.dtype), num_steps
       )
     else:
       assert max_concurrent_steps <= num_steps
-      prologue_steps = max_concurrent_steps - lead
+      prologue_steps = max_concurrent_steps
 
     def prologue(step, fetch_indices):
       for bref in in_brefs:
@@ -460,22 +446,6 @@ def emit_pipeline[T](
           wrapped == max_concurrent_steps, jnp.zeros_like(wrapped), wrapped
       )
 
-    def fetch(step, fetch_index_levels, fetch_slots):
-      for delay_release, fetch_indices, fetch_slot in zip(
-          delay_release_levels, fetch_index_levels, fetch_slots
-      ):
-        fetch_step = step + (max_concurrent_steps - delay_release - lead)
-        def do_fetch(fetch_slot=fetch_slot):
-          for bref in in_brefs:
-            if getattr(bref.spec, "delay_release", 0) == delay_release:
-              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
-
-        jax.lax.cond(
-            lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
-            do_fetch,
-            lambda: None,
-        )
-
     def loop_body(step, carry, *, wait_count=0):
       (indices, fetch_index_levels, last_store_indices, prev_body_carry,
        slot, fetch_slots) = carry
@@ -487,8 +457,6 @@ def emit_pipeline[T](
         # Pre-Hopper: await cp.async copies. The wait-group count must be a
         # compile-time constant, so it is threaded in via ``wait_count``.
         gpu_primitives.wait_gmem_to_smem(wait_count)
-      if lead:
-        fetch(step, fetch_index_levels, fetch_slots)
       # Wait for the previous output SMEM->GMEM copy to complete.
       if copies_out_in_loop:
         gpu_primitives.wait_smem_to_gmem(
@@ -537,8 +505,20 @@ def emit_pipeline[T](
       if copies_out_in_loop:
         gpu_primitives.commit_smem_to_gmem_group()
 
-      if not lead:
-        fetch(step, fetch_index_levels, fetch_slots)
+      for delay_release, fetch_indices, fetch_slot in zip(
+          delay_release_levels, fetch_index_levels, fetch_slots
+      ):
+        fetch_step = step + (max_concurrent_steps - delay_release)
+        def do_fetch(fetch_slot=fetch_slot):
+          for bref in in_brefs:
+            if getattr(bref.spec, "delay_release", 0) == delay_release:
+              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
+
+        jax.lax.cond(
+            lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
+            do_fetch,
+            lambda: None,
+        )
 
       next_fetch_indices_levels = [
           _inc_grid_by_1(fetch_indices, grid)
@@ -556,7 +536,7 @@ def emit_pipeline[T](
     fetch_index_levels = []
     for delay_release in delay_release_levels:
       fetch_indices = indices
-      for _ in range(max_concurrent_steps - delay_release - lead):
+      for _ in range(max_concurrent_steps - delay_release):
         fetch_indices = _inc_grid_by_1(fetch_indices, grid)
       fetch_index_levels.append(fetch_indices)
 
@@ -576,8 +556,7 @@ def emit_pipeline[T](
         jnp.asarray(0, dtype=jnp.int32),
         tuple(
             jnp.asarray(
-                (max_concurrent_steps - delay_release - lead)
-                % max_concurrent_steps,
+                (max_concurrent_steps - delay_release) % max_concurrent_steps,
                 dtype=jnp.int32,
             )
             for delay_release in delay_release_levels
@@ -586,17 +565,16 @@ def emit_pipeline[T](
     if is_cp_async and copies_per_step > 0:
       if has_dynamic_grid:
         steady_steps = lax.max(
-            jnp.zeros_like(num_steps),
-            num_steps - (max_concurrent_steps - 1 - lead),
+            jnp.zeros_like(num_steps), num_steps - (max_concurrent_steps - 1)
         )
       else:
-        steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
+        steady_steps = max(0, num_steps - (max_concurrent_steps - 1))
       loop_carry = lax.fori_loop(
           0,
           steady_steps,
           functools.partial(
               loop_body,
-              wait_count=(max_concurrent_steps - 1 - lead) * copies_per_step,
+              wait_count=(max_concurrent_steps - 1) * copies_per_step,
           ),
           init_loop_carry,
       )

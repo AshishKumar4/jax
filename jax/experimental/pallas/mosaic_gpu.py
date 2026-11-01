@@ -75,8 +75,6 @@ from jax._src.pallas.mosaic_gpu.primitives import barrier_test as barrier_test
 from jax._src.pallas.mosaic_gpu.primitives import barrier_wait as barrier_wait
 from jax._src.pallas.mosaic_gpu.primitives import broadcasted_iota as broadcasted_iota
 from jax._src.pallas.mosaic_gpu.primitives import commit_smem as commit_smem
-from jax._src.pallas.mosaic_gpu.primitives import fence as fence
-from jax._src.pallas.mosaic_gpu.primitives import fence_proxy_async as fence_proxy_async
 from jax._src.pallas.mosaic_gpu.primitives import commit_smem_to_gmem_group as commit_smem_to_gmem_group
 from jax._src.pallas.mosaic_gpu.primitives import commit_tmem as commit_tmem
 from jax._src.pallas.mosaic_gpu.primitives import copy_gmem_to_smem as copy_gmem_to_smem

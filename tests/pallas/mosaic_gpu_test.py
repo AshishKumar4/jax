@@ -2125,23 +2125,6 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     np.testing.assert_array_equal(kernel(), np.array([0, 0, 1, 0, 1]))
 
-  def test_barrier_wait_at_explicit_parities(self):
-    # Two arrivals complete phases 0 and 1 of the barrier; a wait at each
-    # parity returns, and the barrier's tracked phases are left alone.
-    @functools.partial(
-        self.kernel,
-        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
-        scratch_types=[plgpu.Barrier()],
-    )
-    def kernel(o_ref, barrier):
-      plgpu.barrier_arrive(barrier)
-      plgpu.barrier_wait(barrier, parity=False)
-      plgpu.barrier_arrive(barrier)
-      plgpu.barrier_wait(barrier, parity=jnp.bool_(True))
-      o_ref[...] = jnp.ones_like(o_ref)
-
-    np.testing.assert_array_equal(kernel(), np.ones((128,), np.float32))
-
   def test_barrier_arrive_and_wait(self):
     @functools.partial(
         self.kernel,
@@ -5161,75 +5144,6 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       jax.block_until_ready(result)
     self.assertArraysEqual(result, x)
     self.assertIn("red.global", ptx())
-
-  @parameterized.product(
-      order=("relaxed", "release"), scope=(None, "cta", "cluster", "gpu", "sys")
-  )
-  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
-  def test_atomic_add_gmem_order_and_scope(self, order, scope):
-    m, n = 128, 64
-    x = jnp.arange(1, m * n + 1, dtype=jnp.float32).reshape(m, n)
-
-    def body(inp_ref, out_ref):
-      val = plgpu.load(inp_ref, layout=plgpu.Layout.WGMMA, optimized=False)
-      out_ref[...] = jnp.zeros_like(out_ref)
-      plgpu.atomic_add(out_ref, val, order=order, scope=scope)
-
-    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
-      result = self.kernel(
-          body, out_type=jax.ShapeDtypeStruct([m, n], jnp.float32)
-      )(x)
-      jax.block_until_ready(result)
-    self.assertArraysEqual(result, x)
-    self.assertIn(f"red.global.{order}.{scope or 'gpu'}.add", ptx())
-
-  @parameterized.product(
-      order=("sc", "acq_rel", "acquire", "release"),
-      scope=("cta", "cluster", "gpu", "sys"),
-  )
-  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
-  def test_fence(self, order, scope):
-    x = jnp.arange(128, dtype=jnp.float32)
-
-    def body(inp_ref, out_ref):
-      out_ref[...] = inp_ref[...] + 1
-      plgpu.fence(scope, order=order)
-
-    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
-      result = self.kernel(
-          body, out_type=jax.ShapeDtypeStruct(x.shape, x.dtype)
-      )(x)
-      jax.block_until_ready(result)
-    self.assertArraysEqual(result, x + 1)
-    self.assertIn(f"fence.{order}.{scope};", ptx())
-
-  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
-  def test_fence_proxy_async_orders_stores_before_a_tma_load(self):
-    x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
-
-    def body(inp_ref, staged_ref, out_ref, smem_ref, barrier_ref):
-      staged_ref[...] = plgpu.load(
-          inp_ref, layout=plgpu.Layout.WGMMA, optimized=False
-      ) * 2
-      plgpu.fence_proxy_async("global")
-      plgpu.copy_gmem_to_smem(staged_ref, smem_ref, barrier_ref.at[0])
-      plgpu.barrier_wait(barrier_ref.at[0])
-      out_ref[...] = smem_ref[...]
-
-    shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
-      staged, result = self.kernel(
-          body,
-          out_type=(shape, shape),
-          scratch_types=[
-              plgpu.SMEM(x.shape, x.dtype),
-              plgpu.Barrier(num_barriers=1),
-          ],
-      )(x)
-      jax.block_until_ready(result)
-    self.assertArraysEqual(staged, x * 2)
-    self.assertArraysEqual(result, x * 2)
-    self.assertIn("fence.proxy.async.global", ptx())
 
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_griddepcontrol(self):

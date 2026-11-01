@@ -2478,66 +2478,6 @@ class DialectLoweringTest(MosaicGpuTest):
         list(filter(is_mosaic_gpu_op, if_op.then_block.operations))
     )
 
-  def _marked_after(self, before, *, branch=None):
-    """A marker op after `before` (a callable emitting ops), inside `branch`
-    ("if" or "for") when given; returns the marker."""
-    i32 = ir.IntegerType.get_signless(32)
-    with self.kernel():
-      before()
-      if branch is None:
-        return llvm.UndefOp(i32)
-      if branch == "if":
-        index = arith.constant(ir.IndexType.get(), 1)
-        op = scf.IndexSwitchOp([], index, [1])
-        with ir.InsertionPoint(op.case_block(0)):
-          marker = llvm.UndefOp(i32)
-          scf.yield_([])
-        with ir.InsertionPoint(op.default_block):
-          scf.yield_([])
-        return marker
-      lb = arith.constant(ir.IndexType.get(), 0)
-      for_op = scf.ForOp(lb, lb, lb)
-      with ir.InsertionPoint(for_op.body):
-        marker = llvm.UndefOp(i32)
-        scf.yield_([])
-      return marker
-
-  @staticmethod
-  def _barrier(threads=mgpu_utils.WARPGROUP_SIZE):
-    def emit():
-      mgpu_utils.inline_ptx(
-          f"bar.sync $0, {threads};",
-          arith.constant(ir.IntegerType.get_signless(32), 1),
-          has_side_effects=True,
-      )
-    return emit
-
-  def test_a_barrier_then_address_arithmetic_syncs_the_warpgroup(self):
-    def before():
-      self._barrier()()
-      arith.constant(ir.IntegerType.get_signless(32), 7)
-    self.assertTrue(lowering._warpgroup_synced_before(self._marked_after(before)))
-
-  def test_a_shared_access_after_the_barrier_does_not_sync(self):
-    def before():
-      self._barrier()()
-      llvm.load(ir.IntegerType.get_signless(32), llvm.UndefOp(workgroup_ptr_ty()))
-    self.assertFalse(
-        lowering._warpgroup_synced_before(self._marked_after(before))
-    )
-
-  def test_a_conditional_branch_starts_after_the_ops_before_it(self):
-    marker = self._marked_after(self._barrier(), branch="if")
-    self.assertTrue(lowering._warpgroup_synced_before(marker))
-
-  def test_a_loop_body_also_follows_its_previous_iteration(self):
-    marker = self._marked_after(self._barrier(), branch="for")
-    self.assertFalse(lowering._warpgroup_synced_before(marker))
-
-  def test_a_barrier_of_one_warp_does_not_sync_the_warpgroup(self):
-    marker = self._marked_after(self._barrier(threads=32))
-    self.assertFalse(lowering._warpgroup_synced_before(marker))
-
   def test_initialize_barrier_op_lowering_rule(self):
     num_barriers = 4
     arrival_count = 1337

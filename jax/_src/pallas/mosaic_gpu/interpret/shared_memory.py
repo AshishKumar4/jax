@@ -1376,16 +1376,13 @@ class Barrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
   ):
-    """Waits for the next phase `thread` observes; given a `parity`, the
-    phase must be of it (the hardware waits for the phase of that parity)."""
     # Fail early if the kernel has already failed. This cannot be done while
     # holding the lock on `self.cv`, so the below loop checks `self.aborted`
     # and we only call `check_failed` again once `self.cv` has been released.
     self.shared_memory.check_failed()
     try:
-      self._wait(thread, logging_info, parity)
+      self._wait(thread, logging_info)
     except _BarrierAborted:
       self.shared_memory.check_failed()
       raise RuntimeError(
@@ -1396,7 +1393,6 @@ class Barrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
   ):
     with self.cv:
       last_observed_phase = self.last_observed_phase_by_thread.get(
@@ -1445,13 +1441,6 @@ class Barrier(memory.Allocation):
                 " but its constituent warps have previously observed different"
                 f" phases: {observed_phases}."
             )
-
-      if parity is not None and parity != last_observed_phase % 2:
-        raise ValueError(
-            f"Thread {thread} is waiting at barrier {id(self)} for a phase of"
-            f" parity {parity}, but the next phase it observes is phase"
-            f" {last_observed_phase}, of parity {last_observed_phase % 2}."
-        )
 
       # Suppose our last observed phase was phase `p`...
       if last_observed_phase <= self.phase - 2:
@@ -1687,7 +1676,6 @@ class ClusterBarrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
   ):
     if self.enable_logging and logging_info is not None:
       with self.lock:
@@ -1698,7 +1686,7 @@ class ClusterBarrier(memory.Allocation):
             )
         )
 
-    self.block_barrier(thread).wait(thread, logging_info, parity)
+    self.block_barrier(thread).wait(thread, logging_info)
 
   def block_barrier(self, thread: Thread) -> Barrier:
     """The barrier for the block that `thread` belongs to."""
