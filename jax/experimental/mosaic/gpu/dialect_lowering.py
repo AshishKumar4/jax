@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import math
 import operator
+import re
 from typing import Any, Literal, assert_never, cast
 
 from jax._src.interpreters import mlir as mlir_interpreter
@@ -503,6 +504,22 @@ def _multimem_load_reduce_op_lowering_rule(
   return [fragmented_array_to_ir(fa_res, op.result.type)]
 
 
+ATOMIC_ORDER = "mosaic_gpu.atomic_order"
+ATOMIC_SCOPE = "mosaic_gpu.atomic_scope"
+"""Discardable attributes of an atomic `vector_store`: its memory order and
+scope (`FragmentedArray.store_untiled`'s `atomic_order`, `atomic_scope`)."""
+
+
+def _atomic_ordering(op: ir.OpView) -> dict[str, str]:
+  """An atomic store's order and scope where its op states them."""
+  names = {ATOMIC_ORDER: "atomic_order", ATOMIC_SCOPE: "atomic_scope"}
+  return {
+      keyword: ir.StringAttr(op.attributes[name]).value
+      for name, keyword in names.items()
+      if name in op.attributes
+  }
+
+
 @_register_lowering(mgpu.VectorStoreOp)
 def _vector_store_op_lowering_rule(
     ctx: LoweringContext, op: mgpu.VectorStoreOp
@@ -512,6 +529,7 @@ def _vector_store_op_lowering_rule(
     atomic: Any = str(mgpu.AtomicOpType(op.atomic_type.value))
   else:
     atomic = None
+  ordering = _atomic_ordering(op)
 
   [to_store_layout] = inference_utils.in_layouts(op)
   fragmented_array = _fragmented_array_from_ir(op.valueToStore, to_store_layout)
@@ -525,7 +543,9 @@ def _vector_store_op_lowering_rule(
 
   if ref_type.memory_space is None:  # GMEM
     ref = utils.MultimemRef(ref) if op.multimem.value else ref
-    fragmented_array.store_untiled(ref, optimized=optimized, atomic=atomic)
+    fragmented_array.store_untiled(
+        ref, optimized=optimized, atomic=atomic, **ordering
+    )
   elif ref_type.memory_space == utils.smem():
     transforms_attr = inference_utils.in_transforms(op)[0]
     swizzle = swizzle_from_transforms_attr(transforms_attr)
@@ -540,10 +560,11 @@ def _vector_store_op_lowering_rule(
           optimized,
           tiling_rank=len(tiling_transform.tiling),
           atomic=atomic,
+          **ordering,
       )
     else:
       fragmented_array.store_untiled(
-          ref, optimized=optimized, swizzle=swizzle, atomic=atomic
+          ref, optimized=optimized, swizzle=swizzle, atomic=atomic, **ordering
       )
   else:
     raise ValueError(f"Unsupported memory space: {ref_type.memory_space}")
@@ -1213,7 +1234,11 @@ def _mgpu_async_load_op_lowering_rule(
   # flatten -> async_copy -> unflatted here, as long as flattened size is a
   # multiple of 16.
 
-  if ctx.auto_barriers and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP:
+  if (
+      ctx.auto_barriers
+      and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP
+      and not _warpgroup_synced_before(load_op)
+  ):
     utils.warpgroup_barrier()  # Make sure the writes have completed.
 
   # TODO(dasenov): Add support for the remaining op properties.
@@ -1238,6 +1263,84 @@ def _mgpu_async_load_op_lowering_rule(
       **{} if is_cp_async else predicate,  # pyrefly: ignore[bad-argument-type]
   )
   return []
+
+
+# Ops that touch no shared memory from a thread: arithmetic, address and view
+# computations, special-register reads, and cp.async's own issue and commit
+# (asynchronous copies a warpgroup barrier does not order anyway).
+_NO_THREAD_SMEM_ACCESS = (
+    "arith.", "index.", "math.", "builtin.unrealized_conversion_cast",
+    "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison",
+    "llvm.getelementptr", "llvm.extractvalue", "llvm.insertvalue",
+    "llvm.ptrtoint", "llvm.inttoptr", "llvm.addrspacecast", "llvm.bitcast",
+    "llvm.zext", "llvm.sext", "llvm.trunc", "llvm.add", "llvm.mul",
+    "llvm.and", "llvm.or", "llvm.shl", "llvm.lshr", "llvm.icmp",
+    "nvvm.read.ptx.sreg.", "nvvm.cp.async.shared.global",
+    "nvvm.cp.async.commit.group", "nvvm.cp.async.wait.group",
+    "memref.subview", "memref.reinterpret_cast", "memref.cast",
+    "memref.collapse_shape", "memref.expand_shape", "memref.transpose",
+    "memref.view", "memref.extract_aligned_pointer_as_index",
+    "memref.extract_strided_metadata", "scf.yield",
+)
+_STRUCTURED = ("scf.if", "scf.index_switch", "scf.for")
+_WARPGROUP_BARRIER = re.compile(
+    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;"
+)
+
+
+def _no_thread_smem_access(op: ir.Operation) -> bool:
+  """Whether `op`, and every op its regions hold, touches no shared memory."""
+  name = op.name
+  if name.startswith(_STRUCTURED):
+    return all(
+        _no_thread_smem_access(inner)
+        for region in op.regions
+        for block in region.blocks
+        for inner in block.operations
+    )
+  return name.startswith(_NO_THREAD_SMEM_ACCESS)
+
+
+def _is_warpgroup_barrier(op: ir.Operation) -> bool:
+  """Whether `op` is a barrier every thread of a warpgroup takes part in."""
+  if op.name in ("nvvm.barrier0", "nvvm.barrier", "gpu.barrier"):
+    return True
+  if op.name != "llvm.inline_asm":
+    return False
+  asm = ir.StringAttr(op.attributes["asm_string"]).value
+  match = _WARPGROUP_BARRIER.match(asm)
+  return match is not None and (
+      match.group(4) is None or int(match.group(4)) >= utils.WARPGROUP_SIZE
+  )
+
+
+def _warpgroup_synced_before(op: ir.OpView) -> bool:
+  """Whether a warpgroup barrier precedes `op` with no thread's access to
+  shared memory between them on every path that reaches it.
+
+  The walk goes back through `op`'s block and out of the conditionals holding
+  it (a branch's start follows the ops before it); a loop's body or the
+  kernel's start ends it, a loop's start following its previous iteration too.
+  Ops already lowered precede `op`, so a preceding copy's issue is seen as the
+  cp.async ops it lowered to.
+  """
+  operation = op.operation
+  while True:
+    block = operation.block
+    before = []
+    for inner in block.operations:
+      if inner.operation == operation:
+        break
+      before.append(inner.operation)
+    for previous in reversed(before):
+      if _is_warpgroup_barrier(previous):
+        return True
+      if not _no_thread_smem_access(previous):
+        return False
+    owner = block.owner
+    if owner is None or owner.operation.name not in ("scf.if", "scf.index_switch"):
+      return False
+    operation = owner.operation
 
 
 @_register_lowering(mgpu.AsyncPrefetchOp, support_warp_semantics=True)
