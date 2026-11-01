@@ -955,6 +955,7 @@ def _barrier_wait(
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
     allocation_key_as_array: jax.Array,
+    parity: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
   barrier_key = HostAllocationKey.from_array(allocation_key_as_array)
@@ -968,6 +969,7 @@ def _barrier_wait(
   barrier.wait(
       thread,
       logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
+      parity=None if int(parity) < 0 else int(parity),
   )
   return token
 
@@ -979,7 +981,9 @@ def call_barrier_wait(
     thread: memory.Thread,
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
+    parity: jax.Array | None = None,
 ):
+  """Waits at a barrier; at a phase of `parity` where given (`barrier_wait`'s)."""
   return callback.io_callback_numpy_inputs(
       functools.partial(_barrier_wait, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
@@ -987,6 +991,7 @@ def call_barrier_wait(
       mesh_location,
       thread,
       allocation_key_as_array,
+      jnp.int32(-1) if parity is None else jnp.asarray(parity, jnp.int32),
   )
 
 

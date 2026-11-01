@@ -1954,12 +1954,16 @@ def _barrier_wait_pp_eqn(
     context: jax_core.JaxprPpContext,
     settings: jax_core.JaxprPpSettings,
 ):
-  del settings
   barrier, *flat_transforms = eqn.invars
+  pp_params = {}
+  if eqn.params.get("has_parity", False):
+    *flat_transforms, parity = flat_transforms
+    pp_params["parity"] = parity.pretty_print(context)
   transforms_treedef = eqn.params["transforms_treedef"]
   transforms = transforms_treedef.unflatten(flat_transforms)
   return pp.concat([
       pp.text("barrier_wait"),
+      jax_core.pp_kv_pairs(pp_params.items(), context, settings),
       pp.text(" "),
       state_primitives.pp_ref_transforms(context, barrier, transforms),
   ])
@@ -1979,7 +1983,13 @@ def _barrier_wait_lowering(
     barrier,
     *flat_transforms,
     transforms_treedef,
+    has_parity: bool = False,
 ):
+  if has_parity:
+    *flat_transforms, parity = flat_transforms
+    parity = lowering._ensure_ir_value(parity, jnp.bool)  # pylint: disable=protected-access
+  else:
+    parity = None
   barrier_aval = ctx.avals_in[0]
   assert isinstance(barrier_aval, state_types.AbstractRef)
   transforms = transforms_treedef.unflatten(flat_transforms)
@@ -1989,18 +1999,37 @@ def _barrier_wait_lowering(
   base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
-  barrier.wait(orders_tensor_core=orders_tensor_core)
+  if parity is None:
+    barrier.wait(orders_tensor_core=orders_tensor_core)
+  else:
+    barrier.wait_parity(parity, orders_tensor_core=orders_tensor_core)
   return ()
 
 
-def barrier_wait(barrier: state.AbstractRef) -> None:
-  """Waits on the given barrier."""
+def barrier_wait(
+    barrier: state.AbstractRef,
+    *,
+    parity: bool | jax.Array | None = None,
+) -> None:
+  """Waits on the given barrier.
+
+  Without a ``parity``, the wait takes the barrier's next phase, which the
+  kernel tracks for each barrier of an array. With one, it waits for the phase
+  of that parity to complete and tracks nothing: a ring whose barriers all
+  complete a phase each turn shares one parity bit between them (the turn's),
+  where tracking spends a bit test and a flip on every wait. A barrier is
+  awaited one way throughout a kernel.
+  """
   barrier, transforms = state_primitives.get_ref_and_transforms(
       barrier, None, "barrier_wait"
   )
   flat_transforms, transforms_treedef = tree_util.tree_flatten(transforms)
   barrier_wait_p.bind(
-      barrier, *flat_transforms, transforms_treedef=transforms_treedef,
+      barrier,
+      *flat_transforms,
+      *() if parity is None else (parity,),
+      transforms_treedef=transforms_treedef,
+      has_parity=parity is not None,
   )
 
 
