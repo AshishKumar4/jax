@@ -826,7 +826,8 @@ def MosaicGPU_WGMMAOp : Op<MosaicGPU_Dialect, "wgmma",
   let hasVerifier = 1;
 }
 
-def MosaicGPU_MMASupportedABType : AnyTypeOf<[F64, TF32, F16, BF16, F8E4M3FN, F8E5M2, I8, I<4>, I1],
+// F32 operands multiply as TF32 (`mma.sync.m16n8k8.tf32`, each rounded to it first).
+def MosaicGPU_MMASupportedABType : AnyTypeOf<[F64, F32, TF32, F16, BF16, F8E4M3FN, F8E5M2, I8, I<4>, I1],
     "A type supported by the `a` and `b` operands of the synchronous `mma` op">;
 
 def MosaicGPU_MMASupportedAccumulatorType : AnyTypeOf<[F64, F32, F16, I32],
