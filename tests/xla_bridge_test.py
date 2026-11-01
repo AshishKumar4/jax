@@ -22,6 +22,7 @@ from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
+from jax.extend import backend as jex_backend
 from jax._src.lib import _profiler
 from jax._src.lib import xla_client as xc
 
@@ -399,7 +400,7 @@ class GetBackendTest(jtu.JaxTestCase):
       self.assertIsNone(xb.initialized_xla_flags())
       xb.get_backend()
       os.environ["XLA_FLAGS"] = "--xla_dump_to=/tmp/elsewhere"
-      self.assertEqual(xb.initialized_xla_flags(), "--xla_cpu_enable_fast_math=false")
+      self.assertEqual(jex_backend.initialized_xla_flags(), "--xla_cpu_enable_fast_math=false")
       xb._clear_backends()
       self.assertIsNone(xb.initialized_xla_flags())
       xb.get_backend.cache_clear()
