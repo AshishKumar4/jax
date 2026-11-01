@@ -457,6 +457,36 @@ class X64ContextTests(jtu.JaxTestCase):
     np.testing.assert_array_equal(gx, [[[1., 2., 2., 1.]]])
     np.testing.assert_array_equal(gw, [[[3., 3.]]])
 
+  def test_a_ragged_dot_user_request_canonicalizes_and_a_recorded_one_binds(self):
+    # A user's float request to ragged_dot canonicalizes with x64 off, as dot's
+    # does; a wide request staged in an x64 scope keeps its dtype when its
+    # transformation rules run outside it.
+    lhs = jnp.ones((4, 2), jnp.float32)
+    rhs = jnp.ones((2, 2, 3), jnp.float32)
+    sizes = jnp.array([2, 2], jnp.int32)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      out = lax.ragged_dot(lhs, rhs, sizes, preferred_element_type=float)
+    self.assertEqual(out.dtype, np.float32)
+
+    def wide(l, r, s):
+      with jax.enable_x64(True):
+        return lax.ragged_dot(l, r, s,
+                              preferred_element_type=jnp.float64).astype(
+                                  jnp.float32).sum()
+
+    def staged(l, r, s):
+      return lax.cond(True, wide, lambda l, r, s: jnp.float32(0), l, r, s)
+
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      gl, gr = jax.grad(staged, argnums=(0, 1))(lhs, rhs, sizes)
+      # Its supported batching: every operand mapped on its leading axis.
+      batched = jax.vmap(staged)(lhs[None], rhs[None], sizes[None])
+    self.assertEqual((gl.dtype, gr.dtype), (np.float32, np.float32))
+    np.testing.assert_array_equal(gl, np.full((4, 2), 3.0, np.float32))
+    np.testing.assert_array_equal(batched, [24.0])
+
   def test_a_user_request_for_a_wide_dtype_on_a_wide_value_still_narrows(self):
     # A user's float64 request canonicalizes with x64 off whatever its operand
     # holds: only a transformation rule binds a jaxpr's dtype as recorded.
