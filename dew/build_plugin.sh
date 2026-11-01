@@ -1,7 +1,11 @@
 #!/bin/bash
-# Dew's JAX CUDA plugin wheels (jax-cuda12-plugin, jax-cuda13-plugin), built from a commit of this fork: the plugin
-# is the one native package Dew patches (its Mosaic GPU compile path and passes); jax is this fork's Python and
-# jaxlib and jax-cuda-pjrt stay the stock release the commit posts. Bazel builds them with JAX's hermetic C++,
+# Dew's JAX CUDA wheels, built from a commit of this fork: the CUDA plugin (jax-cuda12-plugin, jax-cuda13-plugin: its
+# kernels and Mosaic GPU's Python extension) for each Python, and the PJRT plugin (jax-cuda12-pjrt, jax-cuda13-pjrt:
+# xla_cuda_plugin.so, where Mosaic GPU's custom call compiles a kernel's PTX, its compilation provider among it),
+# one a CUDA, as it names no Python. Both are the native packages Dew patches: a patch to Mosaic GPU's compile path
+# reaches a kernel only through the PJRT plugin (post42 built the CUDA plugin alone, and its kernels still compiled
+# through stock PJRT's nvJitLink); jax is this fork's Python and jaxlib stays the stock release the commit posts.
+# Bazel builds them with JAX's hermetic C++,
 # CUDA and Python toolchains (ci_linux_<machine>_cudaN, as JAX's CI builds its own) and reads and writes Dew's remote
 # cache, so a JAX version's cold build is paid once and a patch change rebuilds in minutes.
 #
@@ -48,7 +52,10 @@ printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
     started=$(date +%s) code=0
-    python3 build/build.py build --wheels=jax-cuda-plugin --cuda_major_version="$cuda" --python_version="$python" \
+    # The PJRT plugin names no Python: built once a CUDA, with the first Python's plugin.
+    wheels=jax-cuda-plugin
+    [ "$python" != "${pythons%% *}" ] || wheels=jax-cuda-plugin,jax-cuda-pjrt
+    python3 build/build.py build --wheels="$wheels" --cuda_major_version="$cuda" --python_version="$python" \
       --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
