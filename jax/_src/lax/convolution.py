@@ -145,6 +145,33 @@ def conv_general_dilated(
   If ``dimension_numbers`` is ``None``, the default is ``('NCHW', 'OIHW',
   'NCHW')`` (for a 2D convolution).
   """
+  preferred_element_type = (
+      None if preferred_element_type is None
+      else dtypes.check_and_canonicalize_user_dtype(
+          preferred_element_type, "conv_general_dilated"
+      )
+  )
+  return _conv_general_dilated(
+      lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
+      dimension_numbers, feature_group_count, batch_group_count, precision,
+      preferred_element_type, out_sharding)
+
+
+def _conv_general_dilated(
+  lhs: Array, rhs: Array, window_strides: Sequence[int],
+  padding: str | Sequence[tuple[int, int]],
+  lhs_dilation: Sequence[int] | None = None,
+  rhs_dilation: Sequence[int] | None = None,
+  dimension_numbers: ConvGeneralDilatedDimensionNumbers  = None,
+  feature_group_count: int = 1, batch_group_count: int = 1,
+  precision: lax.PrecisionLike = None,
+  preferred_element_type: DTypeLike | None = None,
+  out_sharding: NamedSharding | P | None = None) -> Array:
+  """`conv_general_dilated` with `preferred_element_type` as given: the public
+  function's, a user's request canonicalized; and a transformation rule's
+  (batching, transposition), its jaxpr's param bound as recorded, as
+  canonicalizing it again outside the `jax.enable_x64` scope that traced it
+  would narrow a float64 convolution to float32."""
   dnums = conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
   out_sharding = canonicalize_sharding(out_sharding, 'dot_general')
   if lhs_dilation is None:
@@ -172,12 +199,6 @@ def conv_general_dilated(
         "padding argument to conv_general_dilated should be a string or a "
         f"sequence of (low, high) pairs, got {padding}") from e
 
-  preferred_element_type = (
-      None if preferred_element_type is None
-      else dtypes.check_and_canonicalize_user_dtype(
-          preferred_element_type, "conv_general_dilated"
-      )
-  )
   lhs, rhs = core.auto_insert_reshard(lhs, rhs)
   return conv_general_dilated_p.bind(
       lhs, rhs, window_strides=tuple(window_strides), padding=tuple(padding),
@@ -544,8 +565,8 @@ def _conv_general_dilated_transpose_lhs(
       rhs_dilation)
   revd_weights = lax.rev(rhs, rhs_sdims)
   if g.dtype != revd_weights.dtype:
-    revd_weights = lax.convert_element_type(revd_weights, g.dtype)
-  out = conv_general_dilated(
+    revd_weights = lax._convert_element_type(revd_weights, g.dtype)
+  out = _conv_general_dilated(
       g, revd_weights, window_strides=lhs_dilation, padding=padding,
       lhs_dilation=window_strides, rhs_dilation=rhs_dilation,
       dimension_numbers=trans_dimension_numbers,
@@ -554,7 +575,7 @@ def _conv_general_dilated_transpose_lhs(
       preferred_element_type=preferred_element_type,
       out_sharding=lhs.aval.sharding)
   if out.dtype != lhs.aval.dtype:
-    out = lax.convert_element_type(out, lhs.aval.dtype)
+    out = lax._convert_element_type(out, lhs.aval.dtype)
   if batch_group_count > 1:
     out = _reshape_axis_out_of(lhs_spec[1], batch_group_count, out)
     out = _reshape_axis_into(lhs_spec[1], lhs_spec[0], out)
@@ -585,8 +606,8 @@ def _conv_general_dilated_transpose_rhs(
       window_strides, np.take(g.shape, out_sdims), padding, lhs_dilation,
       rhs_dilation)
   if g.dtype != lhs.dtype:
-    lhs = lax.convert_element_type(lhs, g.dtype)
-  out = conv_general_dilated(
+    lhs = lax._convert_element_type(lhs, g.dtype)
+  out = _conv_general_dilated(
       lhs, g, window_strides=rhs_dilation, padding=padding,
       lhs_dilation=lhs_dilation, rhs_dilation=window_strides,
       dimension_numbers=trans_dimension_numbers,
@@ -595,7 +616,7 @@ def _conv_general_dilated_transpose_rhs(
       preferred_element_type=preferred_element_type,
       out_sharding=rhs.aval.sharding)
   if out.dtype != rhs.aval.dtype:
-    out = lax.convert_element_type(out, rhs.aval.dtype)
+    out = lax._convert_element_type(out, rhs.aval.dtype)
   return out
 
 def _conv_general_dilated_batch_rule(
@@ -668,7 +689,7 @@ def _conv_general_dilated_batch_rule(
       new_lhs = _reshape_axis_into(lhs_bdim, lhs_spec[1], lhs)
       feature_group_count *= lhs.shape[lhs_bdim]
     new_rhs = _reshape_axis_into(rhs_bdim, rhs_spec[0], rhs)
-    out = conv_general_dilated(
+    out = _conv_general_dilated(
       new_lhs, new_rhs, window_strides, padding, lhs_dilation, rhs_dilation,
       dimension_numbers, feature_group_count=feature_group_count,
       batch_group_count=batch_group_count, precision=precision,
@@ -680,7 +701,7 @@ def _conv_general_dilated_batch_rule(
   elif lhs_bdim is not None:
     if batch_group_count == 1:
       new_lhs = _reshape_axis_into(lhs_bdim, lhs_spec[0], lhs)
-      out = conv_general_dilated(new_lhs, rhs, window_strides, padding,
+      out = _conv_general_dilated(new_lhs, rhs, window_strides, padding,
                                  lhs_dilation, rhs_dilation, dimension_numbers,
                                  feature_group_count, precision=precision,
                                  preferred_element_type=preferred_element_type,
@@ -694,7 +715,7 @@ def _conv_general_dilated_batch_rule(
                                    lhs_spec[0] + 1,
                                    new_lhs)
       new_lhs = _reshape_axis_into(lhs_spec[0], lhs_spec[0], new_lhs)
-      out = conv_general_dilated(new_lhs, rhs, window_strides, padding,
+      out = _conv_general_dilated(new_lhs, rhs, window_strides, padding,
                                  lhs_dilation, rhs_dilation, dimension_numbers,
                                  feature_group_count, batch_group_count,
                                  precision=precision,
@@ -706,7 +727,7 @@ def _conv_general_dilated_batch_rule(
   elif rhs_bdim is not None:
     if feature_group_count == 1 and batch_group_count == 1:
       new_rhs = _reshape_axis_into(rhs_bdim, rhs_spec[0], rhs)
-      out = conv_general_dilated(lhs, new_rhs, window_strides, padding,
+      out = _conv_general_dilated(lhs, new_rhs, window_strides, padding,
                                  lhs_dilation, rhs_dilation, dimension_numbers,
                                  feature_group_count, batch_group_count,
                                  precision=precision,
@@ -729,7 +750,7 @@ def _conv_general_dilated_batch_rule(
       new_rhs = _reshape_axis_into(rhs_bdim + int(rhs_spec[0] < rhs_bdim),
                                    rhs_spec[0] + 1, new_rhs)
       new_rhs = _reshape_axis_into(rhs_spec[0], rhs_spec[0], new_rhs)
-      out = conv_general_dilated(lhs, new_rhs, window_strides, padding,
+      out = _conv_general_dilated(lhs, new_rhs, window_strides, padding,
                                  lhs_dilation, rhs_dilation, dimension_numbers,
                                  feature_group_count, batch_group_count,
                                  precision=precision,
@@ -812,7 +833,7 @@ def _conv_general_dilated_lower(
     complex_conv = mlir.lower_fun(
       partial(
         _complex_mul,
-        partial(conv_general_dilated, window_strides=window_strides,
+        partial(_conv_general_dilated, window_strides=window_strides,
                 padding=padding, lhs_dilation=lhs_dilation,
                 rhs_dilation=rhs_dilation, dimension_numbers=dimension_numbers,
                 feature_group_count=feature_group_count,

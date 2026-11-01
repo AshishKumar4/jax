@@ -2826,15 +2826,30 @@ def dot(lhs: ArrayLike, rhs: ArrayLike, *,
         " un-batched matrix-matrix, matrix-vector, or vector-vector products;"
         f" got {lhs_shape=} {rhs_shape=}")
 
+  preferred_element_type = (
+      None if preferred_element_type is None else
+      dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
+  return _dot_general_bound(lhs, rhs, dimension_numbers, precision=precision,
+                            preferred_element_type=preferred_element_type,
+                            out_sharding=out_sharding,
+                            reduction_order=reduction_order)
+
+
+def _dot_general_bound(lhs, rhs, dimension_numbers: DotDimensionNumbers, *,
+                       precision: PrecisionLike = None,
+                       preferred_element_type: DTypeLike | None = None,
+                       out_sharding=None, reduction_order: Any = None) -> Array:
+  """`dot_general_p` bound with `preferred_element_type` as given: `dot`'s, a
+  user's request canonicalized; and a transformation rule's (batching,
+  transposition), its jaxpr's param bound as recorded, as canonicalizing it
+  again outside the `jax.enable_x64` scope that traced it would narrow a float64
+  product to float32."""
   out_sharding = canonicalize_sharding(out_sharding, 'dot_general')
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   cdims = (api_util._ensure_index_tuple(lhs_contract),
            api_util._ensure_index_tuple(rhs_contract))
   bdims = (api_util._ensure_index_tuple(lhs_batch),
            api_util._ensure_index_tuple(rhs_batch))
-  preferred_element_type = (
-      None if preferred_element_type is None else
-      dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
   lhs, rhs = core.auto_insert_reshard(lhs, rhs)
   return dot_general_p.bind(lhs, rhs,
                             dimension_numbers=(cdims, bdims),
@@ -5395,11 +5410,13 @@ ad.defjvp(atanh_p, lambda g, x: div(g, one_minus_square(x)))
 mlir.register_lowering(atanh_p, partial(_nary_lower_hlo, chlo.atanh))
 
 real_p = unop(_complex_basetype, _complex, 'real')
-ad.deflinear2(real_p, lambda t, _: [complex(t, np.zeros((), _dtype(t)))])
+# The zero imaginary part in the cotangent's own dtype, a recorded wide one too: a NumPy zero of it would be
+# canonicalized narrow outside the x64 scope that traced it.
+ad.deflinear2(real_p, lambda t, _: [complex(t, _zeros(t))])
 mlir.register_lowering(real_p, partial(_nary_lower_hlo, hlo.real))
 
 imag_p = unop(_complex_basetype, _complex, 'imag')
-ad.deflinear2(imag_p, lambda t, _: [complex(np.zeros((), _dtype(t)), neg(t))])
+ad.deflinear2(imag_p, lambda t, _: [complex(_zeros(t), neg(t))])
 mlir.register_lowering(imag_p, partial(_nary_lower_hlo, hlo.imag))
 
 
@@ -5730,8 +5747,10 @@ def _pow_jvp_lhs(g, ans, x, y):
   result_dtype = dtypes.result_type(x, y)
   if result_dtype == bool:
     result_dtype = 'int32'
-  x = convert_element_type(x, result_dtype)
-  y = convert_element_type(y, result_dtype)
+  # The operands' own result type, a recorded wide one too: never canonicalized
+  # narrow outside the x64 scope that traced it.
+  x = _convert_element_type(x, np.dtype(result_dtype))
+  y = _convert_element_type(y, np.dtype(result_dtype))
   if dtypes.issubdtype(y_dtype, np.integer):
     if x.shape != y.shape:
       shape = broadcast_shapes(x.shape, y.shape)
@@ -5747,7 +5766,7 @@ def _pow_jvp_lhs(g, ans, x, y):
 def _pow_jvp_rhs(g, ans, x, y):
   y_dtype = dtypes.dtype(y)
   assert dtypes.issubdtype(y_dtype, np.inexact)
-  return convert_element_type(mul(g, mul(log(_replace_zero(x)), ans)), y_dtype)
+  return _convert_element_type(mul(g, mul(log(_replace_zero(x)), ans)), y_dtype)
 ad.defjvp2(pow_p, _pow_jvp_lhs, _pow_jvp_rhs)
 
 def _pow_lower(ctx, x, y):
@@ -6999,9 +7018,9 @@ def _dot_general_transpose_lhs(g, x, y, *, dimension_numbers, precision,
   ds = xs.update(spec=xs.spec.update(partitions=inverse_spec))
   if ds.mesh.empty:
     ds = core.get_cur_mesh_sharding(P(*[None] * x.aval.ndim))
-  dot_general_out = dot_general(g, y, dims, precision=precision,
-                                preferred_element_type=preferred_element_type,
-                                out_sharding=ds)
+  dot_general_out = _dot_general_bound(
+      g, y, dims, precision=precision,
+      preferred_element_type=preferred_element_type, out_sharding=ds)
   x_bar = transpose(dot_general_out, tuple(out_axes))
   if x_bar.dtype != x.aval.dtype:
     x_bar = _convert_element_type(x_bar, x.aval.dtype, x.aval.weak_type,
@@ -7342,7 +7361,7 @@ ad.defjvp2(
 )
 _dot_general_batch_rule = functools.partial(
     _dot_batch_rule, _dot_general_batch_unpack_args,
-    _dot_general_batch_unpack_dims, dot_general)
+    _dot_general_batch_unpack_dims, _dot_general_bound)
 batching.fancy_primitive_batchers[dot_general_p] = _dot_general_batch_rule
 core.pp_eqn_rules[dot_general_p] = _dot_general_pp_rule
 
@@ -8144,8 +8163,9 @@ def _ragged_dot_general_impl(
       mode, lhs.ndim, lhs_ragged_dim, l_batch, l_contract
   )
 
+  # The primitive's recorded preferred type, bound as recorded (`_dot_general_bound`).
   _dot_general = partial(
-      dot_general,
+      _dot_general_bound,
       precision=precision,
       preferred_element_type=preferred_element_type,
   )
@@ -10498,7 +10518,10 @@ def _reduce_chooser_jvp_rule(g, ans, operand, *, axes, out_sharding, reduction_o
   # locations in a single pass (rather than comparing equality) and use a
   # gather, and/or even push along the chosen elements of g (b/112040122)
   shape = [1 if i in axes else d for i, d in enumerate(operand.shape)]
-  location_indicators = convert_element_type(
+  # In the tangent's dtype as it is, a wide one too (a float64 reduction traced
+  # under jax.enable_x64, differentiated outside it), which a request through
+  # `convert_element_type` would canonicalize narrow.
+  location_indicators = _convert_element_type(
       _eq_meet(operand, reshape(ans, shape)), g.dtype)
   counts = reduce_sum(location_indicators, axes)
   return div(reduce_sum(mul(g, location_indicators), axes), counts)
@@ -11914,13 +11937,15 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
 
 
 def _balanced_cmp(x, y):
-  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN
+  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN, in x's dtype as it is: a
+  # wide one (a float64 max traced under jax.enable_x64, differentiated outside
+  # it) from constants made in the canonical dtype, where all three are exact.
   gt_mask = gt(x, y)
   eq_mask = eq(x, y)
-  ones = full_like(gt_mask, 1, dtype=x.dtype)
-  zeros = full_like(gt_mask, 0, dtype=x.dtype)
-  half = full_like(gt_mask, 0.5, dtype=x.dtype)
-  return select(gt_mask, ones, select(eq_mask, half, zeros))
+  def filled(value):
+    constant = full_like(gt_mask, value, dtype=dtypes.canonicalize_dtype(x.dtype))
+    return _convert_element_type(constant, x.dtype)
+  return select(gt_mask, filled(1), select(eq_mask, filled(0.5), filled(0)))
 
 
 def _eq_meet(a, b):
