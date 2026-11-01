@@ -122,51 +122,10 @@ jobs:
           read -ra dependencies <<< "$DEPENDENCIES"
           uv pip install -q --python tested/bin/python source-dist/*.whl "${dependencies[@]}"
           read -ra tests <<< "$TESTS"
-          cd source
-          ../tested/bin/python -m pytest -q -p no:cacheprovider "${tests[@]}"
+          # Against the installed wheel, out of the source tree (dew/test_wheel.sh).
+          bash dew/dew/test_wheel.sh tested/bin/python source-dist/*.whl source "${tests[@]}"
       - name: Index it
         run: |
           shopt -s nullglob
           wheels=(dist/*.whl)
-          [ ${#wheels[@]} -gt 0 ] || { echo "::error::no wheel to index"; exit 1; }
-          # A project's name as PEP 503 serves it, from a wheel's file name (PEP 427: its - written _).
-          project() { basename "$1" | cut -d- -f1 | tr '_.A-Z' '--a-z'; }
-          package=$(project "${wheels[0]}")
-          for wheel in "${wheels[@]}"; do
-            [ "$(project "$wheel")" = "$package" ] || { echo "::error::$wheel is not $package's"; exit 1; }
-          done
-          echo "PACKAGE=$package" >> "$GITHUB_ENV"
-          if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key "packages/$package/manifest.json" \
-              > /dev/null 2> head.txt; then
-            aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$package/manifest.json" manifest.json
-          elif grep -q "(404)" head.txt; then
-            # New to the index: from now on it shadows PyPI's project for an installer listing this index first.
-            [ "$NEW_PROJECT" = "$package" ] || {
-              echo "::error::$package is new to the index, which would serve it in place of PyPI's to every installer that lists the index first (Dew's lock among them); publish it with new_project=$package once Dew's pyproject maps $package to this index explicitly"
-              exit 1
-            }
-            echo '{}' > manifest.json
-          else
-            cat head.txt
-            exit 1
-          fi
-          projects=$(aws s3api list-objects-v2 --endpoint-url "$R2" --bucket "$BUCKET" --prefix packages/ \
-                       --delimiter / --query 'CommonPrefixes[].Prefix' --output text \
-                     | tr '\t' '\n' | sed -n 's|^packages/\(.*\)/$|\1|p')
-          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" --package "$package" \
-            --projects $projects > new.txt
-          cat new.txt
-      - name: Upload it, the index last
-        run: |
-          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" \
-                    ${4:+--cache-control "$4"} > /dev/null; }
-          while read -r name; do
-            put "packages/$PACKAGE/$name" "site/packages/$PACKAGE/$name" application/octet-stream
-            put "packages/$PACKAGE/$name.metadata" "site/packages/$PACKAGE/$name.metadata" text/plain
-          done < new.txt
-          put "packages/$PACKAGE/manifest.json" manifest.json application/json
-          # Each page under both names installers ask for, revalidated at every request (patch-stack.yml's).
-          for page in simple/ "simple/$PACKAGE/"; do
-            put "$page" "site/${page}index.html" text/html no-cache
-            put "${page}index.html" "site/${page}index.html" text/html no-cache
-          done
+          bash dew/dew/index.sh site "${wheels[@]}"

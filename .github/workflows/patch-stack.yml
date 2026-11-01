@@ -1,11 +1,14 @@
 # The fixes Dew carries on JAX (dew/patch_stack.py), moved onto each new JAX release and published to
 # Dew's package index, https://pypi.dewml.dev/simple. Every six hours it looks for a release upstream has
 # tagged that this fork carries no stack for; it rebases the newest stack onto it, dropping the fixes the
-# release already has, runs the stack's tests, pushes the branch and publishes its wheel. A conflict, a red
-# test or a release that holds every fix opens an issue here. Run by hand with `publish`, it publishes a
-# stack's wheel again (one already in the index is kept as it is). A wheel reaches the index only after
-# the stack's tests passed on it; with `yank`, it marks
-# wheels the index lists yanked (PEP 592), so an installer resolving a range passes them over.
+# release already has, runs the stack's tests and pushes the result as a candidate (candidate/vNEW), opening
+# an issue that asks for its whole-stack review (bible §2): it never moves the stack branch nor publishes. A
+# conflict, a red test or a release that holds every fix says so in that issue. Run by hand with `publish`
+# once a stack is reviewed, it publishes its release's one approved artifact set: the jax wheel, tested
+# installed and out of its source tree, and, where the stack carries native patches, the CUDA and PJRT
+# plugins of every supported Python and machine its plugin release (plugin-VERSION) holds, all or none (a
+# file the index lists already is kept as it is). With `test`, it tests a candidate's ref; with `yank`, it
+# marks wheels the index lists yanked (PEP 592), so an installer resolving a range passes them over.
 name: patch stack
 
 on:
@@ -14,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "publish this stack's wheel, e.g. 0.12.0, instead of looking for a new release"
+        description: "publish this reviewed stack's artifact set, e.g. 0.12.0.1 (its stack branch's release), instead of looking for a new release"
         required: false
       rehearse:
         description: "rebase and test onto a release without pushing or publishing, e.g. \"0.11.2 0.12.0\""
@@ -82,7 +85,7 @@ jobs:
     if: inputs.test == ''
     runs-on: ubuntu-latest
     outputs:
-      release: ${{ steps.pushed.outputs.release || inputs.publish }}
+      release: ${{ inputs.publish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,15 +127,17 @@ jobs:
           uv pip install -q --python ../venv/bin/python "jaxlib==${{ steps.rebase.outputs.new }}" . $TEST_DEPENDENCIES
           tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "${{ steps.rebase.outputs.new }}")"
           ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $tests 2>&1 | tee ../tests.txt
-      - name: Push it
+      - name: Push it as a candidate
         id: pushed
-        if: steps.rebase.outputs.result == 'rebased' && inputs.rehearse == ''
+        if: always() && steps.rebase.outputs.result == 'rebased' && inputs.rehearse == ''
         run: |
+          # A candidate for review, never the stack branch: the stack moves, and its artifacts are published, only
+          # once its whole stack is reviewed (bible §2; `publish`).
           cd jax
-          git push origin "v${{ steps.rebase.outputs.new }}-cache-key-pool-fingerprints"
-          echo "release=${{ steps.rebase.outputs.new }}" >> "$GITHUB_OUTPUT"
+          new="${{ steps.rebase.outputs.new }}"
+          git push origin "v$new-cache-key-pool-fingerprints:refs/heads/candidate/v$new"
       - name: Open an issue
-        if: inputs.rehearse == '' && (failure() || steps.rebase.outputs.result == 'conflict' || steps.rebase.outputs.result == 'upstreamed')
+        if: inputs.rehearse == '' && steps.next.outputs.pair != '' && (always())
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -140,7 +145,13 @@ jobs:
           case "${{ steps.rebase.outputs.result }}" in
             conflict) why="a fix does not apply" ;;
             upstreamed) why="the release holds every fix: Dew can return to it" ;;
-            *) why="the rebase or its tests failed" ;;
+            rebased)
+              if [ "${{ job.status }}" = success ]; then
+                why="candidate/v$new is rebased and green, for its whole-stack review before publish"
+              else
+                why="candidate/v$new is rebased, its tests red"
+              fi ;;
+            *) why="the rebase failed" ;;
           esac
           {
             echo "Carrying the patch stack onto jax ${new:-?}: $why."
@@ -166,6 +177,12 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: auto
       R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      GH_TOKEN: ${{ github.token }}
+      # The native projects a stack with native patches ships beside jax, each built for every supported Python
+      # (the plugins; the PJRT plugins name none) on each machine (dew/build_plugin.sh).
+      PYTHONS: "cp312 cp313 cp314"
+      MACHINES: "x86_64 aarch64"
+      CUDAS: "12 13"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -187,59 +204,55 @@ jobs:
           uv pip install -q --python venv/bin/python pip
           venv/bin/python -m pip download -q --no-deps --only-binary :all: --dest dist "jax==$RELEASE"
           ls dist
+      - name: Its native artifacts, all of them
+        if: env.RELEASE != ''
+        run: |
+          # A stack that patches native code (jaxlib/, jax_plugins/) reaches a kernel only through its own CUDA and
+          # PJRT plugins (post42 shipped the plugin's patch alone, and kernels compiled through stock PJRT): the
+          # set publishes whole or not at all, from the plugin release of the stack's version.
+          if git -C jax diff --quiet "jax-v$RELEASE" HEAD -- jaxlib jax_plugins; then
+            echo "no native patch: jax alone"
+            exit 0
+          fi
+          version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
+          mkdir -p native
+          gh release download "plugin-$version" --repo "${{ github.repository }}" --dir native --pattern "*.whl"
+          missing=()
+          for cuda in $CUDAS; do
+            for machine in $MACHINES; do
+              ls native/jax_cuda"$cuda"_pjrt-"$version"-py3-none-manylinux_*_"$machine".whl > /dev/null 2>&1 \
+                || missing+=("jax-cuda$cuda-pjrt $machine")
+              for python in $PYTHONS; do
+                ls native/jax_cuda"$cuda"_plugin-"$version"-"$python"-"$python"-manylinux_*_"$machine".whl \
+                  > /dev/null 2>&1 || missing+=("jax-cuda$cuda-plugin $python $machine")
+              done
+            done
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf '::error::plugin-%s lacks %s\n' "$version" "${missing[@]}"
+            exit 1
+          fi
+          ls native
       - name: Test the stack's wheel
         if: env.RELEASE != ''
         run: |
-          # The stack's tests, run from the tree the wheel was built from (which they import, as `python -m`
-          # puts it first), with the wheel installed beside its release's jaxlib: a manual publication is
-          # tested as a new release's is.
+          # The stack's tests against the wheel installed beside its release's jaxlib, out of the tree it was
+          # built from (dew/test_wheel.sh), which a source-tree run imports first.
           uv venv -q --python 3.12 tested
-          uv pip install -q --python tested/bin/python dist/jax-"$RELEASE".post*-py3-none-any.whl "jaxlib==$RELEASE" \
-            $TEST_DEPENDENCIES
-          cd jax
-          tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "$RELEASE")"
-          ../tested/bin/python -m pytest -q -n auto -p no:cacheprovider $tests
+          wheel=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl)
+          uv pip install -q --python tested/bin/python "$wheel" "jaxlib==$RELEASE" $TEST_DEPENDENCIES
+          tests="$TESTS $(cd jax && python3 ../dew/dew/patch_stack.py tests "$RELEASE")"
+          PYTEST_ARGS="-n auto" bash dew/dew/test_wheel.sh tested/bin/python "$wheel" jax $tests
       - name: Index them
         run: |
-          # The manifest lists what the index holds: absent only before the first publication, and any other
-          # failure to read it stops here, so an index is never written without what it held.
-          if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key packages/jax/manifest.json \
-              > /dev/null 2> head.txt; then
-            aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/jax/manifest.json" manifest.json
-          elif grep -q "(404)" head.txt; then
-            echo '{}' > manifest.json
-          else
-            cat head.txt
-            exit 1
-          fi
-          # The wheels built here (none where the run only yanks), and the files `yank` names.
+          # jax (its wheels, or only the files `yank` names), then each native project, every one through
+          # dew/index.sh.
           shopt -s nullglob
-          wheels=(dist/*.whl)
-          read -ra names <<< "$(printf '%s' "$YANK" | tr '\r\n' '  ')"
-          yanks=()
-          if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" "--reason=$REASON"); fi
-          # The index's other packages, which its root page keeps listing.
-          projects=$(aws s3api list-objects-v2 --endpoint-url "$R2" --bucket "$BUCKET" --prefix packages/ \
-                       --delimiter / --query 'CommonPrefixes[].Prefix' --output text \
-                     | tr '\t' '\n' | sed -n 's|^packages/\(.*\)/$|\1|p')
-          python3 dew/dew/patch_stack.py index manifest.json site "${wheels[@]}" "${yanks[@]}" \
-            --projects $projects > new.txt
-          cat new.txt
-      - name: Upload them, the index last
-        run: |
-          # put KEY FILE TYPE [CACHE-CONTROL]
-          put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" \
-                    ${4:+--cache-control "$4"} > /dev/null; }
-          while read -r name; do
-            put "packages/jax/$name" "site/packages/jax/$name" application/octet-stream
-            put "packages/jax/$name.metadata" "site/packages/jax/$name.metadata" text/plain
-          done < new.txt
-          put packages/jax/manifest.json manifest.json application/json
-          # Installers ask for the directories (simple/, simple/jax/); each is stored under both names. A page
-          # changes at every publication, so an installer revalidates it each time (no-cache: R2 answers a
-          # conditional request with 304 while it holds), never resolving from a copy older than the index; with
-          # no Cache-Control, uv takes a cached page as fresh for a share of its age and misses a new wheel.
-          for page in simple/ simple/jax/; do
-            put "$page" "site/${page}index.html" text/html no-cache
-            put "${page}index.html" "site/${page}index.html" text/html no-cache
+          PACKAGE=jax bash dew/dew/index.sh site dist/*.whl
+          export YANK=
+          for cuda in $CUDAS; do
+            for project in pjrt plugin; do
+              wheels=(native/jax_cuda"$cuda"_"$project"-*.whl)
+              [ ${#wheels[@]} -eq 0 ] || bash dew/dew/index.sh site "${wheels[@]}"
+            done
           done

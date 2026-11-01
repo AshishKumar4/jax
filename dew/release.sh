@@ -12,6 +12,10 @@
 # (0.12.0.1.post39), NEW the release it makes (0.12.0.1.post40), MESSAGE the release commit's message, and each
 # COMMIT a commit or a range (`A..B`) cherry-picked in order. The stack branch must be at BASE's release branch,
 # and NEW's must not exist yet.
+#
+# The stack is one commit a carried patch family (its subject "[stack] NAME: ..."), its final form: a commit that
+# repairs a family is a `git commit --fixup` of it, folded into the family here, so the release carries no repair
+# history; a commit of a new family is its own "[stack] NAME:" commit; and the release commit sets the version, last.
 set -euo pipefail
 
 checkout=$1 base=$2 new=$3 message=$4
@@ -26,6 +30,8 @@ stack=v$release-cache-key-pool-fingerprints
 # The branches as origin holds them now, wherever the clone last saw them.
 git -C "$checkout" fetch -q origin "+refs/heads/release/$base:refs/remotes/origin/release/$base" \
   "+refs/heads/$stack:refs/remotes/origin/$stack"
+git -C "$checkout" fetch -q --no-tags https://github.com/jax-ml/jax.git \
+  "refs/tags/jax-v$release:refs/tags/jax-v$release"
 published=$(git -C "$checkout" rev-parse "origin/release/$base")
 if [[ $(git -C "$checkout" rev-parse "origin/$stack") != "$published" ]]; then
   echo "release.sh: $stack is not at release/$base ($published)" >&2
@@ -42,9 +48,19 @@ fi
 work=$(mktemp -d)
 trap 'git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"' EXIT
 git -C "$checkout" worktree add -q --detach "$work" "$published"
+# The base's release commit (its version) set aside, the commits picked, each fixup folded into its family, and
+# the version set by a release commit of its own on top.
+git -C "$work" reset -q --hard HEAD~1
 for commit in "$@"; do
   git -C "$work" cherry-pick "$commit" > /dev/null
 done
+GIT_SEQUENCE_EDITOR=: git -C "$work" rebase -q -i --autosquash "jax-v$release"
+if git -C "$work" log --format=%s "jax-v$release..HEAD" | grep -v '^\[stack\] ' | grep -q .; then
+  echo "release.sh: a commit is neither a family's nor a fixup of one:" >&2
+  git -C "$work" log --format='%h %s' "jax-v$release..HEAD" | grep -v ' \[stack\] ' >&2
+  exit 1
+fi
+git -C "$work" show "$published:jax/version.py" > "$work/jax/version.py"
 # The versions as literal strings: a dot in one matches only a dot.
 sed -i "s/^_release_version: str | None = \"${base//./\\.}\"\$/_release_version: str | None = \"$new\"/" \
   "$work/jax/version.py"
