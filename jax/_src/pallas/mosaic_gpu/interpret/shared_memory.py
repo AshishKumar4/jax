@@ -69,12 +69,12 @@ def _to_int(x):
 
   Useful for classes like MeshLocation that can be called in 3 contexts:
   1. By the user at trace time with tuples of jax tracers
-  2. By io_callback at runtime with tuples of jax array scalars
+  2. By io_callback at runtime with tuples of jax or NumPy array scalars
   3. By the user at runtime with python integer tuples
   """
   if isinstance(x, jax.core.Tracer):
     return x
-  if isinstance(x, jax.Array):
+  if isinstance(x, (jax.Array, np.ndarray, np.generic)):
     return x.item()
   if isinstance(x, int):
     return x

@@ -403,7 +403,7 @@ def interpret_pallas_call(
   # the interpreted kernel, to ensure that execution of this interpreted kernel
   # cannot overlap with the interpretation of any other kernel.
   token = jnp.int32(thread_map.TOP_LEVEL_TOKEN_VALUE)
-  token = callback.io_callback(
+  token = callback.io_callback_numpy_inputs(
       gpu_callbacks.ordering_barrier,
       gpu_callbacks.TOKEN_SHAPE_DTYPE,
       token,
@@ -519,7 +519,7 @@ def interpret_pallas_call(
     )
     token, _ = jaxpr_interpreter.interpret(jaxpr, token, *kernel_buffer_keys)
 
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.kernel_thread_finished),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
@@ -560,7 +560,7 @@ def interpret_pallas_call(
         use_ordered_callback=True,
         on_exception=gpu_callbacks.fail,
     )
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.cluster_finished),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
@@ -601,7 +601,7 @@ def interpret_pallas_call(
 
   token = gpu_callbacks.call_clean_up_shared_memory(token)
 
-  callback.io_callback(
+  callback.io_callback_numpy_inputs(
       gpu_callbacks.ordering_barrier,
       gpu_callbacks.TOKEN_SHAPE_DTYPE,
       token,
