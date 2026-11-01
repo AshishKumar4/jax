@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import contextlib
 from functools import partial
 import itertools
 import math
@@ -5390,6 +5391,171 @@ class CompositeTest(jtu.JaxTestCase):
 
 class RaggedTest(jtu.JaxTestCase):
 
+  @parameterized.product(
+      mode=("noncontracting", "noncontracting_permuted", "contracting", "contracting_permuted",
+            "contracting_sizes1d", "batch", "batch_permuted"),
+      explicit_sharding=(False, True))
+  def test_ragged_dot_higher_order(self, mode, explicit_sharding):
+    if explicit_sharding and jax.device_count() < 2:
+      self.skipTest("Explicit sharding needs two devices")
+    with jax.enable_x64():
+      rng = self.rng()
+      sizes = jnp.array([2, 0, 3], jnp.int32)
+      if mode == "noncontracting":
+        x = jnp.asarray(rng.normal(size=(6, 3)) / 4)
+        y = jnp.asarray(rng.normal(size=(3, 3, 4)) / 4)
+        ends = jnp.cumsum(sizes, dtype=sizes.dtype)
+        rows = jnp.arange(6, dtype=sizes.dtype)
+        mask = ((rows[:, None] >= (ends - sizes)[None, :]) &
+                (rows[:, None] < ends[None, :])).astype(x.dtype)
+        dims = lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
+        reference = lambda a, b: jnp.einsum("rg,rk,gkn->rn", mask, a, b)
+      elif mode == "noncontracting_permuted":
+        x = jnp.asarray(rng.normal(size=(2, 2, 2, 6, 3)) / 4)
+        y = jnp.asarray(rng.normal(size=(4, 3, 2, 2)) / 4)
+        sizes = jnp.array([[[2, 0, 3], [1, 2, 2]],
+                           [[0, 4, 1], [3, 1, 1]]], jnp.int32)
+        ends = jnp.cumsum(sizes, axis=-1, dtype=sizes.dtype)
+        rows = jnp.arange(6, dtype=sizes.dtype)[None, None, None, :]
+        mask = ((rows >= (ends - sizes)[..., None]) & (rows < ends[..., None])).astype(x.dtype)
+        dims = lax.RaggedDotDimensionNumbers((((0,), (2,)), ((2,), (3,))), (3,), (1,))
+        reference = lambda a, b: jnp.einsum("kpbrm,ngkb,bpgr->bprmn", a, b, mask)
+      elif mode.startswith("contracting"):
+        x = jnp.asarray(rng.normal(size=(2, 3, 2, 6)) / 4)
+        y = jnp.asarray(rng.normal(size=(2, 6, 4, 2)) / 4)
+        sizes = jnp.array([[[2, 0, 3], [1, 2, 2]],
+                           [[0, 4, 1], [3, 1, 1]]], jnp.int32)
+        ends = jnp.cumsum(sizes, axis=-1, dtype=sizes.dtype)
+        rows = jnp.arange(6, dtype=sizes.dtype)
+        mask = ((rows[None, None, None, :] >= (ends - sizes)[..., None]) &
+                (rows[None, None, None, :] < ends[..., None])).astype(x.dtype)
+        if mode == "contracting_sizes1d":
+          sizes = jnp.array([2, 0, 3], jnp.int32)
+          ends = jnp.cumsum(sizes, dtype=sizes.dtype)
+          rows = jnp.arange(6, dtype=sizes.dtype)[None, :]
+          mask = ((rows >= (ends - sizes)[:, None]) & (rows < ends[:, None])).astype(x.dtype)
+          dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+          reference = lambda a, b: jnp.einsum("bmpr,brnp,gr->gbmn", a, b, mask)
+        elif mode == "contracting":
+          dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+          reference = lambda a, b: jnp.einsum("bmpr,brnp,bpgr->gbmn", a, b, mask)
+        else:
+          x, y = x.transpose(3, 1, 0, 2), y.transpose(3, 2, 1, 0)
+          dims = lax.RaggedDotDimensionNumbers((((3, 0), (0, 2)), ((2,), (3,))), (0,), ())
+          reference = lambda a, b: jnp.einsum("rmbp,pnrb,bpgr->gbmn", a, b, mask)
+      else:
+        x = jnp.asarray(rng.normal(size=(2, 6, 3, 2)) / 4)
+        y = jnp.asarray(rng.normal(size=(2, 2, 6, 4)) / 4)
+        sizes = jnp.array([[2, 0, 4], [1, 3, 2]], jnp.int32)
+        if mode == "batch":
+          dims = lax.RaggedDotDimensionNumbers((((3,), (1,)), ((0, 1), (0, 2))), (1,), ())
+          reference = lambda a, b: jnp.einsum("brmk,bkrn->brmn", a, b)
+        else:
+          x, y = x.transpose(2, 1, 3, 0), y.transpose(3, 0, 2, 1)
+          dims = lax.RaggedDotDimensionNumbers((((2,), (3,)), ((3, 1), (1, 2))), (1,), ())
+          reference = lambda a, b: jnp.einsum("mrkb,nbrk->brmn", a, b)
+
+      values = (x, y)
+      mesh, out_sharding = None, None
+      if explicit_sharding:
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("d",),
+                                 axis_types=(jax.sharding.AxisType.Explicit,))
+        _, (x_batch, y_batch) = dims.dot_dimension_numbers
+        if x_batch and sizes.ndim > 1:
+          sizes = jax.device_put(sizes, jax.NamedSharding(
+              mesh, jax.P("d", *[None] * (sizes.ndim - 1))))
+        axes = (x_batch[0], y_batch[0]) if x_batch else (0, None)
+        shardings = []
+        for value, axis in zip(values, axes):
+          spec = [None] * value.ndim
+          if axis is not None:
+            spec[axis] = "d"
+          shardings.append(jax.NamedSharding(mesh, jax.P(*spec)))
+        values = tuple(jax.device_put(value, sharding) for value, sharding in zip(values, shardings))
+        spec = [None] * reference(x, y).ndim
+        spec[1 if mode.startswith("contracting") else 0] = "d"
+        out_sharding = jax.NamedSharding(mesh, jax.P(*spec))
+
+      def actual(a, b):
+        return lax.ragged_dot_general(a, b, sizes, dims, precision=lax.Precision.HIGHEST,
+                                     out_sharding=out_sharding)
+
+      def evaluated(function):
+        with jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext():
+          return jax.jit(function)(*values)
+
+      self.assertAllClose(evaluated(actual), jax.jit(reference)(x, y),
+                          atol=1e-12, rtol=1e-12)
+      direction = tuple(jnp.asarray(rng.normal(size=value.shape)) for value in (x, y))
+
+      def loss(product):
+        return lambda a, b: jnp.sin(product(a, b)).sum()
+
+      def along(gradient):
+        return lambda a, b: sum(jnp.sum(g * d) for g, d in zip(gradient(a, b), direction))
+
+      actual_loss, expected_loss = loss(actual), loss(reference)
+      for order in range(3):
+        actual_grad = jax.grad(actual_loss, argnums=(0, 1))
+        expected_grad = jax.grad(expected_loss, argnums=(0, 1))
+        actual_result = evaluated(actual_grad)
+        self.assertAllClose(actual_result, jax.jit(expected_grad)(x, y),
+                            atol=1e-10, rtol=1e-10,
+                            err_msg=f"{mode}, reverse derivative {order + 1}")
+        if explicit_sharding:
+          for gradient, sharding in zip(actual_result, shardings):
+            self.assertEqual(gradient.sharding, sharding)
+        actual_loss, expected_loss = along(actual_grad), along(expected_grad)
+
+  @parameterized.product(
+      case=((jnp.float16, None), (jnp.bfloat16, None),
+            (jnp.float16, lax.DotAlgorithmPreset.DEFAULT),
+            (jnp.bfloat16, lax.DotAlgorithmPreset.DEFAULT),
+            (jnp.float16, lax.DotAlgorithmPreset.F16_F16_F32),
+            (jnp.bfloat16, lax.DotAlgorithmPreset.BF16_BF16_F32)),
+      shardy=(False, True))
+  @jtu.with_explicit_mesh((1,), ("d",))
+  def test_ragged_dot_prefix_rounds_once(self, case, shardy, mesh):
+    # Rounding each prefix's partial sum first would lose the residual in
+    # (1 + residual) + (-1). The final result is exactly representable.
+    dtype, precision = case
+    if (precision in (lax.DotAlgorithmPreset.F16_F16_F32, lax.DotAlgorithmPreset.BF16_BF16_F32)
+        and jtu.test_device_matches(["cpu"])):
+      self.skipTest("CPU does not support these named algorithms with 16-bit results")
+    residual = 2.0 ** (-jnp.finfo(dtype).nmant - 1)
+    with config.use_shardy_partitioner(shardy):
+      x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
+      y = jnp.ones((1, 2, 1, 2), dtype)
+      sizes = jnp.full((1, 2, 1), 2, jnp.int32)
+      dims = lax.RaggedDotDimensionNumbers((((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+      actual = jax.jit(lambda a, b: lax.ragged_dot_general(
+          a, b, sizes, dims, precision=precision, out_sharding=jax.P()))(x, y)
+      self.assertArraysEqual(actual, jnp.full((1, 1, 1, 1), residual, dtype))
+
+  def test_ragged_dot_fences_its_moved_layouts_on_the_gpu_alone(self):
+    # A prefix-dependent ragged contraction moves and flattens its operands'
+    # prefixes on the GPU: those operands are fenced from the input fusion
+    # there, and on no other platform; differentiation adds no barrier.
+    dims = lax.RaggedDotDimensionNumbers(
+        (((2, 3), (3, 1)), ((0,), (0,))), (3,), ())
+
+    def f(a, b, sizes):
+      return lax.ragged_dot_general(a, b, sizes, dims)
+
+    avals = (core.ShapedArray((1, 2, 2, 4), jnp.float32),
+             core.ShapedArray((1, 4, 3, 2), jnp.float32),
+             core.ShapedArray((1, 2, 2), jnp.int32))
+    traced = jax.jit(f).trace(*avals)
+    with config.jax_ragged_dot_use_ragged_dot_instruction(True):
+      cuda = traced.lower(lowering_platforms=("cuda",)).as_text()
+      tpu = traced.lower(lowering_platforms=("tpu",)).as_text()
+    self.assertIn("optimization_barrier", cuda)
+    self.assertNotIn("optimization_barrier", tpu)
+    grad = jax.make_jaxpr(jax.grad(lambda a, b, s: f(a, b, s).sum()))(
+        jnp.ones((1, 2, 2, 4)), jnp.ones((1, 4, 3, 2)),
+        jnp.full((1, 2, 2), 2, jnp.int32))
+    self.assertNotIn("optimization_barrier", str(grad))
+
   def check_wsc_in_lowered(self, text):
     if config.use_shardy_partitioner.value:
       self.assertIn('sdy.sharding_constraint', text)
@@ -5453,6 +5619,27 @@ class RaggedTest(jtu.JaxTestCase):
             )
             .as_text(dialect="stablehlo"),
         )
+
+  @parameterized.parameters(
+      (lax.DotAlgorithmPreset.TF32_TF32_F32_X3, jnp.float32),
+      (lax.DotAlgorithmPreset.BF16_BF16_F32, jnp.bfloat16),
+  )
+  def test_ragged_dot_keeps_a_named_algorithm_on_the_native_platforms(
+      self, preset, dtype):
+    # CHLO's ragged_dot carries no dot algorithm: a named one lowers through
+    # the decomposition's dot_general, which carries it, on every platform.
+    lowered = jax.jit(
+        lambda x, y, s: lax.ragged_dot(x, y, s, precision=preset)
+    ).trace(
+        core.ShapedArray((16, 4), dtype=dtype),
+        core.ShapedArray((2, 4, 3), dtype=dtype),
+        core.ShapedArray((2,), dtype=jnp.int32),
+    )
+    for platform in ("cuda", "tpu"):
+      text = lowered.lower(lowering_platforms=(platform,)).as_text(
+          dialect="stablehlo")
+      self.assertNotIn("chlo.ragged_dot", text)
+      self.assertIn("algorithm", text)
 
   def test_ragged_dot_general_preserves_named_scope(self):
     if not jtu.test_device_matches(["tpu"]):
