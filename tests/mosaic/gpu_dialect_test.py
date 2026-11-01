@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 
+from unittest import mock
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
@@ -2610,6 +2611,52 @@ class DialectLoweringTest(MosaicGpuTest):
         ValueError, "missing a layout and can not be lowered"
     ):
       mgpu.lower_mgpu_dialect(self.module, launch_ctx)
+
+  def test_the_divisibility_analysis_answers_each_subproblem_once(self):
+    # A product's power-of-two splits ask after its operands again and again:
+    # a chain of ten squarings of an unknown index is analysed in work linear
+    # in its length, not exponential (each subproblem once per analysis).
+    index = ir.IndexType.get()
+    with self.kernel():
+      value = llvm.UndefOp(index).result
+      for _ in range(10):
+        value = arith.muli(value, value)
+      known = {}
+      with mock.patch.object(
+          mgpu_utils, "_is_known_divisible", wraps=mgpu_utils._is_known_divisible
+      ) as analysed:
+        for bit in range(1, 11):
+          mgpu_utils.is_known_divisible(value, 1 << bit, known=known)
+    self.assertLessEqual(analysed.call_count, 11 * 11 * 11)
+
+  def test_an_untiled_copy_s_offset_is_known_as_the_divisibility_analysis_proves(
+      self,
+  ):
+    # The untiled CP_ASYNC copy's alignment reads its offset's divisibility
+    # from Mosaic GPU's one analysis (`utils.is_known_divisible`): a select of
+    # multiples, a minimum, a product of two strided values, an unsigned cast.
+    index, i64 = ir.IndexType.get(), ir.IntegerType.get_signless(64)
+    i1 = ir.IntegerType.get_signless(1)
+    with self.kernel():
+      def c(value):
+        return arith.constant(index, value)
+      pred = llvm.UndefOp(i1).result
+      selected = arith.select(pred, c(2), c(4))
+      other = arith.select(pred, c(8), c(16))
+      unknown = llvm.UndefOp(index).result
+      known = {
+          "select": launch_context._known_multiple(selected),
+          "min": launch_context._known_multiple(arith.minui(c(8), c(16))),
+          "product": launch_context._known_multiple(arith.muli(selected, other)),
+          "cast": launch_context._known_multiple(
+              arith.index_castui(index, arith.index_castui(i64, other))
+          ),
+          "unknown": launch_context._known_multiple(unknown),
+      }
+    self.assertEqual(
+        known,
+        {"select": 2, "min": 8, "product": 16, "cast": 8, "unknown": 1},
+    )
 
   def test_lowering_load_and_store_with_only_swizzle_lowers(self):
     shape = (128, 128)
