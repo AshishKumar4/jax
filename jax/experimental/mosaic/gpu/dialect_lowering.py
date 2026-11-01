@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import math
 import operator
+import re
 from typing import Any, Literal, assert_never, cast
 
 from jax._src.interpreters import mlir as mlir_interpreter
@@ -1211,7 +1212,11 @@ def _mgpu_async_load_op_lowering_rule(
   # flatten -> async_copy -> unflatted here, as long as flattened size is a
   # multiple of 16.
 
-  if ctx.auto_barriers and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP:
+  if (
+      ctx.auto_barriers
+      and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP
+      and not _warpgroup_synced_before(load_op)
+  ):
     utils.warpgroup_barrier()  # Make sure the writes have completed.
 
   # TODO(dasenov): Add support for the remaining op properties.
@@ -1280,6 +1285,113 @@ if hasattr(mgpu, "AsyncLoadIm2colOp"):
         predicate=predicate,
     )
     return []
+
+
+# Ops that touch no shared memory from a thread: arithmetic, address and view
+# computations, special-register reads (the NVVM ones and the GPU dialect's
+# thread, block and grid indices and dimensions), the dynamic shared memory's
+# base address, and cp.async's own issue and commit (asynchronous copies a
+# warpgroup barrier does not order anyway).
+_NO_THREAD_SMEM_ACCESS = (
+    "arith.", "index.", "math.", "builtin.unrealized_conversion_cast",
+    "gpu.thread_id", "gpu.block_id", "gpu.block_dim", "gpu.grid_dim",
+    "gpu.lane_id", "gpu.cluster_id", "gpu.cluster_dim",
+    "gpu.cluster_block_id", "gpu.dynamic_shared_memory",
+    "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison",
+    "llvm.getelementptr", "llvm.extractvalue", "llvm.insertvalue",
+    "llvm.ptrtoint", "llvm.inttoptr", "llvm.addrspacecast", "llvm.bitcast",
+    "llvm.zext", "llvm.sext", "llvm.trunc", "llvm.add", "llvm.mul",
+    "llvm.and", "llvm.or", "llvm.shl", "llvm.lshr", "llvm.icmp",
+    "nvvm.read.ptx.sreg.", "nvvm.cp.async.shared.global",
+    "nvvm.cp.async.commit.group", "nvvm.cp.async.wait.group",
+    "memref.subview", "memref.reinterpret_cast", "memref.cast",
+    "memref.collapse_shape", "memref.expand_shape", "memref.transpose",
+    "memref.view", "memref.extract_aligned_pointer_as_index",
+    "memref.extract_strided_metadata", "scf.yield",
+)
+_STRUCTURED = ("scf.if", "scf.index_switch", "scf.for")
+_WARPGROUP_BARRIER = re.compile(
+    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;"
+)
+
+
+def _no_thread_smem_access(op: ir.Operation) -> bool:
+  """Whether `op`, and every op its regions hold, touches no shared memory."""
+  name = op.name
+  if name.startswith(_STRUCTURED):
+    return all(
+        _no_thread_smem_access(inner)
+        for region in op.regions
+        for block in region.blocks
+        for inner in block.operations
+    )
+  return name.startswith(_NO_THREAD_SMEM_ACCESS)
+
+
+def _constant_int(value: ir.Value) -> int | None:
+  """`value`'s integer where an `arith.constant` or `llvm.mlir.constant` defines
+  it, else None."""
+  owner = value.owner
+  if not isinstance(owner, (ir.Operation, ir.OpView)):
+    return None
+  operation = owner.operation if isinstance(owner, ir.OpView) else owner
+  if operation.name not in ("arith.constant", "llvm.mlir.constant"):
+    return None
+  attribute = operation.attributes["value"]
+  return attribute.value if isinstance(attribute, ir.IntegerAttr) else None
+
+
+def _is_warpgroup_barrier(op: ir.Operation) -> bool:
+  """Whether `op` is a barrier every thread of a warpgroup takes part in: one of
+  the whole CTA (`nvvm.barrier0`, `gpu.barrier`, an `nvvm.barrier` that names no
+  thread count), or one whose thread count is a constant of at least a
+  warpgroup. An `nvvm.barrier` of fewer threads (`numberOfThreads=32`, one
+  warp's) or of a count not known here orders no warpgroup."""
+  if op.name in ("nvvm.barrier0", "gpu.barrier"):
+    return True
+  if op.name == "nvvm.barrier":
+    # Its operands by segment: barrierId, then numberOfThreads (each optional).
+    segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+    if segments[1] == 0:
+      return True
+    threads = _constant_int(op.operands[segments[0]])
+    return threads is not None and threads >= utils.WARPGROUP_SIZE
+  if op.name != "llvm.inline_asm":
+    return False
+  asm = ir.StringAttr(op.attributes["asm_string"]).value
+  match = _WARPGROUP_BARRIER.match(asm)
+  return match is not None and (
+      match.group(4) is None or int(match.group(4)) >= utils.WARPGROUP_SIZE
+  )
+
+
+def _warpgroup_synced_before(op: ir.OpView) -> bool:
+  """Whether a warpgroup barrier precedes `op` with no thread's access to
+  shared memory between them on every path that reaches it.
+
+  The walk goes back through `op`'s block and out of the conditionals holding
+  it (a branch's start follows the ops before it); a loop's body or the
+  kernel's start ends it, a loop's start following its previous iteration too.
+  Ops already lowered precede `op`, so a preceding copy's issue is seen as the
+  cp.async ops it lowered to.
+  """
+  operation = op.operation
+  while True:
+    block = operation.block
+    before = []
+    for inner in block.operations:
+      if inner.operation == operation:
+        break
+      before.append(inner.operation)
+    for previous in reversed(before):
+      if _is_warpgroup_barrier(previous):
+        return True
+      if not _no_thread_smem_access(previous):
+        return False
+    owner = block.owner
+    if owner is None or owner.operation.name not in ("scf.if", "scf.index_switch"):
+      return False
+    operation = owner.operation
 
 
 @_register_lowering(mgpu.AsyncPrefetchOp, support_warp_semantics=True)
