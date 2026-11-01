@@ -427,6 +427,7 @@ cc_test(
     tags = ["requires-gpu-sm90"],
     deps = [
         ":mosaic_gpu_support",
+        ":target",
         "@com_google_absl//absl/base:log_severity",
         "@com_google_absl//absl/log:globals",
         "@com_google_absl//absl/log:scoped_mock_log",
@@ -443,6 +444,7 @@ cc_test(
         "@xla//xla/pjrt/plugin/xla_gpu:xla_gpu_pjrt_client",
         "@xla//xla/service:gpu_plugin",
         "@xla//xla/stream_executor/cuda:all_runtime",
+        "@xla//xla/stream_executor/cuda:compilation_provider",
         "@xla//xla/stream_executor/cuda:cuda_platform",
         "@xla//xla/tsl/platform:env",
     ],
