@@ -22,7 +22,7 @@ on:
         default: ubuntu-24.04-arm
       pythons:
         required: true
-        default: "3.12 3.14"
+        default: "3.12 3.13 3.14"
       cudas:
         required: true
         default: "12 13"

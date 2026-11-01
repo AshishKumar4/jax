@@ -10,8 +10,10 @@
 # cache, so a JAX version's cold build is paid once and a patch change rebuilds in minutes.
 #
 #   build_plugin.sh REF VERSION OUT [PYTHONS] [CUDAS]     on a Linux x86_64 or aarch64 host (its wheels' platform)
-#   e.g. build_plugin.sh plugin-post42 0.12.0.1.post42.dev1 "$OUT" "3.12 3.14" "12 13"
+#   e.g. build_plugin.sh release/0.12.0.1.post44 0.12.0.1.post44 "$OUT"
 #
+# REF is a branch, a tag or a commit's sha. PYTHONS defaults to every Python Dew supports (its requires-python
+# floor to its newest classifier: 3.12, 3.13 and 3.14), so one build is a release's whole set for its machine.
 # VERSION is every wheel's version: the commit's jax release (`_version`) and a suffix Bazel and the wheel
 # builder both name the wheel with (ML_WHEEL_VERSION_SUFFIX; the commit's own _release_version unset in the
 # build tree, so the builder takes the same suffix). DEW_BAZEL_TOKEN_FILE holds the
@@ -20,15 +22,18 @@
 # it reads); DEW_BAZEL_CACHE is the cache's URL. OUT receives the wheels (dist/), their sha256 list
 # (wheels.sha256), each build's log and seconds (builds.tsv) and the commit built (commit.txt).
 set -euo pipefail
-ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.14"} cudas=${5:-"12 13"}
+ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
 here=$(cd "$(dirname "$0")" && pwd)
 token_file=${DEW_BAZEL_TOKEN_FILE:-$here/bazel.token}
 cache=${DEW_BAZEL_CACHE:-https://dew-bazel.ashishkmr472.workers.dev/bazel}
 tree=$(mktemp -d /tmp/dew-plugin-XXXX)
 trap 'rm -rf "$tree"' EXIT
 mkdir -p "$out/dist"
-git clone -q --filter=blob:none --branch "$ref" https://github.com/AshishKumar4/jax "$tree/jax"
+# Fetched by name or sha alike (git clone --branch takes no sha), then checked out detached.
+git init -q "$tree/jax"
 cd "$tree/jax"
+git fetch -q --filter=blob:none https://github.com/AshishKumar4/jax "$ref"
+git checkout -q --detach FETCH_HEAD
 git rev-parse HEAD | tee "$out/commit.txt"
 base=$(sed -n 's/^_version = "\(.*\)"$/\1/p' jax/version.py)
 case "$version" in "$base"?*) suffix=${version#"$base"} ;; *) echo "$version is not $base with a suffix"; exit 1 ;; esac
