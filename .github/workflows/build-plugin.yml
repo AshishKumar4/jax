@@ -51,6 +51,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd "$RUNNER_TEMP/out"
-          machine=$(uname -m)
-          cp wheels.sha256 "wheels-$machine.sha256"
-          gh release upload "${{ inputs.release }}" dist/*.whl "wheels-$machine.sha256" -R "$GITHUB_REPOSITORY"
+          # One checksum file a machine and set of Pythons: a later build for other Pythons (cp313 after cp312 and
+          # cp314) adds its own beside the first's, never over it.
+          sums="wheels-$(uname -m)-py$(echo ${{ inputs.pythons }} | tr ' ' '-').sha256"
+          cp wheels.sha256 "$sums"
+          gh release upload "${{ inputs.release }}" dist/*.whl "$sums" -R "$GITHUB_REPOSITORY"
