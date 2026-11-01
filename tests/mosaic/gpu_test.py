@@ -5906,6 +5906,24 @@ class FragmentedArrayTest(TestCase):
     x = np.arange(m * n, dtype=dtype).reshape(m, n)
     np.testing.assert_allclose(result, np_op(x), atol=2e-7, rtol=2e-7)
 
+  @parameterized.parameters(
+      (mgpu.FragmentedArray.ceil, np.ceil),
+      (mgpu.FragmentedArray.floor, np.floor),
+  )
+  def test_rounding(self, op, np_op, m=64, n=32):
+
+    def kernel(ctx, dst, _):
+      del ctx
+      # Quarters either side of zero, so every rounding direction is exercised.
+      op(iota_tensor(m, n, jnp.float32) * 0.25 - 64.0).store_untiled(dst, optimized=False)
+
+    out_shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
+    result = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
+    )()
+    x = np.arange(m * n, dtype=np.float32).reshape(m, n) * 0.25 - 64.0
+    np.testing.assert_array_equal(result, np_op(x))
+
   def test_select(self, m=64, n=32):
 
     def kernel(ctx, dst, _):

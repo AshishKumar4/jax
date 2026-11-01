@@ -2215,6 +2215,18 @@ class FragmentedArray:
         mlir_math.roundeven, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
     )
 
+  def ceil(self) -> FragmentedArray:
+    """Same as `lax.ceil`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.ceil)
+
+  def floor(self) -> FragmentedArray:
+    """Same as `lax.floor`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.floor)
+
   def erf(self) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError(self.mlir_dtype)
