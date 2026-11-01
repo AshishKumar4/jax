@@ -67,6 +67,22 @@ class InterpretThreadMapTest(jtu.JaxTestCase):
     # value of `concurrent_calls` should be zero.
     self.assertEqual(concurrent_calls[0], 0)
 
+  def test_thread_map_reads_its_inputs_back_from_no_device(self):
+    # Its constants and inputs reach its threads as the host's arrays, put on
+    # the device once: none is read back from the CPU device first, which the
+    # device-to-host guard would hold.
+    seen = []
+
+    def f(core_index, token, x):
+      jax.experimental.io_callback(seen.append, (), x[0] + core_index,
+                                   ordered=True)
+      return token
+
+    x = jnp.arange(3, dtype=jnp.int32)
+    with jax.transfer_guard_device_to_host('disallow'):
+      jax.block_until_ready(thread_map(f, 4, jnp.int32(0), x))
+    self.assertCountEqual([int(value) for value in seen], [0, 1, 2, 3])
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
