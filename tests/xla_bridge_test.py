@@ -364,17 +364,20 @@ class GetBackendTest(jtu.JaxTestCase):
     self._orig_backends = xb._backends
     self._orig_backend_errors = xb._backend_errors
     self._orig_default_backend = xb._default_backend
+    self._orig_initialized_xla_flags = xb._initialized_xla_flags
 
   def _reset_backend_state(self):
     xb._backends = {}
     xb._backend_errors = {}
     xb._default_backend = None
+    xb._initialized_xla_flags = None
     xb.get_backend.cache_clear()
 
   def _restore_backend_state(self):
     xb._backends = self._orig_backends
     xb._backend_errors = self._orig_backend_errors
     xb._default_backend = self._orig_default_backend
+    xb._initialized_xla_flags = self._orig_initialized_xla_flags
     xb.get_backend.cache_clear()
 
   def test_default(self):
@@ -385,6 +388,28 @@ class GetBackendTest(jtu.JaxTestCase):
     self.assertEqual(backend.platform, "platform_A")
     # All backends initialized.
     self.assertEqual(len(xb._backends), len(xb._backend_factories))
+
+  def test_initialized_xla_flags_are_those_the_backends_initialized_under(self):
+    # XLA reads XLA_FLAGS once, as it initializes a backend: what it read stays, whatever the environment says after,
+    # until the backends are cleared; none before they initialize.
+    self._register_factory("platform_A", 20)
+    flags = os.environ.get("XLA_FLAGS")
+    try:
+      os.environ["XLA_FLAGS"] = "--xla_cpu_enable_fast_math=false"
+      self.assertIsNone(xb.initialized_xla_flags())
+      xb.get_backend()
+      os.environ["XLA_FLAGS"] = "--xla_dump_to=/tmp/elsewhere"
+      self.assertEqual(xb.initialized_xla_flags(), "--xla_cpu_enable_fast_math=false")
+      xb._clear_backends()
+      self.assertIsNone(xb.initialized_xla_flags())
+      xb.get_backend.cache_clear()
+      xb.get_backend()
+      self.assertEqual(xb.initialized_xla_flags(), "--xla_dump_to=/tmp/elsewhere")
+    finally:
+      if flags is None:
+        os.environ.pop("XLA_FLAGS", None)
+      else:
+        os.environ["XLA_FLAGS"] = flags
 
   def test_specific_platform(self):
     self._register_factory("platform_A", 20)
