@@ -212,6 +212,31 @@ class InterpretTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(jax.errors.JaxRuntimeError, 'RACE DETECTED'):
       kernel(jnp.arange(8, dtype=jnp.int32)).block_until_ready()
 
+  @jtu.parameterized.parameters("commit_smem", "fence_proxy_async")
+  def test_a_shared_proxy_fence_orders_stores_before_a_tma_copy(self, ordered_by):
+    # `fence_proxy_async("shared")` makes this thread's SMEM stores visible to
+    # the async proxy as `commit_smem` does; `fence` and the global proxy fence
+    # run too, ordering nothing more in the interpreter's memory.
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32),
+        scratch_types=dict(smem=plgpu.SMEM((128, 64), jnp.float32)),
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(x_ref, o_ref, smem):
+      smem[...] = x_ref[...] * 2
+      plgpu.fence(scope="cta", order="acq_rel")
+      plgpu.fence_proxy_async("global")
+      if ordered_by == "commit_smem":
+        plgpu.commit_smem()
+      else:
+        plgpu.fence_proxy_async("shared")
+      plgpu.copy_smem_to_gmem(smem, o_ref)
+      plgpu.wait_smem_to_gmem(0)
+
+    x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
+    np.testing.assert_array_equal(_kernel(x), x * 2)
+
   def test_store(self):
     @functools.partial(
         plgpu.kernel,
