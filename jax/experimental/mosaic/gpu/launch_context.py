@@ -1112,6 +1112,24 @@ class LaunchContext:
                         *(t.batch(len(squeezed_dims)) for t in gmem_transform))
 
     untransformed_slice_shape = tuple(slice_shape)
+    if implementation == AsyncCopyImplementation.CP_ASYNC and squeezed_dims:
+      # CP_ASYNC offsets the slice's base by the untransformed indices and
+      # strides, then squeezes, so the transforms apply to the slice with its
+      # squeezed dimensions gone (which may lie between its sliced ones, as a
+      # head index between a sequence and its features): those lead its shape.
+      logical_shape = tuple(
+          d for d, squeezed in zip(slice_shape, is_squeezed) if not squeezed
+      )
+      for t in gmem_transform:
+        logical_shape = t.transform_shape(logical_shape)
+      return (
+          [1] * len(squeezed_dims) + list(logical_shape),
+          untransformed_slice_shape,
+          dyn_base_indices,
+          squeezed_dims,
+          gather_indices,
+          gmem_transform,
+      )
     slice_shape = untransformed_slice_shape
     for t in gmem_transform:
       dyn_base_indices = t.transform_index(dyn_base_indices)
@@ -1448,8 +1466,10 @@ class LaunchContext:
 
       gmem_strides, _ = gmem_ref_ty.get_strides_and_offset()
       transformed_strides = gmem_strides
-      for t in gmem_transform:
-        transformed_strides = t.transform_strides(transformed_strides)
+      # A squeezing copy's base indices are untransformed (_prepare_async_copy).
+      if not squeezed_dims:
+        for t in gmem_transform:
+          transformed_strides = t.transform_strides(transformed_strides)
       gmem_offset = utils.dyn_dot(
           dyn_base_indices, [c(s, index) for s in transformed_strides]
       )
