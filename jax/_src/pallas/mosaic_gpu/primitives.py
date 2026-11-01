@@ -3706,7 +3706,9 @@ def _fence_proxy_async_lowering(ctx: lowering.LoweringRuleContext, *, space):
         nvvm.ProxyKind.async_shared, space=nvvm.SharedSpace.shared_cta
     )
   else:
-    nvvm.fence_proxy(nvvm.ProxyKind.async_global)
+    # Inline PTX: the plugin's NVVM and jaxlib's Python bindings may differ in
+    # this op's attributes, where the shared form above is Mosaic's own.
+    mgpu_utils.inline_ptx("fence.proxy.async.global;", has_side_effects=True)
   return ()
 
 
@@ -3764,8 +3766,11 @@ def _griddepcontrol_wait_abstract_eval():
     griddepcontrol_wait_p, *gpu_core.WGxWARP_SEMANTICS
 )
 def _griddepcontrol_wait_lowering(ctx: lowering.LoweringRuleContext):
+  void = ir.Type.parse("!llvm.void")
   with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
-    nvvm.griddepcontrol(nvvm.GridDepActionKind.wait)
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.wait;", "", has_side_effects=True
+    )
   return ()
 
 
@@ -3800,8 +3805,11 @@ def _griddepcontrol_launch_dependents_abstract_eval():
 def _griddepcontrol_launch_dependents_lowering(
     ctx: lowering.LoweringRuleContext,
 ):
+  void = ir.Type.parse("!llvm.void")
   with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
-    nvvm.griddepcontrol(nvvm.GridDepActionKind.launch_dependents)
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.launch_dependents;", "", has_side_effects=True
+    )
   return ()
 
 
