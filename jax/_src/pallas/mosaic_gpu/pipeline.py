@@ -591,16 +591,38 @@ def emit_pipeline[T](
         )
       else:
         steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
-      loop_carry = lax.fori_loop(
-          0,
-          steady_steps,
-          functools.partial(
-              loop_body,
-              wait_count=(max_concurrent_steps - 1 - lead) * copies_per_step,
-          ),
-          init_loop_carry,
+      steady_wait = (max_concurrent_steps - 1 - lead) * copies_per_step
+      fetch_starts = tuple(
+          (max_concurrent_steps - delay_release - lead) % max_concurrent_steps
+          for delay_release in delay_release_levels
       )
+
+      def turned(step, carry, slot, wait_count=steady_wait):
+        # A step at a slot the walk knows, a constant, and its fetches' slots
+        # with it, so no step forms a slot's address. The ring starts at slot
+        # zero, so a rotation's steps, unrolled, each know theirs.
+        slots = jnp.asarray(slot, dtype=jnp.int32), tuple(
+            jnp.asarray((slot + start) % max_concurrent_steps, jnp.int32)
+            for start in fetch_starts
+        )
+        return loop_body(step, (*carry[:4], *slots), wait_count=wait_count)
+
+      def rotation(index, carry):
+        for slot in range(max_concurrent_steps):
+          carry = turned(index * max_concurrent_steps + slot, carry, slot)
+        return carry
+
+      rotations = steady_steps // max_concurrent_steps
+      loop_carry = lax.fori_loop(0, rotations, rotation, init_loop_carry)
       if has_dynamic_grid:
+        # The steady steps past the last whole rotation, at the slot the
+        # loop carries (zero, after whole rotations).
+        loop_carry = lax.fori_loop(
+            rotations * max_concurrent_steps,
+            steady_steps,
+            functools.partial(loop_body, wait_count=steady_wait),
+            loop_carry,
+        )
         # cp.async.wait_group requires an immediate operand. We await all
         # in-flight copies upfront to avoid unrolling the drain.
         # TODO(slebedev): Consider branching on the number of remaining steps
@@ -613,13 +635,16 @@ def emit_pipeline[T](
             loop_carry,
         )
       else:
-        # cp.async wait-group must be a compile-time constant. Drain steps are
-        # unrolled with decreasing wait counts (down to 0).
-        for step in range(steady_steps, num_steps):
-          loop_carry = loop_body(
+        # The steady steps past the last whole rotation, then the drain, whose
+        # cp.async wait-group counts, compile-time constants, decrease to 0:
+        # each unrolled at its slot.
+        for step in range(rotations * max_concurrent_steps, num_steps):
+          loop_carry = turned(
               jnp.asarray(step),
               loop_carry,
-              wait_count=(num_steps - 1 - step) * copies_per_step,
+              step % max_concurrent_steps,
+              wait_count=steady_wait if step < steady_steps
+              else (num_steps - 1 - step) * copies_per_step,
           )
       last_indices, _, _, final_carry, _, _ = loop_carry
     else:
