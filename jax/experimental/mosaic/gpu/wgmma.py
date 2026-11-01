@@ -312,6 +312,16 @@ def wgmma_m64(
   return to_acc_vec_regs(acc_regs)
 
 
+def _at_use(base: ir.Value) -> ir.Value:
+  """`base`, a 64-bit descriptor base, copied where it is read: an opaque,
+  side-effecting copy no compiler pass moves out of an enclosing loop, so the
+  descriptors derived from it are formed at their instructions."""
+  return llvm.inline_asm(
+      ir.IntegerType.get_signless(64), [base], "mov.b64 $0, $1;", "=l,l",
+      asm_dialect=0, has_side_effects=True,
+  )
+
+
 def wgmma(
     acc: WGMMAAccumulator,
     a: fa.FragmentedArray | ir.Value,
@@ -474,6 +484,16 @@ def wgmma(
     a = wgmma_fence(a)  # Make sure the registers are ready.
 
   i64 = ir.IntegerType.get_signless(64)
+  # Each shared operand's descriptors are formed from its base at the
+  # instructions that read them. Where the operand's address is fixed across a
+  # loop (a block staged once and read every step), the compiler would
+  # otherwise hoist every group's descriptor out of the loop and hold them all,
+  # two registers each, across it: 64 registers for two operands of 16 groups.
+  # An opaque copy of the base at the product keeps the group descriptors at
+  # their instructions, one base a operand live instead.
+  if not a_in_regs:
+    a_desc_base = _at_use(a_desc_base)
+  b_desc_base = _at_use(b_desc_base)
   new_acc_regs = acc._value.registers.copy()
   for mi in range(m_groups):
     for ki in range(k_groups):
