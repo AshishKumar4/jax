@@ -42,6 +42,7 @@ from jax._src.util import unzip2, split_list
 from jax import checkpoint_policies
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
+from jax.experimental import io_callback
 from jax._src import dispatch
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.interpreters import batching
@@ -2961,6 +2962,52 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(
       jax.grad(lambda x: f(x).sum())(x),
       np.cos(x) if jtu.device_under_test() == "cpu" else -np.sin(x))
+
+  def test_platform_dependent_kept_branch_threads_ordered_effects(self):
+    # The kept branch's ordered effect takes the token of the effect before
+    # the conditional and hands its own to the one after, as a conditional's
+    # branch does.
+    log = []
+
+    def mark(tag):
+      io_callback(lambda: log.append(tag), None, ordered=True)
+
+    def branch(tag, fun):
+      def kept(x):
+        mark(tag)
+        return fun(x)
+      return kept
+
+    def f(x):
+      mark("before")
+      y = lax.platform_dependent(x, cpu=branch("cpu", jnp.sin),
+                                 default=branch("default", jnp.cos))
+      mark("after")
+      return y
+
+    x = np.float32(1.)
+    self.assertNotIn("stablehlo.case", jax.jit(f).lower(x).as_text())
+    jax.jit(f)(x)
+    jax.effects_barrier()
+    kept = "cpu" if jtu.device_under_test() == "cpu" else "default"
+    self.assertEqual(log, ["before", kept, "after"])
+
+  @parameterized.parameters(False, True)
+  def test_platform_dependent_kept_branch_reads_a_captured_array(
+      self, simplified_constants):
+    # The kept branch's captured array lowers as a conditional's branch's
+    # does, under either treatment of a jaxpr's constants.
+    c = jnp.arange(3, dtype=np.float32)
+
+    def f(x):
+      return lax.platform_dependent(x, cpu=lambda x: x + c,
+                                    default=lambda x: x - c)
+
+    x = np.ones(3, dtype=np.float32)
+    with config.use_simplified_jaxpr_constants(simplified_constants):
+      self.assertNotIn("stablehlo.case", jax.jit(f).lower(x).as_text())
+      self.assertArraysEqual(
+          jax.jit(f)(x), x + c if jtu.device_under_test() == "cpu" else x - c)
 
   def test_platform_dependent_with_non_existent_custom_call(self):
     if not jtu.test_device_matches(["cpu"]):
