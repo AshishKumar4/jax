@@ -17,6 +17,7 @@ from __future__ import annotations
 import heapq
 import logging
 import os
+import secrets
 import time
 from typing import Any
 import warnings
@@ -151,7 +152,24 @@ class LRUCache(CacheInterface):
 
       self._evict_if_needed(additional_size=len(value))
 
-      cache_path.write_bytes(value)
+      if self._is_local:
+        # Written aside and renamed into place, so a process reading the cache
+        # beside this one (with no eviction there is no lock) sees the whole
+        # entry or none of it.
+        # A short random name opened exclusively, as `write_bytes` would open
+        # the entry: its permissions the process's umask's, and no key too long
+        # for its own name refused for its temporary one.
+        written = self.path / f".{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(written, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+          with os.fdopen(descriptor, "wb") as file:
+            file.write(value)
+          os.replace(written, cache_path)
+        except BaseException:
+          os.unlink(written)
+          raise
+      else:
+        cache_path.write_bytes(value)
 
       if self.eviction_enabled:
         timestamp = time.time_ns().to_bytes(8, "little")
