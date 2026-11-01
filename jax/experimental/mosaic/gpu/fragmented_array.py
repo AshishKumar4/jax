@@ -52,6 +52,11 @@ c = utils.c
 
 
 ReductionKind = nvvm.ReductionKind
+AtomicOrder: TypeAlias = Literal["relaxed", "release"]
+"""An atomic store's memory order: `release` makes the storing thread's earlier
+writes visible to a thread that observes the store with acquire semantics."""
+AtomicScope: TypeAlias = Literal["cta", "cluster", "gpu", "sys"]
+"""The threads an atomic store is ordered and atomic against."""
 
 @dataclasses.dataclass(frozen=True)
 class Tiling:
@@ -4106,6 +4111,8 @@ class FragmentedArray:
       swizzle: int = 16,
       optimized: bool = True,
       atomic: Literal["add", "max", "min", "and", "or", "xor"] | None = None,
+      atomic_order: AtomicOrder = "relaxed",
+      atomic_scope: AtomicScope | None = None,
   ) -> None:
     if self.is_unreduced:
       raise ValueError("Cannot store unreduced FragmentedArray")
@@ -4149,6 +4156,7 @@ class FragmentedArray:
             )
             self._store_register_atomic(
                 base_ptr, get(self.registers), atomic, is_smem,
+                order=atomic_order, scope=atomic_scope,
             )
           elif bitwidth >= 8:
             # vector.store lowering doesn't work for element types with < 8 bits
@@ -4173,7 +4181,10 @@ class FragmentedArray:
       case TiledLayout():
         ref_shape = ir.MemRefType(ref.type).shape
         ref = utils.memref_reshape(ref, (*(1 for _ in ref_shape), *ref_shape))
-        self.store_tiled(ref, swizzle=swizzle, optimized=optimized, atomic=atomic)
+        self.store_tiled(
+            ref, swizzle=swizzle, optimized=optimized, atomic=atomic,
+            atomic_order=atomic_order, atomic_scope=atomic_scope,
+        )
       case _:
         raise NotImplementedError(self.layout)
 
@@ -4345,10 +4356,23 @@ class FragmentedArray:
       is_smem: bool,
       multimem: bool = False,
       cluster_barrier_ptr: ir.Value | None = None,
+      order: AtomicOrder = "relaxed",
+      scope: AtomicScope | None = None,
   ):
+    """Each register of `vreg` reduced into memory at `base_ptr`.
+
+    `order` is the reduction's memory order (`relaxed`, or `release`: the
+    thread's earlier writes are visible to whoever observes it), `scope` the
+    threads it orders against, the memory space's own scope where None (the
+    CTA's for shared memory, the GPU's for global, the system's for multimem).
+    """
+    if order not in ("relaxed", "release"):
+      raise ValueError(f"Unsupported atomic order: {order}")
     i32 = ir.IntegerType.get_signless(32)
     if cluster_barrier_ptr is not None:
       assert not is_smem and not multimem
+      if order != "relaxed" or scope is not None:
+        raise NotImplementedError("red.async is relaxed at cluster scope")
       ptr_ty = llvm.PointerType.get(address_space=7)
       assert cluster_barrier_ptr.type == ptr_ty, cluster_barrier_ptr.type
       red = "red.async"
@@ -4358,12 +4382,12 @@ class FragmentedArray:
     elif multimem:
       assert not is_smem
       red = "multimem.red"
-      scope = "sys"
+      scope = scope or "sys"
       space = ".global"
       ptr_constraint = "l"
     else:
       red = "red"
-      scope = "cta" if is_smem else "gpu"
+      scope = scope or ("cta" if is_smem else "gpu")
       space = ".shared::cta" if is_smem else ".global"
       ptr_constraint = "r" if is_smem else "l"
       if not is_smem and base_ptr.type.address_space != 1:
@@ -4444,7 +4468,7 @@ class FragmentedArray:
                   llvm.extractelement(pair, arith.constant(i32, 0)),
                   llvm.extractelement(pair, arith.constant(i32, 1)),
               ],
-              f"{red}{space}.relaxed.{scope}.{atomic}{noftz}.v2.{element_type} [$0], {{$1, $2}};",
+              f"{red}{space}.{order}.{scope}.{atomic}{noftz}.v2.{element_type} [$0], {{$1, $2}};",
               f"{ptr_constraint},h,h",
               has_side_effects=True,
           )
@@ -4453,7 +4477,7 @@ class FragmentedArray:
           llvm.inline_asm(
               ir.Type.parse("!llvm.void"),
               [ptr, *regs_slice],
-              f"{red}{space}.relaxed.{scope}.{atomic}{noftz}.v{width}.{element_type}x2 [$0], {operands};",
+              f"{red}{space}.{order}.{scope}.{atomic}{noftz}.v{width}.{element_type}x2 [$0], {operands};",
               f"{ptr_constraint}" + ",r" * width,
               has_side_effects=True,
           )
@@ -4470,7 +4494,7 @@ class FragmentedArray:
         llvm.inline_asm(
             ir.Type.parse("!llvm.void"),
             operands,
-            f"{red}{space}.relaxed.{scope}.{atomic}{noftz}.{ptx_t} [$0], $1{barrier_op};",
+            f"{red}{space}.{order}.{scope}.{atomic}{noftz}.{ptx_t} [$0], $1{barrier_op};",
             constraints,
             has_side_effects=True,
         )
@@ -4482,6 +4506,8 @@ class FragmentedArray:
       optimized: bool = True,
       tiling_rank: int | None = None,
       atomic: Literal["add", "max", "min", "and", "or", "xor"] | None = None,
+      atomic_order: AtomicOrder = "relaxed",
+      atomic_scope: AtomicScope | None = None,
   ):
     if self.is_unreduced:
       raise ValueError("Cannot store unreduced FragmentedArray")
@@ -4503,6 +4529,7 @@ class FragmentedArray:
       for get, _update, _idx, base_ptr in stores:
         self._store_register_atomic(
             base_ptr, get(self.registers), atomic, is_smem, multimem=multimem,
+            order=atomic_order, scope=atomic_scope,
         )
       return
     # Note that the loop below will "race" for layouts that replicate data.
