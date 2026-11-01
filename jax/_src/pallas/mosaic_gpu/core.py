@@ -147,6 +147,11 @@ class CompilerParams:
       must have a different collective_id if they perform communication between
       different sets of devices (e.g. if one kernel does neighbor comms on mesh
       axis x, while another does neighbor comms on mesh axis y).
+    min_blocks_per_sm: The minimum number of blocks of the kernel that should
+      be resident on one SM at once, as the second argument of CUDA's
+      ``__launch_bounds__``. ptxas limits the registers per thread so that this
+      many blocks fit the register file (spilling if it must). Defaults to 1,
+      which leaves ptxas free to use up to 255 registers per thread.
   """
   approx_math: bool = False
   dimension_semantics: Sequence[DimensionSemantics] | None = None
@@ -161,6 +166,7 @@ class CompilerParams:
   skip_device_barrier: bool = False
   is_multi_process: bool = False
   collective_id: int | None = None
+  min_blocks_per_sm: int = 1
 
   def __post_init__(self):
     if self.collective_id is not None and not (
