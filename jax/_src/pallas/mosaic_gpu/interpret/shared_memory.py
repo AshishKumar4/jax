@@ -1687,6 +1687,7 @@ class ClusterBarrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
+      parity: int | None = None,
   ):
     if self.enable_logging and logging_info is not None:
       with self.lock:
@@ -1697,7 +1698,7 @@ class ClusterBarrier(memory.Allocation):
             )
         )
 
-    self.block_barrier(thread).wait(thread, logging_info)
+    self.block_barrier(thread).wait(thread, logging_info, parity)
 
   def block_barrier(self, thread: Thread) -> Barrier:
     """The barrier for the block that `thread` belongs to."""
