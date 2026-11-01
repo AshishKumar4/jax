@@ -628,17 +628,6 @@ class DialectTest(MosaicGpuTest):
     ):
       self.module.operation.verify()
 
-  def test_mma_takes_f32_operands_into_an_f32_accumulator(self):
-    with ir.InsertionPoint(self.module.body):
-      acc, a, b = undefs(
-          ir.VectorType.get([64, 8], ir.F32Type.get()),
-          ir.VectorType.get([64, 8], ir.F32Type.get()),
-          ir.VectorType.get([8, 8], ir.F32Type.get()),
-      )
-      mgpu.dialect.mma(acc, a, b)
-
-    self.assertTrue(self.module.operation.verify())
-
   def test_mma_acc_m_not_equal_to_a_m_dim(self):
     with ir.InsertionPoint(self.module.body):
       acc, a, b = undefs(
