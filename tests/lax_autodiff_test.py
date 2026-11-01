@@ -875,6 +875,32 @@ class LaxAutodiffTest(jtu.JaxTestCase):
     check_grads(reduce, operands, 2, ["fwd", "rev"], tol, tol)
 
   @jtu.sample_product(
+    [dict(shape=shape, dims=dims)
+      for shape, dims in [
+          [(3, 4, 5), (1,)],
+          [(3, 4, 5), (0, 2)],
+          [(3, 1), (1,)],
+      ]
+    ],
+    dtype=grad_float_dtypes,
+  )
+  def testReduceConstantOperandGrad(self, shape, dtype, dims):
+    # A logsumexp in one pass: the running maximum, the sum of exponentials scaled to it, beside a
+    # constant count of ones and an integer column index, whose tangents are symbolic zeros.
+    rng = jtu.rand_default(self.rng(), scale=1)
+    tol = {np.float32: 1e-2, np.float64: 1e-4}
+    init_vals = (np.array(-np.inf, dtype), np.array(0, dtype), np.array(0, np.int32))
+    def op(xs, ys):
+      larger = lax.max(xs[0], ys[0])
+      total = xs[1] * lax.exp(xs[0] - larger) + ys[1] * lax.exp(ys[0] - larger)
+      return larger, total, lax.select(xs[0] >= ys[0], xs[2], ys[2])
+    def reduce(x):
+      columns = lax.broadcasted_iota(np.int32, x.shape, x.ndim - 1)
+      larger, total, _ = lax.reduce((x, lax.full_like(x, 1), columns), init_vals, op, dims)
+      return larger + lax.log(total)
+    check_grads(reduce, (rng(shape, dtype),), 2, ["fwd", "rev"], tol, tol)
+
+  @jtu.sample_product(
     [dict(init_val=init_val, op=op, dtype=dtype, rng_factory=rng_factory,
           shape=shape, dims=dims, strides=strides, padding=padding,
           base_dilation=base_dilation, window_dilation=window_dilation)
