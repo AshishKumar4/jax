@@ -19,6 +19,9 @@ on:
       rehearse:
         description: "rebase and test onto a release without pushing or publishing, e.g. \"0.11.2 0.12.0\""
         required: false
+      test:
+        description: "a candidate stack's ref to test, its release's stock jaxlib beside it, e.g. release/0.12.0.1.post44-candidate (no push, no publish)"
+        required: false
       yank:
         description: "mark these wheels yanked, instead of looking for a new release, e.g. \"jax-0.12.0.post7-py3-none-any.whl\""
         required: false
@@ -51,7 +54,32 @@ defaults:
     shell: bash
 
 jobs:
+  test:
+    if: inputs.test != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+      - uses: astral-sh/setup-uv@v6
+      - name: Test the candidate
+        env:
+          CANDIDATE: ${{ inputs.test }}
+        run: |
+          git clone -q --filter=blob:none "https://github.com/${{ github.repository }}.git" jax
+          cd jax
+          git checkout -q "$CANDIDATE"
+          # Its release: the jaxlib its version.py's _version names, which it installs beside.
+          release=$(sed -n 's/^_version = "\(.*\)"$/\1/p' jax/version.py)
+          git fetch -q --no-tags https://github.com/jax-ml/jax.git "refs/tags/jax-v$release:refs/tags/jax-v$release"
+          uv venv -q --python 3.12 ../venv
+          uv pip install -q --python ../venv/bin/python "jaxlib==$release" . $TEST_DEPENDENCIES
+          tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "$release")"
+          echo "tests: $tests"
+          ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $tests 2>&1 | tee ../tests.txt
+
   carry:
+    if: inputs.test == ''
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.pushed.outputs.release || inputs.publish }}
