@@ -2276,6 +2276,103 @@ def _eval_jaxpr_lowering_rule(
   )
 
 
+def _unit_axis_slice_axis(source_shape, shape, start_indices) -> int | None:
+  """The singleton axis of a supported whole-row/column slice, if any."""
+  if (
+      len(shape) == 2 and shape.count(1) == 1
+      and tuple(source_shape) != tuple(shape)
+  ):
+    axis = shape.index(1)
+    other = 1 - axis
+    if shape[other] == source_shape[other] and start_indices[other] == 0:
+      return axis
+  return None
+
+
+@_register_resource_estimator(lax.slice_p)
+def _unit_axis_slice_resource_estimator(
+    ctx, x_aval, *, limit_indices, start_indices, strides
+):
+  del strides
+  shape = tuple(e - b for b, e in zip(start_indices, limit_indices))
+  if (
+      ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup
+      and _unit_axis_slice_axis(x_aval.shape, shape, start_indices) is not None
+  ):
+    return Resources(smem_scratch_bytes=ctx.reduction_scratch_bytes)
+  return Resources()
+
+
+def _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices, axis):
+  """Select a row/column without requiring a sub-tile strided slice.
+
+  Mask integer bit patterns, then take unsigned max with zero: exactly one
+  element contributes to each output. Unlike summing floats, this preserves
+  NaN payloads, infinities, negative zero, and negative integers bit-for-bit.
+  """
+  other = 1 - axis
+  element_type = x.type.element_type
+  bitwidth = mgpu_utils.bitwidth(element_type)
+  pattern_type = ir.IntegerType.get_signless(bitwidth)
+  pattern_vector_type = ir.VectorType.get(x.type.shape, pattern_type)
+  bits = (
+      x if element_type == pattern_type
+      else arith_dialect.bitcast(pattern_vector_type, x)
+  )
+  # Selects and cross-warp reductions below 16 bits are not all supported.
+  # Widen their unsigned bit patterns, not signed values, so truncation
+  # restores every bit; 16 and 32 bits keep their width and scratch.
+  widened = 32 if bitwidth < 16 else bitwidth
+  int_type = ir.IntegerType.get_signless(widened)
+  int_vector_type = ir.VectorType.get(x.type.shape, int_type)
+  if widened != bitwidth:
+    bits = arith_dialect.extui(int_vector_type, bits)
+  i32 = ir.IntegerType.get_signless(32)
+  indices = mgpu.dialect.broadcasted_iota(
+      ir.VectorType.get(x.type.shape, i32), axis
+  )
+  offset = vector_dialect.broadcast(
+      indices.type, arith_dialect.constant(i32, start_indices[axis])
+  )
+  mask = arith_dialect.cmpi(arith_dialect.CmpIPredicate.eq, indices, offset)
+  zero = arith_dialect.constant(int_type, 0)
+  bits = arith_dialect.select(
+      mask, bits, vector_dialect.broadcast(int_vector_type, zero)
+  )
+  reduced_type = ir.VectorType.get((shape[other],), int_type)
+  reduction = vector_dialect.MultiDimReductionOp(
+      vector_dialect.CombiningKind.MAXUI,
+      bits,
+      vector_dialect.broadcast(reduced_type, zero),
+      [axis],
+  )
+  for key, value in (
+      ("offset", ctx.module_ctx.smem_used_bytes),
+      ("scratch_size", ctx.module_ctx.warpgroup_reduction_scratch_bytes),
+      ("scratch_warpgroups", ctx.module_ctx.warpgroups),
+  ):
+    reduction.attributes[key] = ir.IntegerAttr.get(i32, value)
+  result = vector_dialect.shape_cast(
+      ir.VectorType.get(shape, int_type), reduction.result
+  )
+  if bitwidth == 1:
+    # FragmentedArray.astype cannot pack a short vector of i1 bits into a
+    # byte. The widened boolean patterns are exactly zero or one.
+    return arith_dialect.cmpi(
+        arith_dialect.CmpIPredicate.ne,
+        result,
+        vector_dialect.broadcast(result.type, zero),
+    )
+  if widened != bitwidth:
+    result = arith_dialect.trunci(
+        ir.VectorType.get(shape, pattern_type), result
+    )
+  return (
+      result if element_type == pattern_type
+      else arith_dialect.bitcast(ir.VectorType.get(shape, element_type), result)
+  )
+
+
 @register_lowering_rule(lax.slice_p, mgpu.LoweringSemantics.Lane)
 def _slice_lowering_rule(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
@@ -2290,10 +2387,15 @@ def _slice_lowering_rule(
 def _slice_lowering_rule_wg(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
 ):
-  del limit_indices
   assert isinstance(x.type, ir.VectorType)
   if strides is not None:
     raise NotImplementedError("Strides are not supported.")
+  shape = tuple(ctx.avals_out[0].shape)
+  axis = _unit_axis_slice_axis(x.type.shape, shape, start_indices)
+  if axis is not None:
+    return _unit_axis_slice_lowering_rule_wg(
+        ctx, x, shape, start_indices, axis
+    )
   out_ty = ir.VectorType.get(
       ctx.avals_out[0].shape, ir.VectorType(x.type).element_type
   )
