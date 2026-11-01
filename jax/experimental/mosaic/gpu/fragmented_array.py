@@ -1616,6 +1616,16 @@ class FragmentedArray:
       )
     if self.layout == WGMMA_LAYOUT_UPCAST_4X and new_layout == WGMMA_LAYOUT:
       return self.to_layout(WGMMA_LAYOUT_UPCAST_2X).to_layout(new_layout)
+    from .mma import can_relayout_acc_to_lhs
+
+    if can_relayout_acc_to_lhs(self.layout, new_layout, bitwidth):
+      # The accumulator's (row tile, 8-column tile, half) registers are the
+      # LHS's (row tile, 16-column tile, 8-column half, half): the same
+      # registers, the column tile split in two.
+      registers = self.registers.reshape(new_layout.registers_shape(shape))
+      return FragmentedArray(
+          _registers=registers, _layout=new_layout, _is_signed=self.is_signed
+      )
     if not isinstance(self.layout, WGSplatFragLayout):
       raise NotImplementedError(
           f"Cannot convert from {self.layout} to {new_layout}"
