@@ -2487,14 +2487,12 @@ class DialectLoweringTest(MosaicGpuTest):
       if branch is None:
         return llvm.UndefOp(i32)
       if branch == "if":
-        cst = arith.constant(i32, ir.IntegerAttr.get(i32, 1))
-        op = scf.IndexSwitchOp([], cst, [1], 1)
-        for region in op.regions:
-          region.blocks.append()
-        with ir.InsertionPoint(op.regions[1].blocks[0]):
+        index = arith.constant(ir.IndexType.get(), 1)
+        op = scf.IndexSwitchOp([], index, [1])
+        with ir.InsertionPoint(op.case_block(0)):
           marker = llvm.UndefOp(i32)
           scf.yield_([])
-        with ir.InsertionPoint(op.regions[0].blocks[0]):
+        with ir.InsertionPoint(op.default_block):
           scf.yield_([])
         return marker
       lb = arith.constant(ir.IndexType.get(), 0)
