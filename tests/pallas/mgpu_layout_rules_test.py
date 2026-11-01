@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from absl.testing import absltest
+from absl.testing import parameterized
 
 import jax
 from jax._src import test_util as jtu
@@ -108,19 +109,21 @@ class LayoutInTypesTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(ValueError, "Failed to infer layouts"):
       f.trace(arr1, arr2)
 
-  def test_mma_layout_is_propagated(self):
+  @parameterized.parameters(None, 2)
+  def test_mma_layout_is_propagated(self, m_warps):
     arr1 = jnp.arange(64 * 128, dtype=jnp.bfloat16).reshape(64, 128)
     arr2 = jnp.arange(128 * 256, dtype=jnp.bfloat16).reshape(128, 256)
+    split = {} if m_warps is None else {"m_warps": m_warps}
 
     with mlir.make_ir_context():
-      layouts = MMALayouts(mgpu_utils.dtype_to_ir_type(jnp.bfloat16))
+      layouts = MMALayouts(mgpu_utils.dtype_to_ir_type(jnp.bfloat16), **split)
 
     @explicit_layout
     def mma(acc, x_val, y_val):
       self.assertEqual(acc.layout, _from_fa_layout(layouts.acc))
       self.assertEqual(x_val.layout, _from_fa_layout(layouts.lhs))
       self.assertEqual(y_val.layout, _from_fa_layout(layouts.rhs))
-      out_val = plgpu.mma(acc, x_val, y_val)
+      out_val = plgpu.mma(acc, x_val, y_val, m_warps=m_warps)
       self.assertEqual(out_val.layout, _from_fa_layout(layouts.acc))
       return out_val
 
@@ -131,9 +134,9 @@ class LayoutInTypesTest(jtu.JaxTestCase):
         y = plgpu.load(y_gmem, optimized=False)
         acc = jnp.zeros((x.shape[0], y.shape[1]), dtype=jnp.float32)
 
-        x_layout = GPUTiledLayout.for_array(x, plgpu.Layout.MMA_LHS(jnp.bfloat16))
-        y_layout = GPUTiledLayout.for_array(y, plgpu.Layout.MMA_RHS(jnp.bfloat16))
-        acc_layout = GPUTiledLayout.for_array(acc, plgpu.Layout.MMA_ACC(jnp.float32))
+        x_layout = GPUTiledLayout.for_array(x, plgpu.Layout.MMA_LHS(jnp.bfloat16, **split))
+        y_layout = GPUTiledLayout.for_array(y, plgpu.Layout.MMA_RHS(jnp.bfloat16, **split))
+        acc_layout = GPUTiledLayout.for_array(acc, plgpu.Layout.MMA_ACC(jnp.float32, **split))
 
         o_val = mma(acc, x, y, in_layouts=(acc_layout, x_layout, y_layout))
         o_gmem[...] = o_val
