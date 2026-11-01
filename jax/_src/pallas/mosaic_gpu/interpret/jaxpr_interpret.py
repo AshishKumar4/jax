@@ -1330,6 +1330,26 @@ class JaxprInterpreter:
         thread=self.thread,
     ), []
 
+  def _interpret_fence_proxy_async_p(
+      self, eqn, token: jax.Array, _get_invals: Callable[[], Sequence[Any]]
+  ):
+    assert eqn.primitive is gpu_primitives.fence_proxy_async_p
+    if eqn.params["space"] != "shared":
+      # The interpreter models no async proxy for global memory: a TMA read of
+      # it sees every store before it.
+      return token, []
+    # `fence.proxy.async.shared::cta`: this thread's generic-proxy SMEM
+    # accesses visible to the async proxy, as `commit_smem` makes them.
+    return callback.io_callback_numpy_inputs(
+        functools.partial(
+            gpu_callbacks.commit_smem, source_info=eqn.source_info
+        ),
+        gpu_callbacks.TOKEN_SHAPE_DTYPE,
+        token=token,
+        mesh_location=self.mesh_location,
+        thread=self.thread,
+    ), []
+
   def _interpret_try_cluster_cancel_p(
       self, eqn, token: jax.Array, get_invals: Callable[[], Sequence[Any]]
   ):
@@ -1496,6 +1516,13 @@ class JaxprInterpreter:
             out = deferred_invals()[0]
           case gpu_primitives.commit_smem_p:
             token, out = self._interpret_commit_smem_p(eqn, token, deferred_invals)
+          case gpu_primitives.fence_p:
+            # The interpreter's memory is sequentially consistent: a fence of
+            # any scope or order orders nothing it does not already.
+            out = []
+          case gpu_primitives.fence_proxy_async_p:
+            token, out = self._interpret_fence_proxy_async_p(
+                eqn, token, deferred_invals)
           case gpu_primitives.inline_mgpu_p:
             token, out = self._interpret_inline_mgpu_p(
                 eqn, token, deferred_invals)
