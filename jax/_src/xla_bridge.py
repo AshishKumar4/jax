@@ -277,6 +277,8 @@ _backend_factories: dict[str, BackendRegistration] = {}
 _default_backend: xla_client.Client | None = None
 _backends : dict[str, xla_client.Client] = {}
 _backend_errors : dict[str, str] = {}
+# XLA_FLAGS as the backends read it when they initialized (`initialized_xla_flags`), None before they have.
+_initialized_xla_flags : str | None = None
 _backend_lock = threading.Lock()
 _plugins_registered: bool = False
 _plugin_lock = threading.Lock()
@@ -808,17 +810,26 @@ def register_plugin_callbacks(callback):
       _plugin_callbacks.append(callback)
 
 
+def initialized_xla_flags() -> str | None:
+  """The XLA_FLAGS environment variable as XLA read it when JAX's backends initialized, which XLA reads once, then:
+  what the backends run with, whatever the environment says after; None before they have initialized (and after
+  `clear_backends`, until they initialize again)."""
+  return _initialized_xla_flags
+
+
 def backends() -> dict[str, xla_client.Client]:
   global _backends
   global _backend_errors
   global _default_backend
   global _at_fork_handler_installed
+  global _initialized_xla_flags
 
   _discover_and_register_pjrt_plugins()
 
   with _backend_lock:
     if _backends:
       return _backends
+    _initialized_xla_flags = os.environ.get("XLA_FLAGS", "")
 
     # os.register_at_fork only exists on Unix.
     if not _at_fork_handler_installed and hasattr(os, "register_at_fork"):
@@ -913,12 +924,14 @@ def _clear_backends() -> None:
   global _backends
   global _backend_errors
   global _default_backend
+  global _initialized_xla_flags
 
   logger.debug("Clearing JAX backend caches.")
   with _backend_lock:
     _backends = {}
     _backend_errors = {}
     _default_backend = None
+    _initialized_xla_flags = None
 
 
 def _init_backend(platform: str) -> xla_client.Client:

@@ -25,6 +25,7 @@ from jax._src.xla_bridge import (
   backends as backends,
   backend_xla_version as backend_xla_version,
   get_backend as get_backend,
+  initialized_xla_flags as initialized_xla_flags,
   register_backend_factory as register_backend_factory,
 )
 from jax._src.interpreters.pxla import (
