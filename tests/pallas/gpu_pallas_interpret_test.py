@@ -1138,6 +1138,54 @@ class InterpretTest(jtu.JaxTestCase):
     y = _kernel(x)
     np.testing.assert_array_equal(y, x + 2)
 
+  @jtu.parameterized.product(offset=[0, 1])
+  def test_ring_awaited_at_explicit_parities(self, offset):
+    # A two-slot ring whose waits name the turn's parity, as one bit a ring
+    # shares; an offset of one names the other parity, which no phase the
+    # waiting thread observes next has.
+    stages, turns = 2, 6
+    x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=x,
+        scratch_types=dict(
+            smem=plgpu.SMEM((stages, 128), x.dtype),
+            full=plgpu.Barrier(num_barriers=stages),
+            consumed=plgpu.Barrier(num_barriers=stages),
+        ),
+        num_threads=2,
+        thread_name='t',
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(x_ref, out_ref, smem, full, consumed):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def producer():
+        @pl.loop(0, turns)
+        def _(turn):
+          slot, rotation = turn % stages, turn // stages
+          pl.when(rotation > 0)(lambda: plgpu.barrier_wait(
+              consumed.at[slot], parity=(rotation - 1 + offset) % 2 == 1))
+          smem[slot] = x_ref[turn] + 1
+          plgpu.barrier_arrive(full.at[slot])
+
+      @pl.when(thread_id == 1)
+      def consumer():
+        @pl.loop(0, turns)
+        def _(turn):
+          slot, rotation = turn % stages, turn // stages
+          plgpu.barrier_wait(full.at[slot], parity=rotation % 2 == 1)
+          out_ref[turn] = smem[slot] + 1
+          plgpu.barrier_arrive(consumed.at[slot])
+
+    if offset:
+      with self.assertRaises(jax.errors.JaxRuntimeError):
+        _kernel(x).block_until_ready()
+    else:
+      np.testing.assert_array_equal(_kernel(x), x + 2)
+
   @jtu.parameterized.product(with_race=[True, False])
   def test_barrier_multidimensional_1d(self, with_race):
     shape = (2,)
