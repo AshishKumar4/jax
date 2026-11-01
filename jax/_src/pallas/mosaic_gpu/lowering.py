@@ -1013,6 +1013,7 @@ def lower_jaxpr_to_module(
       base_loc=base_loc,
       uses_pdl=uses_pdl,
       is_multi_process=params.is_multi_process,
+      min_blocks_per_sm=params.min_blocks_per_sm,
   )
 
   mgpu_core.lower_mgpu_module(
