@@ -7397,6 +7397,7 @@ class FragmentedArrayTest(TestCase):
   @parameterized.product(
       dtype=(
           jnp.float64,
+          jnp.float32,
           jnp.bfloat16,
           jnp.float16,
           jnp.float8_e4m3fn,
@@ -7444,8 +7445,18 @@ class FragmentedArrayTest(TestCase):
       b = self.prng.uniform(-1, 1, (n, k)).astype(dtype)
       acc = self.prng.uniform(-1, 1, (m, n)).astype(acc_dtype)
 
+    if dtype == jnp.float32:
+      # TF32 operands, each rounded to nearest, ties away (`cvt.rna`), whose
+      # products are exact in f32.
+      def tf32(x):
+        bits = np.asarray(x, np.float32).view(np.uint32)
+        return ((bits + np.uint32(0x1000)) & np.uint32(0xFFFFE000)).view(np.float32)
+      operands = (tf32(a), tf32(b))
+    else:
+      operands = (a, b)
     expected = acc + jax.lax.dot(
-        a.astype(acc_dtype), b.astype(acc_dtype).T, precision="high"
+        operands[0].astype(acc_dtype), operands[1].astype(acc_dtype).T,
+        precision="highest" if dtype == jnp.float32 else "high",
     )
     result = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), (acc, a, b), expected, ()
