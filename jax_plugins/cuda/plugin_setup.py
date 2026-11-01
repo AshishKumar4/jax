@@ -46,10 +46,6 @@ def load_version_module(pkg_path):
 _version_module = load_version_module(package_name)
 __version__ = _version_module._get_version_for_build()
 _cmdclass = _version_module._get_cmdclass(package_name)
-# A post-release of this plugin (Dew's build: the plugin's own sources patched) runs on the PJRT plugin of
-# the release it posts, which it leaves unchanged: it requires that release's jax-cuda-pjrt, not its own
-# post number's, which no index holds.
-_pjrt_version = _version_module._version
 
 class BinaryDistribution(Distribution):
   """This class makes 'bdist_wheel' include an ABI tag on the wheel."""
@@ -68,7 +64,7 @@ setup(
     author_email="jax-dev@google.com",
     packages=[package_name],
     python_requires=">=3.12",
-    install_requires=[f"jax-cuda{cuda_version}-pjrt=={_pjrt_version}"],
+    install_requires=[f"jax-cuda{cuda_version}-pjrt=={__version__}"],
     extras_require={
       'with-cuda': [
           f"nvidia-cublas{cuda_wheel_suffix}{nvidia_cublas_version}",
