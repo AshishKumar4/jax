@@ -297,6 +297,29 @@ cc_library(
 )
 
 cc_library(
+    name = "kernel_store",
+    srcs = ["kernel_store.cc"],
+    hdrs = ["kernel_store.h"],
+    linkopts = ["-ldl"],
+    deps = [
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+cc_test(
+    name = "kernel_store_test",
+    srcs = ["kernel_store_test.cc"],
+    deps = [
+        ":kernel_store",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "custom_call",
     srcs = ["custom_call.cc"],
     linkopts = if_oss(
@@ -311,6 +334,7 @@ cc_library(
     ],
     deps = [
         ":dump",
+        ":kernel_store",
         ":launch_config",
         ":mosaic_gpu_cc_proto",
         ":nvshmem",

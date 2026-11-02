@@ -22,6 +22,11 @@ limitations under the License.
 namespace mosaic {
 namespace gpu {
 
+// The module attributes the pass leaves the PTX it assembled and the PTX
+// compiler's log in.
+inline constexpr char kPtxAttr[] = "mosaic_gpu.ptx";
+inline constexpr char kCompilationLogAttr[] = "mosaic_gpu.compilation_log";
+
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
 // `gpu.binary` ops wrapping a CUBIN binary, each assembled for the compute
 // capability its own NVVM target names.

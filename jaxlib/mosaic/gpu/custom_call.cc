@@ -57,6 +57,7 @@ limitations under the License.
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "third_party/gpus/cuda/include/cuda.h"
 #include "third_party/gpus/cuda/include/driver_types.h"
 #include "llvm/ADT/SmallVector.h"
@@ -134,6 +135,7 @@ limitations under the License.
 #include "jaxlib/mosaic/gpu/assembly_to_binary.h"
 #include "jaxlib/mosaic/gpu/dump.h"
 #include "jaxlib/mosaic/gpu/gpu_module_to_assembly.h"
+#include "jaxlib/mosaic/gpu/kernel_store.h"
 #include "jaxlib/mosaic/gpu/launch_config.h"
 #include "jaxlib/mosaic/gpu/launch_lowering.h"
 #include "jaxlib/mosaic/gpu/mosaic_gpu.pb.h"
@@ -516,6 +518,12 @@ struct CompiledKernel {
   // The following fields are used for de/serialization of CompiledKernel.
   std::string object_file;
   std::string host_func_name;
+  // What decided its compile (`CompileIdentity`), and what the compile said:
+  // the PTX it assembled, the PTX compiler's log, and its dumps' basename.
+  std::string identity;
+  std::string ptx;
+  std::string compilation_log;
+  std::string dump_basename;
 };
 
 absl::Status CUresultAsStatus(CUresult launch_result,
@@ -804,6 +812,14 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> CreateAndInitJIT(
       std::move(gpu_binary), std::move(kernel_name), smem_bytes, cluster_size);
 }
 
+// The LLVM command-line options a Mosaic GPU compile sets: `div.full` for
+// float32 division, which generates better SASS.
+const std::vector<std::string>& MosaicLlvmOptions() {
+  static const absl::NoDestructor<std::vector<std::string>> options(
+      std::vector<std::string>{"-nvptx-prec-divf32=1"});
+  return *options;
+}
+
 absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
     llvm::StringRef module_str, se::CudaComputeCapability cc,
     const xla::cpu::TargetMachineOptions& cpu_target_machine_options) {
@@ -874,8 +890,7 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
   }
 #endif
 
-  // Use `div.full` for float32 division---this generates better SASS.
-  const std::vector<std::string> llvm_cl_options{"-nvptx-prec-divf32=1"};
+  const std::vector<std::string>& llvm_cl_options = MosaicLlvmOptions();
   // Acquire a lock over the LLVM command line options here. XLA uses this
   // lock to override the default LLVM command line options on a per-client
   // basis. This means that failing to acquire this lock and explicitly
@@ -924,14 +939,158 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
 
   ASSIGN_OR_RETURN(auto host_func_name, GetHostFuncName(*module));
 
-  return CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
-                          use_nvshmem, multimem_used, std::move(gpu_binary),
-                          std::move(kernel_name), smem_bytes, cluster_size);
+  auto ptx_attr = (*module)->getAttrOfType<mlir::StringAttr>(
+      mosaic::gpu::kPtxAttr);
+  auto log_attr = (*module)->getAttrOfType<mlir::StringAttr>(
+      mosaic::gpu::kCompilationLogAttr);
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<CompiledKernel> kernel,
+      CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
+                       use_nvshmem, multimem_used, std::move(gpu_binary),
+                       std::move(kernel_name), smem_bytes, cluster_size));
+  kernel->ptx = ptx_attr ? ptx_attr.getValue().str() : "";
+  kernel->compilation_log = log_attr ? log_attr.getValue().str() : "";
+  kernel->dump_basename = dump_opts.module_basename;
+  return kernel;
 }
+
+constexpr int kKernelProtoVersion = 5;
+
+mosaic::gpu::MosaicGpuKernelProto KernelProto(const CompiledKernel& kernel,
+                                              const KernelHash& hash) {
+  mosaic::gpu::MosaicGpuKernelProto kernel_proto;
+  kernel_proto.set_version(kKernelProtoVersion);
+  kernel_proto.set_object_file(kernel.object_file);
+  kernel_proto.set_is_nvshmem_used(kernel.is_nvshmem_used);
+  kernel_proto.set_is_multimem_used(kernel.is_multimem_used);
+  kernel_proto.set_kernel_hash(hash.data(), sizeof(KernelHash));
+  kernel_proto.set_host_func_name(kernel.host_func_name);
+  kernel_proto.set_gpu_binary(kernel.gpu_binary);
+  kernel_proto.set_kernel_name(kernel.kernel_name);
+  kernel_proto.set_smem_bytes(kernel.smem_bytes);
+  kernel_proto.set_cluster_size(kernel.cluster_size);
+  kernel_proto.set_identity(kernel.identity);
+  kernel_proto.set_ptx(kernel.ptx);
+  kernel_proto.set_compilation_log(kernel.compilation_log);
+  kernel_proto.set_dump_basename(kernel.dump_basename);
+  return kernel_proto;
+}
+
+// The kernel a proto holds, loaded: its host object linked, its diagnostics
+// kept. Refused where it is another version's.
+absl::StatusOr<std::unique_ptr<CompiledKernel>> KernelOfProto(
+    const mosaic::gpu::MosaicGpuKernelProto& kernel_proto) {
+  if (kernel_proto.version() != kKernelProtoVersion) {
+    return absl::InternalError(absl::StrCat(
+        "Unsupported Mosaic GPU kernel version: ", kernel_proto.version()));
+  }
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<CompiledKernel> kernel,
+      CreateAndInitJIT(
+          llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
+                                           "kernel"),
+          kernel_proto.host_func_name(), kernel_proto.is_nvshmem_used(),
+          kernel_proto.is_multimem_used(), kernel_proto.gpu_binary(),
+          kernel_proto.kernel_name(), kernel_proto.smem_bytes(),
+          kernel_proto.cluster_size()));
+  kernel->identity = kernel_proto.identity();
+  kernel->ptx = kernel_proto.ptx();
+  kernel->compilation_log = kernel_proto.compilation_log();
+  kernel->dump_basename = kernel_proto.dump_basename();
+  return kernel;
+}
+
+// What decides the compile of `module` for `cc` and `cpu` with this binary's
+// compilation provider (`mosaic::gpu::CompileInputs`).
+absl::StatusOr<std::string> IdentityOf(
+    llvm::StringRef module, const se::CudaComputeCapability& cc,
+    const xla::cpu::TargetMachineOptions& cpu,
+    const se::cuda::CompilationProvider& provider) {
+  ASSIGN_OR_RETURN(std::string ptx_isa, GetPtxIsaVersion(provider));
+  std::vector<std::string> bitcode{
+      ::xla::gpu::nvptx::LibDevicePath(mosaic::gpu::kDefaultCudaDataDir)};
+  std::string host_target = absl::StrCat(cpu.triple(), "|", cpu.cpu(), "|",
+                                         cpu.GetTargetMachineFeatures());
+  std::string gpu_target = cc.ToString();
+  return mosaic::gpu::CompileIdentity(mosaic::gpu::CompileInputs{
+      .module = absl::string_view(module.data(), module.size()),
+      .gpu_target = gpu_target,
+      .ptx_isa = ptx_isa,
+      .provider = provider.name(),
+      .host_target = host_target,
+      .bitcode = bitcode,
+      .llvm_options = MosaicLlvmOptions(),
+  });
+}
+
+// `module` compiled for `cc` and `cpu`, or read from the store
+// (MOSAIC_GPU_COMPILATION_CACHE_DIR, `kernel_store.h`) where it holds a
+// kernel of its identity: a stored kernel runs no MLIR pass, LLVM or PTX
+// compile, and replays the PTX and the PTX compiler's log where the dumps ask
+// for them. The store is read and written only where the PTX compiler is in
+// process (its build is the binary's, which keys every entry), and read only
+// where no dump asks for what only a compile makes (passes, SASS, resources).
+// An entry another build wrote, or one that does not parse, is a miss; a
+// stored kernel that fails to load fails as a compile would.
+absl::StatusOr<std::unique_ptr<CompiledKernel>> CompiledOrStored(
+    llvm::StringRef module, const se::CudaComputeCapability& cc,
+    const xla::cpu::TargetMachineOptions& cpu, const std::string& identity) {
+  ASSIGN_OR_RETURN(se::cuda::CompilationProvider * provider,
+                   mosaic::gpu::GetAssemblyToBinaryCompilationProvider());
+  std::optional<std::string> store = mosaic::gpu::StoreDirectory();
+  bool in_process = absl::StrContains(provider->name(), "Nvptxcompiler");
+  mosaic::gpu::DumpOptions asked = mosaic::gpu::DumpOptionsFromEnvironment();
+  bool replayed = !(asked.mlir_passes || asked.constraint_system ||
+                    asked.sass || asked.sass_ctrl || asked.resources);
+  if (store.has_value() && in_process && replayed) {
+    std::optional<std::string> entry =
+        mosaic::gpu::ReadEntry(*store, identity);
+    mosaic::gpu::MosaicGpuKernelProto kernel_proto;
+    if (entry.has_value() && kernel_proto.ParseFromString(*entry) &&
+        kernel_proto.version() == kKernelProtoVersion &&
+        kernel_proto.identity() == identity &&
+        !kernel_proto.is_nvshmem_used()) {
+      ASSIGN_OR_RETURN(std::unique_ptr<CompiledKernel> kernel,
+                       KernelOfProto(kernel_proto));
+      if (asked.ptx) {
+        mosaic::gpu::DumpToFileOrStdout(
+            kernel->ptx, kernel->dump_basename + ".ptx", asked.dump_path);
+      }
+      if (asked.ptxas) {
+        mosaic::gpu::DumpToFileOrStdout(kernel->compilation_log,
+                                        kernel->dump_basename + ".ptxas",
+                                        asked.dump_path);
+      }
+      VLOG(3) << "Mosaic GPU kernel " << identity << " read from the store";
+      return kernel;
+    }
+    if (entry.has_value()) {
+      LOG(WARNING) << "Mosaic GPU: the store's entry for " << identity
+                   << " is not a kernel of this version; compiling it again";
+    }
+  }
+  ASSIGN_OR_RETURN(std::unique_ptr<CompiledKernel> kernel,
+                   Compile(module, cc, cpu));
+  kernel->identity = identity;
+  if (store.has_value() && in_process && !kernel->is_nvshmem_used) {
+    std::string entry =
+        KernelProto(*kernel, KernelHash{}).SerializeAsString();
+    mosaic::gpu::WriteEntry(*store, identity, entry);
+  }
+  return kernel;
+}
+
+// A kernel of one identity: compiled once a process, every thread asking
+// meanwhile waiting on that compile and given its result, a failure included.
+struct KernelEntry {
+  absl::Notification ready;
+  absl::Status status;
+  std::unique_ptr<CompiledKernel> kernel;
+};
 
 struct KernelCache {
   absl::Mutex mutex;
-  absl::flat_hash_map<KernelHash, std::unique_ptr<CompiledKernel>> kernels
+  absl::flat_hash_map<std::string, std::shared_ptr<KernelEntry>> kernels
       ABSL_GUARDED_BY(mutex);
 };
 
@@ -940,25 +1099,46 @@ static KernelCache& GetKernelCache() {
   return *cache;
 }
 
+// The kernel of `identity`, made by `factory` once a process: a thread asking
+// while another makes it waits for that one and takes its result, outside the
+// cache's lock. A failure reaches every waiter and is not kept, so a later ask
+// makes it again.
 absl::StatusOr<CompiledKernel*> GetOrCreateKernel(
-    const KernelHash& kernel_hash,
+    const std::string& identity,
     absl::FunctionRef<absl::StatusOr<std::unique_ptr<CompiledKernel>>()>
         factory) {
   auto& cache = GetKernelCache();
+  std::shared_ptr<KernelEntry> entry;
+  bool mine = false;
   {
     absl::MutexLock lock(cache.mutex);
-    auto it = cache.kernels.find(kernel_hash);
-    if (it != cache.kernels.end()) {
-      return it->second.get();
+    auto [it, inserted] = cache.kernels.try_emplace(identity, nullptr);
+    if (inserted) {
+      it->second = std::make_shared<KernelEntry>();
+      mine = true;
     }
+    entry = it->second;
   }
-  // Release the lock while compiling the kernel. It is possible that multiple
-  // threads compile the same kernel concurrently. In that case, we will discard
-  // all but the first result.
-  ASSIGN_OR_RETURN(auto kernel, factory());
-  absl::MutexLock lock(cache.mutex);
-  auto [iter, _] = cache.kernels.try_emplace(kernel_hash, std::move(kernel));
-  return iter->second.get();
+  if (mine) {
+    absl::StatusOr<std::unique_ptr<CompiledKernel>> made = factory();
+    if (made.ok()) {
+      entry->kernel = *std::move(made);
+    } else {
+      entry->status = made.status();
+      absl::MutexLock lock(cache.mutex);
+      auto it = cache.kernels.find(identity);
+      if (it != cache.kernels.end() && it->second == entry) {
+        cache.kernels.erase(it);
+      }
+    }
+    entry->ready.Notify();
+  } else {
+    entry->ready.WaitForNotification();
+  }
+  if (!entry->status.ok()) {
+    return entry->status;
+  }
+  return entry->kernel.get();
 }
 
 class KernelHandle {
@@ -1130,23 +1310,12 @@ struct CustomCallResources {
 };
 absl::StatusOr<std::string> CustomCallResources::Serialize(
     const CustomCallResources& resources) {
-  mosaic::gpu::MosaicGpuKernelProto kernel_proto;
   CompiledKernel* kernel = resources.kernel;
   if (kernel == nullptr) {
     return absl::InternalError(
         "Failed to serialize CustomCallResources: CompiledKernel is null");
   }
-  kernel_proto.set_version(4);
-  kernel_proto.set_object_file(kernel->object_file);
-  kernel_proto.set_is_nvshmem_used(kernel->is_nvshmem_used);
-  kernel_proto.set_is_multimem_used(kernel->is_multimem_used);
-  kernel_proto.set_kernel_hash(resources.hash.data(), sizeof(KernelHash));
-  kernel_proto.set_host_func_name(kernel->host_func_name);
-  kernel_proto.set_gpu_binary(kernel->gpu_binary);
-  kernel_proto.set_kernel_name(kernel->kernel_name);
-  kernel_proto.set_smem_bytes(kernel->smem_bytes);
-  kernel_proto.set_cluster_size(kernel->cluster_size);
-  return kernel_proto.SerializeAsString();
+  return KernelProto(*kernel, resources.hash).SerializeAsString();
 }
 
 absl::StatusOr<std::unique_ptr<CustomCallResources>>
@@ -1165,28 +1334,17 @@ CustomCallResources::Deserialize(absl::string_view data) {
   std::memcpy(resources->hash.data(), kernel_proto.kernel_hash().data(),
               sizeof(KernelHash));
 
-  if (kernel_proto.version() != 4) {
+  if (kernel_proto.version() != kKernelProtoVersion) {
     return absl::InternalError(absl::StrCat(
         "Unsupported Mosaic GPU kernel version: ", kernel_proto.version()));
   }
-
-  std::string host_func_name = kernel_proto.host_func_name();
-  std::string gpu_binary = kernel_proto.gpu_binary();
-  std::string kernel_name = kernel_proto.kernel_name();
-  int32_t smem_bytes = kernel_proto.smem_bytes();
-  int32_t cluster_size = kernel_proto.cluster_size();
-
+  // Keyed by what decided its compile, as a kernel compiled in this process is.
   ASSIGN_OR_RETURN(
       resources->kernel,
       GetOrCreateKernel(
-          resources->hash,
+          kernel_proto.identity(),
           [&]() -> absl::StatusOr<std::unique_ptr<CompiledKernel>> {
-            return CreateAndInitJIT(
-                llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
-                                                 "kernel"),
-                std::move(host_func_name), kernel_proto.is_nvshmem_used(),
-                kernel_proto.is_multimem_used(), std::move(gpu_binary),
-                std::move(kernel_name), smem_bytes, cluster_size);
+            return KernelOfProto(kernel_proto);
           }));
   return resources;
 }
@@ -1220,12 +1378,18 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
   std::memcpy(hash.data(), kernel_hash.data(), sizeof(KernelHash));
   CHECK(cc != nullptr);
   CHECK(cpu_target_machine_options != nullptr);
+  ASSIGN_OR_RETURN(se::cuda::CompilationProvider * provider,
+                   mosaic::gpu::GetAssemblyToBinaryCompilationProvider());
+  const se::CudaComputeCapability& cuda_cc = *cc->cuda_compute_capability();
+  ASSIGN_OR_RETURN(std::string identity,
+                   IdentityOf(module, cuda_cc, *cpu_target_machine_options,
+                              *provider));
   ASSIGN_OR_RETURN(
       CompiledKernel * kernel,
       GetOrCreateKernel(
-          hash, [&]() -> absl::StatusOr<std::unique_ptr<CompiledKernel>> {
-            return Compile(module, *cc->cuda_compute_capability(),
-                           *cpu_target_machine_options);
+          identity, [&]() -> absl::StatusOr<std::unique_ptr<CompiledKernel>> {
+            return CompiledOrStored(module, cuda_cc,
+                                    *cpu_target_machine_options, identity);
           }));
   if (kernel->is_nvshmem_used) {
     return absl::UnimplementedError("NVSHMEM is not supported in XLA.");
@@ -1980,8 +2144,17 @@ __attribute__((visibility("default"))) void** MosaicGpuCompile(
   if (!cc.ok()) {
     return nullptr;
   }
-  auto kernel =
-      Compile(module_str, *cc, xla::cpu::TargetMachineOptions::Native());
+  xla::cpu::TargetMachineOptions host =
+      xla::cpu::TargetMachineOptions::Native();
+  auto provider = mosaic::gpu::GetAssemblyToBinaryCompilationProvider();
+  if (!provider.ok()) {
+    return nullptr;
+  }
+  auto identity = IdentityOf(module_str, *cc, host, **provider);
+  if (!identity.ok()) {
+    return nullptr;
+  }
+  auto kernel = CompiledOrStored(module_str, *cc, host, *identity);
   if (!kernel.ok()) {
     return nullptr;
   }

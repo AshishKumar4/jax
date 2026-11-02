@@ -57,6 +57,10 @@ struct DumpOptions {
 // dumps. The module is annotated with an attribute that records the basename
 // used for dumps, to ensure that we use a consistent module basename for the
 // same module even if we end up calling this function multiple times.
+// The dumps the environment asks for (MOSAIC_GPU_DUMP_*), with no module's
+// basename: what a kernel read from the store replays (`custom_call.cc`).
+DumpOptions DumpOptionsFromEnvironment();
+
 DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module);
 
 // Dumps `content` to `path`/`name` if `path` is non-empty, otherwise to

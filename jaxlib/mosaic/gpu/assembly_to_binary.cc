@@ -125,9 +125,14 @@ class AssemblyToBinaryPass
     mlir::MLIRContext* ctx = module.getContext();
     DumpOptions dump_opts = GetOrSetDumpOptionsForModule(module);
 
+    // The compilation log is always asked for: it and the PTX are kept with the
+    // kernel (`kPtxAttr`, `kCompilationLogAttr`), which a kernel read from the
+    // store replays where the dumps ask for them, with no compile.
     se::cuda::CompilationOptions compilation_options;
-    compilation_options.dump_compilation_log = dump_opts.ptxas;
+    compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
+    std::string kept_ptx;
+    std::string kept_log;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -175,6 +180,7 @@ class AssemblyToBinaryPass
       }
       ptx_str = *ptx_str_or;
       dump_ptx_if_enabled();
+      kept_ptx += ptx_str.str();
 
       absl::StatusOr<se::cuda::Assembly> sass_or =
           compilation_provider_->Compile(*cc, ptx_str, compilation_options);
@@ -183,6 +189,9 @@ class AssemblyToBinaryPass
         return mlir::WalkResult::interrupt();
       }
 
+      if (sass_or->compilation_log.has_value()) {
+        kept_log += *sass_or->compilation_log;
+      }
       if (dump_opts.ptxas) {
         if (!sass_or->compilation_log.has_value()) {
           binary.emitOpError("Expected a compilation log to be available.");
@@ -212,7 +221,10 @@ class AssemblyToBinaryPass
 
     if (result.wasInterrupted()) {
       signalPassFailure();
+      return;
     }
+    module->setAttr(kPtxAttr, mlir::StringAttr::get(ctx, kept_ptx));
+    module->setAttr(kCompilationLogAttr, mlir::StringAttr::get(ctx, kept_log));
   }
 
  private:

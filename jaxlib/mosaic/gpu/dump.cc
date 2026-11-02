@@ -238,31 +238,8 @@ constexpr std::string_view kDumpBasenameAttr = "mosaic_gpu.dump_basename";
 
 }  // namespace
 
-DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module) {
-  // Use a static variable in order to ensure that subsequent compilations of
-  // modules that share the same name will result in distinct dumps.
-  static std::atomic<int> dumped_module_count = 0;
+DumpOptions DumpOptionsFromEnvironment() {
   DumpOptions opts;
-  // In order to make sure that we use a consistent module basename for the same
-  // module even if we end up calling this function multiple times, we set an
-  // attribute on the module that records its basename whenever we first
-  // generate it. Subsequent calls will just return the value from the
-  // attribute.
-  if (auto attr = module->getAttrOfType<mlir::StringAttr>(kDumpBasenameAttr)) {
-    opts.module_basename = attr.getValue().str();
-  } else {
-    int current_count = dumped_module_count.fetch_add(1);
-    if (std::optional<llvm::StringRef> name = module.getName();
-        name.has_value()) {
-      opts.module_basename = absl::StrCat(name->str(), "_", current_count);
-    } else {
-      opts.module_basename = absl::StrCat("mosaic_gpu_module_", current_count);
-    }
-    module->setAttr(
-        kDumpBasenameAttr,
-        mlir::StringAttr::get(module.getContext(), opts.module_basename));
-  }
-
   if (char* dump_to = getenv("MOSAIC_GPU_DUMP_TO"); dump_to != nullptr) {
     // "sponge" is a special value, which if set, will result in the files being
     // dumped to a directory path specified in the `TEST_UNDECLARED_OUTPUTS_DIR`
@@ -302,6 +279,36 @@ DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module) {
   opts.sass = getenv("MOSAIC_GPU_DUMP_SASS") != nullptr || opts.sass_ctrl;
   opts.resources = getenv("MOSAIC_GPU_DUMP_RESOURCES") != nullptr;
   return opts;
+}
+
+DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module) {
+  // Use a static variable in order to ensure that subsequent compilations of
+  // modules that share the same name will result in distinct dumps.
+  static std::atomic<int> dumped_module_count = 0;
+  DumpOptions opts;
+  // In order to make sure that we use a consistent module basename for the same
+  // module even if we end up calling this function multiple times, we set an
+  // attribute on the module that records its basename whenever we first
+  // generate it. Subsequent calls will just return the value from the
+  // attribute.
+  if (auto attr = module->getAttrOfType<mlir::StringAttr>(kDumpBasenameAttr)) {
+    opts.module_basename = attr.getValue().str();
+  } else {
+    int current_count = dumped_module_count.fetch_add(1);
+    if (std::optional<llvm::StringRef> name = module.getName();
+        name.has_value()) {
+      opts.module_basename = absl::StrCat(name->str(), "_", current_count);
+    } else {
+      opts.module_basename = absl::StrCat("mosaic_gpu_module_", current_count);
+    }
+    module->setAttr(
+        kDumpBasenameAttr,
+        mlir::StringAttr::get(module.getContext(), opts.module_basename));
+  }
+
+  DumpOptions requested = DumpOptionsFromEnvironment();
+  requested.module_basename = opts.module_basename;
+  return requested;
 }
 
 void DumpToFileOrStdout(std::string_view content, std::string_view name,

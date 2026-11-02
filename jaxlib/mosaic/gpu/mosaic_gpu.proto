@@ -16,6 +16,14 @@ message MosaicGpuKernelProto {
   string kernel_name = 9;
   int32 smem_bytes = 10;
   int32 cluster_size = 11;
+  // Since version 5: what decided the compile (kernel_store.h's
+  // CompileIdentity), which keys the kernel in a process.
+  string identity = 12;
+  // Since version 5: the PTX assembled and the PTX compiler's log, kept with
+  // the kernel whatever the dumps asked, and the basename its dumps take.
+  bytes ptx = 13;
+  string compilation_log = 14;
+  string dump_basename = 15;
 
   reserved 6;
   reserved "init_func_name";
