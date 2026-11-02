@@ -230,7 +230,7 @@ absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     const std::string& ptx_isa, const std::string& nvshmem_path,
     bool verify_target) {
   static absl::once_flag register_passes_flag;
-  absl::call_once(register_passes_flag, [&compilation_provider, &cc]() {
+  absl::call_once(register_passes_flag, [&compilation_provider]() {
     mosaic::gpu::EnsureLLVMNVPTXTargetIsRegistered();
     EnsureLLVMisInitialized();
     mlir::registerCanonicalizerPass();
@@ -253,7 +253,7 @@ absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     mlir::registerGPUPasses();
     mlir::registerGpuLaunchSinkIndexComputationsPass();
     mosaic::gpu::registerGpuModuleToAssemblyPass();
-    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider, cc);
+    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider);
     mosaic::gpu::registerGpuLaunchLoweringPass();
     mosaic::gpu::registerConvertGpuToLLVMPass();
     mosaic::gpu::registerByvalInsertionPass();

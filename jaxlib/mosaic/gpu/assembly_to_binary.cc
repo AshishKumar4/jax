@@ -30,10 +30,14 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/strip.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -80,16 +84,36 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
       ptx_str.substr(end_pos).str());
 }
 
+// The compute capability an NVVM target's chip names ("sm_90a", "sm_100a",
+// "sm_86"), which a binary is assembled for: each binary's own, so one process
+// assembles for several capabilities, in either order or at once.
+absl::StatusOr<se::CudaComputeCapability> CapabilityOfChip(
+    absl::string_view chip) {
+  if (!absl::ConsumePrefix(&chip, "sm_")) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Expected an sm_ chip, got ", chip));
+  }
+  size_t digits = 0;
+  while (digits < chip.size() && absl::ascii_isdigit(chip[digits])) {
+    ++digits;
+  }
+  if (digits < 2) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Expected a chip of a major and a minor, got sm_", chip));
+  }
+  return se::CudaComputeCapability::FromString(
+      absl::StrCat(chip.substr(0, digits - 1), ".",
+                   chip.substr(digits - 1)));
+}
+
 class AssemblyToBinaryPass
     : public jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp> {
  public:
   using jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp>::Pass;
 
-  AssemblyToBinaryPass(
-      const se::cuda::CompilationProvider* compilation_provider,
-      se::CudaComputeCapability cc)
-      : compilation_provider_(std::move(compilation_provider)),
-        cc_(std::move(cc)) {}
+  explicit AssemblyToBinaryPass(
+      const se::cuda::CompilationProvider* compilation_provider)
+      : compilation_provider_(compilation_provider) {}
 
   static constexpr llvm::StringLiteral kArgumentName =
       "mosaic-gpu-assembly-to-binary";
@@ -120,6 +144,19 @@ class AssemblyToBinaryPass
 
       llvm::StringRef ptx_str = object.getObject().getValue();
 
+      auto target =
+          mlir::dyn_cast<mlir::NVVM::NVVMTargetAttr>(object.getTarget());
+      if (!target) {
+        binary.emitOpError("Expected an NVVM target.");
+        return mlir::WalkResult::interrupt();
+      }
+      absl::StatusOr<se::CudaComputeCapability> cc =
+          CapabilityOfChip(target.getChip().str());
+      if (!cc.ok()) {
+        binary.emitOpError(cc.status().message());
+        return mlir::WalkResult::interrupt();
+      }
+
       auto dump_ptx_if_enabled = [&]() {
         if (dump_opts.ptx) {
           DumpToFileOrStdout(ptx_str, dump_opts.module_basename + ".ptx",
@@ -140,7 +177,7 @@ class AssemblyToBinaryPass
       dump_ptx_if_enabled();
 
       absl::StatusOr<se::cuda::Assembly> sass_or =
-          compilation_provider_->Compile(cc_, ptx_str, compilation_options);
+          compilation_provider_->Compile(*cc, ptx_str, compilation_options);
       if (!sass_or.ok()) {
         binary.emitOpError(sass_or.status().message());
         return mlir::WalkResult::interrupt();
@@ -180,19 +217,15 @@ class AssemblyToBinaryPass
 
  private:
   const se::cuda::CompilationProvider* compilation_provider_;
-  se::CudaComputeCapability cc_;
 };
 
 }  // namespace
 
 void registerAssemblyToBinaryPass(
-    const se::cuda::CompilationProvider* compilation_provider,
-    const se::CudaComputeCapability& cc) {
-  ::mlir::registerPass(
-      [compilation_provider, cc]() -> std::unique_ptr<::mlir::Pass> {
-        return std::make_unique<AssemblyToBinaryPass>(compilation_provider,
-                                                      std::move(cc));
-      });
+    const se::cuda::CompilationProvider* compilation_provider) {
+  ::mlir::registerPass([compilation_provider]() -> std::unique_ptr<::mlir::Pass> {
+    return std::make_unique<AssemblyToBinaryPass>(compilation_provider);
+  });
 }
 
 }  // namespace gpu

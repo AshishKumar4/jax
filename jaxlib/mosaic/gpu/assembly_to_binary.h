@@ -23,10 +23,10 @@ namespace mosaic {
 namespace gpu {
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
-// `gpu.binary` ops wrapping a CUBIN binary.
+// `gpu.binary` ops wrapping a CUBIN binary, each assembled for the compute
+// capability its own NVVM target names.
 void registerAssemblyToBinaryPass(
-    const stream_executor::cuda::CompilationProvider* compilation_provider,
-    const stream_executor::CudaComputeCapability& cc);
+    const stream_executor::cuda::CompilationProvider* compilation_provider);
 
 }  // namespace gpu
 }  // namespace mosaic
