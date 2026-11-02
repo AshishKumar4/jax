@@ -1,0 +1,46 @@
+diff --git a/third_party/triton/common/pipeliner_multiuse_load.patch b/third_party/triton/common/pipeliner_multiuse_load.patch
+new file mode 100644
+index 0000000..8027cff
+--- /dev/null
++++ b/third_party/triton/common/pipeliner_multiuse_load.patch
+@@ -0,0 +1,31 @@
++diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp
++--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp
+++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/LowerLoops.cpp
++@@ -419,18 +419,19 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
++             out.push_back(user);
++         }
++       };
++-  // Pattern match the op sequence used for loading mmav3 operands
++-  if (!mustLoadToRegisters(loadOp)) {
++-    assert(loadOp->hasOneUse());
++-    ttg::LocalAllocOp alloc =
++-        dyn_cast<ttg::LocalAllocOp>(*loadOp->getUsers().begin());
+++  // replaceUsesWithLocalLoad aliases compatible local_alloc users to the
+++  // async-copy buffer even when other users also require a register load.
+++  // Such a buffer remains live until its asynchronous MMA consumers finish.
+++  for (Operation *user : loadOp->getUsers()) {
+++    auto alloc = dyn_cast<ttg::LocalAllocOp>(user);
++     if (alloc) {
++       SmallVector<Operation *> nonViewUsers;
++       collectNonViewUsers(alloc, nonViewUsers);
++-      return llvm::any_of(nonViewUsers, [&](Operation *op) {
++-        return isa<ttng::WarpGroupDotOp>(op);
++-      });
+++      if (llvm::any_of(nonViewUsers, [&](Operation *op) {
+++            return isa<ttng::WarpGroupDotOp>(op);
+++          }))
+++        return true;
++     }
++   }
++   return false;
++ }
+diff --git a/third_party/triton/common/series b/third_party/triton/common/series
+index 7661fac..ed0db60 100644
+--- a/third_party/triton/common/series
++++ b/third_party/triton/common/series
+@@ -38,3 +38,4 @@ fix_load_ops.patch
+ cxx17_support.patch
+ llvm_cl996124567.patch
+ llvm_cl998243985.patch
++pipeliner_multiuse_load.patch
