@@ -30,6 +30,7 @@ from jax._src import ad_util
 from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import custom_derivatives
 from jax._src import debugging
 from jax._src import dtypes
@@ -1795,7 +1796,10 @@ def jaxpr_subcomp(
     )
     with (source_info_util.user_context(eqn.source_info.traceback), loc,
           eqn.ctx.manager):
-      if eqn.primitive in lowering_rules[ctx.kernel_type]:
+      # Any call primitive lowers as `eval_jaxpr_p`, its body inlined.
+      primitive = (jax_core.eval_jaxpr_p
+                   if eqn.primitive in eval_jaxpr_lib.call_primitives else eqn.primitive)
+      if primitive in lowering_rules[ctx.kernel_type]:
         if (eqn.primitive, ctx.kernel_type) not in skip_mlir_conversions:
           invals = [
               _ensure_valid_argument(x, cast(ShapedAbstractValue, v.aval))
@@ -1827,7 +1831,7 @@ def jaxpr_subcomp(
               isinstance(aval.memory_space, tpu_core.AccMemorySpace)
           )
         # TODO(phawkins): allow KeyScalarBundle/AccRef here as well as ir.Value.
-        can_cache = (eqn.primitive not in _uncacheable_primitives and
+        can_cache = (primitive not in _uncacheable_primitives and
                      all(isinstance(x, ir.Value) for x in invals) and
                      not any(is_acc_aval(o) for o in avals_out))
         if can_cache:
@@ -1867,7 +1871,7 @@ def jaxpr_subcomp(
             try:
               cache_entry = _emit_pallas_lowering_rule_as_fun(
                   ctx, eqn.primitive,
-                  lowering_rules[ctx.kernel_type][eqn.primitive],
+                  lowering_rules[ctx.kernel_type][primitive],
                   rule_context, cast(list[ir.Value], invals), **eqn.params
               )
               if ctx.dynamic_shape_env is not None:
@@ -1892,7 +1896,7 @@ def jaxpr_subcomp(
         else:
           try:
             assert rule_context is not None
-            ans = lowering_rules[ctx.kernel_type][eqn.primitive](
+            ans = lowering_rules[ctx.kernel_type][primitive](
                 rule_context, *invals, **eqn.params
             )
           except LoweringException:
