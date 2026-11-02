@@ -35,6 +35,12 @@ bazel_dep(name = "xla")
 archive_override(
     module_name = "xla",
     integrity = "sha256-jimpbS/fgAqu8KabcWiSJndhvo8efIrepYUZ7ad/D/4=",
+    patch_strip = 1,
+    patches = [
+        # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
+        # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
+        "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+    ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
 )
