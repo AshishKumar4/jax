@@ -1,0 +1,15 @@
+--- a/gpu/cuda/build_templates/cuda_nvcc.BUILD.tpl
++++ b/gpu/cuda/build_templates/cuda_nvcc.BUILD.tpl
+@@ -124,10 +124,10 @@
+ 
+ cc_library(
+     name = "nvptxcompiler",
+-    %{comment}deps = if_static_cuda(if_cuda_newer_than(
++    %{comment}deps = if_cuda_newer_than(
+         %{comment}"13_0",
+         %{comment}["@cuda_nvptxcompiler//:nvptxcompiler"],
+         %{comment}[":nvptxcompiler_static_library"],
+-    %{comment})),
++    %{comment}),
+     visibility = ["//visibility:public"],
+ )

@@ -217,6 +217,10 @@ common:cuda_common --@local_config_cuda//cuda:include_cuda_libs=true
 #   acceptable, because the workaround is "remove the nvidia-..." pip packages.
 # The list of CUDA pip packages that JAX depends on are present in setup.py.
 common:cuda_common --linkopt=-Wl,--disable-new-dtags
+# Dew: XLA's and Mosaic GPU's compilation providers compile PTX through libnvptxcompiler, in process and whole-program
+# (Mosaic's honouring setmaxnreg and .minnctapersm), not the ptxas binary as a subprocess; its archive is linked by
+# third_party/rules_ml_toolchain/nvptxcompiler_linked.patch.
+common:cuda_common --@xla//xla/stream_executor/cuda:enable_libnvptxcompiler_support=true
 
 common:cuda12 --config=cuda_common
 common:cuda12 --config=cuda_v12
