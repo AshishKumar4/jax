@@ -13,3 +13,23 @@
 +    %{comment}),
      visibility = ["//visibility:public"],
  )
+--- a/gpu/cuda/build_templates/cuda_nvptxcompiler.BUILD.tpl
++++ b/gpu/cuda/build_templates/cuda_nvptxcompiler.BUILD.tpl
+@@ -14,7 +14,7 @@
+ 
+ cc_library(
+     name = "nvptxcompiler",
+-    %{comment}deps = [":nvptxcompiler_static_library"],
++    %{comment}deps = [":headers", ":nvptxcompiler_static_library"],
+     visibility = ["//visibility:public"],
+ )
+ 
+@@ -29,6 +29,7 @@
+ cc_library(
+     name = "headers",
+     hdrs = [":header_list"],
++    include_prefix = "third_party/gpus/cuda/include",
+     includes = ["include"],
+     strip_include_prefix = "include",
+ )
+\ No newline at end of file
