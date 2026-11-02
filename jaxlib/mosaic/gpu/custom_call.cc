@@ -1069,8 +1069,10 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> CompiledOrStored(
                    << " is not a kernel of this version; compiling it again";
     }
   }
+  VLOG(1) << "Mosaic GPU kernel " << identity << " compile started";
   ASSIGN_OR_RETURN(std::unique_ptr<CompiledKernel> kernel,
                    Compile(module, cc, cpu));
+  VLOG(1) << "Mosaic GPU kernel " << identity << " compile ended";
   kernel->identity = identity;
   if (store.has_value() && in_process && !kernel->is_nvshmem_used) {
     std::string entry =
@@ -2108,6 +2110,9 @@ XLA_FFI_DEFINE_HANDLER(
         .Attrs(),
     {ffi::Traits::kCmdBufferCompatible});
 
+// Its instantiation compiles with a lease and an MLIR context of its own, and
+// one kernel compiles once however many ask (`GetOrCreateKernel`), so XLA
+// instantiates a program's kernels in parallel, after IR emission.
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                          {
                              /*instantiate=*/kMosaicGPUInstantiate,
@@ -2115,7 +2120,8 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                              /*initialize=*/kMosaicGpuInitialize,
                              /*execute=*/kMosaicGpuExecute,
                              /*record=*/kMosaicGpuRecord,
-                         });
+                         },
+                         XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION);
 
 }  // namespace
 

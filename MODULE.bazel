@@ -46,6 +46,8 @@ archive_override(
         # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
         # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+        # Mosaic GPU's kernels instantiate in parallel, after IR emission (jaxlib/mosaic/gpu/custom_call.cc).
+        "//third_party:xla/instantiate_after_emission.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],

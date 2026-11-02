@@ -1,0 +1,495 @@
+# Dew: a custom call whose FFI handler declares XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION (Mosaic GPU's)
+# is instantiated after IR emission, in parallel on the compile thread pool, outside the emitter's LLVM options
+# lease, rather than one after another during emission.
+diff --git a/xla/ffi/api/api.h b/xla/ffi/api/api.h
+index e2284f8..e21991b 100644
+--- a/xla/ffi/api/api.h
++++ b/xla/ffi/api/api.h
+@@ -266,6 +266,12 @@ enum class Traits : uint32_t {
+   //      allocations);
+   //   3. the FFI handler may not query the execution status of the stream.
+   kCmdBufferCompatible = XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE,
++
++  // Indicates that the handler's instantiate may run on any thread once IR
++  // emission ends, beside other instantiations of handlers with this trait
++  // (XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION).
++  kInstantiateAfterEmission =
++      XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION,
+ };
+ 
+ // Forward declare template defined below.
+diff --git a/xla/ffi/api/c_api.h b/xla/ffi/api/c_api.h
+index f9cd113..f44af5e 100644
+--- a/xla/ffi/api/c_api.h
++++ b/xla/ffi/api/c_api.h
+@@ -530,6 +530,14 @@ enum XLA_FFI_Handler_TraitsBits {
+   // that calls to FFI handler always launch exactly the same device operations
+   // (can depend on attribute values) that can be captured and then replayed.
+   XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE = 1u << 0,
++
++  // The handler's instantiate may run on any thread once the compiler has
++  // emitted every thunk, beside other instantiations of handlers with this
++  // trait: it reads nothing of the emitter's but its arguments, and takes
++  // LLVM's command-line options lease itself where it compiles with LLVM.
++  // XLA:GPU then runs such instantiations in parallel after IR emission,
++  // outside the emitter's own lease, rather than one after another during it.
++  XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION = 1u << 1,
+ };
+ 
+ typedef uint32_t XLA_FFI_Handler_Traits;
+diff --git a/xla/ffi/ffi_registry.cc b/xla/ffi/ffi_registry.cc
+index b3af22d..72d27dd 100644
+--- a/xla/ffi/ffi_registry.cc
++++ b/xla/ffi/ffi_registry.cc
+@@ -66,6 +66,10 @@ bool IsCommandBufferCompatible(const XLA_FFI_Metadata& metadata) {
+   return metadata.traits & XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE;
+ }
+ 
++bool IsInstantiatedAfterEmission(const XLA_FFI_Metadata& metadata) {
++  return metadata.traits & XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION;
++}
++
+ static std::vector<std::string> GetHandlerStages(
+     const XLA_FFI_Handler_Bundle& bundle) {
+   std::vector<std::string> stages;
+diff --git a/xla/ffi/ffi_registry.h b/xla/ffi/ffi_registry.h
+index 517f6fd..d91054e 100644
+--- a/xla/ffi/ffi_registry.h
++++ b/xla/ffi/ffi_registry.h
+@@ -83,12 +83,19 @@ HandlerRegistrationMap& StaticHandlerRegistrationMap();
+ 
+ bool IsCommandBufferCompatible(const XLA_FFI_Metadata& metadata);
+ 
++// Whether the handler's instantiate may run after IR emission, on any thread
++// (XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION).
++bool IsInstantiatedAfterEmission(const XLA_FFI_Metadata& metadata);
++
+ // Decodes XLA FFI traits packed into a 32-bit integer into a vector of traits.
+ inline std::vector<Traits> DecodeTraits(XLA_FFI_Handler_Traits traits) {
+   std::vector<Traits> result;
+   if (traits & XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE) {
+     result.push_back(Traits::kCmdBufferCompatible);
+   }
++  if (traits & XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION) {
++    result.push_back(Traits::kInstantiateAfterEmission);
++  }
+   return result;
+ }
+ 
+@@ -102,6 +109,9 @@ static void AbslStringify(Sink& sink, Traits traits) {
+     case Traits::kCmdBufferCompatible:
+       absl::Format(&sink, "cmd_buffer_compatible");
+       break;
++    case Traits::kInstantiateAfterEmission:
++      absl::Format(&sink, "instantiate_after_emission");
++      break;
+   }
+ }
+ 
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index d10ad35..596e4b6 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -561,6 +561,7 @@ cc_library(
+         "//xla/core/host_offloading:host_offloading_executable_proto_cc",
+         "//xla/ffi:attribute_map",
+         "//xla/ffi:attributes",
++        "//xla/ffi:ffi_registry",
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/ir:hlo_instruction_utils",
+         "//xla/mlir/utils:error_util",
+@@ -581,11 +582,13 @@ cc_library(
+         "//xla/stream_executor/gpu:gpu_blas_lt",
+         "//xla/tools:hlo_decomposer_lib",
+         "//xla/tsl/concurrency:future",
++        "//xla/tsl/platform:env",
+         "@com_google_absl//absl/algorithm:container",
+         "@com_google_absl//absl/base:nullability",
+         "@com_google_absl//absl/cleanup",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/container:inlined_vector",
++        "@com_google_absl//absl/functional:any_invocable",
+         "@com_google_absl//absl/log",
+         "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/status",
+@@ -594,6 +597,7 @@ cc_library(
+         "@com_google_absl//absl/strings",
+         "@com_google_absl//absl/strings:str_format",
+         "@com_google_absl//absl/strings:string_view",
++        "@com_google_absl//absl/synchronization",
+         "@com_google_absl//absl/types:span",
+         "@llvm-project//llvm:Support",
+         "@llvm-project//llvm:ir_headers",
+@@ -1673,6 +1677,7 @@ cc_library(
+         "//xla/stream_executor:platform",
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/tsl/platform:env",
++        "@com_google_absl//absl/cleanup",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/log",
+         "@com_google_absl//absl/log:check",
+diff --git a/xla/service/gpu/compile_module_to_llvm_ir.cc b/xla/service/gpu/compile_module_to_llvm_ir.cc
+index 36df696..3f2a919 100644
+--- a/xla/service/gpu/compile_module_to_llvm_ir.cc
++++ b/xla/service/gpu/compile_module_to_llvm_ir.cc
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include <utility>
+ #include <vector>
+ 
++#include "absl/cleanup/cleanup.h"
+ #include "absl/log/check.h"
+ #include "absl/log/log.h"
+ #include "absl/status/status.h"
+@@ -219,7 +220,7 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+     llvm_ir::LLVMCommandLineOptionsReleasableLock& llvm_options_lock,
+     KernelCompiler* compiler,
+     xla::cpu::TargetMachineOptions cpu_target_machine_options,
+-    MlirContextPool* mlir_context_pool) {
++    MlirContextPool* mlir_context_pool, tsl::thread::ThreadPool* thread_pool) {
+   tsl::profiler::TraceMe traceme("CompileModuleToLlvmIr");
+   const se::DeviceDescription& device_desc =
+       gpu_topology.gpu_target_config().device_description;
+@@ -252,6 +253,12 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+       data_layout, compiler, std::move(cpu_target_machine_options),
+       mlir_context_pool);
+   ThunkEmitter thunk_emitter(&ir_emitter_context, &llvm_options_lock);
++  // On every exit, no instantiation deferred while emitting outlives the
++  // emitter its thunks' futures reach.
++  absl::Cleanup deferred_drained = [&thunk_emitter] {
++    thunk_emitter.CancelDeferredInstantiations(absl::CancelledError(
++        "the compile ended before its custom calls were instantiated"));
++  };
+ 
+   const DebugOptions& options = hlo_module->config().debug_options();
+   ScopedAnnotation annotation(Phase("XlaEmitLlvmIr", hlo_module));
+@@ -279,6 +286,13 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+     VLOG(2) << "Constants LLVM module is empty; skipping target compilation.";
+   }
+ 
++  {
++    // The custom calls whose handlers instantiate after emission, in parallel,
++    // each under an LLVM options lease of its own, none of which it could take
++    // while emission held this compile's.
++    auto released_lock_keeper = llvm_options_lock.TemporarilyReleaseLock();
++    thunk_emitter.RunDeferredInstantiations(thread_pool);
++  }
+   ABSL_ASSIGN_OR_RETURN(ThunkSequence thunks, std::move(future_thunks).Await());
+   results.executable =
+       std::make_unique<SequentialThunk>(Thunk::ThunkInfo{}, std::move(thunks));
+diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compile_module_to_llvm_ir.h
+index 2c6c78d..9cc4e12 100644
+--- a/xla/service/gpu/compile_module_to_llvm_ir.h
++++ b/xla/service/gpu/compile_module_to_llvm_ir.h
+@@ -44,6 +44,7 @@ limitations under the License.
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+ #include "xla/stream_executor/platform.h"
++#include "xla/tsl/platform/threadpool.h"
+ #include "xla/util.h"
+ 
+ namespace xla::gpu {
+@@ -72,7 +73,7 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+     llvm_ir::LLVMCommandLineOptionsReleasableLock& llvm_options_lock,
+     KernelCompiler* compiler,
+     xla::cpu::TargetMachineOptions cpu_target_machine_options,
+-    MlirContextPool* mlir_context_pool);
++    MlirContextPool* mlir_context_pool, tsl::thread::ThreadPool* thread_pool);
+ 
+ void LinkLlvmModulesInPlace(
+     std::vector<std::unique_ptr<llvm::Module>>& llvm_modules);
+diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
+index d438020..0678b7d 100644
+--- a/xla/service/gpu/gpu_compiler.cc
++++ b/xla/service/gpu/gpu_compiler.cc
+@@ -2832,7 +2832,7 @@ GpuCompiler::CompileToBackendResult(
+             gpu_topology, alias_info.get(),
+             std::move(buffer_size_bytes_function), llvm_options_lock,
+             &kernel_compiler, std::move(cpu_target_machine_options),
+-            &mlir_context_pool_));
++            &mlir_context_pool_, thread_pool.get_mutable()));
+ 
+     backend_result.binary = std::move(compile_module_results.constants_binary);
+   }
+diff --git a/xla/service/gpu/thunk_emitter.cc b/xla/service/gpu/thunk_emitter.cc
+index 5d1be01..51daaf4 100644
+--- a/xla/service/gpu/thunk_emitter.cc
++++ b/xla/service/gpu/thunk_emitter.cc
+@@ -29,6 +29,7 @@ limitations under the License.
+ #include "absl/base/nullability.h"
+ #include "absl/container/flat_hash_map.h"
+ #include "absl/container/inlined_vector.h"
++#include "absl/functional/any_invocable.h"
+ #include "absl/log/check.h"
+ #include "absl/log/log.h"
+ #include "absl/status/status.h"
+@@ -38,6 +39,8 @@ limitations under the License.
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/str_format.h"
+ #include "absl/strings/string_view.h"
++#include "absl/synchronization/blocking_counter.h"
++#include "absl/synchronization/mutex.h"
+ #include "absl/types/span.h"
+ #include "llvm/ADT/APInt.h"
+ #include "llvm/ADT/StringRef.h"
+@@ -119,6 +122,7 @@ limitations under the License.
+ #include "xla/core/host_offloading/host_offloading_executable.pb.h"
+ #include "xla/ffi/attribute_map.h"
+ #include "xla/ffi/attributes.h"
++#include "xla/ffi/ffi_registry.h"
+ #include "xla/future.h"
+ #include "xla/hlo/ir/hlo_casting_utils.h"
+ #include "xla/hlo/ir/hlo_computation.h"
+@@ -1291,7 +1295,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitNativeCustomCallThunks(
+   return handler(*instr, ctx);
+ }
+ 
+-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
++Future<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+     const HloCustomCallInstruction* instr) {
+   const std::string& call_target_name = instr->custom_call_target();
+ 
+@@ -1347,7 +1351,33 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+             << "Fall back to parse the raw backend config str.";
+   }
+ 
+-  auto ffi_thunk = [&]() -> absl::StatusOr<std::unique_ptr<Thunk>> {
++  // A custom call's thunks, or where xla_gpu_mock_custom_calls is set, none in
++  // place of one that could not be created.
++  auto thunks_of = [mock = ir_emitter_context_->debug_options()
++                               .xla_gpu_mock_custom_calls()](
++                       absl::StatusOr<std::unique_ptr<Thunk>> thunk)
++      -> absl::StatusOr<ThunkSequence> {
++    ThunkSequence thunks;
++    if (thunk.ok()) {
++      thunks.push_back(*std::move(thunk));
++    }
++    if (mock) {
++      // xla_gpu_mock_custom_calls=true means we won't emit thunks for all
++      // custom call targets that couldn't be found.
++      return thunks;
++    }
++    if (!thunk.ok()) {
++      return thunk.status();
++    }
++    return thunks;
++  };
++
++  using Create =
++      absl::AnyInvocable<absl::StatusOr<std::unique_ptr<Thunk>>() &&>;
++
++  // The FFI thunk's creation, which runs its handler's instantiate, with every
++  // input it reads owned: decoded here, created now or after emission.
++  auto ffi_thunk = [&]() -> absl::StatusOr<Create> {
+     // Enforce the opt-in AOT custom-call allowlist. An empty allowlist
+     // disables the check. This only gates FFI custom calls that lower to a
+     // CustomCallThunk; legacy custom calls and custom kernels are unaffected.
+@@ -1383,17 +1413,25 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+     const bool enable_pdl =
+         IsPdlEnabled(ir_emitter_context_->debug_options(),
+                      ir_emitter_context_->gpu_compute_capability());
+-    auto released_lock_keeper = llvm_options_lock_->TemporarilyReleaseLock();
+-    return CustomCallThunk::Create(
+-        Thunk::ThunkInfo::WithProfileAnnotation(
+-            instr, ir_emitter_context_->GetNextThunkId()),
+-        call_target_name, std::move(operands), std::move(results),
+-        std::move(attributes),
+-        called_computations.empty() ? nullptr : called_computations[0],
+-        ir_emitter_context_->platform_name(),
+-        ir_emitter_context_->gpu_compute_capability(),
+-        /*execution_state=*/nullptr,
+-        ir_emitter_context_->cpu_target_machine_options(), enable_pdl);
++    return Create(
++        [thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
++             instr, ir_emitter_context_->GetNextThunkId()),
++         call_target_name, operands = std::move(operands),
++         results = std::move(results), attributes = std::move(attributes),
++         called_computation =
++             called_computations.empty() ? nullptr : called_computations[0],
++         platform_name = std::string(ir_emitter_context_->platform_name()),
++         gpu_compute_capability = ir_emitter_context_->gpu_compute_capability(),
++         cpu_target_machine_options =
++             ir_emitter_context_->cpu_target_machine_options(),
++         enable_pdl]() mutable -> absl::StatusOr<std::unique_ptr<Thunk>> {
++          return CustomCallThunk::Create(
++              std::move(thunk_info), call_target_name, std::move(operands),
++              std::move(results), std::move(attributes), called_computation,
++              platform_name, gpu_compute_capability,
++              /*execution_state=*/nullptr, cpu_target_machine_options,
++              enable_pdl);
++        });
+   };
+ 
+   auto legacy_thunk = [&]() -> absl::StatusOr<std::unique_ptr<Thunk>> {
+@@ -1409,22 +1447,74 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+         ir_emitter_context_->platform_name());
+   };
+ 
+-  absl::StatusOr<std::unique_ptr<Thunk>> custom_call_thunk =
+-      is_ffi_custom_call ? ffi_thunk() : legacy_thunk();
++  if (!is_ffi_custom_call) {
++    return thunks_of(legacy_thunk());
++  }
++  absl::StatusOr<Create> create = ffi_thunk();
++  if (!create.ok()) {
++    return thunks_of(create.status());
++  }
++  // A handler that instantiates after emission is instantiated then, beside
++  // the others (`RunDeferredInstantiations`), outside this emitter's LLVM
++  // options lease; any other now, with the lease released, as it may compile
++  // with LLVM options of its own.
++  absl::StatusOr<ffi::HandlerRegistration> registration =
++      ffi::FindHandler(call_target_name, ir_emitter_context_->platform_name());
++  if (registration.ok() &&
++      ffi::IsInstantiatedAfterEmission(registration->metadata)) {
++    auto [promise, future] = MakePromise<ThunkSequence>();
++    absl::MutexLock lock(deferred_mutex_);
++    deferred_instantiations_.push_back(DeferredInstantiation{
++        [instantiate = *std::move(create), thunks_of]() mutable {
++          return thunks_of(std::move(instantiate)());
++        },
++        std::move(promise)});
++    return std::move(future);
++  }
++  auto released_lock_keeper = llvm_options_lock_->TemporarilyReleaseLock();
++  return thunks_of(std::move(*create)());
++}
+ 
+-  ThunkSequence thunks;
+-  if (custom_call_thunk.ok()) {
+-    thunks.push_back(std::move(custom_call_thunk.value()));
++void ThunkEmitter::RunDeferredInstantiations(
++    tsl::thread::ThreadPool* thread_pool) {
++  std::vector<DeferredInstantiation> deferred;
++  {
++    absl::MutexLock lock(deferred_mutex_);
++    deferred.swap(deferred_instantiations_);
+   }
+-  if (ir_emitter_context_->debug_options().xla_gpu_mock_custom_calls()) {
+-    // xla_gpu_mock_custom_calls=true means we won't emit thunks for all custom
+-    // call targets that couldn't be found.
+-    return thunks;
++  VLOG(1) << "Instantiating " << deferred.size()
++          << " custom calls deferred past IR emission";
++  auto run = [](DeferredInstantiation& each) {
++    each.thunks.Set(std::move(each.create)());
++  };
++  // On one of the pool's own threads, or with no pool, one after another: a
++  // pool thread waiting on its own pool could wait on itself.
++  if (thread_pool == nullptr || thread_pool->CurrentThreadId() != -1 ||
++      deferred.size() < 2) {
++    absl::c_for_each(deferred, run);
++  } else {
++    absl::BlockingCounter ran(static_cast<int>(deferred.size()));
++    for (DeferredInstantiation& each : deferred) {
++      thread_pool->Schedule([&each, &ran, &run] {
++        run(each);
++        ran.DecrementCount();
++      });
++    }
++    ran.Wait();
++  }
++  VLOG(1) << "Instantiated " << deferred.size()
++          << " custom calls deferred past IR emission";
++}
++
++void ThunkEmitter::CancelDeferredInstantiations(const absl::Status& status) {
++  std::vector<DeferredInstantiation> deferred;
++  {
++    absl::MutexLock lock(deferred_mutex_);
++    deferred.swap(deferred_instantiations_);
+   }
+-  if (!custom_call_thunk.ok()) {
+-    return custom_call_thunk.status();
++  for (DeferredInstantiation& each : deferred) {
++    each.thunks.Set(status);
+   }
+-  return thunks;
+ }
+ 
+ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFft(
+@@ -1507,7 +1597,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTriangularSolveCustomCall(
+   return ThunkSequence::Of<SequentialThunk>(info, std::move(thunks));
+ }
+ 
+-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
++Future<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
+     const HloCustomCallInstruction* instr) {
+   auto operands = instr->operands();
+   const auto& shape = instr->shape();
+diff --git a/xla/service/gpu/thunk_emitter.h b/xla/service/gpu/thunk_emitter.h
+index 46df8a0..18855bc 100644
+--- a/xla/service/gpu/thunk_emitter.h
++++ b/xla/service/gpu/thunk_emitter.h
+@@ -25,9 +25,11 @@ limitations under the License.
+ #include "absl/base/nullability.h"
+ #include "absl/cleanup/cleanup.h"
+ #include "absl/container/flat_hash_map.h"
++#include "absl/functional/any_invocable.h"
+ #include "absl/status/status.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
++#include "absl/synchronization/mutex.h"
+ #include "llvm/IR/Module.h"
+ #include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_handler_registry.h"
+ #include "xla/backends/gpu/runtime/async_execution.h"
+@@ -47,6 +49,7 @@ limitations under the License.
+ #include "xla/service/llvm_ir/llvm_command_line_options.h"
+ #include "xla/service/shaped_slice.h"
+ #include "xla/shape_util.h"
++#include "xla/tsl/platform/threadpool.h"
+ 
+ namespace xla::gpu {
+ 
+@@ -92,6 +95,17 @@ class ThunkEmitter {
+ 
+   Future<ThunkSequence> EmitHloEntryComputation(const HloModule* module);
+ 
++  // Runs the custom calls' instantiations deferred while emitting, those whose
++  // handlers instantiate after emission
++  // (XLA_FFI_HANDLER_TRAITS_INSTANTIATE_AFTER_EMISSION), on `thread_pool` where
++  // there is one, each fulfilling its thunks' future, and returns once every
++  // one has run. The caller holds no LLVM options lease: each takes its own.
++  void RunDeferredInstantiations(tsl::thread::ThreadPool* thread_pool);
++
++  // Fails with `status` every deferred instantiation not yet run, so no thunk's
++  // future outlives the emitter unfulfilled.
++  void CancelDeferredInstantiations(const absl::Status& status);
++
+   llvm::Module* constants_module() { return constants_module_.get(); }
+   LlvmKernelSource ConsumeConstantsModule() {
+     return LlvmKernelSource{std::move(constants_module_context_),
+@@ -250,7 +264,7 @@ class ThunkEmitter {
+   absl::StatusOr<ThunkSequence> EmitCublasLtMatmulMx(
+       const HloCustomCallInstruction* instr);
+ 
+-  absl::StatusOr<ThunkSequence> EmitGenericCustomCall(
++  Future<ThunkSequence> EmitGenericCustomCall(
+       const HloCustomCallInstruction* instr);
+ 
+   // Emits the thunk sequence produced by a registered thunk-folding handler
+@@ -319,7 +333,7 @@ class ThunkEmitter {
+ 
+   Future<ThunkSequence> EmitSort(const HloSortInstruction* sort);
+ 
+-  absl::StatusOr<ThunkSequence> EmitTopKCustomCall(
++  Future<ThunkSequence> EmitTopKCustomCall(
+       const HloCustomCallInstruction* instr);
+ 
+   absl::StatusOr<ThunkSequence> EmitTriangularSolveCustomCall(
+@@ -376,6 +390,16 @@ class ThunkEmitter {
+   // set of options.
+   llvm_ir::LLVMCommandLineOptionsReleasableLock* llvm_options_lock_;
+ 
++  // A custom call's instantiation deferred until emission ends, every input it
++  // reads owned, and the promise of its thunks.
++  struct DeferredInstantiation {
++    absl::AnyInvocable<absl::StatusOr<ThunkSequence>() &&> create;
++    Promise<ThunkSequence> thunks;
++  };
++  absl::Mutex deferred_mutex_;
++  std::vector<DeferredInstantiation> deferred_instantiations_
++      ABSL_GUARDED_BY(deferred_mutex_);
++
+   // AllocationOverrides lets EmitDynamicSliceFusionV2 redirect buffer lookups
+   // for specific HLO instructions. When emitting embedded thunks for a
+   // dynamic-slice fusion, the hero's operands and results must map to
