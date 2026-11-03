@@ -938,6 +938,27 @@ class PallasCallInterpretTest(PallasCallTest):
   INTERPRET = True
 
 
+class CallPrimitiveTpuLoweringTest(jtu.JaxTestCase):
+
+  def test_a_call_primitives_body_reads_the_kernels_grid(self):
+    # Lowered for TPU on any host: a call primitive's body is inlined where it
+    # is, with the kernel's grid, never cached as a function that reads none.
+    call_p = jex_core.create_call_primitive("test_grid_call")
+
+    def kernel(x_ref, o_ref):
+      value = x_ref[...]
+      closed = jax.make_jaxpr(
+          lambda v: v + pl.program_id(0).astype(v.dtype))(value)
+      o_ref[...] = call_p.bind(value, call_jaxpr=closed)[0]
+
+    x = jax.ShapeDtypeStruct((16, 128), jnp.float32)
+    fn = pl.pallas_call(
+        kernel, out_shape=x, grid=(2,),
+        in_specs=[pl.BlockSpec((8, 128), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((8, 128), lambda i: (i, 0)))
+    jax.jit(fn).trace(x).lower(lowering_platforms=("tpu",))
+
+
 class PallasCallDCETest(jtu.JaxTestCase):
 
   def add_one(self, x, compiler_params=None):
