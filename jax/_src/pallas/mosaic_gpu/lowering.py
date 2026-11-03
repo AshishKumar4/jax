@@ -34,6 +34,7 @@ from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import custom_derivatives
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import debugging
 from jax._src import deprecations
 from jax._src import dtypes
@@ -241,7 +242,11 @@ def _estimate_resources(
   rs = Resources(smem_scratch_bytes=0)
   for eqn in jaxpr.eqns:
     # TODO(slebedev): Add support for other primitives, notably control flow.
-    if rule := _resource_estimators.get(eqn.primitive):
+    primitive = eqn.primitive
+    if primitive in eval_jaxpr_lib.call_primitives:
+      # Any call primitive is estimated as `eval_jaxpr_p`, a call of its body.
+      primitive = pe.eval_jaxpr_p
+    if rule := _resource_estimators.get(primitive):
       rs = rs.or_(
           rule(ctx, *(invar.aval for invar in eqn.invars), **eqn.params),
           ctx.axis_names,
@@ -1140,8 +1145,12 @@ def lower_jaxpr_to_mosaic_gpu(
           eqn.source_info.traceback or module_ctx.outer_traceback,
       )
     with source_info_util.user_context(eqn.source_info.traceback), loc:
-      if eqn.primitive not in mosaic_lowering_rules[
-          (module_ctx.lowering_semantics, module_ctx.primitive_semantics)]:
+      rules = mosaic_lowering_rules[
+          (module_ctx.lowering_semantics, module_ctx.primitive_semantics)]
+      # Any call primitive lowers as `eval_jaxpr_p`, its body inlined.
+      primitive = (pe.eval_jaxpr_p if eqn.primitive in eval_jaxpr_lib.call_primitives
+                   else eqn.primitive)
+      if primitive not in rules:
         raise NotImplementedError(
             "Unimplemented primitive in Pallas Mosaic GPU lowering:"
             f" {eqn.primitive.name} for lowering semantics"
@@ -1158,9 +1167,7 @@ def lower_jaxpr_to_mosaic_gpu(
         wrapper_stack = contextlib.ExitStack()
         wrapper_stack.enter_context(launch_ctx.named_region(name))
         named_regions.append(wrapper_stack)
-      rule = mosaic_lowering_rules[
-          (module_ctx.lowering_semantics, module_ctx.primitive_semantics)
-          ][eqn.primitive]
+      rule = rules[primitive]
       # If the equation is immediately followed by a layout cast on its output,
       # we provide the layout as a hint to the rule.
       out_layout_hint = None
