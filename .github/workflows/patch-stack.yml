@@ -209,12 +209,23 @@ jobs:
         run: |
           # A stack that patches native code (jaxlib/, jax_plugins/) reaches a kernel only through its own CUDA and
           # PJRT plugins (post42 shipped the plugin's patch alone, and kernels compiled through stock PJRT): the
-          # set publishes whole or not at all, from the plugin release of the stack's version.
+          # set publishes whole or not at all, from the plugin release of the stack's version. A post release of
+          # Python fixes alone ships jax alone beside the plugins of the earlier one whose native code it holds
+          # (`patch_stack.py plugins`), which the index lists already and Dew's pins name.
           if git -C jax diff --quiet "jax-v$RELEASE" HEAD -- jaxlib jax_plugins; then
             echo "no native patch: jax alone"
             exit 0
           fi
           version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
+          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version")
+          if [ -z "$plugins" ]; then
+            echo "::error::no plugin release holds $version's native code: build plugin-$version (dew/build_plugin.sh)"
+            exit 1
+          fi
+          if [ "$plugins" != "plugin-$version" ]; then
+            echo "$version's native code is $plugins's: jax alone, beside those plugins"
+            exit 0
+          fi
           mkdir -p native
           gh release download "plugin-$version" --repo "${{ github.repository }}" --dir native --pattern "*.whl"
           missing=()

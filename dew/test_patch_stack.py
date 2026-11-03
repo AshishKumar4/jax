@@ -87,6 +87,53 @@ def test_the_stacks_tests_are_the_test_files_it_adds_or_changes_over_its_release
                                              "tests/new_test.py"]
 
 
+def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_code(tmp_path, monkeypatch):
+    """A post release ships its own plugin release where origin has one; else the newest earlier post release's of
+    the same JAX release whose commit it differs from only under jax/ and tests/; else none, and its plugins are to
+    be built. A dev build's, a later post release's and another release's are never one."""
+    origin, clone = tmp_path / "origin.git", tmp_path / "clone"
+
+    def run(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=clone, check=True,
+                       capture_output=True)
+
+    def commit(files: dict[str, str], message: str) -> None:
+        for name, text in files.items():
+            (clone / name).parent.mkdir(parents=True, exist_ok=True)
+            (clone / name).write_text(text)
+        run("add", "-A")
+        run("commit", "-qm", message)
+
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    clone.mkdir()
+    run("init", "-q")
+    run("remote", "add", "origin", str(origin))
+    commit({"jaxlib/kernel.cc": "post44", "jax/core.py": "post44", "tests/core_test.py": ""}, "post44")
+    run("tag", "plugin-0.12.0.1.post44")
+    commit({"jaxlib/kernel.cc": "post45"}, "post45")
+    run("tag", "plugin-0.12.0.1.post45")
+    commit({"jax/core.py": "post46.dev1"}, "post46.dev1")
+    run("tag", "plugin-0.12.0.1.post46.dev1")
+    run("tag", "plugin-0.12.1.post1")
+    run("push", "-q", "origin", "--tags")
+    for tag in ("plugin-0.12.0.1.post44", "plugin-0.12.0.1.post45", "plugin-0.12.0.1.post46.dev1",
+                "plugin-0.12.1.post1"):
+        run("tag", "-d", tag)
+    monkeypatch.chdir(clone)
+
+    commit({"jax/core.py": "post46", "jax/version.py": "post46", "tests/core_test.py": "post46"}, "post46")
+    assert patch_stack.plugins("0.12.0.1.post46") == "plugin-0.12.0.1.post45"
+    commit({"jaxlib/kernel.cc": "post46"}, "a native fix")
+    assert patch_stack.plugins("0.12.0.1.post46") == ""
+    run("tag", "plugin-0.12.0.1.post46")
+    run("push", "-q", "origin", "plugin-0.12.0.1.post46")
+    assert patch_stack.plugins("0.12.0.1.post46") == "plugin-0.12.0.1.post46"
+    run("checkout", "-q", "plugin-0.12.0.1.post45")
+    assert patch_stack.plugins("0.12.0.1.post45") == "plugin-0.12.0.1.post45"
+    commit({"jax/core.py": "post47"}, "post47")
+    assert patch_stack.plugins("0.12.0.1.post47") == "plugin-0.12.0.1.post45"
+
+
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
     """A fork's build (0.1.8.post1) is indexed only beside its base release's own wheel (0.1.8), listed already or
     indexed with it: an installer that finds the package on this index looks for every version here (uv's

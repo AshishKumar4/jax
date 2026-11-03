@@ -4,6 +4,7 @@ release to the next.
     python dew/patch_stack.py next              # "OLD NEW": the newest carried release and a newer one
     python dew/patch_stack.py rebase OLD NEW    # in a clone holding jax-vOLD, jax-vNEW and the OLD branch
     python dew/patch_stack.py tests RELEASE     # the stack's own test files, in a clone holding jax-vRELEASE
+    python dew/patch_stack.py plugins VERSION   # the plugin release the stack at VERSION ships beside its jax
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
     python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
@@ -31,6 +32,10 @@ version commits would remain and the fork has nothing left to carry for NEW.
 
 `tests` prints the test files the stack checked out adds or changes over jax-vRELEASE: each fix's own
 regressions, which the workflow runs, with the API they change, before it pushes or publishes a stack.
+
+`plugins` prints the plugin release (plugin-X, its CUDA and PJRT plugins) the stack checked out ships beside its
+jax: its own where the fork has one, else an earlier post release's built from the same native code; nothing
+where neither is, and its plugins are to be built (dew/build_plugin.sh).
 """
 
 from __future__ import annotations
@@ -52,6 +57,7 @@ UPSTREAM = "https://github.com/jax-ml/jax.git"
 FORK = "https://github.com/AshishKumar4/jax.git"
 TAG = re.compile(r"refs/tags/jax-v(\d+(?:\.\d+){2,3})$")
 STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints$")
+PLUGINS = re.compile(r"refs/tags/plugin-(\d+(?:\.\d+){2,3})\.post(\d+)$")
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -65,6 +71,26 @@ def branch(version: str) -> str:
 def tests(release: str) -> list[str]:
     """The test files HEAD adds or changes over jax-vRELEASE: the stack's fixes' own regressions."""
     return git("diff", "--name-only", "--diff-filter=d", f"jax-v{release}", "HEAD", "--", "tests/*_test.py").split()
+
+
+def plugins(version: str) -> str:
+    """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
+    its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
+    commit HEAD differs from only in jax's Python package and tests (jax/, tests/), so its plugins are built from
+    HEAD's own native code, as a post release of Python fixes alone is (Main, 2026-11-03: post46's two Mosaic GPU
+    fixes); "" where neither is. A dev build's (X.postN.devM) is never one: the index never listed it."""
+    release, _, post = version.rpartition(".post")
+    tags = git("ls-remote", "origin", "refs/tags/plugin-*").split()[1::2]
+    published = {int(match.group(2)): tag for tag in tags
+                 if (match := PLUGINS.match(tag)) and match.group(1) == release and int(match.group(2)) <= int(post)}
+    for found in sorted(published, reverse=True):
+        tag = published[found]
+        if found == int(post):
+            return tag.removeprefix("refs/tags/")
+        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
+        if not git("diff", "--name-only", tag, "HEAD", "--", ".", ":(exclude)jax/", ":(exclude)tests/").strip():
+            return tag.removeprefix("refs/tags/")
+    return ""
 
 
 def upstreamed(old: str, new: str) -> set[str]:
@@ -228,6 +254,7 @@ def main() -> int:
     rebasing.add_argument("old")
     rebasing.add_argument("new")
     commands.add_parser("tests").add_argument("release")
+    commands.add_parser("plugins").add_argument("version")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
     indexing.add_argument("site", type=Path)
@@ -242,6 +269,9 @@ def main() -> int:
         return 0
     if args.command == "tests":
         print(" ".join(tests(args.release)))
+        return 0
+    if args.command == "plugins":
+        print(plugins(args.version))
         return 0
     if args.command == "index":
         index(args.manifest, args.site, args.files, args.yank, args.reason, args.package, args.projects)

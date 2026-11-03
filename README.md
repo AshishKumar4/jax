@@ -62,7 +62,10 @@ A post release between JAX releases, `X.postN` from `X.post(N-1)` and the review
 pushes the release branch and the stack branch together, asks `patch-stack.yml` to publish and watches that run
 to its end. A step that fails before the push ends the run with the fork as it was; one after it (the publish
 red, or its run never started) leaves both branches at the composed release, unpublished, which
-`gh workflow run patch-stack.yml --ref dew -f publish=X` publishes again once its run's log is read.
+`gh workflow run patch-stack.yml --ref dew -f publish=X` publishes again once its run's log is read. Where the stack
+patches native code, its jax ships with the CUDA and PJRT plugins of its plugin release (`plugin-X.postN`,
+built by `dew/build_plugin.sh`), all or none; a post release of Python fixes alone ships its jax beside the
+plugins of the earlier post release whose native code it holds (`patch_stack.py plugins`).
 
 `.github/workflows/patch-stack.yml` looks for a new JAX release every six hours, rebases the newest
 stack onto it with `dew/patch_stack.py`, runs the stack's tests, pushes the branch and
