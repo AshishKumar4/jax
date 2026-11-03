@@ -20,6 +20,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import enum
+import functools
 import math
 from typing import Any, TYPE_CHECKING, Literal, assert_never, cast, final
 
@@ -675,6 +676,91 @@ class IsTransferableTmemRegisters(IsTransferable):
     return f"IsTransferableTmemRegisters({self.source} ⟶ {self.target})"
 
 
+def _target() -> utils.Arch:
+  """The target a transfer check plans for: the one the module stating it names
+  (`utils.get_arch`), else, with no insertion point or one inside an op no module
+  holds yet (a kernel body layout inference reads before it is placed), the one
+  `utils.get_arch` infers with no module: the compile-only mesh's device, else the
+  attached one."""
+  try:
+    return utils.get_arch()
+  except ValueError:  # No module above the insertion point: detached, or none.
+    return utils.Arch(*utils._infer_arch())
+
+
+@functools.cache
+def _is_supported_smem_transfer(
+    smem_layout: SMEMTransforms,
+    reg_layout: fa.FragmentedLayout,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    bitwidth: int,
+    optimized: bool,
+    arch: utils.Arch,
+) -> bool:
+  """Whether SMEM with `smem_layout` transfers to or from registers in `reg_layout`.
+
+  The answer depends on its arguments and the target, `arch` (the caller's,
+  `utils.get_arch`: transposed 8-bit transfers are Blackwell's alone), for which
+  the transfer is planned, in a throwaway function of a module of its own that
+  states it, about a millisecond a call. Layout inference asks it of
+  the same transfers on every reduction of its search, tens of thousands of times
+  for a kernel with a few SMEM refs whose transforms are unknown, so it is
+  computed once per transfer and target: one process compiling a layout for two
+  targets reads each target's own answer.
+  """
+  tiling_transform = smem_layout.tiling
+  swizzle = smem_layout.swizzle
+
+  if not isinstance(reg_layout, fa.TiledLayout):
+    return tiling_transform is None and swizzle is None
+  tiling = tiling_transform.tiling if tiling_transform is not None else ()
+  tiling_rank = len(tiling)
+
+  # If `tiling_rank` is 0, then we tile by the shape. This is the logic that
+  # is implemented in `load_untiled` and `store_untiled`.
+  if tiling_rank == 0:
+    tiling = shape
+    tiling_rank = len(tiling)
+
+  int_ty = ir.IntegerType.get_signless(bitwidth)
+  layout = ir.StridedLayoutAttr.get(0, lowering.tile_strides(strides, tiling))
+  ref_shape = utils.tile_shape(shape, tiling)
+  assert len(layout.strides) == len(ref_shape), (len(layout.strides), len(ref_shape))
+  memref_ty = ir.MemRefType.get(ref_shape, int_ty, layout, utils.smem())
+  # The plan reads its target from its module (`utils.get_arch`): this one's.
+  i32 = ir.IntegerType.get_signless(32)
+  scratch = ir.Module.create()
+  scratch.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch.major)
+  scratch.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, arch.minor)
+  with ir.InsertionPoint(scratch.body):
+    dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
+  dummy_block = dummy_func.add_entry_block()
+  try:
+    with ir.InsertionPoint(dummy_block):
+      fake_ref_op = builtin.UnrealizedConversionCastOp([memref_ty], [])
+      fake_ref = fake_ref_op.results[0]
+      for use_txmatrix in [True, False]:
+        try:
+          next(
+              fa.FragmentedArray.transfer_tiled(
+                  fake_ref,
+                  swizzle or 16,
+                  reg_layout,
+                  shape,
+                  optimized=optimized,
+                  ref_tiling_rank=tiling_rank,
+                  use_txmatrix=use_txmatrix,
+              )
+          )
+          return True
+        except (fa.TxMatrixIneligible, fa.TransferPlanDerivationError, fa.UnsupportedTransferError):
+          continue
+      return False
+  finally:
+    dummy_func.erase()
+
+
 @dataclasses.dataclass(frozen=True)
 class IsTransferableSmemRegisters(IsTransferable):
   """States that `source` layout must be transferable across memory spaces to `target` layout.
@@ -691,50 +777,10 @@ class IsTransferableSmemRegisters(IsTransferable):
       smem_layout: SMEMTransforms,
       reg_layout: fa.FragmentedLayout,
   ) -> bool:
-    tiling_transform = smem_layout.tiling
-    swizzle = smem_layout.swizzle
-
-    if not isinstance(reg_layout, fa.TiledLayout):
-      return tiling_transform is None and swizzle is None
-    tiling = tiling_transform.tiling if tiling_transform is not None else ()
-    tiling_rank = len(tiling)
-
-    # If `tiling_rank` is 0, then we tile by the shape. This is the logic that
-    # is implemented in `load_untiled` and `store_untiled`.
-    if tiling_rank == 0:
-      tiling = self.shape
-      tiling_rank = len(tiling)
-
-    int_ty = ir.IntegerType.get_signless(self.bitwidth)
-    layout = ir.StridedLayoutAttr.get(0, lowering.tile_strides(self.strides, tiling))
-    ref_shape = utils.tile_shape(self.shape, tiling)
-    assert len(layout.strides) == len(ref_shape), (len(layout.strides), len(ref_shape))
-    memref_ty = ir.MemRefType.get(ref_shape, int_ty, layout, utils.smem())
-    dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
-    dummy_block = dummy_func.add_entry_block()
-    try:
-      with ir.InsertionPoint(dummy_block):
-        fake_ref_op = builtin.UnrealizedConversionCastOp([memref_ty], [])
-        fake_ref = fake_ref_op.results[0]
-        for use_txmatrix in [True, False]:
-          try:
-            next(
-                fa.FragmentedArray.transfer_tiled(
-                    fake_ref,
-                    swizzle or 16,
-                    reg_layout,
-                    self.shape,
-                    optimized=self.optimized,
-                    ref_tiling_rank=tiling_rank,
-                    use_txmatrix=use_txmatrix,
-                )
-            )
-            return True
-          except (fa.TxMatrixIneligible, fa.TransferPlanDerivationError, fa.UnsupportedTransferError):
-            continue
-        return False
-    finally:
-      dummy_func.erase()
+    return _is_supported_smem_transfer(
+        smem_layout, reg_layout, self.shape, self.strides, self.bitwidth,
+        self.optimized, _target(),
+    )
 
   def _constant_holds(self) -> bool:
     match self.source, self.target:
