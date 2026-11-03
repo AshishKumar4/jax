@@ -4026,6 +4026,7 @@ class ArchInferenceTest(parameterized.TestCase):
       ("the_attached_capability", "NVIDIA GPU", "8.0", 166912),
       ("the_attached_kind", "NVIDIA A100-SXM4-40GB", None, 166912),
   )
+  @jtu.thread_unsafe_test()  # Patches `jax.local_devices`.
   def test_a_compile_only_target_takes_the_default_shared_memory_limit(
       self, kind, capability, limit
   ):
