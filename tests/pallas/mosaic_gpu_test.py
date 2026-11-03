@@ -35,6 +35,7 @@ import jax
 from jax import export
 from jax import lax
 from jax import sharding
+from jax.extend import core as jex_core
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import dtypes
@@ -295,6 +296,19 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     x = jnp.linspace(-5.0, 5.0, 128, dtype=jnp.float32)
     np.testing.assert_allclose(kernel(x), jax.nn.relu(x) * 2.0)
+
+  def test_call_primitive_computes_its_body(self):
+    # A primitive `create_call_primitive` makes lowers as its body, inlined.
+    call_p = jex_core.create_call_primitive("test_call")
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      closed = jax.make_jaxpr(lambda v: v * 2.0 + 1.0)(x)
+      o_ref[...] = call_p.bind(x, call_jaxpr=closed)[0]
+
+    x = jnp.linspace(-5.0, 5.0, 128, dtype=jnp.float32)
+    np.testing.assert_array_equal(kernel(x), x * 2.0 + 1.0)
 
   @parameterized.parameters("custom_vjp", "custom_vjp_in_vjp", "custom_jvp")
   def test_custom_derivative_call_computes_its_primal(self, name):
