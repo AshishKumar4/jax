@@ -1831,7 +1831,10 @@ def jaxpr_subcomp(
               isinstance(aval.memory_space, tpu_core.AccMemorySpace)
           )
         # TODO(phawkins): allow KeyScalarBundle/AccRef here as well as ir.Value.
+        # A call primitive's body is inlined where it is, as its own function it
+        # would read no grid (`program_id`).
         can_cache = (primitive not in _uncacheable_primitives and
+                     eqn.primitive not in eval_jaxpr_lib.call_primitives and
                      all(isinstance(x, ir.Value) for x in invals) and
                      not any(is_acc_aval(o) for o in avals_out))
         if can_cache:
