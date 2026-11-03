@@ -1490,6 +1490,46 @@ class UnswizzleRef(state_types.Transform):
     return pp.text(f"{{unswizzle({self.swizzle})}}")
 
 
+@dataclasses.dataclass(frozen=True)
+class PlainTransform(state_types.Transform):
+  """Lays an SMEM ref out plainly: neither tiled nor swizzled.
+
+  Under warpgroup semantics, layout inference chooses the transforms of a ref
+  that states none, searching every tiling and swizzle its uses admit. A ref
+  that only a plain layout serves (one sliced at row offsets no tiling divides)
+  states it, so the search takes it as given.
+  """
+
+  def transform_type(
+      self, x: jax_core.AbstractValue
+  ) -> jax_core.AbstractValue:
+    return x
+
+  def undo(self, x: jax_core.AbstractValue) -> state_types.Transform:
+    return PlainRef()
+
+
+@tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class PlainRef(state_types.Transform):
+  """A ref declared plain (`PlainTransform`): it changes no type and commutes
+  with every other transform unchanged."""
+
+  def transform_type(self, x: jax_core.AbstractValue) -> jax_core.AbstractValue:
+    return x
+
+  def undo(self, x: jax_core.AbstractValue) -> state_types.Transform:
+    return PlainTransform()
+
+  def commute(
+      self, other: state_types.Transform
+  ) -> tuple[state_types.Transform, PlainRef]:
+    return other, self
+
+  def pretty_print(self, context: jax_core.JaxprPpContext) -> pp.Doc:
+    return pp.text("{plain}")
+
+
 @tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class CollapseLeadingBatchDimensionsTransform(state_types.Transform):
