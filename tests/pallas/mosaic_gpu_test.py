@@ -659,6 +659,35 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         run_kernel(optimized=True)
       np.testing.assert_array_equal(run_kernel(optimized=False), x + 1)
 
+  def test_plain_scratch_read_at_a_row_offset_no_tiling_divides(self):
+    # A scratch ref only a plain layout serves, declared plain: its rows are
+    # written whole and read from a row offset of 63, which no tiling divides.
+    shape = (64, 32)
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct(shape, jnp.float32),
+        scratch_types=[
+            plgpu.SMEM(
+                (2 * shape[0], shape[1]),
+                jnp.float32,
+                transforms=(plgpu.PlainTransform(),),
+            ),
+        ],
+    )
+    def kernel(x_ref, out_ref, scratch_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      plgpu.store(scratch_ref.at[pl.ds(0, 64)], jnp.zeros_like(x), optimized=False)
+      plgpu.store(scratch_ref.at[pl.ds(64, 64)], x, optimized=False)
+      plgpu.commit_smem()
+      shifted = plgpu.load(
+          scratch_ref.at[pl.ds(63, 64)], layout=plgpu.Layout.WGMMA, optimized=False
+      )
+      plgpu.store(out_ref, shifted, optimized=False)
+
+    x = jnp.arange(math.prod(shape), dtype=jnp.float32).reshape(shape)
+    expected = jnp.concatenate([jnp.zeros((1, shape[1]), jnp.float32), x[:-1]])
+    np.testing.assert_array_equal(kernel(x), expected)
+
   def test_reshape_tiled(self):
     shape1, shape2 = (6 * 64, 8), (2, 3, 64, 8)
 
