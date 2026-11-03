@@ -1505,6 +1505,9 @@ class PlainTransform(state_types.Transform):
   ) -> jax_core.AbstractValue:
     return x
 
+  def transform_array(self, x: Any) -> Any:
+    return x
+
   def undo(self, x: jax_core.AbstractValue) -> state_types.Transform:
     return PlainRef()
 
