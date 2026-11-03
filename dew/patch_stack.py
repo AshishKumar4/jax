@@ -13,9 +13,9 @@ release to the next.
 that release has no stack yet; nothing where it has.
 
 `rebase` takes the commits of vOLD-cache-key-pool-fingerprints past the tag jax-vOLD and applies each, in
-order, onto jax-vNEW as vNEW-cache-key-pool-fingerprints. The stack holds one commit a carried patch family, its
-final form (dew/release.sh folds each repair into its family), so each commit applied is a family's live net
-patch, never a historical chain whose later commits cancel it:
+order, onto jax-vNEW as vNEW-cache-key-pool-fingerprints. The stack holds each post release's commits in the order
+they were released, as dew/release.sh grows each release forward from the last: a carried patch family's, a
+repair of one, and the release commit that sets its version:
 
 - a commit whose change jax-vNEW already holds is dropped: an equal patch (`git cherry`), or one whose
   fix applies as nothing;

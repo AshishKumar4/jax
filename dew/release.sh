@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A post release of the stack, composed and published in one run: the newest published release branch, the
-# reviewed and green commits it gains in their order, the version bumped, both branches pushed at once and
+# reviewed and green commits it gains in their order on top of it, the version bumped, both branches pushed at once,
+# each only forward, and
 # patch-stack.yml asked to publish, its own run (by the token its name carries) watched to its end. Any step
 # that fails ends the run there: one before the push leaves the fork as it was, so no push or publish follows
 # a broken step (Main, 2026-10-30: a typed chain pushed a half-composed post40 and began its publish); one
@@ -13,9 +14,10 @@
 # COMMIT a commit or a range (`A..B`) cherry-picked in order. The stack branch must be at BASE's release branch,
 # and NEW's must not exist yet.
 #
-# The stack is one commit a carried patch family (its subject "[stack] NAME: ..."), its final form: a commit that
-# repairs a family is a `git commit --fixup` of it, folded into the family here, so the release carries no repair
-# history; a commit of a new family is its own "[stack] NAME:" commit; and the release commit sets the version, last.
+# Each release grows from the one before, which it holds whole, so neither branch moves but forward (owner,
+# 2026-10-31; Main, 2026-11-03: post46's composition, rebuilt under post45's release commit, was a force push): each
+# commit it gains is a carried patch family's (its subject "[stack] NAME: ...") or a repair of one (a
+# `git commit --fixup` of it, kept as its own commit), and its release commit sets the version, last.
 set -euo pipefail
 
 checkout=$1 base=$2 new=$3 message=$4
@@ -30,8 +32,6 @@ stack=v$release-cache-key-pool-fingerprints
 # The branches as origin holds them now, wherever the clone last saw them.
 git -C "$checkout" fetch -q origin "+refs/heads/release/$base:refs/remotes/origin/release/$base" \
   "+refs/heads/$stack:refs/remotes/origin/$stack"
-git -C "$checkout" fetch -q --no-tags https://github.com/jax-ml/jax.git \
-  "refs/tags/jax-v$release:refs/tags/jax-v$release"
 published=$(git -C "$checkout" rev-parse "origin/release/$base")
 if [[ $(git -C "$checkout" rev-parse "origin/$stack") != "$published" ]]; then
   echo "release.sh: $stack is not at release/$base ($published)" >&2
@@ -48,16 +48,13 @@ fi
 work=$(mktemp -d)
 trap 'git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"' EXIT
 git -C "$checkout" worktree add -q --detach "$work" "$published"
-# The base's release commit (its version) set aside, the commits picked, each fixup folded into its family, and
-# the version set by a release commit of its own on top.
-git -C "$work" reset -q --hard HEAD~1
+# The commits picked onto the published release, and the version set by a release commit of its own on top.
 for commit in "$@"; do
   git -C "$work" cherry-pick "$commit" > /dev/null
 done
-GIT_SEQUENCE_EDITOR=: git -C "$work" rebase -q -i --autosquash "jax-v$release"
-if git -C "$work" log --format=%s "jax-v$release..HEAD" | grep -v '^\[stack\] ' | grep -q .; then
+if git -C "$work" log --format=%s "$published..HEAD" | grep -Ev '^(fixup! )?\[stack\] ' | grep -q .; then
   echo "release.sh: a commit is neither a family's nor a fixup of one:" >&2
-  git -C "$work" log --format='%h %s' "jax-v$release..HEAD" | grep -v ' \[stack\] ' >&2
+  git -C "$work" log --format='%h %s' "$published..HEAD" | grep -Ev '^[0-9a-f]+ (fixup! )?\[stack\] ' >&2
   exit 1
 fi
 git -C "$work" show "$published:jax/version.py" > "$work/jax/version.py"
@@ -68,10 +65,9 @@ grep -Fqx "_release_version: str | None = \"$new\"" "$work/jax/version.py"
 git -C "$work" commit -q -am "$message"
 composed=$(git -C "$work" rev-parse HEAD)
 
-# Both branches move together, or neither: the stack branch only from where it was found, the release branch
-# only where none is.
-git -C "$work" push -q --atomic "--force-with-lease=refs/heads/$stack:$published" \
-  "--force-with-lease=refs/heads/release/$new:" origin \
+# Both branches move together, or neither: the stack branch forward from the published release (a push that is
+# no fast-forward is refused), the release branch only where none is.
+git -C "$work" push -q --atomic "--force-with-lease=refs/heads/release/$new:" origin \
   "$composed:refs/heads/release/$new" "$composed:refs/heads/$stack"
 
 # From here a failure leaves both branches at the composed release, unpublished: its run's log says why, and

@@ -58,7 +58,8 @@ uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
 A post release between JAX releases, `X.postN` from `X.post(N-1)` and the reviewed, green commits it gains, is
-`dew/release.sh CHECKOUT BASE NEW MESSAGE COMMIT...`: one run that applies them in order, bumps the version,
+`dew/release.sh CHECKOUT BASE NEW MESSAGE COMMIT...`: one run that applies them in order on top of
+`X.post(N-1)`, which it holds whole, so neither branch moves but forward, bumps the version,
 pushes the release branch and the stack branch together, asks `patch-stack.yml` to publish and watches that run
 to its end. A step that fails before the push ends the run with the fork as it was; one after it (the publish
 red, or its run never started) leaves both branches at the composed release, unpublished, which

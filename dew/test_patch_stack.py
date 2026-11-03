@@ -183,7 +183,8 @@ def isolated(tmp_path) -> dict:
 
 def fork(tmp_path, environment):
     """A fork whose release/0.12.0.1.post39 and stack branch hold one commit, a clone of it, and branches of
-    the clone's: a fix to carry, two that conflict with each other, and one that sets a near-miss version."""
+    the clone's: a family's fix to carry, two families that conflict with each other, and a commit of no family
+    that sets a near-miss version."""
     def run(cwd, *args):
         return subprocess.run(["git", "-C", str(cwd), *args], env=environment, check=True, capture_output=True,
                               text=True).stdout.strip()
@@ -206,17 +207,18 @@ def fork(tmp_path, environment):
         run(checkout, "checkout", "-q", "-b", name, "main")
         (checkout / path).write_text(text)
         run(checkout, "add", "-A")
-        run(checkout, "commit", "-qm", name)
+        run(checkout, "commit", "-qm", name if name == "near" else f"[stack] {name}: {name}")
         commits[name] = run(checkout, "rev-parse", "HEAD")
     return origin, checkout, commits, run
 
 
 def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_held(tmp_path):
-    """release.sh pushes the release branch and the stack branch together, asks patch-stack.yml to publish and
-    watches the run its dispatch's token names, only once every commit it carries has applied and the version
-    reads exactly the new release: a cherry-pick that conflicts, a version that only nearly matches, or a stack
-    branch moved off the release it grows from, ends the run with nothing pushed and nothing asked; a
-    dispatched run that never appears ends it within its bound, the branches left at the composed release."""
+    """release.sh pushes the release branch and the stack branch together, the release grown on top of the one
+    before so both move only forward, asks patch-stack.yml to publish and watches the run its dispatch's token
+    names, only once every commit it carries has applied as a family's and the version reads exactly the new
+    release: a cherry-pick that conflicts, a commit of no family, or a stack branch moved off the release it
+    grows from, ends the run with nothing pushed and nothing asked; a dispatched run that never appears ends it
+    within its bound, the branches left at the composed release."""
     environment = isolated(tmp_path)
     origin, checkout, commits, run = fork(tmp_path, environment)
     (tmp_path / "bin").mkdir()
@@ -245,6 +247,9 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     assert run(origin, "rev-parse", "release/0.12.0.1.post40") == stack
     assert run(origin, "show", f"{stack}:jax/version.py") == '_release_version: str | None = "0.12.0.1.post40"'
     assert run(origin, "show", f"{stack}:fix.py") == "fixed"
+    published = run(origin, "rev-parse", "release/0.12.0.1.post39")
+    assert run(origin, "rev-list", f"{published}..{stack}").split() == [stack, run(origin, "rev-parse", f"{stack}^")]
+    assert run(origin, "log", "-1", "--format=%s", f"{stack}^") == "[stack] fix: fix"
     asked = json.loads(calls.read_text())
     dispatch, = [call for call in asked if call[:2] == ["workflow", "run"]]
     assert dispatch[:9] == ["workflow", "run", "patch-stack.yml", "-R", "AshishKumar4/jax", "--ref", "dew", "-f",
