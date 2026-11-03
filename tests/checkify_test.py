@@ -30,6 +30,7 @@ from jax._src import config
 from jax._src import core
 from jax._src import test_util as jtu
 from jax._src.checkify import JaxRuntimeError, FailedCheckError, ErrorEffect, OOBError
+import jax.extend as jex
 import jax.numpy as jnp
 
 config.parse_flags_with_absl()
@@ -1033,6 +1034,28 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     f = checkify.checkify(jax.grad(summify(jax.remat(
         partial(partial, jax.lax.map)(lambda x: jnp.sin(x * y))))))
     f(jnp.array([3.]))  # don't crash
+
+  @parameterized.parameters(True, False)
+  def test_call_primitive_checks_within_and_is_kept(self, jit):
+    # A primitive create_call_primitive makes, as a library marks a span with:
+    # checkify checks within its body and keeps the call.
+    marked_p = jex.core.create_call_primitive("marked")
+
+    def marked(x):
+      body = jax.make_jaxpr(jnp.log)(x)
+      return marked_p.bind(x, call_jaxpr=body)[0]
+
+    checked = checkify.checkify(marked, errors=checkify.nan_checks)
+    if jit:
+      checked = jax.jit(checked)
+    err, out = checked(jnp.float32(-1.))
+    self.assertIsNotNone(err.get())
+    err, out = checked(jnp.float32(1.))
+    self.assertIsNone(err.get())
+    self.assertEqual(out, 0.)
+    jaxpr = jax.make_jaxpr(checkify.checkify(marked, errors=checkify.nan_checks))(
+        jnp.float32(1.))
+    self.assertIn(marked_p, {eqn.primitive for eqn in jaxpr.eqns})
 
   def test_while_loop_leaks(self):
     def f(x):
