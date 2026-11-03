@@ -15,7 +15,9 @@
 """Layout inference tests for the Mosaic GPU MLIR dialect."""
 
 import dataclasses
+import types
 from typing import assert_never
+from unittest import mock
 
 from absl.testing import parameterized
 import jax
@@ -4013,19 +4015,38 @@ class ArchInferenceTest(parameterized.TestCase):
     with jax.sharding.use_abstract_mesh(mesh):
       self.assertEqual(mgpu_utils._infer_arch(), arch)
 
-  def test_a_compile_only_target_takes_the_default_shared_memory_limit(self):
-    # A target stating a capability no attached device has is not held to the
-    # attached device's shared memory: a kernel for an H100 lowered on an
-    # A100's host (163 KiB) is checked against the 227 KiB default.
+  @parameterized.named_parameters(
+      # Another GPU stated by its capability, or by its kind alone (an H100,
+      # whose capability Mosaic GPU already defaults to): a compile-only
+      # target, held to the 227 KiB default.
+      ("another_capability", "NVIDIA GPU", "12.3", 227 * 1024),
+      ("another_kind", "NVIDIA H100 80GB HBM3", None, 227 * 1024),
+      # The attached device itself, by its capability or by its kind: its own
+      # limit.
+      ("the_attached_capability", "NVIDIA GPU", "8.0", 166912),
+      ("the_attached_kind", "NVIDIA A100-SXM4-40GB", None, 166912),
+  )
+  def test_a_compile_only_target_takes_the_default_shared_memory_limit(
+      self, kind, capability, limit
+  ):
+    # A kernel for an H100 lowered on an A100's host (163 KiB) is checked
+    # against the 227 KiB default, not the attached A100's limit.
+    attached = types.SimpleNamespace(
+        device_kind="NVIDIA A100-SXM4-40GB", compute_capability="8.0",
+        shared_memory_per_block_optin=166912,
+    )
     device = jax.sharding.AbstractDevice(
-        device_kind="NVIDIA GPU", num_cores=None, platform="cuda",
-        compute_capability="12.3",
+        device_kind=kind, num_cores=None, platform="cuda",
+        compute_capability=capability,
     )
     mesh = jax.sharding.AbstractMesh(
         (1,), ("x",), (jax.sharding.AxisType.Explicit,), abstract_device=device
     )
-    with jax.sharding.use_abstract_mesh(mesh):
-      self.assertEqual(mgpu_core._max_smem_bytes(), 227 * 1024)
+    with (
+        mock.patch.object(jax, "local_devices", lambda: [attached]),
+        jax.sharding.use_abstract_mesh(mesh),
+    ):
+      self.assertEqual(mgpu_core._max_smem_bytes(), limit)
 
 
 if __name__ == "__main__":

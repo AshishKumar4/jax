@@ -759,16 +759,21 @@ def _max_smem_bytes() -> int:
   shared memory per thread block available in compute capabilities 9.0 and
   10.x:
   https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
-  A kernel lowered for an abstract device that states another compute
-  capability than the attached device's (a compile-only target) is checked
-  against that default too, not the attached device's limit. We assume all
-  devices have the same amount of shared memory.
+  A kernel lowered for an abstract device other than the attached one (a
+  compile-only target) is checked against that default too, not the attached
+  device's limit: one that states another compute capability, or, stating
+  none, is of another kind (an H100, whose capability Mosaic GPU already
+  defaults to, as `utils._infer_arch` reads it). We assume all devices have the
+  same amount of shared memory.
   """
   device = jax.local_devices()[0]
-  target = getattr(
-      jax.sharding.get_abstract_mesh().abstract_device, "compute_capability", None
-  )
-  if target is not None and target != getattr(device, "compute_capability", None):
+  target = jax.sharding.get_abstract_mesh().abstract_device
+  stated = getattr(target, "compute_capability", None)
+  if target is not None and (
+      stated != getattr(device, "compute_capability", None)
+      if stated is not None
+      else target.device_kind != device.device_kind
+  ):
     return 227 * 1024
   return getattr(device, "shared_memory_per_block_optin", 227 * 1024)
 
