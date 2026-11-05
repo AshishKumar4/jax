@@ -80,6 +80,13 @@ def from_elt(trace: BatchTrace, axis_size: AxisSize, mesh_axis: MeshAxis,
     return handler(_cont, axis_size, x, spec), spec
   val, bdim = trace.to_batch_info(x)
   bdim_inferred = bdim if spec is infer else spec
+  if (spec is None and bdim is not None and not sum_match
+      and isinstance(x, BatchTracer) and x.staged_custom_jvp is not None):
+    raise ValueError(
+        f"vmap out_axes=None cannot return custom_jvp {x.staged_custom_jvp!r} "
+        "as shared: its staged application is treated as batched over a "
+        "mapped input. Use out_axes=0 or call the custom_jvp function "
+        "unjitted under vmap.")
   try:
     return matchaxis(trace.axis_data, bdim, spec, val,
                      sum_match=sum_match), bdim_inferred
@@ -128,12 +135,13 @@ def flatten_fun_for_vmap(f: Callable,
 ### Tracer
 
 class BatchTracer(Tracer['BatchTrace']):
-  __slots__ = ['val', 'batch_dim', 'source_info']
+  __slots__ = ['val', 'batch_dim', 'source_info', 'staged_custom_jvp']
 
   _trace: BatchTrace
 
   def __init__(self, trace: BatchTrace, val, batch_dim: NotMapped | int,
-               source_info: source_info_util.SourceInfo | None = None):
+               source_info: source_info_util.SourceInfo | None = None,
+               staged_custom_jvp: str | None = None):
     from jax._src import hijax  # pyrefly: ignore[missing-module-attribute]
 
     aval = core.typeof(val)
@@ -161,6 +169,7 @@ class BatchTracer(Tracer['BatchTrace']):
     self.val = val
     self.batch_dim = batch_dim
     self.source_info = source_info
+    self.staged_custom_jvp = staged_custom_jvp
 
   def _short_repr(self):
     return f"VmapTracer(aval={self.aval}, batched={core.typeof(self.val)})"
@@ -261,11 +270,16 @@ class BatchTrace(Trace):
         val_out, dim_out = fancy_primitive_batchers[p](
             self.axis_data, vals_in, dims_in, **params)
         src = source_info_util.current()
+        origin = next((t.staged_custom_jvp for t in tracers
+                       if isinstance(t, BatchTracer) and t._trace.tag is self.tag
+                       and t.staged_custom_jvp is not None), None)
         if p.multiple_results:
-          return [BatchTracer(self, x, d, src) if d is not None else x
-                  for x, d in zip(val_out, dim_out)]
+          origins = getattr(dim_out, 'staged_custom_jvps', [None] * len(val_out))
+          return [BatchTracer(self, x, d, src, name or origin)
+                  if d is not None else x
+                  for x, d, name in zip(val_out, dim_out, origins)]
         else:
-          return (BatchTracer(self, val_out, dim_out, src)
+          return (BatchTracer(self, val_out, dim_out, src, origin)
                   if dim_out is not None else val_out)
     elif unmapped_args:  # Not all primitives have batching rules defined
       avals = tuple(core.typeof(x) for x in vals_in)
@@ -278,12 +292,23 @@ class BatchTrace(Trace):
     in_vals, in_dims = unzip2(map(self.to_batch_info, tracers))
     fun, out_dims1 = batch_subtrace(fun, self.tag, self.axis_data, in_dims)
     jvp, out_dims2 = batch_custom_jvp_subtrace(jvp, self.tag, self.axis_data, in_dims)
+    staged = (isinstance(self.parent_trace, pe.DynamicJaxprTrace)
+              and any(d is not None for d in in_dims))
+    if staged:
+      # The deferred JVP may use mapped inputs ignored by the primal. Fix
+      # both staged representations now, without evaluating the JVP rule.
+      fun, out_dims1 = _batch_custom_jvp_outputs(
+          fun, self.axis_data, out_dims1, False)
+      jvp, out_dims2 = _batch_custom_jvp_outputs(
+          jvp, self.axis_data, out_dims2, True)
     avals = tuple(core.typeof(x) for x in in_vals)
     out_vals = prim.bind_with_trace(self.parent_trace, tuple(in_vals), avals,
                                     dict(subfuns=(fun, jvp), symbolic_zeros=symbolic_zeros))
     fst, out_dims = lu.merge_linear_aux(out_dims1, out_dims2)
     src = source_info_util.current()
-    return [BatchTracer(self, v, d, src) for v, d in zip(out_vals, out_dims)]
+    name = fun.debug_info.func_name if staged else None
+    return [BatchTracer(self, v, d, src, name)
+            for v, d in zip(out_vals, out_dims)]
 
   def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, /, *, out_trees,
                               symbolic_zeros):
@@ -461,7 +486,9 @@ def _batch_jaxpr_inner(f, store, axis_data, tag, in_axes, *in_vals):
           core.add_explicit_mesh_axis_names(axis_data.explicit_mesh_axis)):
       outs = f(*in_tracers)
     out_vals, out_axes = unzip2(map(trace.to_batch_info, outs))
-  store.store(out_axes)
+  store.store(_BatchDims(out_axes, [
+      x.staged_custom_jvp if isinstance(x, BatchTracer) and x._trace.tag is tag
+      else None for x in outs]))
   return out_vals
 
 @lu.transformation_with_aux2
@@ -502,6 +529,21 @@ class ZeroIfMapped: pass
 zero_if_mapped = ZeroIfMapped()
 
 ### functions for handling custom_vjp
+
+class _BatchDims(list):
+  """Output axes with diagnostic provenance, retained by cached jit batching."""
+  def __init__(self, dims, staged_custom_jvps):
+    super().__init__(dims)
+    self.staged_custom_jvps = staged_custom_jvps
+
+@lu.transformation_with_aux2
+def _batch_custom_jvp_outputs(f, store, axis_data, out_dims, is_jvp, *args):
+  outs = f(*args)
+  dims = out_dims()
+  outs = map(partial(_matchaxis_symzeros, axis_data),
+             dims * 2 if is_jvp else dims, [0] * len(outs), outs)
+  store.store([0] * len(dims))
+  return outs
 
 @lu.transformation_with_aux2
 def batch_custom_jvp_subtrace(f, store, tag, axis_data, in_dims, *in_vals):
