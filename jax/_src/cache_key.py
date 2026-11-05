@@ -216,54 +216,28 @@ def _strip_mosaic_debug_info(m: ir.Module) -> None:
       return ir.WalkResult.ADVANCE
 
     # Fallback for when debug_locations are still embedded in the kernel bytecode
-    # (e.g. when jax_mosaic_unzip_debug_locations is disabled). The kernel is
-    # read in a context of its own (`_kernel_context`): the module's context
-    # may be another thread's too.
+    # (e.g. when jax_mosaic_unzip_debug_locations is disabled).
     body = custom_call_config["body"]
-    stripped = _stripped_kernel(base64.b64decode(body), tpu.register_dialect)
-    if stripped is None:
-      return ir.WalkResult.ADVANCE
-    custom_call_config["body"] = base64.b64encode(stripped).decode()
-    with m.context:
-      op.attributes["backend_config"] = ir.StringAttr.get(
-          json.dumps(bc, separators=(",", ":"))
+    ctx = m.context
+    tpu.register_dialect(ctx)
+    ctx.allow_unregistered_dialects = True
+    with ctx:
+      try:
+        kernel = ir.Module.parse(base64.b64decode(body), context=ctx)
+      except ir.MLIRError:
+        return ir.WalkResult.ADVANCE
+      pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
+          kernel.operation
       )
+      out = io.BytesIO()
+      kernel.operation.write_bytecode(out)
+    custom_call_config["body"] = base64.b64encode(out.getvalue()).decode()
+    op.attributes["backend_config"] = ir.StringAttr.get(
+        json.dumps(bc, separators=(",", ":"))
+    )
     return ir.WalkResult.ADVANCE
 
   m.operation.walk(_strip_kernel)
-
-
-def _stripped_kernel(serialized: bytes,
-                     dialect: Callable[[ir.Context], object] | None = None,
-                     version: int | None = None) -> bytes | None:
-  """A serialized kernel module without its debug info, at bytecode `version`
-  (the writer's default where None); None where it does not parse, or its
-  `dialect` cannot be registered (a callable returning False).
-
-  The kernel is read in a context of its own, unregistered dialects allowed
-  there and its `dialect` registered there, never in the program's: a program's
-  context is shared with other lowerings on its thread and may be another
-  thread's too (`mlir.make_ir_context`), and a setting toggled on it while
-  another thread parses there lets that thread's parse fail ("created with
-  unregistered dialect") or its key change.
-  """
-  ctx = ir.Context()
-  ctx.allow_unregistered_dialects = True
-  if dialect is not None and dialect(ctx) is False:
-    return None
-  with ctx, ir.Location.unknown():
-    try:
-      kernel = ir.Module.parse(serialized)
-    except ir.MLIRError:
-      return None
-    pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
-        kernel.operation)
-    out = io.BytesIO()
-    if version is None:
-      kernel.operation.write_bytecode(out)
-    else:
-      kernel.operation.write_bytecode(out, desired_version=version)
-  return out.getvalue()
 
 
 def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
@@ -277,8 +251,7 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
   The top-level strip-debuginfo pass does not reach into a kernel serialized in
   an attribute, so a kernel's source locations leak into the cache key: the
   same kernel compiled from two checkouts keyed differently. The kernel is
-  read in a context of its own with unregistered dialects allowed
-  (`_stripped_kernel`), and only its key is written, at
+  read with unregistered dialects allowed, and only its key is written, at
   bytecode version 0, which holds every operation's properties as attributes.
   A kernel written at a later version holds its operations' properties in a
   form only their dialect reads, so `dialect` registers it first, and a kernel
@@ -293,16 +266,30 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
     config = ir.DictAttr(op.attributes["mhlo.backend_config"])
     if field not in config:
       return ir.WalkResult.ADVANCE
-    body = _stripped_kernel(ir.StringAttr(config[field]).value_bytes, dialect,
-                            version=0)
-    if body is None:
+    ctx = m.context
+    if dialect is not None and not dialect(ctx):
       return ir.WalkResult.ADVANCE
-    with m.context:
-      entries = {entry.name: entry.attr for entry in config}
-      entries[field] = ir.StringAttr.get(body)
-      if digest is not None:
-        entries[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
-      op.attributes["mhlo.backend_config"] = ir.DictAttr.get(entries)
+    allowed = ctx.allow_unregistered_dialects
+    ctx.allow_unregistered_dialects = True
+    try:
+      with ctx:
+        try:
+          kernel = ir.Module.parse(
+              ir.StringAttr(config[field]).value_bytes, context=ctx)
+        except ir.MLIRError:
+          return ir.WalkResult.ADVANCE
+        pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
+            kernel.operation)
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        body = out.getvalue()
+        entries = {entry.name: entry.attr for entry in config}
+        entries[field] = ir.StringAttr.get(body)
+        if digest is not None:
+          entries[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
+        op.attributes["mhlo.backend_config"] = ir.DictAttr.get(entries)
+    finally:
+      ctx.allow_unregistered_dialects = allowed
     return ir.WalkResult.ADVANCE
 
   m.operation.walk(_strip_kernel)
