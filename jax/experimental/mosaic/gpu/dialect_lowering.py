@@ -1266,10 +1266,15 @@ def _mgpu_async_load_op_lowering_rule(
 
 
 # Ops that touch no shared memory from a thread: arithmetic, address and view
-# computations, special-register reads, and cp.async's own issue and commit
-# (asynchronous copies a warpgroup barrier does not order anyway).
+# computations, special-register reads (the NVVM ones and the GPU dialect's
+# thread, block and grid indices and dimensions), the dynamic shared memory's
+# base address, and cp.async's own issue and commit (asynchronous copies a
+# warpgroup barrier does not order anyway).
 _NO_THREAD_SMEM_ACCESS = (
     "arith.", "index.", "math.", "builtin.unrealized_conversion_cast",
+    "gpu.thread_id", "gpu.block_id", "gpu.block_dim", "gpu.grid_dim",
+    "gpu.lane_id", "gpu.cluster_id", "gpu.cluster_dim",
+    "gpu.cluster_block_id", "gpu.dynamic_shared_memory",
     "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison",
     "llvm.getelementptr", "llvm.extractvalue", "llvm.insertvalue",
     "llvm.ptrtoint", "llvm.inttoptr", "llvm.addrspacecast", "llvm.bitcast",
