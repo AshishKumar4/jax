@@ -289,7 +289,7 @@ def _initialize_barrier_op_lowering_rule(
   return []
 
 
-@_register_lowering(mgpu.AssumeMultipleOp)
+@_register_lowering(mgpu.AssumeMultipleOp, support_warp_semantics=True)
 def _assume_multiple_op_lowering_rule(
     _: LoweringContext,
     op: mgpu.AssumeMultipleOp,
