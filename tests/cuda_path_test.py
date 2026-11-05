@@ -32,10 +32,10 @@ class CudaPathTest(absltest.TestCase):
     self.enter_context(absltest.mock.patch.dict(os.environ, {}, clear=False))
     os.environ.pop('CUDA_ROOT', None)
     os.environ.pop('PYTHON_RUNFILES', None)
-    # Only this test's packages under nvidia/: the environment's own wheels (its site-packages) are off the path while
-    # the lookup runs, jax itself already imported.
-    self.enter_context(absltest.mock.patch.object(
-        sys, 'path', [str(self.root), *(path for path in sys.path if 'site-packages' not in path)]))
+    # Only this test's packages under nvidia/: nothing else is on the path while the lookup runs (no site- or
+    # dist-packages, no PYTHONPATH entry), which imports nothing but the nvidia packages it looks for, jax and the
+    # standard library it reads already imported.
+    self.enter_context(absltest.mock.patch.object(sys, 'path', [str(self.root)]))
     saved = {name: module for name, module in sys.modules.items()
              if name == 'nvidia' or name.startswith('nvidia.')}
     for name in saved:
