@@ -2243,6 +2243,35 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     np.testing.assert_array_equal(output[128:], jnp.zeros((128,)))
     np.testing.assert_array_equal(completed, jnp.zeros((2,), dtype=jnp.int32))
 
+  def test_multiple_of_in_a_warp(self):
+    # A warp's scalar annotated as a multiple, as a persistent kernel's load
+    # warp aligns a tile's slice start, lowers in the warp's code too.
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+        scratch_types=[plgpu.SMEM([128], jnp.float32), plgpu.Barrier()],
+        grid=(2,),
+        grid_names=("block",),
+    )
+    def kernel(x_ref, o_ref, scratch_ref, barrier_ref):
+      block_id = jax.lax.axis_index("block")
+
+      @plgpu.warp_map
+      def _(warp_id):
+        start = pl.multiple_of(block_id * 128, 128)
+        plgpu.copy_gmem_to_smem(
+            x_ref.at[pl.ds(start, 128)],
+            scratch_ref,
+            barrier_ref,
+            predicate=warp_id == 0,
+        )
+
+      plgpu.barrier_wait(barrier_ref)
+      plgpu.copy_smem_to_gmem(scratch_ref, o_ref.at[pl.ds(block_id * 128, 128)])
+      plgpu.wait_smem_to_gmem(0)
+
+    x = jnp.arange(256).astype(jnp.float32)
+    np.testing.assert_array_equal(kernel(x), x)
+
   @parameterized.parameters(jnp.float32, jnp.float4_e2m1fn)
   def test_collective_copy_gmem_to_smem(self, dtype):
 
