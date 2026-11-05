@@ -270,6 +270,14 @@ class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
           ValueError, "custom_jvp 'f'.*staged application.*batched over a mapped "
           "input.*out_axes=0.*unjitted under vmap"):
         jax.vmap(staged, in_axes=(None, 0), out_axes=None)(x, ignored)
+    # sum_match would sum the conservative broadcast into a wrong result, primal and gradient alike: refused too.
+    for read in (lambda x: jax.vmap(staged, in_axes=(None, 0), out_axes=None, sum_match=True)(x, ignored),
+                 api.grad(lambda x: jax.vmap(staged, in_axes=(None, 0), out_axes=None,
+                                             sum_match=True)(x, ignored))):
+      with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
+        read(x)
+    self.assertAllClose(
+        jax.vmap(f, in_axes=(None, 0), out_axes=None, sum_match=True)(x, ignored), 3.)
     self.assertAllClose(
         jax.vmap(f, in_axes=(None, 0), out_axes=None)(x, ignored), 3.)
     shared = jax.vmap(lambda _: staged(x, jnp.float32(2)), out_axes=None)

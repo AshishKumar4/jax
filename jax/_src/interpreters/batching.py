@@ -80,7 +80,10 @@ def from_elt(trace: BatchTrace, axis_size: AxisSize, mesh_axis: MeshAxis,
     return handler(_cont, axis_size, x, spec), spec
   val, bdim = trace.to_batch_info(x)
   bdim_inferred = bdim if spec is infer else spec
-  if (spec is None and bdim is not None and not sum_match
+  # A staged custom_jvp's conservative batching is not a true mapped value:
+  # returning it shared, or summing it with sum_match, would read a synthetic
+  # broadcast as the result.
+  if (spec is None and bdim is not None
       and isinstance(x, BatchTracer) and x.staged_custom_jvp is not None):
     raise ValueError(
         f"vmap out_axes=None cannot return custom_jvp {x.staged_custom_jvp!r} "
