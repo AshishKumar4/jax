@@ -2519,6 +2519,21 @@ class DialectLoweringTest(MosaicGpuTest):
       arith.constant(ir.IntegerType.get_signless(32), 7)
     self.assertTrue(lowering._warpgroup_synced_before(self._marked_after(before)))
 
+  def test_a_barrier_then_index_reads_and_the_shared_base_syncs_the_warpgroup(self):
+    # A pipeline's copy addresses its slot from the dynamic shared memory's
+    # base and the block's dimensions: reads of no thread's shared memory, so
+    # the barrier before them orders the copy (Dew 3181: an A100 GEMM's fetch
+    # kept a barrier a copy behind `gpu.dynamic_shared_memory` and
+    # `gpu.block_dim`).
+    def before():
+      self._barrier()()
+      mgpu_utils.thread_idx()
+      i8 = ir.IntegerType.get_signless(8)
+      gpu.dynamic_shared_memory(
+          ir.MemRefType.get((mgpu_utils.DYNAMIC,), i8, memory_space=mgpu_utils.smem())
+      )
+    self.assertTrue(lowering._warpgroup_synced_before(self._marked_after(before)))
+
   def test_a_shared_access_after_the_barrier_does_not_sync(self):
     def before():
       self._barrier()()
