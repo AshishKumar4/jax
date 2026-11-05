@@ -30,6 +30,7 @@ import numpy as np
 from jax._src import ad_util
 from jax._src import api_util
 from jax._src import config
+from jax._src import counted_registry
 from jax._src import core
 from jax._src import dtypes
 from jax._src import effects
@@ -1643,13 +1644,15 @@ ConstFoldRule = Callable[
     [list[Any | None], Any, list[AbstractValue]],
     list[Any | None] | None,
 ]
-const_fold_rules: dict[Primitive, ConstFoldRule] = {}
+const_fold_rules: dict[Primitive, ConstFoldRule] = counted_registry.CountedDict(
+    name="jax._src.interpreters.partial_eval.const_fold_rules")
 
 ForwardingRule = Callable[
     [JaxprEqn],
     tuple[list[int | None], JaxprEqn | None]
 ]
-forwarding_rules: dict[Primitive, ForwardingRule] = {}
+forwarding_rules: dict[Primitive, ForwardingRule] = counted_registry.CountedDict(
+    name="jax._src.interpreters.partial_eval.forwarding_rules")
 
 
 @multi_weakref_lru_cache
@@ -1967,7 +1970,8 @@ class DynamicJaxprTrace(core.Trace):
     return self.frame.to_jaxpr(self, out_tracers, debug_info, source_info)
 
 
-custom_staging_rules: dict[Primitive, Callable] = {}
+custom_staging_rules: dict[Primitive, Callable] = counted_registry.CountedDict(
+    name="jax._src.interpreters.partial_eval.custom_staging_rules")
 
 @lu.transformation2
 def _interleave_fun(f, every_others, *args, **kwargs):

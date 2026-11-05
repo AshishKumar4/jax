@@ -261,6 +261,7 @@ pytype_strict_library(
         ":compiler",
         ":config",
         ":core",
+        ":counted_registry",
         ":deprecations",
         ":dtypes",
         ":effects",
@@ -468,6 +469,7 @@ py_library_providing_imports_info(
         ":callback",
         ":config",
         ":core",
+        ":counted_registry",
         ":custom_batching",
         ":custom_derivatives",
         ":custom_partitioning_sharding_rule",
@@ -493,6 +495,11 @@ py_library_providing_imports_info(
         ":xla_bridge",
         "//jax/_src/lib",
     ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "counted_registry",
+    srcs = ["counted_registry.py"],
 )
 
 pytype_strict_library(
@@ -569,6 +576,7 @@ pytype_strict_library(
         ":xla_metadata_lib",
         "//jax/_src/lib",
     ] + py_deps("numpy"),
+    deps = [":counted_registry"],
 )
 
 pytype_strict_library(
@@ -731,6 +739,7 @@ pytype_strict_library(
     ],
     deps = [
         ":config",
+        ":counted_registry",
         ":traceback_util",
         ":typing",
         ":util",
@@ -756,6 +765,7 @@ pytype_strict_library(
 pytype_strict_library(
     name = "effects",
     srcs = ["effects.py"],
+    deps = [":counted_registry"],
 )
 
 pytype_strict_library(
@@ -976,6 +986,7 @@ pytype_strict_library(
         ":api_util",
         ":config",
         ":core",
+        ":counted_registry",
         ":dtypes",
         ":effects",
         ":flattree",
@@ -1053,6 +1064,7 @@ pytype_strict_library(
         ":api_util",
         ":config",
         ":core",
+        ":counted_registry",
         ":dtypes",
         ":effects",
         ":flattree",
@@ -1468,6 +1480,7 @@ pytype_strict_library(
     deps = [
         ":ad_util",
         ":core",
+        ":counted_registry",
         ":dtypes",
         ":effects",
         ":indexing",

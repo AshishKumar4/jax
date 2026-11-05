@@ -27,6 +27,7 @@ from typing import Any, Literal, cast, overload
 
 import jax
 from jax import numpy as jnp
+from jax._src import counted_registry
 from jax._src.lib import mosaic_gpu_dialect as dialect  # noqa: F401
 from jax.extend import backend as jex_backend
 from jax.interpreters import mlir
@@ -40,6 +41,8 @@ from jaxlib.mlir.dialects import nvvm
 from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
+
+from . import lowering_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -2069,7 +2072,9 @@ def warp_tree_reduce(value, op, group_size):
   return result
 
 
-_MEMORY_SPACES = {f"#gpu.address_space<{str(x)}>": x for x in gpu.AddressSpace}
+_MEMORY_SPACES = counted_registry.CountedDict(
+    {f"#gpu.address_space<{str(x)}>": x for x in gpu.AddressSpace},
+    name="mosaic_gpu.utils._MEMORY_SPACES")
 
 
 def get_memref_llvm_address_space(memref_ty: ir.MemRefType) -> int | None:
@@ -2713,6 +2718,8 @@ class Arch:
 
 
 def _infer_arch() -> tuple[int, int]:
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.arch
   device: Any = jax.sharding.get_abstract_mesh().abstract_device
   default_device = jex_backend.get_default_device()
   if device is None:

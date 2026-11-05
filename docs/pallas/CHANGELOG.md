@@ -57,6 +57,34 @@ Remember to align the itemized text with the first line of an item within a list
   * Added support for im2col TMA copies to
     {func}`jax.experimental.pallas.mosaic_gpu.copy_gmem_to_smem` via the
     {func}`jax.experimental.pallas.mosaic_gpu.im2col_ref` transformation.
+  * Added the `jax_pallas_lowering_cache_dir` flag (environment variable
+    `JAX_PALLAS_LOWERING_CACHE_DIR`), a persistent cache of Mosaic GPU kernels'
+    lowerings. A kernel lowered before, by this process or another, is read
+    back instead of lowered again. A lowering is cached only when the cache can
+    show that it depends on nothing but its key: the installed `jax`, `jaxlib`
+    and CUDA plugin files must match their wheels' `RECORD` (a module loaded
+    later too); every function, class, partial, primitive and constant of the
+    modules of those files that the process has loaded is part of the key by
+    what it is (so a function, a method, a constant or a primitive's behaviour
+    rebound to another, a sealed one too, is another key, and one that is not
+    code of those files leaves the lowering uncached); every rule the lowering
+    dispatches through (the lowering rules, resource estimators, state
+    discharge rules, the Mosaic GPU dialect's and layout inference's rules and
+    the tables they index, and the part of JAX's tracing tables that those
+    reach) is in the key by its code and the state it holds; nothing that
+    counts its changes (`jax._src.counted_registry`: those tables, assigning an
+    attribute of a module, a primitive or a function's code and defaults) may
+    change while the kernel is lowered, even if it is changed back; a primitive
+    must be one a module of those files holds; and the kernel and what the
+    lowering reads of the process must be exactly encodable. Anything else is
+    lowered afresh, and counted by the
+    `/jax/pallas/mosaic_gpu/lowering_cache/*` {mod}`jax.monitoring` events. A
+    cached lowering carries no source locations, whether it is a miss or a hit.
+    An entry carries a checksum of what it holds, and one that does not match
+    it is lowered again. `jax_pallas_lowering_cache_verify`
+    (`JAX_PALLAS_LOWERING_CACHE_VERIFY=1`) also lowers each hit afresh and
+    raises when the two differ, and a process that used the cache with it and
+    verified no hit exits with status 3.
 
 * Deprecations
 

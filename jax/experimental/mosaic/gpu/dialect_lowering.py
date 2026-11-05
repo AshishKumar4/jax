@@ -24,6 +24,7 @@ import operator
 import re
 from typing import Any, Literal, assert_never, cast
 
+from jax._src import counted_registry
 from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib import mosaic_gpu_dialect as mgpu
 from jax._src.lib.mlir import ir
@@ -132,7 +133,8 @@ MlirLoweringRule = Callable[
 ]
 
 
-_lowerings: dict[str, MlirLoweringRule] = {}
+_lowerings: dict[str, MlirLoweringRule] = counted_registry.CountedDict(
+    name="mosaic_gpu.dialect_lowering._lowerings")
 
 
 def _undo_conversion_cast(
@@ -248,7 +250,8 @@ def unwrap_transformed_memref(
 
   return result
 
-_supported_warp_lowerings: set[str] = set()
+_supported_warp_lowerings: set[str] = counted_registry.CountedSet(
+    name="mosaic_gpu.dialect_lowering._supported_warp_lowerings")
 
 
 def _register_lowering(
@@ -1688,7 +1691,7 @@ def _divf_lowering_rule(
 _lowerings[arith.DivFOp.OPERATION_NAME] = _divf_lowering_rule
 
 
-CMPI_IMPLS = {
+CMPI_IMPLS = counted_registry.CountedDict({
     arith.CmpIPredicate.eq: (operator.eq, False),
     arith.CmpIPredicate.ne: (operator.ne, False),
     arith.CmpIPredicate.slt: (operator.lt, True),
@@ -1699,7 +1702,7 @@ CMPI_IMPLS = {
     arith.CmpIPredicate.ule: (operator.le, False),
     arith.CmpIPredicate.ugt: (operator.gt, False),
     arith.CmpIPredicate.uge: (operator.ge, False),
-}
+}, name="mosaic_gpu.dialect_lowering.CMPI_IMPLS")
 
 
 @_register_lowering(arith.CmpIOp)
@@ -1717,14 +1720,14 @@ def _cmpi_op_lowering_rule(
   return [fragmented_array_to_ir(impl(lhs, rhs), op.result.type)]
 
 
-CMPF_IMPLS = {
+CMPF_IMPLS = counted_registry.CountedDict({
     arith.CmpFPredicate.OEQ: operator.eq,
     arith.CmpFPredicate.UNE: operator.ne,
     arith.CmpFPredicate.OLT: operator.lt,
     arith.CmpFPredicate.OLE: operator.le,
     arith.CmpFPredicate.OGT: operator.gt,
     arith.CmpFPredicate.OGE: operator.ge,
-}
+}, name="mosaic_gpu.dialect_lowering.CMPF_IMPLS")
 
 
 @_register_lowering(arith.CmpFOp)
