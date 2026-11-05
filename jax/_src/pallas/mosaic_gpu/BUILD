@@ -43,6 +43,7 @@ pytype_strict_library(
     deps = [
         ":core",
         ":lowering",
+        ":lowering_cache",
         "//jax",
         "//jax/_src:config",
         "//jax/_src:core",
@@ -56,6 +57,94 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "lowering_cache_seal",
+    srcs = ["lowering_cache_seal.py"],
+)
+
+pytype_strict_library(
+    name = "lowering_cache_encoding",
+    srcs = ["lowering_cache_encoding.py"],
+    deps = [
+        ":core",
+        ":lowering_cache_seal",
+        "//jax",
+        "//jax/_src:core",
+        "//jax/_src:effects",
+        "//jax/_src:flattree",
+        "//jax/_src:frozen_dict",
+        "//jax/_src:lax",
+        "//jax/_src:literals",
+        "//jax/_src:mesh",
+        "//jax/_src:named_sharding",
+        "//jax/_src:partition_spec",
+        "//jax/_src:state_types",
+        "//jax/_src:tree_util",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "lowering_cache_universe",
+    srcs = ["lowering_cache_universe.py"],
+    deps = [
+        ":lowering_cache_encoding",
+        ":lowering_cache_seal",
+        "//jax/_src:core",
+        "//jax/_src:counted_registry",
+    ] + py_deps("numpy"),
+)
+
+pytype_strict_library(
+    name = "lowering_cache_registries",
+    srcs = ["lowering_cache_registries.py"],
+    deps = [
+        ":lowering",
+        ":lowering_cache_encoding",
+        ":lowering_cache_seal",
+        ":lowering_cache_universe",
+        ":primitives",
+        "//jax/_src:api",
+        "//jax/_src:core",
+        "//jax/_src:counted_registry",
+        "//jax/_src:dtypes",
+        "//jax/_src:effects",
+        "//jax/_src:lax",
+        "//jax/_src:mlir",
+        "//jax/_src:partial_eval",
+        "//jax/_src:state_types",
+        "//jax/experimental:mosaic_gpu",
+    ],
+)
+
+pytype_strict_library(
+    name = "lowering_cache_store",
+    srcs = ["lowering_cache_store.py"],
+    deps = ["//jax/_src:lru_cache"],
+)
+
+pytype_strict_library(
+    name = "lowering_cache",
+    srcs = ["lowering_cache.py"],
+    deps = [
+        ":core",
+        ":lowering",
+        ":lowering_cache_encoding",
+        ":lowering_cache_registries",
+        ":lowering_cache_seal",
+        ":lowering_cache_store",
+        "//jax",
+        "//jax/_src:config",
+        "//jax/_src:core",
+        "//jax/_src:dtypes",
+        "//jax/_src:layout",
+        "//jax/_src:mesh",
+        "//jax/_src:mlir",
+        "//jax/_src:monitoring",
+        "//jax/_src/lib",
+        "//jax/experimental:mosaic_gpu",
+    ] + py_deps("ml_dtypes") + py_deps("numpy"),
+)
+
+pytype_strict_library(
     name = "lowering",
     srcs = ["lowering.py"],
     deps = [
@@ -65,6 +154,7 @@ pytype_strict_library(
         "//jax/_src:checkify",
         "//jax/_src:config",
         "//jax/_src:core",
+        "//jax/_src:counted_registry",
         "//jax/_src:custom_derivatives",
         "//jax/_src:debugging",
         "//jax/_src:deprecations",

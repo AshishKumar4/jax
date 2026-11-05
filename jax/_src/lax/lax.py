@@ -33,6 +33,7 @@ from jax._src import api
 from jax._src import api_util
 from jax._src import array
 from jax._src import config
+from jax._src import counted_registry
 from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
@@ -5855,12 +5856,12 @@ def _convert_element_type_jvp_rule(tangent, primal_result, operand, *,
     return convert_element_type_p.bind(tangent, new_dtype=new_tangent_dtype,
                                        weak_type=weak_type, sharding=sharding)
 
-_foldable_types = {
+_foldable_types = counted_registry.CountedSet({
     literals.TypedNdArray,
     np.ndarray,
     *dtypes.python_scalar_types,
     *literals.typed_scalar_types,
-}
+}, name="jax._src.lax.lax._foldable_types")
 
 def _convert_elt_type_folding_rule(consts, params, out_avals):
   # We constant-fold convert_element_types applied to constants if those

@@ -25,6 +25,7 @@ import math
 import re
 from typing import Any, assert_never, cast
 
+from jax._src import counted_registry
 from jax._src import traceback_util
 from jax._src.lib import mosaic_gpu_dialect as mgpu  # noqa: F401
 from jax._src.lib.mlir import ir
@@ -759,7 +760,9 @@ ConstraintSystemDerivationRule = Callable[
 ]
 _constraint_system_derivation_rules: dict[
     str, ConstraintSystemDerivationRule
-] = {}
+] = counted_registry.CountedDict(
+    name="mosaic_gpu.layout_inference._constraint_system_derivation_rules"
+)
 
 
 def _add_constraint_system_derivation_rule(op: type[ir.OpView]):

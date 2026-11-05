@@ -39,6 +39,7 @@ import numpy as np
 
 from jax._src import dtypes
 from jax._src import config
+from jax._src import counted_registry
 from jax._src import effects
 from jax._src.frozen_dict import FrozenDict
 from jax._src import mesh as mesh_lib
@@ -606,8 +607,10 @@ class Literal:
 
 # The types of constants that can be used with core.Literal. Other constants
 # end up as `constvars`.
-literalable_types: set[type] = set()
-literalable_scalar_types: set[type] = set()
+literalable_types: set[type] = counted_registry.CountedSet(
+    name="jax._src.core.literalable_types")
+literalable_scalar_types: set[type] = counted_registry.CountedSet(
+    name="jax._src.core.literalable_scalar_types")
 
 def is_literalable(x: Any, for_ad: bool = False) -> bool:
   x_type = type(x)
@@ -679,7 +682,14 @@ class Primitive:
   is_effectful = None
 
   def __init__(self, name: str):
-    self.name = name
+    object.__setattr__(self, "name", name)
+
+  def __setattr__(self, name, value):
+    # What a primitive does (`def_impl`, `def_abstract_eval`, ...) is what is set on
+    # it, and a cache of what was lowered through it has to know when it is set.
+    counted_registry.bump()
+    object.__setattr__(self, name, value)
+    counted_registry.bump()
 
   def __repr__(self):
     return f'{self.name}'
@@ -950,7 +960,8 @@ def check_bool_conversion(arr: Array):
                      " is ambiguous. Use a.any() or a.all()")
 
 
-pytype_aval_mappings: dict[type, Callable[[Any], AbstractValue]] = {}
+pytype_aval_mappings: dict[type, Callable[[Any], AbstractValue]] = (
+    counted_registry.CountedDict(name="jax._src.core.pytype_aval_mappings"))
 
 def _str_abstractify(x):
   raise TypeError(f"Argument '{x}' of type {type(x)} is not a valid JAX type")

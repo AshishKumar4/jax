@@ -29,6 +29,7 @@ from jax._src import api
 from jax._src import array
 from jax._src import compiler
 from jax._src import config
+from jax._src import counted_registry
 from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
@@ -141,7 +142,8 @@ shard_arg_handlers: dict[
        Sequence[xc.ArrayCopySemantics]],
       Sequence[Any],
     ],
-] = {}
+] = counted_registry.CountedDict(
+    name="jax._src.interpreters.pxla.shard_arg_handlers")
 
 
 @util.cache(max_size=2048, trace_context_in_key=False)
