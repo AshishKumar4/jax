@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent.futures
 import hashlib
 import os
 import re
@@ -398,6 +399,59 @@ class CacheKeyTest(jtu.JaxTestCase):
 
     self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
                      program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+
+  def test_kernels_key_alike_from_threads_sharing_one_context(self):
+    # Programs lowered back to back on a thread share one MLIR context
+    # (`mlir.make_ir_context`), which another thread's lowerings may share too:
+    # threads keying programs whose Mosaic GPU kernels need unregistered
+    # dialects key each as one thread alone keys it, none failing to read its
+    # kernel.
+    with ir.Context() as kernel_ctx, ir.Location.unknown():
+      kernel_ctx.allow_unregistered_dialects = True
+      kernel = ir.Module.parse(
+          "module {\n"
+          '  "stable_mosaic_gpu.func"() ({\n'
+          '    "stable_mosaic_gpu.return"() : () -> () '
+          'loc("/home/ubuntu/s/trees/0/src/kernels.py":3:5)\n'
+          "  }) : () -> ()\n"
+          "}\n")
+      out = io.BytesIO()
+      kernel.operation.write_bytecode(out, desired_version=0)
+      body = out.getvalue()
+
+    with mlir.make_ir_context() as ctx, ir.Location.unknown():
+      def program():
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @mosaic_gpu_v2(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(
+            {"module": ir.StringAttr.get(body),
+             "kernel_hash": ir.StringAttr.get(hashlib.sha256(body).digest())})
+        return module
+
+      alone = cache_key._canonicalize_ir(program(), False)
+      self.assertFalse(ctx.allow_unregistered_dialects)
+      programs = [program() for _ in range(1024)]
+
+    def keyed(module):
+      return cache_key._canonicalize_ir(module, False)
+
+    # Threads switch as often as the interpreter lets them, so one's keying
+    # runs between another's steps.
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+      with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        keys = list(pool.map(keyed, programs))
+    finally:
+      sys.setswitchinterval(interval)
+    self.assertEqual(keys, [alone] * len(programs))
 
   def test_triton_kernels_differing_in_a_property_key_apart(self):
     # Pallas Triton writes its kernels at the default bytecode version, which
