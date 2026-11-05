@@ -1288,7 +1288,7 @@ def _scan_batching_rule(axis_data, args, dims, reverse, length, jaxpr,
       ft_in=ft_in, ft_out=ft_out, unroll=unroll)
   carry_bdims = [0 if b else None for b in carry_batched]
   ys_bdims = [1 if b else None for b in ys_batched]
-  return outs, carry_bdims + ys_bdims
+  return outs, batching.staged_dims(carry_bdims + ys_bdims, batched_out)
 
 def _scan_dce_rule(used_outputs: list[bool], live_ins: list[bool],
                    eqn: core.JaxprEqn
@@ -1937,7 +1937,7 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
   for _ in range(1 + len(carry_bat)):
     _, carry_bat_out = batching.batch_jaxpr(
         body_jaxpr, axis_data, bconst_bat + carry_bat, instantiate=carry_bat)
-    if carry_bat == carry_bat_out:
+    if carry_bat == list(carry_bat_out):
       break
     carry_bat = safe_map(operator.or_, carry_bat, carry_bat_out)
   else:
@@ -1956,7 +1956,7 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
                       "with batched predicate")
     carry_bat = [True] * len(carry_bat)
     carry_dims = [0] * len(carry_bat)
-    body_jaxpr_batched, _ = batching.batch_jaxpr_axes(
+    body_jaxpr_batched, body_bat = batching.batch_jaxpr_axes(
         body_jaxpr, axis_data, bconst_dims + carry_dims, carry_dims)
     cond_jaxpr_batched, _ = batching.batch_jaxpr_axes(
         cond_jaxpr, axis_data, cconst_dims + carry_dims, [0])
@@ -1968,7 +1968,7 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
     # according to these new batch dims.
     cond_rank = len(cond_jaxpr.out_avals[0].shape)
     carry_dims = [cond_rank if b else None for b in carry_bat]
-    body_jaxpr_batched, _ = batching.batch_jaxpr_axes(
+    body_jaxpr_batched, body_bat = batching.batch_jaxpr_axes(
         body_jaxpr, axis_data, bconst_dims + carry_dims, carry_dims)
     # Now we need to rebatch the `cond_jaxpr` according to the new dims of the
     # carry.
@@ -1993,7 +1993,7 @@ def _while_loop_batching_rule(axis_data, args, dims, cond_nconsts, cond_jaxpr,
   outs = while_p.bind(*(cconsts + bconsts + new_init),
                       cond_nconsts=cond_nconsts, cond_jaxpr=cond_jaxpr_batched,
                       body_nconsts=body_nconsts, body_jaxpr=body_jaxpr_batched)
-  return outs, carry_dims
+  return outs, batching.staged_dims(carry_dims, body_bat)
 
 def _while_loop_jvp(primals, tangents, cond_nconsts, cond_jaxpr, body_nconsts,
                     body_jaxpr):
