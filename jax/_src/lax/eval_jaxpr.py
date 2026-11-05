@@ -21,7 +21,6 @@ from functools import partial
 
 from jax._src import ad_util
 from jax._src import core
-from jax._src import counted_registry
 from jax._src import flattree as ft
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
@@ -128,8 +127,7 @@ def _eval_jaxpr_remat(prim, trace, *args, call_jaxpr, **params):
   return primals_out, res_full, rem
 
 
-call_primitives: set[core.Primitive] = counted_registry.CountedSet(
-    name="jax.lax.eval_jaxpr.call_primitives")
+call_primitives: set[core.Primitive] = set()
 """Every primitive with `eval_jaxpr_p`'s rules (`register_call_primitive_rules`): a call of its body's
 jaxpr (`call_jaxpr`), which a backend that lowers `eval_jaxpr_p` lowers alike."""
 

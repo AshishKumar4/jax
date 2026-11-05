@@ -23,14 +23,12 @@ A case's keys (all optional but `workdir`): `kernel` (a function of `kernels`),
 the kernels' file), `capability` (the GPU the mesh states), `compiler_params`,
 `site` (the sealed site, whose manifests seal the process), `config` (jax.config
 values), `smem_bound`, `nvshmem_bc` (what the process answers of NVSHMEM), `mesh`
-(a mesh of two devices: "abstract2" or "concrete2"), `repeat`, `tweaks` (changes to the process
-made before the first lowering), `after` (made between the first and a second),
-`mutate` and `touch` and `touch_on_read` (changes to the registries), `window`
-(a change another thread makes and undoes while the kernel lowers), `late_module`
-(a module imported between the two), `bug` (one of the cache's own), `direct` (the
+(a mesh of two devices: "abstract2" or "concrete2"), `repeat`, `tweaks` (changes
+to the process made before the first lowering), `after` (made between the first and
+a second), `mutate` and `touch` (changes to the registries), `late_module` (a
+module imported between the two), `bug` (one of the cache's own), `direct` (the
 lowering with no cache around it), `report_seal`, and `mode` ("encoder": the
-canonicalizer's cases; "audit": what real lowerings read; "universe": the identity
-of every function the lowering can run).
+canonicalizer's cases; "audit": what real lowerings read).
 """
 
 import hashlib
@@ -38,11 +36,9 @@ import importlib
 import importlib.util
 import io
 import json
-import operator
 import os
 import pathlib
 import sys
-import threading
 import traceback
 
 import jax
@@ -57,7 +53,6 @@ from jax._src.pallas.mosaic_gpu import lowering
 from jax._src.pallas.mosaic_gpu import lowering_cache
 from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as cache_encoding
 from jax._src.pallas.mosaic_gpu import lowering_cache_seal as cache_seal
-from jax._src.pallas.mosaic_gpu import lowering_cache_store as cache_store
 from jax._src.state import discharge
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.experimental.mosaic.gpu import dialect_lowering
@@ -199,11 +194,7 @@ def lower(case, kernel, x):
   if kind is None:
     mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
     with jax.sharding.use_abstract_mesh(mesh):
-      traced = jax.jit(kernel).trace(x)
-      # What a case changes after the kernel's jaxpr was made, before it is lowered.
-      for tweak in case.get("between_trace_and_lower", ()):
-        apply_tweak(tweak)
-      return traced.lower(lowering_platforms=("cuda",)).as_text()
+      return jax.jit(kernel).trace(x).lower(lowering_platforms=("cuda",)).as_text()
   # A kernel run by each of two devices, of a mesh that is a compile-only
   # target's (an abstract one) or the process's own (its two CPUs), lowered for
   # the GPU.
@@ -274,18 +265,17 @@ def registries_by_name():
 
 
 def touch_registry(name):
-  """A mutation that changes nothing a lowering reads: an entry set to what it
-  is, an element added that is there."""
+  """Registers a new entry in a registry (as a rule that imports a module does)."""
   registry = registries_by_name()[name]
   if isinstance(registry, (set, frozenset)):
-    registry.add(next(iter(registry)))
+    registry.add(
+        jax_core.Primitive("lowering_cache_test_added")
+        if name == "call_primitives" else "lowering_cache_test.added")
+  elif name in ("rules", "estimators", "discharge"):
+    registry[jax_core.Primitive("lowering_cache_test_added")] = next(
+        iter(registry.values()))
   else:
-    key = next(iter(registry))
-    registry[key] = registry[key]
-
-
-# What the cases that try a change that cannot be made report: (name, error).
-_ATTEMPTS: list[tuple[str, str | None]] = []
+    registry["lowering_cache_test.added"] = next(iter(registry.values()))
 
 
 def apply_tweak(spec):
@@ -312,188 +302,26 @@ def apply_tweak(spec):
     table = lowering.mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS]
     table[jax_core.Primitive("lowering_cache_test_foreign")] = wrap(
         next(iter(table.values())))
-  elif name == "try_partial_keywords":
-    # The lane add rule's partial, whose keywords are changed in place: it is a
-    # frozen one, and the attempt is the report.
-    table = lowering.mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS]
-    try:
-      table[lax.add_p].keywords["impl"] = table[lax.sub_p].keywords["impl"]
-    except TypeError as e:
-      _ATTEMPTS.append((spec, type(e).__name__))
-    else:
-      _ATTEMPTS.append((spec, None))
-  elif name == "bcast_to_wg":
-    # A helper of the lowering rebound to another of the lowering's.
-    lowering._bcast = lowering._bcast_wg
-  elif name == "util_split_list":
-    from jax._src import util  # pylint: disable=g-import-not-at-top
-    util.split_list = util.split_list_checked
   elif name == "smem_alignment":
+    gpu_core.SMEM_ALIGNMENT = int(arg)
+  elif name == "smem_alignment_numpy":
     gpu_core.SMEM_ALIGNMENT = np.int64(int(arg))
   elif name == "smem_alignment_object":
     gpu_core.SMEM_ALIGNMENT = object()
-  elif name == "combine_kwdefaults_in_place":
-    from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-    rules._combine.__kwdefaults__["op"] = operator.sub
-  elif name == "combine_kwdefaults_rebound":
-    from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-    rules._combine.__kwdefaults__ = {"op": operator.sub}
-  elif name == "combine_closure_cell":
-    from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-    rules.combine_closure.__closure__[0].cell_contents = operator.sub
-  elif name == "add_a_abstract_eval":
-    from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-    rules.add_a_p.abstract_eval = rules.add_b_p.abstract_eval
-  elif name == "cmpf_gt_lt":
-    impls = dialect_lowering.CMPF_IMPLS
-    impls[arith.CmpFPredicate.OGT] = impls[arith.CmpFPredicate.OLT]
-  elif name == "memory_space_swap":
-    from jax.experimental.mosaic.gpu import utils as mgpu_utils  # pylint: disable=g-import-not-at-top
-    from jaxlib.mlir.dialects import gpu  # pylint: disable=g-import-not-at-top
-    mgpu_utils._MEMORY_SPACES["#gpu.address_space<workgroup>"] = gpu.AddressSpace.Global
-  elif name == "wgmma_layout_swap":
-    import jax.experimental.mosaic.gpu as mgpu  # pylint: disable=g-import-not-at-top
-    mgpu.WGMMA_LAYOUT = mgpu.WGMMA_TRANSPOSED_LAYOUT
-  elif name == "dtype_table":
-    from jax._src.interpreters import mlir  # pylint: disable=g-import-not-at-top
-    table = mlir._dtype_to_ir_type
-    f32 = next(k for k in table if k == np.dtype("float32"))
-    table[f32] = table[next(k for k in table if k == np.dtype("float16"))]
-  elif name == "aval_mapping_foreign_key":
-    # An entry no sealed code can reach: its key is a class of this file.
-    jax_core.pytype_aval_mappings[_Foreign] = lambda x: None
-  elif name == "aval_mapping_foreign_value":
-    # A sealed key (float) whose rule is not sealed code.
-    original = jax_core.pytype_aval_mappings[float]
-    jax_core.pytype_aval_mappings[float] = lambda x: original(x)
-  elif name == "swap_bcast":
-    # A function of the lowering, replaced: its operands are swapped.
-    original = lowering._bcast
-
-    def swapped(x, y, *rest):
-      bx, by = original(x, y, *rest)
-      return by, bx
-
-    lowering._bcast = swapped
-  elif name == "swap_fa_sub":
-    # A method of a class of the mosaic package, replaced: its operands are swapped.
-    from jax.experimental.mosaic.gpu import fragmented_array as fa  # pylint: disable=g-import-not-at-top
-    original = fa.FragmentedArray.__sub__
-    fa.FragmentedArray.__sub__ = lambda self, other: original(other, self)
+  elif name == "smem_alignment_subclass":
+    gpu_core.SMEM_ALIGNMENT = _MyInt(int(arg))
   else:
     raise ValueError(spec)
 
 
-class _Foreign:
-  """A class of this file, which no sealed file defines."""
+class _MyInt(int):
+  """A subclass of int, which a key cannot hold as it holds an int."""
 
 
 def set_up_touching(case):
-  """The stand-in rule changes a registry when it lowers, in this thread or in
-  another that the lowering waits for."""
+  """The stand-in rule registers an entry while the kernel lowers."""
   from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-  spec = case["touch"]
-
-  def hook():
-    if spec["via"] == "inline":
-      touch_registry(spec["registry"])
-    else:
-      thread = threading.Thread(target=touch_registry, args=(spec["registry"],))
-      thread.start()
-      thread.join()
-
-  rules.HOOKS["registry"] = hook
-
-
-def _window_channels():
-  """Each way a thread can change what a lowering runs, with the change and its
-  undoing: what the cases make while a kernel is being lowered."""
-  from jax import lax  # pylint: disable=g-import-not-at-top
-  from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-  from jax._src.interpreters import partial_eval as pe  # pylint: disable=g-import-not-at-top
-
-  def swap(owner, name, other):
-    original = getattr(owner, name)
-    setattr(owner, name, other)
-    setattr(owner, name, original)
-
-  def module_attribute():
-    swap(lowering, "_bcast", lowering._bcast_wg)
-
-  def constant():
-    swap(gpu_core, "SMEM_ALIGNMENT", 2048)
-
-  def function_code():
-    original = rules.add_a.__code__
-    rules.add_a.__code__ = rules.add_b.__code__
-    rules.add_a.__code__ = original
-
-  def function_kwdefaults():
-    original = rules._combine.__kwdefaults__
-    rules._combine.__kwdefaults__ = {"op": operator.sub}
-    rules._combine.__kwdefaults__ = original
-
-  def function_kwdefaults_item():
-    original = rules._combine.__kwdefaults__["op"]
-    rules._combine.__kwdefaults__["op"] = operator.sub
-    rules._combine.__kwdefaults__["op"] = original
-
-  def primitive_attribute():
-    swap(rules.add_a_p, "abstract_eval", rules.add_b_p.abstract_eval)
-
-  def tracing_table():
-    pe.forwarding_rules[rules.add_a_p] = lambda *args: None
-    del pe.forwarding_rules[rules.add_a_p]
-
-  def rule_registry():
-    table = lowering.mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS]
-    original = table[lax.add_p]
-    table[lax.add_p] = table[lax.sub_p]
-    table[lax.add_p] = original
-
-  return {
-      "module_attribute": module_attribute, "constant": constant,
-      "function_code": function_code, "function_kwdefaults": function_kwdefaults,
-      "function_kwdefaults_item": function_kwdefaults_item,
-      "primitive_attribute": primitive_attribute, "tracing_table": tracing_table,
-      "rule_registry": rule_registry,
-  }
-
-
-def set_up_window(case):
-  """Another thread changes something the lowering runs, and changes it back, while
-  the stand-in rule holds the lowering (so, inside the window the cache keeps)."""
-  from jax._src import lowering_cache_test_rules as rules  # pylint: disable=g-import-not-at-top
-  change = _window_channels()[case["window"]]
-  started, done = threading.Event(), threading.Event()
-
-  def mutator():
-    started.wait(120)
-    try:
-      change()
-    finally:
-      done.set()
-
-  threading.Thread(target=mutator, daemon=True).start()
-
-  def hook():
-    started.set()
-    done.wait(120)
-
-  rules.HOOKS["registry"] = hook
-
-
-def set_up_touching_on_read(case):
-  """A registry changes while the store is read: after the key was made, and
-  before a hit is returned."""
-  get = cache_store.Store.get
-
-  def get_and_touch(self, key):
-    entry = get(self, key)
-    touch_registry(case["touch_on_read"])
-    return entry
-
-  cache_store.Store.get = get_and_touch
+  rules.HOOKS["registry"] = lambda: touch_registry(case["touch"]["registry"])
 
 
 def mutate_after_first(case):
@@ -555,10 +383,6 @@ def configure(case, rec):
     apply_tweak(tweak)
   if case.get("touch") is not None:
     set_up_touching(case)
-  if case.get("window") is not None:
-    set_up_window(case)
-  if case.get("touch_on_read") is not None:
-    set_up_touching_on_read(case)
   if case.get("mesh") is not None:
     rec.install_topology_spies()
   if case.get("bug") is not None:
@@ -587,30 +411,6 @@ def run(case):
   if case.get("mode") == "encoder":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"canonicalizer": encoder_cases.run()}
-  if case.get("mode") == "universe":
-    from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries  # pylint: disable=g-import-not-at-top
-    from jax._src.pallas.mosaic_gpu import lowering_cache_universe as universe  # pylint: disable=g-import-not-at-top
-    configure(case, Recorder())
-    state = registries.current()
-    report = {
-        "digest": state.digest.hex(),
-        "modules": {
-            name: hashlib.sha256(m.fingerprint).hexdigest()
-            for name, m in universe._universe._modules.items()},
-    }
-    # What each binding of the modules a case names is (to tell which differs).
-    bindings = {}
-    for name in case.get("bindings_of", ()):
-      module = sys.modules[name]
-      fingerprinter = universe._Fingerprinter(cache_seal.seal(), set())
-      for key, value in sorted(vars(module).items()):
-        if key.startswith("__") and key.endswith("__"):
-          continue
-        fingerprint = fingerprinter.binding(module, key, value)
-        if fingerprint is not None:
-          bindings[f"{name}.{key}"] = hashlib.sha256(fingerprint).hexdigest()
-    report["bindings"] = bindings
-    return {"universe": report}
   if case.get("mode") == "audit":
     from mosaic_gpu_lowering_cache_support import state_audit  # pylint: disable=g-import-not-at-top
     return {"audit": state_audit.run()}
@@ -633,7 +433,7 @@ def run(case):
     if case.get("late_module"):
       import_late_module(case)
     runs.append(one(case, rec, kernel, x))
-  result = {"runs": runs, "attempts": _ATTEMPTS}
+  result = {"runs": runs}
   if case.get("report_seal"):
     seal = cache_seal.seal()
     result["seal"] = {

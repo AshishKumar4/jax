@@ -24,7 +24,6 @@ from typing import Any, Protocol
 from jax._src import ad_util
 from jax._src import api_util
 from jax._src import core
-from jax._src import counted_registry
 from jax._src import flattree as ft
 from jax._src import linear_util as lu
 from jax._src import pjit
@@ -190,8 +189,7 @@ class DischargeRule(Protocol):
     """
 
 
-_discharge_rules: dict[core.Primitive, DischargeRule] = counted_registry.CountedDict(
-    name="jax.state.discharge._discharge_rules")
+_discharge_rules: dict[core.Primitive, DischargeRule] = {}
 
 
 def register_discharge_rule(prim: core.Primitive):
@@ -202,11 +200,11 @@ def register_discharge_rule(prim: core.Primitive):
   return register
 
 
-_neutral_memory_spaces: set[Any] = counted_registry.CountedSet({
+_neutral_memory_spaces: set[Any] = {
     None,
     core.MemorySpace.Device,
     core.MemorySpace.Any,
-}, name="jax._src.state.discharge._neutral_memory_spaces")
+}
 
 def register_neutral_memory_space(ms):
   _neutral_memory_spaces.add(ms)

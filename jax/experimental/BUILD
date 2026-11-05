@@ -275,7 +275,6 @@ py_library_providing_imports_info(
         "//jax",
         "//jax/_src:config",
         "//jax/_src:core",
-        "//jax/_src:counted_registry",
         "//jax/_src:dtypes",
         "//jax/_src:mesh",
         "//jax/_src:mlir",

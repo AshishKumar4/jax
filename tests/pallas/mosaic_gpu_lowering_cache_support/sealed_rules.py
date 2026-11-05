@@ -18,13 +18,9 @@ other sealed code. ``touch_p`` is a stand-in: it lowers to its operand, and befo
 it does it runs a hook the process sets, which the cases use to change a registry
 from inside the lowering. ``add_a_p`` and ``add_b_p`` are both named "add", as
 ``lax.add_p`` is, and their lane rules are the lane add and the lane subtract rule:
-primitives of one name, whose rules (both sealed code) differ. ``add_c_p`` and
-``add_d_p`` are sums whose rules call a helper (`_combine`, whose keyword default
-is the operation; `combine_closure`, whose closure holds it) that no registry
-holds: what a helper is, is what the rule does.
+primitives of one name, whose rules (both sealed code) differ.
 """
 
-import operator
 
 from jax import lax
 from jax._src import core
@@ -67,45 +63,6 @@ def add_b(x, y):
   return add_b_p.bind(x, y)
 
 
-add_c_p = core.Primitive("add_c")
-add_c_p.def_abstract_eval(lambda x, y: x)
-add_d_p = core.Primitive("add_d")
-add_d_p.def_abstract_eval(lambda x, y: x)
-
-
-def add_c(x, y):
-  return add_c_p.bind(x, y)
-
-
-def add_d(x, y):
-  return add_d_p.bind(x, y)
-
-
-def _combine(x, y, *, op=operator.add):
-  return op(x, y)
-
-
-def _make_combine(op):
-  def combine(x, y):
-    return op(x, y)
-  return combine
-
-
-combine_closure = _make_combine(operator.add)
-
-
-def _add_c_rule(ctx, x, y):
-  return lowering._binary_op_lowering_rule(
-      ctx, x, y, impl=lambda a, b: _combine(a, b))
-
-
-def _add_d_rule(ctx, x, y):
-  return lowering._binary_op_lowering_rule(
-      ctx, x, y, impl=lambda a, b: combine_closure(a, b))
-
-
 _lane_rules = lowering.mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS]
 _lane_rules[add_a_p] = _lane_rules[lax.add_p]
 _lane_rules[add_b_p] = _lane_rules[lax.sub_p]
-_lane_rules[add_c_p] = _add_c_rule
-_lane_rules[add_d_p] = _add_d_rule

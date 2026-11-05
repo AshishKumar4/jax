@@ -27,7 +27,6 @@ from typing import Any, Literal, cast, overload
 
 import jax
 from jax import numpy as jnp
-from jax._src import counted_registry
 from jax._src.lib import mosaic_gpu_dialect as dialect  # noqa: F401
 from jax.extend import backend as jex_backend
 from jax.interpreters import mlir
@@ -2072,9 +2071,7 @@ def warp_tree_reduce(value, op, group_size):
   return result
 
 
-_MEMORY_SPACES = counted_registry.CountedDict(
-    {f"#gpu.address_space<{str(x)}>": x for x in gpu.AddressSpace},
-    name="mosaic_gpu.utils._MEMORY_SPACES")
+_MEMORY_SPACES = {f"#gpu.address_space<{str(x)}>": x for x in gpu.AddressSpace}
 
 
 def get_memref_llvm_address_space(memref_ty: ir.MemRefType) -> int | None:

@@ -32,7 +32,6 @@ import warnings
 from jax._src import ad_util
 from jax._src import api_util
 from jax._src import config
-from jax._src import counted_registry
 from jax._src import core
 from jax._src import flattree as ft
 from jax._src import dtypes
@@ -124,7 +123,7 @@ def _is_ir_values(x: IrValues) -> bool:
 
 
 # Non-canonicalized dtype to IR type mapping.
-_dtype_to_ir_type : dict[np.dtype, Callable[[], ir.Type]] = counted_registry.CountedDict({
+_dtype_to_ir_type : dict[np.dtype, Callable[[], ir.Type]] = {
   np.dtype(dtypes.float0): partial(ir.IntegerType.get_signless, 1),
   np.dtype(np.bool_): partial(ir.IntegerType.get_signless, 1),
   np.dtype(dtypes.int4): partial(ir.IntegerType.get_signless, 4),
@@ -156,7 +155,7 @@ _dtype_to_ir_type : dict[np.dtype, Callable[[], ir.Type]] = counted_registry.Cou
   np.dtype(dtypes.float4_e2m1fn): ir.Float4E2M1FNType.get,
   np.dtype(dtypes.float6_e2m3fn): ir.Float6E2M3FNType.get,
   np.dtype(dtypes.float6_e3m2fn): ir.Float6E3M2FNType.get,
-}, name="jax._src.interpreters.mlir._dtype_to_ir_type")
+}
 
 if dtypes.int1 is not None:
   assert dtypes.uint1 is not None

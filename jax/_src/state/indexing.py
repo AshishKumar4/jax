@@ -21,7 +21,6 @@ import math
 import operator
 from typing import cast, Any, ClassVar
 
-from jax._src import counted_registry
 from jax._src import core
 from jax._src import pretty_printer as pp
 from jax._src import tree_util
@@ -82,8 +81,7 @@ def _maybe_concretize(x: Any):
 
 # This registry is used to allow hitypes that are being indexed to register
 # type transformation rules.
-indexer_transform_type_registry: set[type] = counted_registry.CountedSet(
-    name="jax._src.state.indexing.indexer_transform_type_registry")
+indexer_transform_type_registry: set[type] = set()
 
 @tree_util.register_pytree_node_class
 @dataclasses.dataclass(slots=True)

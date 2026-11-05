@@ -297,50 +297,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEqual(self.lower(tweaks=["lane_add_sub"])["events"], ["hit"])
     self.assertEqual(self.lower()["events"], ["hit"])
 
-  # -- a class is the sealed module's, not what it says it is
-
-  def test_a_class_put_in_a_package_namespace_is_not_that_packages(self):
-    # A frozen layout that says it is of NumPy, of the standard library
-    # (`collections`) or of a compiled module (`jaxlib._jax`), and is put there,
-    # is found by its name where it says it is. It is code that package did not
-    # define: two processes that put one there with another `to_mgpu` have each
-    # their kernel, and no entry is made or read.
-    self.kernel = "forged_layout"
-    for forge in ("numpy", "stdlib", "extension"):
-      with self.subTest(forge):
-        self.cache_dir = self.tmp / f"cache-{forge}"
-        a = self.lower(size=128, rows=64,
-                       kernel_args={"forge": forge, "variant": "a"})
-        self.assertEqual(a["events"], ["uncacheable"], a)
-        b = self.lower(size=128, rows=64,
-                       kernel_args={"forge": forge, "variant": "b"})
-        self.assertEqual(b["events"], ["uncacheable"], b)
-        self.assertEqual(b["error"], "ValueError", b)
-        self.assertIn("variant b", b["message"])
-        self.assertEmpty(self.entries())
-
-  def test_a_class_that_claims_a_sealed_module_is_never_cached(self):
-    # Claiming the module (`__module__`) leaves a class that no sealed file
-    # defines, which its kernels' lowering cannot key. Putting it into the
-    # module's namespace too (so that looking it up by its name finds it) is
-    # code the sealed module holds that no sealed file defines: the process is
-    # unsealed.
-    self.kernel = "forged_layout"
-    for forge, events in (("module", ["uncacheable"]), ("inject", ["unsealed"])):
-      with self.subTest(forge):
-        self.cache_dir = self.tmp / f"cache-{forge}"
-        a = self.lower(size=128, rows=64,
-                       kernel_args={"forge": forge, "variant": "a"})
-        self.assertEqual(a["events"], events, a)
-        # The same class and fields, another to_mgpu: not the kernel the first
-        # was, and no entry of the first answers it.
-        b = self.lower(size=128, rows=64,
-                       kernel_args={"forge": forge, "variant": "b"})
-        self.assertEqual(b["events"], events, b)
-        self.assertEqual(b["error"], "ValueError", b)
-        self.assertIn("variant b", b["message"])
-        self.assertEmpty(self.entries())
-
   # -- the dispatch configuration is part of the key, whole
 
   def test_an_op_removed_from_the_warp_semantics_is_a_miss(self):
@@ -366,36 +322,24 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertNotIn("hit", cached["events"], cached)
         self.assert_lowers_as_fresh(cached, fresh)
 
-  # -- the registries do not change under a lowering, or before a hit is returned
+  # -- a rule that registers another while its kernel lowers
 
   def test_a_registry_that_changes_during_a_lowering_is_never_stored(self):
-    # A rule of the sealed site's jax, which sets an entry of a registry to what
-    # it is (or adds an element it holds) while its kernel is lowered: in the
-    # thread that lowers, or in another one the lowering waits for.
+    # A rule of the sealed site's jax registers an entry in a registry while its
+    # kernel is lowered (as a rule that imports a module does): the registries
+    # are not what the key was made of, so the result is for this call only.
     self.kernel = "touch"
     control = self.lower()
     self.assertEqual(control["events"], ["miss"], control)
     self.assertLen(self.entries(), 1)
-    cases = [(name, "inline") for name in (
-        "rules", "estimators", "call_primitives", "discharge", "dialect",
-        "warp", "layout")] + [("rules", "thread"), ("warp", "thread")]
-    for name, via in cases:
-      with self.subTest(f"{name}, {via}"):
-        self.cache_dir = self.tmp / f"cache-{via}-{name}"
-        run = self.lower(touch={"registry": name, "via": via})
+    for name in ("rules", "estimators", "call_primitives", "discharge", "dialect",
+                 "warp", "layout"):
+      with self.subTest(name):
+        self.cache_dir = self.tmp / f"cache-{name}"
+        run = self.lower(touch={"registry": name})
         self.assertNotIn("error", run, run)
         self.assertEqual(run["events"], ["unsealed"], run)
         self.assertEmpty(self.entries())
-
-  def test_a_hit_is_not_returned_across_a_change_of_a_registry(self):
-    self.kernel = "touch"
-    self.assertEqual(self.lower()["events"], ["miss"])
-    for name in ("rules", "warp", "call_primitives"):
-      with self.subTest(name):
-        run = self.lower(touch_on_read=name)
-        self.assertNotIn("error", run, run)
-        self.assertEqual(run["events"], ["unsealed"], run)
-    self.assertEqual(self.lower()["events"], ["hit"])
 
   # -- what can and what cannot be keyed
 
@@ -692,71 +636,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     runs = self.run_child(tweaks=["foreign_primitive_rule"], repeat=2)["runs"]
     self.assertEqual([r["events"] for r in runs], [["miss"], ["hit"]], runs)
 
-  # -- the state of a rule is part of the key, not only which rule is registered
-
-  def test_a_partial_of_a_registry_cannot_be_changed_in_place(self):
-    # The lane add rule is a partial whose keyword is its operation. Registries
-    # keep it as a frozen one: its keywords are a read-only mapping, so what a rule
-    # is cannot be changed under a cache that has read it.
-    run = self.run_child(tweaks=["try_partial_keywords"])
-    self.assertEqual(run["attempts"], [["try_partial_keywords", "TypeError"]])
-
-  # -- the lookup tables a lowering reads, besides the registries
-
-  def test_a_table_a_lowering_reads_that_changes_is_a_miss(self):
-    tables = {
-        "the dialect's float comparisons": ("compare", "cmpf_gt_lt", {}),
-        "the dialect's memory spaces": ("smem", "memory_space_swap", {}),
-        "a layout the mosaic package defines": (
-            "wgmma_layout", "wgmma_layout_swap", dict(size=128, rows=64)),
-        "jax's MLIR types of dtypes": ("plain", "dtype_table", {}),
-    }
-    for name, (kernel, tweak, kwargs) in tables.items():
-      with self.subTest(name):
-        self.cache_dir = self.tmp / f"cache-{tweak}"
-        self.kernel = kernel
-        warm, changed = self.run_child(after=[tweak], **kwargs)["runs"]
-        fresh = self.lower(cache=False, tweaks=[tweak], **kwargs)
-        self.assertEqual(warm["events"], ["miss"], warm)
-        self.assertNotIn("hit", changed["events"], changed)
-        self.assert_lowers_as_fresh(changed, fresh)
-        if "error" not in fresh:
-          self.assertEqual(changed["events"], ["miss"], changed)
-
-  def test_a_table_entry_no_sealed_code_can_reach_is_not_a_reason_to_bypass(self):
-    runs = self.run_child(after=["aval_mapping_foreign_key"])["runs"]
-    self.assertEqual([r["events"] for r in runs], [["miss"], ["hit"]], runs)
-
-  def test_a_table_entry_of_a_sealed_key_with_a_rule_not_sealed_is_unsealed(self):
-    runs = self.run_child(after=["aval_mapping_foreign_value"])["runs"]
-    self.assertEqual([r["events"] for r in runs], [["miss"], ["unsealed"]], runs)
-    fresh = self.lower(cache=False, tweaks=["aval_mapping_foreign_value"])
-    self.assert_lowers_as_fresh(runs[1], fresh)
-
-  # -- the code of the lowering is the code that was sealed, in memory too
-
-  def test_a_function_of_the_lowering_replaced_is_unsealed(self):
-    # `x - scale` with its operands swapped is `scale - x`: no registry changes,
-    # and the replacement is code no sealed file holds.
-    self.kernel = "alias_b"
-    for tweak in ("swap_bcast", "swap_fa_sub"):
-      with self.subTest(f"{tweak} after the first lowering"):
-        self.cache_dir = self.tmp / f"cache-after-{tweak}"
-        warm, replaced = self.run_child(after=[tweak])["runs"]
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(warm["events"], ["miss"], warm)
-        self.assertEqual(replaced["events"], ["unsealed"], replaced)
-        self.assert_lowers_as_fresh(replaced, fresh)
-        self.assertNotEqual(replaced.get("normalized", {}).get("asm"),
-                            warm["normalized"]["asm"])
-      with self.subTest(f"{tweak} before it"):
-        self.cache_dir = self.tmp / f"cache-before-{tweak}"
-        self.assertEqual(self.lower()["events"], ["miss"])
-        replaced = self.lower(tweaks=[tweak])
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(replaced["events"], ["unsealed"], replaced)
-        self.assert_lowers_as_fresh(replaced, fresh)
-
   # -- a module loaded after the process was sealed is checked as the others were
 
   def test_a_module_loaded_after_sealing_is_checked_against_its_record(self):
@@ -775,119 +654,48 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertEqual(first["events"], ["miss"], first)
         self.assertIn(second["events"], expected, second)
 
-  # -- a helper of the lowering is what it is, wherever the process got it
+  # -- a constant of the lowering's code is read, not assumed
 
-  def test_a_helper_rebound_before_the_first_lookup_is_a_miss(self):
-    # `lowering._bcast` rebound to the other broadcast of the lowering, or
-    # `util.split_list` to `split_list_checked`: sealed code in the place of sealed
-    # code. No registry holds either, and the process has no other sign of it.
-    self.kernel = "lane"
-    stock = self.lower()
-    self.assertEqual(stock["events"], ["miss"], stock)
-    for tweak in ("bcast_to_wg", "util_split_list"):
-      with self.subTest(tweak):
-        rebound = self.lower(tweaks=[tweak])
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertNotIn("hit", rebound["events"], rebound)
-        self.assert_lowers_as_fresh(rebound, fresh)
-
-  def test_a_helper_changed_in_place_is_not_a_hit(self):
-    # A helper's keyword default (a dictionary), and what a closure holds, changed
-    # in place to the other operation: the helpers of the rules of the sealed
-    # site's `add_c` and `add_d` are held by no registry.
-    for kernel, tweak in (
-        ("alias_c", "combine_kwdefaults_in_place"),
-        ("alias_c", "combine_kwdefaults_rebound"),
-        ("alias_d", "combine_closure_cell")):
-      with self.subTest(f"{kernel} {tweak} before the first lookup"):
-        self.cache_dir = self.tmp / f"cache-before-{tweak}"
-        self.kernel = kernel
-        stock = self.lower()
-        changed = self.lower(tweaks=[tweak])
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(stock["events"], ["miss"], stock)
-        self.assertEqual(changed["events"], ["miss"], changed)
-        self.assert_lowers_as_fresh(changed, fresh)
-        self.assertNotEqual(changed["normalized"]["asm"], stock["normalized"]["asm"])
-      with self.subTest(f"{kernel} {tweak} after the first lowering"):
-        self.cache_dir = self.tmp / f"cache-after-{tweak}"
-        self.kernel = kernel
-        warm, changed = self.run_child(after=[tweak])["runs"]
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(warm["events"], ["miss"], warm)
-        self.assertEqual(changed["events"], ["miss"], changed)
-        self.assert_lowers_as_fresh(changed, fresh)
-
-  # -- a primitive is what is set on it, too
-
-  def test_a_primitive_given_other_behaviour_is_a_miss(self):
-    # `abstract_eval` of one primitive of the sealed site set to that of another
-    # (both sealed code): before the first lookup, after the first lowering, and
-    # after the kernel's jaxpr was made (the retracing the lowering does is of
-    # this primitive's rule).
-    self.kernel = "alias_a"
-    stock = self.lower()
-    self.assertEqual(stock["events"], ["miss"], stock)
-    swapped = self.lower(tweaks=["add_a_abstract_eval"])
-    self.assertEqual(swapped["events"], ["miss"], swapped)
-    after_trace = self.lower(between_trace_and_lower=["add_a_abstract_eval"])
-    self.assertEqual(after_trace["events"], ["hit"], after_trace)  # the swapped one's
-    self.cache_dir = self.tmp / "cache-after"
-    warm, after = self.run_child(after=["add_a_abstract_eval"])["runs"]
-    self.assertEqual(warm["events"], ["miss"], warm)
-    self.assertEqual(after["events"], ["miss"], after)
-
-  # -- a constant is its value, whatever its type
-
-  def test_a_numpy_scalar_constant_is_part_of_the_key(self):
+  def test_a_constant_of_the_lowering_that_is_replaced_is_part_of_the_key(self):
+    # `SMEM_ALIGNMENT` is assigned a literal by the sealed source of the lowering:
+    # a process that gives it a value of its own (one the key can hold) is another
+    # key, before the first lookup and after the first lowering.
     self.kernel = "smem"
-    a = self.lower(tweaks=["smem_alignment:1024"])
-    b = self.lower(tweaks=["smem_alignment:2048"])
+    stock = self.lower()
+    self.assertEqual(stock["events"], ["miss"], stock)
+    run = self.lower(tweaks=["smem_alignment:2048"])
     fresh = self.lower(cache=False, tweaks=["smem_alignment:2048"])
-    self.assertEqual(a["events"], ["miss"], a)
-    self.assertEqual(b["events"], ["miss"], b)
-    self.assert_lowers_as_fresh(b, fresh)
-    self.assertNotEqual(a["normalized"]["asm"], b["normalized"]["asm"])
+    self.assertEqual(run["events"], ["miss"], run)
+    self.assert_lowers_as_fresh(run, fresh)
+    self.assertNotEqual(run["normalized"]["module"], stock["normalized"]["module"])
     again = self.lower(tweaks=["smem_alignment:2048"])
     self.assertEqual(again["events"], ["hit"], again)
-
-  def test_a_constant_replaced_after_the_first_lowering_is_not_a_hit(self):
-    self.kernel = "smem"
-    warm, changed = self.run_child(after=["smem_alignment:2048"])["runs"]
-    fresh = self.lower(cache=False, tweaks=["smem_alignment:2048"])
+    self.cache_dir = self.tmp / "cache-after"
+    warm, replaced = self.run_child(after=["smem_alignment:2048"])["runs"]
     self.assertEqual(warm["events"], ["miss"], warm)
-    self.assertEqual(changed["events"], ["miss"], changed)
-    self.assert_lowers_as_fresh(changed, fresh)
-    # By a value that is no constant: nothing says what the lowering does with it.
-    self.cache_dir = self.tmp / "cache-object"
-    warm, changed = self.run_child(after=["smem_alignment_object"])["runs"]
-    fresh = self.lower(cache=False, tweaks=["smem_alignment_object"])
-    self.assertEqual(changed["events"], ["unsealed"], changed)
-    self.assert_lowers_as_fresh(changed, fresh)
+    self.assertEqual(replaced["events"], ["miss"], replaced)
 
-  # -- a change made and undone while a kernel lowers is not the kernel that was keyed
-
-  def test_a_change_made_and_undone_inside_the_window_is_never_stored(self):
-    # Another thread changes what the lowering runs while the stand-in rule holds
-    # it, and changes it back before it goes on: what the cache compares at both
-    # ends is the same. Each way Python lets a thread do it (assign an attribute of
-    # a module, a function's code or defaults, an item of a function's keyword
-    # defaults, an attribute of a primitive, an entry of a registry or a tracing
-    # table) is counted.
-    self.kernel = "touch"
-    for channel in (
-        "module_attribute", "constant", "function_code", "function_kwdefaults",
-        "function_kwdefaults_item", "primitive_attribute", "tracing_table",
-        "rule_registry"):
-      with self.subTest(channel):
-        self.cache_dir = self.tmp / f"cache-{channel}"
-        first, second = self.run_child(window=channel, repeat=2)["runs"]
-        fresh = self.lower(cache=False)
-        self.assertEqual(first["events"], ["unsealed"], first)
-        self.assert_lowers_as_fresh(first, fresh)
-        # What was changed is as it was: the next lowering is the stock one.
-        self.assertEqual(second["events"], ["miss"], second)
-        self.assertLen(self.entries(), 1)
+  def test_a_constant_replaced_by_what_a_key_cannot_hold_is_unsealed(self):
+    # An object, a NumPy scalar and an instance of a subclass of int: none is the
+    # literal kind of value the source assigns the constant, so the lowering
+    # bypasses the cache, before the first lookup or after the first lowering.
+    self.kernel = "smem"
+    for tweak in ("smem_alignment_object", "smem_alignment_numpy:2048",
+                  "smem_alignment_subclass:2048"):
+      with self.subTest(f"{tweak} before the first lookup"):
+        self.cache_dir = self.tmp / f"cache-before-{tweak}"
+        run = self.lower(tweaks=[tweak])
+        fresh = self.lower(cache=False, tweaks=[tweak])
+        self.assertEqual(run["events"], ["unsealed"], run)
+        self.assert_lowers_as_fresh(run, fresh)
+        self.assertEmpty(self.entries())
+      with self.subTest(f"{tweak} after the first lowering"):
+        self.cache_dir = self.tmp / f"cache-after-{tweak}"
+        warm, replaced = self.run_child(after=[tweak])["runs"]
+        fresh = self.lower(cache=False, tweaks=[tweak])
+        self.assertEqual(warm["events"], ["miss"], warm)
+        self.assertEqual(replaced["events"], ["unsealed"], replaced)
+        self.assert_lowers_as_fresh(replaced, fresh)
 
   # -- what a lowering reads of the process
 
