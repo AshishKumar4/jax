@@ -33,7 +33,6 @@ from jax._src import ad_util
 from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
-from jax._src import counted_registry
 from jax._src import custom_derivatives
 from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import debugging
@@ -226,9 +225,7 @@ class ResourceEstimator(Protocol):
     ...
 
 
-_resource_estimators: dict[jax_core.Primitive, ResourceEstimator] = (
-    counted_registry.CountedDict(
-        name="mosaic_gpu.lowering._resource_estimators"))
+_resource_estimators: dict[jax_core.Primitive, ResourceEstimator] = {}
 
 
 def _register_resource_estimator(primitive: jax_core.Primitive):
@@ -1049,22 +1046,14 @@ def lower_jaxpr_to_module(
   )
 
 
-def _lowering_rules_of(semantics) -> counted_registry.CountedDict:
-  return counted_registry.CountedDict(
-      name=f"mosaic_gpu.lowering.mosaic_lowering_rules[{semantics}]")
-
-
-mosaic_lowering_rules = counted_registry.CountedDict(
-    {
-        # Lowering rules when using Mosaic GPU lane semantics.
-        gpu_core.LANExWG_SEMANTICS: _lowering_rules_of(gpu_core.LANExWG_SEMANTICS),
-        gpu_core.LANExWARP_SEMANTICS: _lowering_rules_of(gpu_core.LANExWARP_SEMANTICS),
-        # Lowering rules when using Mosaic GPU warpgroup semantics.
-        gpu_core.WGxWG_SEMANTICS: _lowering_rules_of(gpu_core.WGxWG_SEMANTICS),
-        gpu_core.WGxWARP_SEMANTICS: _lowering_rules_of(gpu_core.WGxWARP_SEMANTICS),
-    },
-    name="mosaic_gpu.lowering.mosaic_lowering_rules",
-)
+mosaic_lowering_rules = {
+    # Lowering rules when using Mosaic GPU lane semantics.
+    gpu_core.LANExWG_SEMANTICS: {} ,
+    gpu_core.LANExWARP_SEMANTICS: {} ,
+    # Lowering rules when using Mosaic GPU warpgroup semantics.
+    gpu_core.WGxWG_SEMANTICS: {},
+    gpu_core.WGxWARP_SEMANTICS: {},
+}
 
 
 def register_lowering_rule(

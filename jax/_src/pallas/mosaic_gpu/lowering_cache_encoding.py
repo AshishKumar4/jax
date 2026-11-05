@@ -16,7 +16,10 @@
 
 The encoder is strict: anything it cannot encode exactly (a class outside the
 sealed installation, a mutable container, an object it has no encoding for) raises
-``Uncacheable``, and the lowering is made afresh.
+``Uncacheable``, and the lowering is made afresh. A primitive, a class and a
+function are each known by the module that owns it (``lowering_cache_seal``), and
+a primitive by the sealed module attribute that holds it, so that two primitives
+of one name are two.
 """
 
 from __future__ import annotations
@@ -35,7 +38,6 @@ from typing import Any
 
 import jax
 from jax._src import core as jax_core
-from jax._src import counted_registry
 from jax._src import effects as jax_effects
 from jax._src import flattree
 from jax._src import frozen_dict
@@ -286,8 +288,7 @@ class Encoder:
       if not isinstance(wrapped, types.FunctionType):
         raise Uncacheable("a jitted function that wraps no Python function")
       return seq(b"Fj", [self._e(wrapped, depth + 1)])
-    if isinstance(x, (types.FunctionType, functools.partial,
-                      counted_registry.FrozenPartial, types.MethodType,
+    if isinstance(x, (types.FunctionType, functools.partial, types.MethodType,
                       types.BuiltinFunctionType)):
       return self._callable(x, depth)
     if dataclasses.is_dataclass(x):
@@ -461,7 +462,7 @@ class Encoder:
       return b"Fcycle"
     self._callables.append(fn)
     try:
-      if isinstance(fn, (functools.partial, counted_registry.FrozenPartial)):
+      if isinstance(fn, functools.partial):
         return seq(b"Fp", [
             self._e(fn.func, depth + 1), self._e(tuple(fn.args), depth + 1),
             self._mapping(b"M", fn.keywords.items(), depth),
@@ -496,12 +497,7 @@ class Encoder:
           identity,
           seq(b"Fc", cells),
           self._e(fn.__defaults__, depth + 1),
-          # (A counted dictionary is what a function's keyword defaults become
-          # when `lowering_cache_universe` has looked at the function: the same.)
-          self._e(
-              dict(fn.__kwdefaults__)
-              if isinstance(fn.__kwdefaults__, counted_registry.CountedDict)
-              else fn.__kwdefaults__, depth + 1),
+          self._e(fn.__kwdefaults__, depth + 1),
       ])
     finally:
       self._callables.pop()

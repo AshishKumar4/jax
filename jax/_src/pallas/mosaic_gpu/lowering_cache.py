@@ -18,34 +18,38 @@ Lowering a kernel to a Mosaic GPU module takes about half a second, and a
 program lowers the same kernels again in every process and every run. With
 ``jax_pallas_lowering_cache_dir`` set, ``lower_unpipelined_jaxpr_to_module``
 keeps each module it lowers under a key, and reads it back for the same key.
-Unset, it is ``lowering.lower_unpipelined_jaxpr_to_module`` and nothing else.
+Unset, it is ``lowering.lower_unpipelined_jaxpr_to_module`` and nothing else, and
+nothing else of JAX is changed by this cache: it reads JAX, and never writes it.
 
-A cache is only as good as its key, so a lowering is made afresh (and counted as
-such) unless it is shown to be a function of its key. The parts of that proof
-each have a module:
+The contract is the one of JAX's persistent compilation cache:
 
-* ``lowering_cache_seal``: the code that lowers is the installed ``jax``,
-  ``jaxlib`` and CUDA plugin wheels', checked against their ``RECORD`` manifests
-  (also for a module loaded later), and a function, a method or a class is known
-  by its code, not its name;
-* ``lowering_cache_universe``: every function, class (its methods), partial,
-  primitive and constant of the modules the lowering can run (all of the sealed
-  installation the process has loaded) is part of the key, by what it is, so a
-  function rebound to another (a sealed one too), a method or a constant changed
-  is another key;
-* ``lowering_cache_registries``: the registries a lowering dispatches through
-  (the lowering rules, the dialect's, the layout inference's, the small tables
-  they index, and the part of JAX's tracing tables that sealed code reaches) are
-  sealed code and all of the key, by their entries' code and state; all of it
-  must be unchanged when the lowering is done, a change that is made and undone
-  included (they are counted tables: ``jax._src.counted_registry``);
-* ``lowering_cache_encoding``: the kernel's jaxpr (a primitive being the object a
-  sealed module holds under a name, not its name), the rule's arguments, what the
-  lowering reads of the process, every ``jax.config`` value and the JAX, XLA,
-  MOSAIC, NVSHMEM, CUDA and TRITON environment are hashed through an encoder that
-  raises ``Uncacheable`` for anything it cannot encode exactly;
-* ``lowering_cache_store``: the versioned store of the results, each under a
-  checksum of what it holds.
+* *No stale hit in a process that has not changed JAX's internals.* The key is the
+  identity of the installed code (``lowering_cache_seal``: every installed file of
+  ``jax``, ``jaxlib`` and the CUDA plugins, hashed and compared with its wheel's
+  ``RECORD``) and what the lowering is given, each part encoded explicitly and
+  strictly (``lowering_cache_encoding``): the kernel's jaxpr with its params and
+  avals, the rule's arguments, what the lowering reads of the process (the GPU, the
+  shared memory a block may use, the device topology, NVSHMEM), every
+  ``jax.config`` value and the contexts that are not flags, and the JAX, XLA,
+  MOSAIC, NVSHMEM, CUDA and TRITON environment. A primitive, a class and a
+  function are each named by the module that owns it, which the seal fixes.
+* *What can be detected to differ from the installed code makes the lowering
+  bypass the cache, counted as ``unsealed``:* an installed file that is not its
+  wheel's, a missing ``RECORD`` (an editable or source install), a jax module
+  loaded later that no ``RECORD`` lists, a rule registered in, or replaced in, a
+  registry a lowering dispatches through (``lowering_cache_registries``) that is not
+  sealed code, a registry that changes after the key was made, and a constant of
+  the lowering's packages that is gone or holds what the key cannot hold
+  (``lowering_cache_constants``).
+* *A value the encoder cannot encode exactly bypasses the cache, counted as
+  ``uncacheable``:* a class, enum, pytree node or aval no sealed module owns (a
+  user's layout class), a primitive no sealed module holds, a mutable container.
+  So does a lowering that profiles or dumps.
+* *A process that changes JAX's internals is out of contract.* Rebinding a
+  function or a method of JAX, replacing what a class or a module defines,
+  writing into a rule's closure or a partial's keywords, or changing any of that
+  from another thread while a kernel is lowered, is not detected: this cache does
+  not instrument JAX to see it.
 
 A cached lowering carries no source locations, whether it is a miss or a hit, so
 a kernel moved in its file is still the same kernel.
@@ -88,6 +92,7 @@ from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
+from jax._src.pallas.mosaic_gpu import lowering_cache_constants as constants_lib
 from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as encoding
 from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries_lib
 from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing
@@ -221,6 +226,7 @@ def _key(
     inputs: mgpu_lowering_inputs.LoweringInputs,
     code: sealing.Seal,
     dispatch: bytes,
+    constants: bytes,
 ) -> str:
   enc = encoding.Encoder()
   jaxpr_enc = enc.encode(jaxpr)
@@ -229,6 +235,7 @@ def _key(
       "version": b"mosaic-gpu-lowering-cache-key-v1",
       "installation": code.digest or b"",
       "what it dispatches through": dispatch,
+      "constants": constants,
       "jaxpr": jaxpr_enc,
       # The rule's arguments.
       "input avals": enc.encode(tuple(in_shapes)),
@@ -394,7 +401,7 @@ def lower_unpipelined_jaxpr_to_module(
     dispatch = registries_lib.current()
     key = _key(
         ctx, gpu_mesh, jax_mesh, jaxpr, in_shapes, out_shapes, params, inputs,
-        code, dispatch.digest,
+        code, dispatch.digest, constants_lib.digest(),
     )
   except sealing.Unsealed as e:
     _say_once(str(e))
@@ -427,11 +434,6 @@ def lower_unpipelined_jaxpr_to_module(
     if result is None:
       assert store is not None
       store.discard(key)
-    elif not registries_lib.unchanged(dispatch, deep=False):
-      # Something counted changed since the key was made: the entry is the answer
-      # to a configuration this lowering no longer has, so it is not returned.
-      _count("unsealed")
-      return fresh()
     else:
       if config.jax_pallas_lowering_cache_verify.value:
         lowered = lower_neutral()
@@ -455,8 +457,8 @@ def lower_unpipelined_jaxpr_to_module(
   result = lower_neutral()
   seconds = time.perf_counter() - started
   if not registries_lib.unchanged(dispatch):
-    # A registry changed while the kernel was lowered: the result is for this
-    # call, and is not the lowering the key names.
+    # A registry changed while the kernel was lowered (a rule that registers
+    # another): the result is for this call, and is not the lowering the key names.
     _count("unsealed")
     return result
   _count("miss")

@@ -57,8 +57,6 @@ import dataclasses
 import functools
 from typing import Any
 
-from jax._src import counted_registry
-
 
 class Effect:
   """A generic side-effect."""
@@ -112,9 +110,8 @@ class JaxprInputEffect(Effect):
 
 class EffectTypeSet:
 
-  def __init__(self, name: str | None = None):
-    self._effect_types: set[type[Effect]] = (
-        set() if name is None else counted_registry.CountedSet(name=name))
+  def __init__(self):
+    self._effect_types: set[type[Effect]] = set()
 
   def __repr__(self):
     return f"EffectTypeSet({self._effect_types})"
@@ -143,8 +140,7 @@ ordered_effects: EffectTypeSet = EffectTypeSet()
 shardable_ordered_effects: EffectTypeSet = EffectTypeSet()
 
 lowerable_effects: EffectTypeSet = EffectTypeSet()
-control_flow_allowed_effects: EffectTypeSet = EffectTypeSet(
-    "jax._src.effects.control_flow_allowed_effects")
+control_flow_allowed_effects: EffectTypeSet = EffectTypeSet()
 custom_derivatives_allowed_effects: EffectTypeSet = EffectTypeSet()
 remat_allowed_effects: EffectTypeSet = EffectTypeSet()
 

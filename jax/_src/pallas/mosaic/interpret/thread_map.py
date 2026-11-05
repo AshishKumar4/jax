@@ -20,7 +20,6 @@ from jax._src import callback
 import jax.core as jax_core
 import jax.numpy as jnp
 
-import numpy as np
 
 TOP_LEVEL_TOKEN_VALUE = 42
 NESTED_TOKEN_VALUE = 1337

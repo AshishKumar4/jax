@@ -31,7 +31,6 @@ import warnings
 import ml_dtypes
 import numpy as np
 
-from jax._src import counted_registry
 from jax._src import config
 from jax._src import traceback_util
 from jax._src.lib import _jax
@@ -133,7 +132,7 @@ def supports_inf(dtype: DTypeLike) -> bool:
 bfloat16: type[np.generic] = ml_dtypes.bfloat16
 _bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 
-_custom_float_scalar_types = counted_registry.CountedList([
+_custom_float_scalar_types = [
     float4_e2m1fn,
     float6_e2m3fn,
     float6_e3m2fn,
@@ -146,8 +145,8 @@ _custom_float_scalar_types = counted_registry.CountedList([
     float8_e5m2,
     float8_e5m2fnuz,
     bfloat16,
-], name="jax._src.dtypes._custom_float_scalar_types")
-_custom_float_dtypes = counted_registry.CountedList([
+]
+_custom_float_dtypes = [
     _float4_e2m1fn_dtype,
     _float6_e2m3fn_dtype,
     _float6_e3m2fn_dtype,
@@ -160,7 +159,7 @@ _custom_float_dtypes = counted_registry.CountedList([
     _float8_e5m2_dtype,
     _float8_e5m2fnuz_dtype,
     _bfloat16_dtype,
-], name="jax._src.dtypes._custom_float_dtypes")
+]
 _float8_dtypes = [
     _float8_e3m4_dtype,
     _float8_e4m3_dtype,
@@ -272,12 +271,12 @@ def jax_dtype(obj: DTypeLike | None, *, align: bool = False,
     obj = f()
   return np.dtype(obj, align=align, copy=copy)
 
-_DEFAULT_TYPEMAP: dict[type, Callable[[], np.dtype]] = counted_registry.CountedDict({
+_DEFAULT_TYPEMAP: dict[type, Callable[[], np.dtype]] = {
   bool: lambda: np.dtype(bool),
   int: default_int_dtype,
   float: default_float_dtype,
   complex: default_complex_dtype,
-}, name="jax._src.dtypes._DEFAULT_TYPEMAP")
+}
 
 def itemsize_bits(dtype: DTypeLike) -> int:
   """Number of bits per element for the dtype."""
@@ -299,12 +298,12 @@ def itemsize_bits(dtype: DTypeLike) -> int:
 # Trivial vectorspace datatype needed for tangent values of int/bool primals
 float0: np.dtype = np.dtype([('float0', np.void, 0)])
 
-_dtype_to_32bit_dtype: dict[DType, DType] = counted_registry.CountedDict({
+_dtype_to_32bit_dtype: dict[DType, DType] = {
     np.dtype('int64'): np.dtype('int32'),
     np.dtype('uint64'): np.dtype('uint32'),
     np.dtype('float64'): np.dtype('float32'),
     np.dtype('complex128'): np.dtype('complex64'),
-}, name="jax._src.dtypes._dtype_to_32bit_dtype")
+}
 
 # Note: we promote narrow types to float32 here for backward compatibility
 # with earlier approaches. We might consider revisiting this, or perhaps
@@ -406,16 +405,15 @@ canonicalize_value_handlers = _CanonicalizeValueHandlersDict()
 
 
 # The list of all known Python scalar types.
-python_scalar_types: set[type] = counted_registry.CountedSet(
-    {bool, int, float, complex}, name="jax._src.dtypes.python_scalar_types")
+python_scalar_types: set[type] = {bool, int, float, complex}
 
 # Default dtypes corresponding to Python scalars.
-python_scalar_types_to_dtypes: dict[type, DType] = counted_registry.CountedDict({
+python_scalar_types_to_dtypes: dict[type, DType] = {
   bool: np.dtype('bool'),
   int: np.dtype('int64'),
   float: np.dtype('float64'),
   complex: np.dtype('complex128'),
-}, name="jax._src.dtypes.python_scalar_types_to_dtypes")
+}
 
 @export
 def scalar_type_of(x: Any) -> type:
@@ -561,8 +559,7 @@ can_cast = np.can_cast
 JAXType = type | DType
 
 # Enumeration of all valid JAX types in order.
-_weak_types: list[JAXType] = counted_registry.CountedList(
-    [int, float, complex], name="jax._src.dtypes._weak_types")
+_weak_types: list[JAXType] = [int, float, complex]
 _bool_types: list[JAXType] = [np.dtype(bool)]
 _signed_types: list[JAXType]
 _unsigned_types: list[JAXType]
@@ -611,14 +608,14 @@ _complex_types: list[JAXType] = [
 # StringDType to be used in there.
 string_dtype = np.dtypes.StringDType()
 
-_jax_dtype_set = counted_registry.CountedSet({
+_jax_dtype_set = {
     float0,
     string_dtype,
     *_bool_types,
     *_int_types,
     *_float_types,
     *_complex_types,
-}, name="jax._src.dtypes._jax_dtype_set")
+}
 
 _jax.set_valid_dtypes(_jax_dtype_set)
 
@@ -934,8 +931,7 @@ def register_weak_scalar_type(typ: type):
   """Register a scalar type as a weak type."""
   _registered_weak_types.add(typ)
 
-_registered_weak_types: set[JAXType] = counted_registry.CountedSet(
-    name="jax._src.dtypes._registered_weak_types")
+_registered_weak_types: set[JAXType] = set()
 
 
 def is_weakly_typed(x: Any) -> bool:

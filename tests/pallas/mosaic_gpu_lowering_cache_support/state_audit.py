@@ -13,14 +13,15 @@
 # limitations under the License.
 """What do real lowerings read, that a cache has to know of?
 
-A cached lowering is right if everything it reads is in its key, or sealed, or
-cannot change what it makes. This audit runs real lowerings (a simple kernel, a
-kernel of warps, the Hopper matmul, attention, the Blackwell matmul), traces the
-code they execute, and looks at every global that code loads (a module's name for
-a dict, a set, a config, a context, an object): mutable state, which a process
-can change. Each one is *covered* (the cache keys it, or checks it) or *accepted*,
-with the reason, in `ACCEPTED`. One that is neither fails the audit, so a table a
-lowering starts to read cannot go unnoticed.
+A cached lowering is right if everything it reads is in its key, or is what the
+installed code defines (which the seal hashes), or cannot change what it makes.
+This audit runs real lowerings (a simple kernel, a kernel of warps, the Hopper
+matmul, attention, the Blackwell matmul), traces the code they execute, and looks
+at every global that code loads (a module's name for a dict, a set, a config, a
+context, an object): mutable state, which two processes that have not changed JAX
+can still have differently. Each one is *covered* (the cache keys it, or checks
+it) or *accepted*, with the reason, in `ACCEPTED`. One that is neither fails the
+audit, so a table a lowering starts to read cannot go unnoticed.
 
 It audits the paths these lowerings take, and no others.
 """
@@ -42,13 +43,12 @@ import jax
 import jax.numpy as jnp
 from jax._src import config
 from jax._src import core as jax_core
-from jax._src import counted_registry
 from jax._src import effects as jax_effects
 from jax._src import layout as jax_layout
 from jax._src import mesh as mesh_lib
 from jax._src.pallas.mosaic_gpu import lowering
+from jax._src.pallas.mosaic_gpu import lowering_cache_constants as constants
 from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries
-from jax._src.pallas.mosaic_gpu import lowering_cache_universe as universe
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental import pallas as pl
 
@@ -123,8 +123,44 @@ ACCEPTED = {
     "jax._src.numpy.ufuncs.subtract": "a jnp.ufunc: an immutable wrapper of sealed functions",
 }
 
+# Tables that the installed code defines and fills at import, which no process
+# that has not changed JAX has differently: the part of JAX's tracing that a
+# lowering reads when it re-traces a jaxpr, and the dialect's own static tables. A
+# library that registers an entry for its own type or primitive adds one no sealed
+# kernel has (such a primitive makes its kernel uncacheable); replacing an entry of
+# one the sealed code defines is changing JAX's internals, which is out of the
+# cache's contract.
+_DEFINED_BY_THE_INSTALLED_CODE = (
+    "a table the installed code defines at import (a process that has not changed"
+    " JAX's internals has it as it is; see the cache's contract)")
+ACCEPTED.update({name: _DEFINED_BY_THE_INSTALLED_CODE for name in (
+    "jax._src.core.literalable_scalar_types",
+    "jax._src.core.literalable_types",
+    "jax._src.core.pytype_aval_mappings",
+    "jax._src.dtypes._DEFAULT_TYPEMAP",
+    "jax._src.dtypes._custom_float_dtypes",
+    "jax._src.dtypes._custom_float_scalar_types",
+    "jax._src.dtypes._dtype_to_32bit_dtype",
+    "jax._src.dtypes._jax_dtype_set",
+    "jax._src.dtypes._registered_weak_types",
+    "jax._src.dtypes._weak_types",
+    "jax._src.dtypes.python_scalar_types",
+    "jax._src.dtypes.python_scalar_types_to_dtypes",
+    "jax._src.interpreters.mlir._dtype_to_ir_type",
+    "jax._src.interpreters.partial_eval.const_fold_rules",
+    "jax._src.interpreters.partial_eval.custom_staging_rules",
+    "jax._src.interpreters.partial_eval.forwarding_rules",
+    "jax._src.interpreters.pxla.shard_arg_handlers",
+    "jax._src.lax.lax._foldable_types",
+    "jax._src.state.discharge._neutral_memory_spaces",
+    "jax._src.state.indexing.indexer_transform_type_registry",
+    "jax.experimental.mosaic.gpu.dialect_lowering.CMPF_IMPLS",
+    "jax.experimental.mosaic.gpu.utils._MEMORY_SPACES",
+)})
+
 # By what a global is, besides what it is called.
 _MEMOIZATION = "a cache of a function of its arguments (config, which is keyed, included)"
+_LAYOUT = "a frozen layout the installed source defines (the seal's digest)"
 
 
 def _short(value: Any) -> str:
@@ -175,21 +211,13 @@ def _covered(module: str, name: str, value: Any, table_ids: set[int],
              contexts: dict[int, str]) -> str | None:
   """Why the cache covers this global, or None."""
   if id(value) in table_ids:
-    return "a table of the cache's identity"
+    return "a registry of the cache's identity"
   if id(value) in contexts:
     return contexts[id(value)]
-  if isinstance(value, (counted_registry.CountedDict, counted_registry.CountedSet,
-                        counted_registry.CountedList)):
-    return "a counted registry"
   if any(value is holder for holder in config.config._value_holders.values()):
     return "a config flag (jax.config.values)"
-  if universe.in_scope(module):
-    if value is not None and universe._is_constant(value):
-      return "a constant of the universe (the key holds its value)"
-    if isinstance(value, (
-        type, types.FunctionType, functools.partial, counted_registry.FrozenPartial,
-        jax_core.Primitive)):
-      return "a function, class, partial or primitive of the universe (the key holds what it is)"
+  if constants.in_scope(module) and isinstance(value, functools.partial):
+    return "a partial the installed code defines (the seal's digest)"
   return None
 
 
@@ -203,6 +231,9 @@ def _accepted(module: str, name: str, value: Any) -> str | None:
     return "an immutable aval"
   if _short(value) == "builtins.NotImplementedType":
     return "a builtin singleton"
+  if (constants.in_scope(module)
+      and _short(value) == "jax.experimental.mosaic.gpu.fragmented_array.TiledLayout"):
+    return _LAYOUT
   if _is_function_of_the_installation(value):
     return "a function of the installation (extension bytes, or the function a jit wraps)"
   return None
@@ -300,7 +331,9 @@ def run() -> dict[str, Any]:
   finally:
     lowering.lower_unpipelined_jaxpr_to_module = original
 
-  table_ids = {id(t.get()) for t in registries.tables()}
+  # (`mosaic_lowering_rules` holds the per-semantics registries the key holds.)
+  table_ids = {id(t.get()) for t in registries.tables()} | {
+      id(lowering.mosaic_lowering_rules)}
   contexts = _covered_contexts()
   found: dict[tuple[str, str], Any] = {}
   for code, namespace in executed.items():
