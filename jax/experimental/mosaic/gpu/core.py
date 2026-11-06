@@ -55,6 +55,7 @@ from . import dialect_lowering
 from . import launch_context
 from . import layout_inference
 from . import layouts
+from . import lowering_inputs
 from . import profiler
 from . import tcgen05
 from . import utils
@@ -138,6 +139,8 @@ else:
 
 
 def is_nvshmem_available():
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.nvshmem_available
   try:
     nvshmem_bc_path = os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"]
   except KeyError:
@@ -157,6 +160,8 @@ def is_nvshmem_available():
 
 
 def is_single_process_multi_device_topology():
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.single_process_multi_device_topology
   return (jax.device_count() > 1
           and jax.device_count() == jax.local_device_count())
 
@@ -725,6 +730,9 @@ def _is_known_multihost_mesh(
   Returns:
     True if the mesh is a known multihost mesh, False otherwise.
   """
+  inputs = lowering_inputs.current()
+  if inputs is not None and mesh is inputs.mesh:
+    return inputs.known_multihost_mesh
   if mesh is None or mesh.empty or not isinstance(mesh, mesh_lib.Mesh):
     return False
   tasks = {
@@ -761,6 +769,8 @@ def _max_smem_bytes() -> int:
   defaults to, as `utils._infer_arch` reads it). We assume all devices have the
   same amount of shared memory.
   """
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.max_smem_bytes
   device = jax.local_devices()[0]
   target = jax.sharding.get_abstract_mesh().abstract_device
   stated = getattr(target, "compute_capability", None)
@@ -816,8 +826,12 @@ def _launch(
     smem_bytes = profiler_start + profiler_spec.smem_bytes(block=block)
 
   max_smem_bytes = _max_smem_bytes()
-  if _SMEM_SIZE_BOUND is not None:
-    max_smem_bytes = min(max_smem_bytes, _SMEM_SIZE_BOUND)
+  if (inputs := lowering_inputs.current()) is not None:
+    smem_size_bound = inputs.smem_size_bound
+  else:
+    smem_size_bound = _SMEM_SIZE_BOUND
+  if smem_size_bound is not None:
+    max_smem_bytes = min(max_smem_bytes, smem_size_bound)
   if smem_bytes > max_smem_bytes:
     raise ValueError("Mosaic GPU kernel exceeds available shared memory: "
                      f"{smem_bytes=} > {max_smem_bytes=}")
