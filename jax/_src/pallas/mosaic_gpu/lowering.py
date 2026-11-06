@@ -1223,7 +1223,6 @@ def _program_id_lowering_rule(ctx: LoweringRuleContext, axis):
 
 
 @register_lowering_rule(primitives.multiple_of_p, mgpu.LoweringSemantics.Lane)
-@register_lowering_rule(primitives.multiple_of_p, *gpu_core.LANExWARP_SEMANTICS)
 def _multiple_of_lane_lowering_rule(ctx: LoweringRuleContext, val, *, values):
   del ctx, values
   # Under Lane lowering semantics, we currently don't do anything with the
@@ -1234,7 +1233,6 @@ def _multiple_of_lane_lowering_rule(ctx: LoweringRuleContext, val, *, values):
 @register_lowering_rule(
     primitives.multiple_of_p, mgpu.LoweringSemantics.Warpgroup
 )
-@register_lowering_rule(primitives.multiple_of_p, *gpu_core.WGxWARP_SEMANTICS)
 def _multiple_of_wg_lowering_rule(ctx: LoweringRuleContext, val, *, values):
   [aval] = ctx.avals_in
   if aval.shape:
