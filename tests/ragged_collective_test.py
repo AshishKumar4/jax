@@ -25,6 +25,7 @@ from jax.sharding import PartitionSpec as P
 from jax._src import config
 from jax._src import test_util as jtu
 import jax.numpy as jnp
+import numpy as np
 
 from jax._src.shard_map import shard_map
 
@@ -33,10 +34,13 @@ config.parse_flags_with_absl()
 
 class RaggedCollectiveTest(jtu.JaxTestCase):
 
-  def setUp(self):
-    super().setUp()
+  def assertLowersRagged(self, mlir_module):
+    # XLA:CPU emits no ragged-all-to-all: its lowering is a padded all_to_all.
     if jtu.test_device_matches(['cpu']):
-      self.skipTest('ragged-all-to-all is not supported on CPU')
+      self.assertNotIn('custom_call @ragged_all_to_all', mlir_module)
+      self.assertIn('stablehlo.all_to_all', mlir_module)
+    else:
+      self.assertLowersRagged(mlir_module)
 
   @parameterized.named_parameters(
       dict(
@@ -113,7 +117,7 @@ class RaggedCollectiveTest(jtu.JaxTestCase):
     mlir_module = fwd.lower(
         operand, output, input_offsets, send_sizes, output_offsets, recv_sizes
     ).as_text()
-    self.assertIn('stablehlo.custom_call @ragged_all_to_all', mlir_module)
+    self.assertLowersRagged(mlir_module)
     self.assertIn(
         'replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>', mlir_module
     )
@@ -124,6 +128,44 @@ class RaggedCollectiveTest(jtu.JaxTestCase):
     self.assertAllClose(
         c, jnp.array([[1, 3, 0, 0], [2, 2, 4, 0]], dtype=jnp.int32)
     )
+
+  @parameterized.named_parameters(
+      dict(testcase_name='_two', shards=2, seed=0),
+      dict(testcase_name='_four', shards=4, seed=1),
+  )
+  def test_ragged_all_to_all_writes_each_run_where_its_sender_lands_it(
+      self, shards, seed):
+    # Runs of drawn lengths, some empty, over rows with a trailing axis, landed
+    # at drawn offsets in an output that keeps its own values elsewhere.
+    mesh = jtu.create_mesh((shards,), ('x',))
+    rng = np.random.default_rng(seed)
+    rows, width, out_rows = 6, 3, 12
+    sizes = rng.integers(0, rows // shards + 1, size=(shards, shards))
+    input_offsets = np.cumsum(sizes, axis=1) - sizes
+    gaps = rng.integers(0, 2, size=(shards, shards))
+    landed = np.cumsum(sizes + gaps, axis=0) - (sizes + gaps)
+    operand = rng.normal(size=(shards, rows, width)).astype(np.float32)
+    output = rng.normal(size=(shards, out_rows, width)).astype(np.float32)
+    expected = output.copy()
+    for sender in range(shards):
+      for receiver in range(shards):
+        start, size = input_offsets[sender, receiver], sizes[sender, receiver]
+        at = landed[sender, receiver]
+        expected[receiver, at:at + size] = operand[sender, start:start + size]
+
+    @jax.jit
+    @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+    def fwd(operand, output, input_offsets, send_sizes, output_offsets,
+            recv_sizes):
+      return lax.ragged_all_to_all(
+          operand[0], output[0], input_offsets[0], send_sizes[0],
+          output_offsets[0], recv_sizes[0], axis_name='x')[None]
+
+    args = (operand, output, input_offsets.astype(np.int32),
+            sizes.astype(np.int32), landed.astype(np.int32),
+            sizes.T.astype(np.int32))
+    self.assertLowersRagged(fwd.lower(*args).as_text())
+    self.assertArraysEqual(np.asarray(fwd(*args)), expected)
 
   @parameterized.named_parameters(
       dict(
@@ -281,7 +323,7 @@ class RaggedCollectiveTest(jtu.JaxTestCase):
     mlir_module = fwd.lower(
         operand, output, input_offsets, send_sizes, output_offsets,
         recv_sizes).as_text()
-    self.assertIn('stablehlo.custom_call @ragged_all_to_all', mlir_module)
+    self.assertLowersRagged(mlir_module)
     self.assertIn('replica_groups = dense<[[0, 1], [2, 3]]> :'
                   ' tensor<2x2xi64>', mlir_module)
 
@@ -370,7 +412,7 @@ class RaggedCollectiveTest(jtu.JaxTestCase):
     mlir_module = fwd.lower(
         operand, output, input_offsets, send_sizes, output_offsets,
         recv_sizes).as_text()
-    self.assertIn('stablehlo.custom_call @ragged_all_to_all', mlir_module)
+    self.assertLowersRagged(mlir_module)
     self.assertIn('replica_groups = dense<[[0], [1]]> : tensor<2x1xi64>',
                   mlir_module)
 
