@@ -93,7 +93,8 @@ class InterpretThreadMapTest(jtu.JaxTestCase):
     def f(core_index, token, x, unused, y):
       del unused
       jax.experimental.io_callback(
-          seen.append, (), x[0] + y[1] + scale[1] + core_index, ordered=True)
+          seen.append, (), x[0] + y[1] + scale[1] + core_index.astype(jnp.float32),
+          ordered=True)
       return token
 
     x = jax.device_put(jnp.arange(3, dtype=jnp.float32), jax.devices()[0])
