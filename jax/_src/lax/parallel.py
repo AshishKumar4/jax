@@ -1909,12 +1909,74 @@ def _ragged_all_to_all_impl(*args, **kwargs):
   raise RuntimeError("ragged_all_to_all must be used within a mapped context"
                      " like vmap or shard_map.")
 
+def _ragged_all_to_all_cpu_lowering(ctx, *args, axis_name, axis_index_groups):
+  # XLA:CPU emits no ragged-all-to-all. Each peer's run of the operand, padded
+  # to the operand's length, goes in one all_to_all, and the offsets each sender
+  # states for its peers in another; each received run is then written where
+  # the ragged collective lands it, past the output dropped, and the rest of the
+  # output kept: the same result, moving the padded runs. The rule's operands
+  # enter as plain types and trace with no varying-axes check: the collective's
+  # own abstract evaluation has checked them, and the expansion is one program.
+  plain = [aval.update(manual_axis_type=aval.mat.update(varying=frozenset()))
+           for aval in ctx.avals_in]
+  with config._check_vma(False):
+    return mlir.lower_fun(_padded_ragged_all_to_all, multiple_results=False)(
+        ctx.replace(avals_in=plain), *args, axis_name=axis_name,
+        axis_index_groups=axis_index_groups)
+
+def _padded_ragged_all_to_all(
+    operand, output, input_offsets, send_sizes, output_offsets, recv_sizes,
+    *, axis_name, axis_index_groups
+):
+  shards, run = send_sizes.shape[0], operand.shape[0]
+  index = np.dtype(np.int32)
+  grid = (shards, run)
+
+  def per_peer(values):
+    return lax.broadcast_in_dim(
+        lax.convert_element_type(values, index), grid, (0,))
+
+  def exchanged(x):
+    return all_to_all_p.bind(
+        x, split_axis=0, concat_axis=0, axis_name=axis_name,
+        axis_index_groups=axis_index_groups, tiled=True)
+
+  rows = lax.broadcasted_iota(index, grid, 1)
+  taken = lax.min(lax.add(per_peer(input_offsets), rows),
+                  lax.full(grid, max(run - 1, 0), index))
+  runs = slicing.gather(
+      operand, lax.reshape(taken, (shards * run, 1)),
+      slicing.GatherDimensionNumbers(
+          offset_dims=tuple(range(1, operand.ndim)), collapsed_slice_dims=(0,),
+          start_index_map=(0,)),
+      (1, *operand.shape[1:]), mode=slicing.GatherScatterMode.PROMISE_IN_BOUNDS)
+  sent = lax.reshape(lax.lt(rows, per_peer(send_sizes)),
+                     (shards * run, *(1,) * (operand.ndim - 1)))
+  runs = lax.select(
+      lax.broadcast_in_dim(sent, runs.shape, tuple(range(operand.ndim))),
+      runs, lax.full_like(runs, 0))
+  received = exchanged(runs)
+  landed = exchanged(lax.convert_element_type(output_offsets, index))
+  places = lax.select(
+      lax.lt(rows, per_peer(recv_sizes)),
+      lax.add(per_peer(landed), rows),
+      lax.full(grid, output.shape[0], index))
+  return slicing.scatter(
+      output, lax.reshape(places, (shards * run, 1)),
+      lax.convert_element_type(received, output.dtype),
+      slicing.ScatterDimensionNumbers(
+          update_window_dims=tuple(range(1, output.ndim)),
+          inserted_window_dims=(0,), scatter_dims_to_operand_dims=(0,)),
+      mode=slicing.GatherScatterMode.FILL_OR_DROP)
+
 ragged_all_to_all_p = core.Primitive('ragged_all_to_all')
 ragged_all_to_all_p.def_impl(_ragged_all_to_all_impl)
 ragged_all_to_all_p.def_effectful_abstract_eval(_ragged_all_to_all_effectful_abstract_eval)
 ad.primitive_jvps[ragged_all_to_all_p] = _ragged_all_to_all_jvp
 ad.primitive_transposes[ragged_all_to_all_p] = _ragged_all_to_all_transpose
 mlir.register_lowering(ragged_all_to_all_p, _ragged_all_to_all_lowering)
+mlir.register_lowering(ragged_all_to_all_p, _ragged_all_to_all_cpu_lowering,
+                       platform='cpu')
 batching.fancy_primitive_batchers[ragged_all_to_all_p] = _ragged_all_to_all_batched_collective
 
 
