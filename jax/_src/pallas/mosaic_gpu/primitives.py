@@ -43,7 +43,6 @@ from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.lib.mlir.dialects import builtin as builtin_dialect
 from jax._src.lib.mlir.dialects import gpu as gpu_dialect
 from jax._src.lib.mlir.dialects import llvm as llvm_dialect
-from jax._src.lib.mlir.dialects import nvvm
 from jax._src.lib.mlir.dialects import vector as vector_dialect
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import primitives as pallas_primitives
@@ -56,7 +55,6 @@ from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import layouts as mgpu_layouts
-from jax.experimental.mosaic.gpu.fragmented_array import AtomicOrder, AtomicScope
 from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
@@ -3646,84 +3644,6 @@ def commit_smem():
   commit_smem_p.bind()
 
 
-fence_p = jax_core.Primitive("mgpu_fence")
-fence_p.multiple_results = True
-
-
-@fence_p.def_effectful_abstract_eval
-def _fence_abstract_eval(*, scope, order):
-  del scope, order
-  return (), {gpu_core._memory_effect}
-
-
-@lowering.register_lowering_rule(fence_p, mgpu.LoweringSemantics.Lane)
-@lowering.register_lowering_rule(fence_p, mgpu.LoweringSemantics.Warpgroup)
-def _fence_lowering(ctx: lowering.LoweringRuleContext, *, scope, order):
-  del ctx
-  mgpu_utils.inline_ptx(f"fence.{order}.{scope};", has_side_effects=True)
-  return ()
-
-
-def fence(
-    scope: AtomicScope = "gpu",
-    *,
-    order: Literal["sc", "acq_rel", "acquire", "release"] = "acq_rel",
-) -> None:
-  """Orders this thread's memory accesses before and after it, among `scope`'s
-  threads (PTX `fence`).
-
-  With `acq_rel`, writes before it are visible to a thread that observes a
-  later store and fences in turn; `release` and `acquire` are its halves (sm90
-  and later), and `sc` a sequentially consistent fence.
-  """
-  if order not in ("sc", "acq_rel", "acquire", "release"):
-    raise ValueError(f"Unsupported fence order: {order}")
-  if scope not in ("cta", "cluster", "gpu", "sys"):
-    raise ValueError(f"Unsupported fence scope: {scope}")
-  fence_p.bind(scope=scope, order=order)
-
-
-fence_proxy_async_p = jax_core.Primitive("mgpu_fence_proxy_async")
-fence_proxy_async_p.multiple_results = True
-
-
-@fence_proxy_async_p.def_effectful_abstract_eval
-def _fence_proxy_async_abstract_eval(*, space):
-  del space
-  return (), {gpu_core._memory_effect}
-
-
-@lowering.register_lowering_rule(
-    fence_proxy_async_p, mgpu.LoweringSemantics.Lane
-)
-@lowering.register_lowering_rule(
-    fence_proxy_async_p, mgpu.LoweringSemantics.Warpgroup
-)
-def _fence_proxy_async_lowering(ctx: lowering.LoweringRuleContext, *, space):
-  del ctx
-  if space == "shared":
-    nvvm.fence_proxy(
-        nvvm.ProxyKind.async_shared, space=nvvm.SharedSpace.shared_cta
-    )
-  else:
-    # Inline PTX: the plugin's NVVM and jaxlib's Python bindings may differ in
-    # this op's attributes, where the shared form above is Mosaic's own.
-    mgpu_utils.inline_ptx("fence.proxy.async.global;", has_side_effects=True)
-  return ()
-
-
-def fence_proxy_async(space: Literal["global", "shared"] = "global") -> None:
-  """Orders this thread's generic-proxy accesses to `space` before the async
-  proxy's later ones (TMA, WGMMA, tcgen05): a TMA load of global memory this
-  thread wrote with ordinary stores, say. Unlike `commit_smem`, it takes no
-  barrier; a reader in another thread still needs one (or a release and an
-  acquire) after it.
-  """
-  if space not in ("global", "shared"):
-    raise ValueError(f"Unsupported proxy space: {space}")
-  fence_proxy_async_p.bind(space=space)
-
-
 def broadcasted_iota(
     dtype: jax.typing.DTypeLike,
     shape: Sequence[int],
@@ -5566,10 +5486,8 @@ atomic_store_p.multiple_results = True
 
 
 @atomic_store_p.def_effectful_abstract_eval
-def _atomic_store_abstract_eval(
-    *avals_flat, args_tree, atomic_type, optimized, order, scope
-):
-  del atomic_type, optimized, order, scope
+def _atomic_store_abstract_eval(*avals_flat, args_tree, atomic_type, optimized):
+  del atomic_type, optimized
   ref, transforms, val = args_tree.unflatten(avals_flat)
   if transforms is not None:
     ref = pallas_core.TransformedRef(ref, transforms)
@@ -5588,10 +5506,9 @@ def _atomic_store_abstract_eval(
 
 @discharge.register_discharge_rule(atomic_store_p)
 def _atomic_store_discharge_rule(
-    ctx, *args_flat, args_tree, atomic_type: AtomicOpType, optimized: bool,
-    order: str, scope: str | None,
+    ctx, *args_flat, args_tree, atomic_type: AtomicOpType, optimized: bool
 ):
-  del optimized, order, scope
+  del optimized
   ref, transforms, val, mask = args_tree.unflatten(args_flat)
   *prev_transforms, idx = transforms
   ref = discharge.transform_array(ref, prev_transforms)
@@ -5642,8 +5559,6 @@ def _atomic_store(
     *,
     atomic_type: AtomicOpType,
     optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
 ):
   x_ref, transforms = state_primitives.get_ref_and_transforms(
       x_ref_or_view, None, "atomic_store"
@@ -5654,8 +5569,6 @@ def _atomic_store(
       args_tree=args_tree,
       atomic_type=atomic_type,
       optimized=optimized,
-      order=order,
-      scope=scope,
   )
 
 
@@ -5668,8 +5581,6 @@ def _atomic_store_lowering_rule_wg(
     args_tree,
     atomic_type: AtomicOpType,
     optimized: bool,
-    order: AtomicOrder,
-    scope: AtomicScope | None,
 ):
   ref, transforms, value = args_tree.unflatten(args_flat)
   ref_aval, transforms_avals, value_aval = args_tree.unflatten(ctx.avals_in)
@@ -5684,18 +5595,12 @@ def _atomic_store_lowering_rule_wg(
         f"Unsupported transforms for atomic_store: {remaining_transforms}"
     )
 
-  store = mgpu.dialect.vector_store(
+  mgpu.dialect.vector_store(
       value,
       ref,
       optimized=optimized,
       atomic_type=_atomic_op_type_to_int(atomic_type),
   )
-  # The order and scope ride as discardable attributes the dialect's lowering
-  # reads (`dialect_lowering._atomic_ordering`).
-  if order != "relaxed":
-    store.attributes[mgpu.dialect_lowering.ATOMIC_ORDER] = ir.StringAttr.get(order)
-  if scope is not None:
-    store.attributes[mgpu.dialect_lowering.ATOMIC_SCOPE] = ir.StringAttr.get(scope)
   return ()
 
 
@@ -5706,8 +5611,6 @@ def _atomic_store_lowering_rule(
     args_tree,
     atomic_type: AtomicOpType,
     optimized: bool,
-    order: AtomicOrder,
-    scope: AtomicScope | None,
 ):
   ref, transforms, value = args_tree.unflatten(args_flat)
   ref_aval, transforms_avals, value_aval = args_tree.unflatten(ctx.avals_in)
@@ -5736,14 +5639,9 @@ def _atomic_store_lowering_rule(
           optimized=optimized,
           tiling_rank=len(tiling),
           atomic=atomic_type.value,  # pyrefly: ignore[bad-argument-type]
-          atomic_order=order,
-          atomic_scope=scope,
       )
     case ():
-      value.store_untiled(
-          ref, optimized=optimized, atomic=atomic_type.value,  # pyrefly: ignore[bad-argument-type]
-          atomic_order=order, atomic_scope=scope,
-      )
+      value.store_untiled(ref, optimized=optimized, atomic=atomic_type.value)  # pyrefly: ignore[bad-argument-type]
     case _:
       raise NotImplementedError(
           f"Unsupported transforms for atomic_store: {remaining_transforms}"
@@ -5751,14 +5649,7 @@ def _atomic_store_lowering_rule(
   return ()
 
 
-def atomic_add(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_add(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-add of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level
@@ -5770,24 +5661,11 @@ def atomic_add(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.ADD, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.ADD, optimized=optimized)
 
 
-def atomic_max(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_max(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-max of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level.
@@ -5797,24 +5675,11 @@ def atomic_max(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.MAX, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.MAX, optimized=optimized)
 
 
-def atomic_min(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_min(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-min of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level.
@@ -5824,24 +5689,11 @@ def atomic_min(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.MIN, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.MIN, optimized=optimized)
 
 
-def atomic_and(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_and(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-and of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level.
@@ -5851,24 +5703,11 @@ def atomic_and(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.AND, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.AND, optimized=optimized)
 
 
-def atomic_or(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_or(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-or of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level.
@@ -5878,24 +5717,11 @@ def atomic_or(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.OR, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.OR, optimized=optimized)
 
 
-def atomic_xor(
-    ref: _Ref,
-    val,
-    *,
-    optimized: bool = True,
-    order: AtomicOrder = "relaxed",
-    scope: AtomicScope | None = None,
-) -> None:
+def atomic_xor(ref: _Ref, val, *, optimized: bool = True) -> None:
   """Performs an atomic store-xor of the value to the reference.
 
   Note that atomicity is only guaranteed on the element-level.
@@ -5905,14 +5731,8 @@ def atomic_xor(
     val: The value to store.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the store is available.
-    order: The store's memory order: `release` makes this thread's earlier
-      writes visible to a thread that observes the store with acquire
-      semantics (`semaphore_wait`, an acquire fence).
-    scope: The threads the store is atomic and ordered against; the memory
-      space's own where None (the CTA's for SMEM, the GPU's for GMEM).
   """
-  _atomic_store(ref, val, atomic_type=AtomicOpType.XOR, optimized=optimized,
-      order=order, scope=scope)
+  _atomic_store(ref, val, atomic_type=AtomicOpType.XOR, optimized=optimized)
 
 
 multimem_store_p = jax_core.Primitive("multimem_store")

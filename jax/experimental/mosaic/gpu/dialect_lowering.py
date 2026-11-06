@@ -504,22 +504,6 @@ def _multimem_load_reduce_op_lowering_rule(
   return [fragmented_array_to_ir(fa_res, op.result.type)]
 
 
-ATOMIC_ORDER = "mosaic_gpu.atomic_order"
-ATOMIC_SCOPE = "mosaic_gpu.atomic_scope"
-"""Discardable attributes of an atomic `vector_store`: its memory order and
-scope (`FragmentedArray.store_untiled`'s `atomic_order`, `atomic_scope`)."""
-
-
-def _atomic_ordering(op: ir.OpView) -> dict[str, str]:
-  """An atomic store's order and scope where its op states them."""
-  names = {ATOMIC_ORDER: "atomic_order", ATOMIC_SCOPE: "atomic_scope"}
-  return {
-      keyword: ir.StringAttr(op.attributes[name]).value
-      for name, keyword in names.items()
-      if name in op.attributes
-  }
-
-
 @_register_lowering(mgpu.VectorStoreOp)
 def _vector_store_op_lowering_rule(
     ctx: LoweringContext, op: mgpu.VectorStoreOp
@@ -529,7 +513,6 @@ def _vector_store_op_lowering_rule(
     atomic: Any = str(mgpu.AtomicOpType(op.atomic_type.value))
   else:
     atomic = None
-  ordering = _atomic_ordering(op)
 
   [to_store_layout] = inference_utils.in_layouts(op)
   fragmented_array = _fragmented_array_from_ir(op.valueToStore, to_store_layout)
@@ -543,9 +526,7 @@ def _vector_store_op_lowering_rule(
 
   if ref_type.memory_space is None:  # GMEM
     ref = utils.MultimemRef(ref) if op.multimem.value else ref
-    fragmented_array.store_untiled(
-        ref, optimized=optimized, atomic=atomic, **ordering
-    )
+    fragmented_array.store_untiled(ref, optimized=optimized, atomic=atomic)
   elif ref_type.memory_space == utils.smem():
     transforms_attr = inference_utils.in_transforms(op)[0]
     swizzle = swizzle_from_transforms_attr(transforms_attr)
@@ -560,11 +541,10 @@ def _vector_store_op_lowering_rule(
           optimized,
           tiling_rank=len(tiling_transform.tiling),
           atomic=atomic,
-          **ordering,
       )
     else:
       fragmented_array.store_untiled(
-          ref, optimized=optimized, swizzle=swizzle, atomic=atomic, **ordering
+          ref, optimized=optimized, swizzle=swizzle, atomic=atomic
       )
   else:
     raise ValueError(f"Unsupported memory space: {ref_type.memory_space}")
