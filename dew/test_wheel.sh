@@ -1,6 +1,6 @@
 #!/bin/bash
-# A package's tests run against its installed wheel, never its source tree: the test paths (and the checkout's
-# root conftest.py and pytest.ini, where it has them) copied out of the checkout into a directory of their own,
+# A package's tests run against its installed wheel, never its source tree: the test paths' directories (and the
+# checkout's root conftest.py and pytest.ini, where it has them) copied out of the checkout into a directory of their own,
 # run there by an interpreter that puts no working directory on its path (-P), after each module the wheel
 # installs is checked to import from the environment. A source-tree run imports the checkout first (python -m
 # pytest puts the working directory ahead of site-packages), so a module the wheel leaves out, or packages
@@ -15,10 +15,18 @@ python="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")" wheel=$(realpath "$2") 
 shift 3
 apart=$(mktemp -d)
 trap 'rm -rf "$apart"' EXIT
+# Each test path's whole directory, so the helpers and support packages beside a test (tests/pallas's
+# mosaic_gpu_lowering_cache_support, a test's own fixtures) come with it; pytest runs the test paths alone.
+copied=" "
 for path in "$@" conftest.py pytest.ini; do
-  if [ -e "$checkout/$path" ]; then
-    mkdir -p "$apart/$(dirname "$path")"
+  [ -e "$checkout/$path" ] || continue
+  directory=$(dirname "$path")
+  mkdir -p "$apart/$directory"
+  if [ "$directory" = . ]; then
     cp -r "$checkout/$path" "$apart/$path"
+  elif [ "${copied#* $directory }" = "$copied" ]; then
+    cp -r "$checkout/$directory/." "$apart/$directory/"
+    copied="$copied$directory "
   fi
 done
 # The wheel's top-level modules, from its RECORD (the dist-info and data directories aside).
