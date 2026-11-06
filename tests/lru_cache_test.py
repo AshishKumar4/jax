@@ -80,6 +80,39 @@ class LRUCacheTest(LRUCacheTestCase):
     with self.assertRaisesRegex(ValueError, r"key cannot be empty"):
       cache.put("", b"a")
 
+  def test_delete(self):
+    cache = LRUCache(self.name, max_size=-1)
+
+    cache.put("a", b"a")
+    cache.put("b", b"b")
+    cache.delete("a")
+    self.assertIsNone(cache.get("a"))
+    self.assertEqual(cache.get("b"), b"b")
+    self.assertCacheKeys(("b",))
+
+    # A key with no entry is not an error, and a put after a delete stores.
+    cache.delete("a")
+    cache.put("a", b"a2")
+    self.assertEqual(cache.get("a"), b"a2")
+
+  def test_delete_removes_the_atime_of_the_entry(self):
+    cache = LRUCache(self.name, max_size=1000)
+
+    cache.put("a", b"a")
+    cache.put("b", b"b")
+    self.assertEqual(cache.get("a"), b"a")
+    self.assertTrue((self.path / f"a{_ATIME_SUFFIX}").exists())
+    cache.delete("a")
+    self.assertIsNone(cache.get("a"))
+    self.assertFalse((self.path / f"a{_ATIME_SUFFIX}").exists())
+    self.assertCacheKeys(("b",))
+
+  def test_delete_empty_key(self):
+    cache = LRUCache(self.name, max_size=-1)
+
+    with self.assertRaisesRegex(ValueError, r"key cannot be empty"):
+      cache.delete("")
+
   def test_eviction(self):
     cache = LRUCache(self.name, max_size=2)
 
