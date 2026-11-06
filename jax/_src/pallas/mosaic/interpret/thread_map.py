@@ -31,7 +31,14 @@ def _run(jaxpr, consts, *args):
 
 
 def _run_jaxpr(jaxpr, consts, *args):
-  traced = jax.jit(_run, static_argnums=(0,)).trace(jaxpr, consts, *args)
+  # Every argument kept, so a role body's compiled signature is its jaxpr's:
+  # with its unused arguments pruned, a Blackwell causal forward's role thread
+  # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
+  # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
+  # Which pass drops the leaf is not established; keeping the arguments avoids
+  # it, at the cost of passing buffers the body does not read.
+  traced = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
+      jaxpr, consts, *args)
   traced.lower().compile()(consts, *args)
   return
 
