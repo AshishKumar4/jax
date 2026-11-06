@@ -686,16 +686,15 @@ def _is_supported_smem_transfer(
 ) -> bool:
   """Whether SMEM with `smem_layout` transfers to or from registers in `reg_layout`.
 
-  The answer depends on its arguments and the target, `arch` (the module's,
-  `utils.get_arch`, which planning the transfer reads again: transposed 8-bit
-  transfers are Blackwell's alone), but deriving it plans the transfer in a
-  throwaway function, about a millisecond a call. Layout inference asks it of
+  The answer depends on its arguments and the target, `arch` (the caller's,
+  `utils.get_arch`: transposed 8-bit transfers are Blackwell's alone), for which
+  the transfer is planned, in a throwaway function of a module of its own that
+  states it, about a millisecond a call. Layout inference asks it of
   the same transfers on every reduction of its search, tens of thousands of times
   for a kernel with a few SMEM refs whose transforms are unknown, so it is
   computed once per transfer and target: one process compiling a layout for two
   targets reads each target's own answer.
   """
-  del arch  # A key alone: planning the transfer reads the module's target.
   tiling_transform = smem_layout.tiling
   swizzle = smem_layout.swizzle
 
@@ -715,7 +714,13 @@ def _is_supported_smem_transfer(
   ref_shape = utils.tile_shape(shape, tiling)
   assert len(layout.strides) == len(ref_shape), (len(layout.strides), len(ref_shape))
   memref_ty = ir.MemRefType.get(ref_shape, int_ty, layout, utils.smem())
-  dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
+  # The plan reads its target from its module (`utils.get_arch`): this one's.
+  i32 = ir.IntegerType.get_signless(32)
+  scratch = ir.Module.create()
+  scratch.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch.major)
+  scratch.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, arch.minor)
+  with ir.InsertionPoint(scratch.body):
+    dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
   dummy_block = dummy_func.add_entry_block()
   try:
     with ir.InsertionPoint(dummy_block):
