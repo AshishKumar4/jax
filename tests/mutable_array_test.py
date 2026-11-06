@@ -492,6 +492,21 @@ class MutableArrayTest(jtu.JaxTestCase):
     jax.grad(f)(1.0)
     self.assertAllClose(x_ref[...], 12, check_dtypes=False)
 
+  def test_custom_jvp_primal_with_internal_refs_discharges_in_jit(self):
+    # A custom_jvp whose primal makes, writes and freezes its own ref, called
+    # inside a jit: the jit's state discharge reaches the custom_jvp_call.
+    @jax.custom_jvp
+    def doubled(x):
+      ref = core.new_ref(x)
+      ref[...] += x
+      return core.freeze(ref)
+    doubled.defjvp(lambda primals, tangents: (doubled(*primals), 2 * tangents[0]))
+
+    x = jnp.arange(3.)
+    self.assertAllClose(jax.jit(doubled)(x), 2 * x)
+    self.assertAllClose(jax.jit(jax.vmap(doubled))(x[None]), 2 * x[None])
+    self.assertAllClose(jax.jvp(jax.jit(doubled), (x,), (x,))[1], 2 * x)
+
   @parameterized.parameters([False, True])
   def test_custom_vjp_grad_stats_plumbing(self, jit):
 
