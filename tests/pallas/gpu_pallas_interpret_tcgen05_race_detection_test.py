@@ -623,6 +623,45 @@ class TCGen05RaceDetectionTest(jtu.JaxTestCase):
       with self.assertRaisesRegex(jax.errors.JaxRuntimeError, 'RACE DETECTED'):
         _kernel().block_until_ready()
 
+  @jtu.parameterized.product(wait=[False, True])
+  def test_overwriting_mma_scales_while_mma_in_flight(self, wait):
+    # A block-scaled MMA reads its scales from TMEM as it reads its operands:
+    # storing to them while the MMA may still be reading them is a race.
+    m = n = 128
+    k, block = 256, 32
+    scales = k // block
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        scratch_types=dict(
+            a_smem=plgpu.SMEM((m, k), jnp.float8_e4m3fn),
+            b_smem=plgpu.SMEM((n, k), jnp.float8_e4m3fn),
+            acc=plgpu.TMEM((m, n), jnp.float32),
+            a_scale=plgpu.TMEM((m, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            b_scale=plgpu.TMEM((n, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            barrier=plgpu.Barrier(orders_tensor_core=True),
+        ),
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(_out_ref, a_smem, b_smem, acc, a_scale, b_scale, barrier):
+      plgpu.tcgen05_mma(acc, a_smem, b_smem.transpose((1, 0)), barrier,
+                        a_scale=a_scale, b_scale=b_scale, accumulate=False)
+      if wait:
+        plgpu.barrier_wait(barrier)
+      plgpu.async_store_tmem(a_scale, jnp.ones((m, scales), jnp.float8_e8m0fnu))
+      plgpu.commit_tmem()
+      if not wait:
+        plgpu.barrier_wait(barrier)
+
+    if wait:
+      _kernel()
+    else:
+      with self.assertRaisesRegex(jax.errors.JaxRuntimeError, 'RACE DETECTED'):
+        _kernel().block_until_ready()
+
   @jtu.parameterized.product(
       wait=[False, True],
   )
