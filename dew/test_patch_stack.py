@@ -89,7 +89,7 @@ def test_the_stacks_tests_are_the_test_files_it_adds_or_changes_over_its_release
 
 def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_code(tmp_path, monkeypatch):
     """A post release ships its own plugin release where origin has one; else the newest earlier post release's of
-    the same JAX release whose commit it differs from only under jax/ and tests/; else none, and its plugins are to
+    the same JAX release whose commit it differs from only under jax/, tests/ and docs/; else none, and its plugins are to
     be built. A dev build's, a later post release's and another release's are never one."""
     origin, clone = tmp_path / "origin.git", tmp_path / "clone"
 
@@ -121,7 +121,8 @@ def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_cod
         run("tag", "-d", tag)
     monkeypatch.chdir(clone)
 
-    commit({"jax/core.py": "post46", "jax/version.py": "post46", "tests/core_test.py": "post46"}, "post46")
+    commit({"jax/core.py": "post46", "jax/version.py": "post46", "tests/core_test.py": "post46",
+            "docs/CHANGELOG.md": "post46"}, "post46")
     assert patch_stack.plugins("0.12.0.1.post46") == "plugin-0.12.0.1.post45"
     commit({"jaxlib/kernel.cc": "post46"}, "a native fix")
     assert patch_stack.plugins("0.12.0.1.post46") == ""

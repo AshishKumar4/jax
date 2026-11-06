@@ -80,9 +80,10 @@ def tests(release: str) -> list[str]:
 def plugins(version: str) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
-    commit HEAD differs from only in jax's Python package and tests (jax/, tests/), so its plugins are built from
-    HEAD's own native code, as a post release of Python fixes alone is (Main, 2026-11-03: post46's two Mosaic GPU
-    fixes); "" where neither is. A dev build's (X.postN.devM) is never one: the index never listed it."""
+    commit HEAD differs from only in jax's Python package, its tests and its docs (jax/, tests/, docs/), so its
+    plugins are built from HEAD's own native code, as a post release of Python fixes alone is (Main, 2026-11-03:
+    post46's two Mosaic GPU fixes; post63's lowering cache, whose Pallas changelog entry is a doc); "" where neither
+    is. A dev build's (X.postN.devM) is never one: the index never listed it."""
     release, _, post = version.rpartition(".post")
     tags = git("ls-remote", "origin", "refs/tags/plugin-*").split()[1::2]
     published = {int(match.group(2)): tag for tag in tags
@@ -92,7 +93,8 @@ def plugins(version: str) -> str:
         if found == int(post):
             return tag.removeprefix("refs/tags/")
         git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
-        if not git("diff", "--name-only", tag, "HEAD", "--", ".", ":(exclude)jax/", ":(exclude)tests/").strip():
+        if not git("diff", "--name-only", tag, "HEAD", "--", ".", ":(exclude)jax/", ":(exclude)tests/",
+                   ":(exclude)docs/").strip():
             return tag.removeprefix("refs/tags/")
     return ""
 
