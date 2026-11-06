@@ -138,6 +138,12 @@ class RaggedCollectiveTest(jtu.JaxTestCase):
       self, shards, seed):
     # Runs of drawn lengths, some empty, over rows with a trailing axis, landed
     # at drawn offsets in an output that keeps its own values elsewhere.
+    device_type = jax.devices()[0].platform
+    if device_type == 'tpu' and jtu.get_tpu_version() < 4:
+      raise unittest.SkipTest(
+          'UNSUPPORTED: HLO opcode `ragged-all-to-all` is not supported by TPU'
+          f' v{jtu.get_tpu_version()}'
+      )
     mesh = jtu.create_mesh((shards,), ('x',))
     rng = np.random.default_rng(seed)
     rows, width, out_rows = 6, 3, 12
