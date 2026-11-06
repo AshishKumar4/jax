@@ -1759,9 +1759,8 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
       pipeline_clock: memory.GpuClockBundle | None,
       tma_thread_id: int,
   ) -> memory.GpuClockBundle | None:
-    # TODO(paulbib): Support scales and sparse metadata.
-    assert self.a_scale_key is None
-    assert self.b_scale_key is None
+    # TODO(paulbib): Support sparse metadata.
+    assert (self.a_scale_key is None) == (self.b_scale_key is None)
     assert self.a_sparse_metadata_key is None
     assert self.collective_axis is None, "collective_axis not supported yet"
 
@@ -1819,6 +1818,24 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
 
     acc_range = self.acc_access
     acc_dtype = shared_memory.buffer_shape_and_dtype(self.acc_key).dtype
+
+    if self.a_scale_key is not None:
+      # A block-scaled MMA: each operand's values times their blocks' scales
+      # (`a_scale` one row of K scales for each of a's M rows, `b_scale` one for
+      # each of b's N columns), multiplied exactly in float32.
+      scale_contents = []
+      for key, transforms in ((self.a_scale_key, self.a_scale_transforms),
+                              (self.b_scale_key, self.b_scale_transforms)):
+        content, _, _ = shared_memory.get_buffer_content(
+            key,
+            shared_memory.access(key, transforms or ()),
+            self.thread,
+            logging_info=logging_info,
+        )
+        assert content is not None
+        scale_contents.append(content)
+      a = _scaled(a, scale_contents[0], contracted_axis=1)
+      b = _scaled(b, scale_contents[1], contracted_axis=0)
 
     if self.accumulate:
       acc, _, _ = shared_memory.get_buffer_content(
@@ -1969,6 +1986,10 @@ class TcGen05Copy(memory.PipelineableAsyncTask):
   tmem_access: interpret_utils.Access
   collective_axis: str | None = None
   source_info: source_info_util.SourceInfo | None = None
+  # Whether the copy is `async_copy_scales_to_tmem`'s: block scales laid out
+  # in SMEM as `tcgen05.scales_layout` tiles them, (MN / 128, K / 4, 32, 16),
+  # land in TMEM as the MMA reads them, one row of K scales per row of MN.
+  scales: bool = False
 
   def forms_pipeline(self, parent: memory.PipelineableAsyncTask) -> bool:
     return False
@@ -2013,6 +2034,8 @@ class TcGen05Copy(memory.PipelineableAsyncTask):
       )
 
     tmem_range = self.tmem_access
+    if self.scales:
+      smem = _untiled_scales(smem)
 
     shared_memory.store_buffer_content(
         self.tmem_key,
@@ -2048,6 +2071,7 @@ def async_copy_smem_to_tmem(
     tmem_transforms: tuple[Any, ...],
     collective_axis: str | None = None,
     source_info: source_info_util.SourceInfo | None = None,
+    scales: bool = False,
 ):
   smem_allocation_key = HostAllocationKey.from_array(
       smem_allocation_key_as_array
@@ -2072,10 +2096,37 @@ def async_copy_smem_to_tmem(
           tmem_access=shared_memory.access(tmem_allocation_key, tmem_transforms),
           collective_axis=collective_axis,
           source_info=source_info,
+          scales=scales,
       ),
       thread,
   )
   return token
+
+
+def _untiled_scales(tiled: np.ndarray) -> np.ndarray:
+  """Block scales laid out as `tcgen05.scales_layout` tiles them in SMEM,
+  `(MN / 128, K / 4, 32, 16)`, as `(MN, K)`: row `i` of MN and column `j` of K
+  at `[i // 128, j // 4, i % 32, (i // 32) % 4 * 4 + j % 4]`."""
+  groups, columns, _, _ = tiled.shape
+  return (
+      tiled.reshape(groups, columns, 32, 4, 4)
+      .transpose(0, 3, 2, 1, 4)
+      .reshape(groups * 128, columns * 4)
+  )
+
+
+def _scaled(
+    operand: np.ndarray, scales: np.ndarray, contracted_axis: int
+) -> np.ndarray:
+  """`operand` in float32 times its block scales `scales` (one row of K scales
+  a row of its other axis, each over `K / scales.shape[1]` of its `K`)."""
+  block = operand.shape[contracted_axis] // scales.shape[1]
+  expanded = np.repeat(scales.astype(np.float32), block, axis=1)
+  if contracted_axis == 0:
+    expanded = expanded[: operand.shape[1]].T
+  else:
+    expanded = expanded[: operand.shape[0]]
+  return operand.astype(np.float32) * expanded
 
 
 @fail_on_exception

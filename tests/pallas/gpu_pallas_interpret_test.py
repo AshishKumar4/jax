@@ -434,6 +434,73 @@ class InterpretTest(jtu.JaxTestCase):
     expected = 2 * np.matmul(np.asarray(a), np.asarray(b), dtype=np.float32)
     self.assertArraysEqual(_kernel(a, b), expected)
 
+  def test_block_scaled_mma_multiplies_each_block_by_its_scales(self):
+    # Each operand's blocks of 32 along K times their E8M0 scales, copied to
+    # TMEM from the tiles `tcgen05.scales_layout` lays them out in.
+    m = n = 128
+    k, block = 256, 32
+    scales = k // block
+
+    def tiled(values):
+      # `values` (MN, K / 32) as `async_copy_scales_to_tmem` reads them.
+      mn, kk = values.shape
+      return (
+          values.reshape(mn // 128, 4, 32, kk // 4, 4)
+          .transpose(0, 3, 2, 1, 4)
+          .reshape(mn // 128, kk // 4, 32, 16)
+      )
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        scratch_types=dict(
+            a_smem=plgpu.SMEM((m, k), jnp.float8_e4m3fn),
+            b_smem=plgpu.SMEM((n, k), jnp.float8_e4m3fn),
+            a_scale_smem=plgpu.SMEM((m // 128, scales // 4, 32, 16),
+                                    jnp.float8_e8m0fnu),
+            b_scale_smem=plgpu.SMEM((n // 128, scales // 4, 32, 16),
+                                    jnp.float8_e8m0fnu),
+            acc=plgpu.TMEM((m, n), jnp.float32),
+            a_scale=plgpu.TMEM((m, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            b_scale=plgpu.TMEM((n, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            barrier=plgpu.Barrier(orders_tensor_core=True),
+        ),
+        interpret=InterpretParams(),
+    )
+    def _kernel(a, b, a_scales, b_scales, out_ref, a_smem, b_smem,
+                a_scale_smem, b_scale_smem, acc, a_scale, b_scale, barrier):
+      a_smem[...] = a[...]
+      b_smem[...] = b[...]
+      a_scale_smem[...] = a_scales[...]
+      b_scale_smem[...] = b_scales[...]
+      plgpu.commit_smem()
+      plgpu.async_copy_scales_to_tmem(a_scale_smem, a_scale)
+      plgpu.async_copy_scales_to_tmem(b_scale_smem, b_scale)
+      plgpu.tcgen05_mma(acc, a_smem, b_smem.transpose((1, 0)),
+                        a_scale=a_scale, b_scale=b_scale, accumulate=False)
+      plgpu.tcgen05_commit_arrive(barrier)
+      plgpu.barrier_wait(barrier)
+      out_ref[...] = plgpu.async_load_tmem(acc)
+
+    a = jax.random.normal(jax.random.key(0), (m, k)).astype(jnp.float8_e4m3fn)
+    b = jax.random.normal(jax.random.key(1), (n, k)).astype(jnp.float8_e4m3fn)
+    a_scales = jax.lax.bitcast_convert_type(
+        jax.random.randint(jax.random.key(2), (m, scales), 122, 132,
+                           dtype=jnp.uint8), jnp.float8_e8m0fnu)
+    b_scales = jax.lax.bitcast_convert_type(
+        jax.random.randint(jax.random.key(3), (n, scales), 122, 132,
+                           dtype=jnp.uint8), jnp.float8_e8m0fnu)
+    result = _kernel(a, b, tiled(a_scales), tiled(b_scales))
+
+    def dequantized(values, scales):
+      return np.asarray(values, np.float32) * np.repeat(
+          np.asarray(scales, np.float32), block, axis=1)
+
+    expected = np.matmul(dequantized(a, a_scales), dequantized(b, b_scales).T)
+    np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-6)
+
   def test_transpose_ref(self):
     @functools.partial(
         plgpu.kernel,

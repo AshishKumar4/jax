@@ -1162,7 +1162,8 @@ class JaxprInterpreter:
       tmem_tree: jax.tree_util.PyTreeDef,
       collective_axis: str | None,
   ):
-    assert eqn.primitive is gpu_primitives.async_copy_smem_to_tmem_p
+    assert eqn.primitive in (gpu_primitives.async_copy_smem_to_tmem_p,
+                             gpu_primitives.async_copy_scales_to_tmem_p)
     smem_transforms, tmem_transforms = jax.tree.unflatten(
         jax.tree_util.treedef_tuple((
             smem_tree,
@@ -1181,6 +1182,9 @@ class JaxprInterpreter:
                 gpu_callbacks.async_copy_smem_to_tmem,
                 source_info=eqn.source_info,
                 collective_axis=collective_axis,
+                scales=(
+                    eqn.primitive is gpu_primitives.async_copy_scales_to_tmem_p
+                ),
             ),
             gpu_callbacks.TOKEN_SHAPE_DTYPE,
             token=token,
@@ -1458,7 +1462,8 @@ class JaxprInterpreter:
           case gpu_primitives.tcgen05_mma_p:
             token, out = self._interpret_tcgen05_mma_p(
                 eqn, token, deferred_invals())
-          case gpu_primitives.async_copy_smem_to_tmem_p:
+          case (gpu_primitives.async_copy_smem_to_tmem_p
+                | gpu_primitives.async_copy_scales_to_tmem_p):
             token, out = self._interpret_async_copy_smem_to_tmem_p(
                 eqn, token, *deferred_invals(), **eqn.params)
           case gpu_primitives.async_load_tmem_p:
