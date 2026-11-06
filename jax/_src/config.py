@@ -2390,6 +2390,29 @@ jax_pallas_poison_buffers = bool_state(
     ),
 )
 
+jax_pallas_lowering_cache_dir = optional_string_state(
+    name='jax_pallas_lowering_cache_dir',
+    default=None,
+    help=(
+        'If set, a directory in which Pallas Mosaic GPU kernels\' lowerings are'
+        ' kept, so a kernel lowered before, by this process or another, is'
+        ' read back instead of lowered again. The cache is used only for'
+        ' lowerings it can prove depend on nothing but its key, and its'
+        ' modules carry no source locations. Unset, nothing is cached.'
+    ),
+)
+
+jax_pallas_lowering_cache_verify = bool_state(
+    name='jax_pallas_lowering_cache_verify',
+    default=False,
+    help=(
+        'If set with jax_pallas_lowering_cache_dir, each lowering the cache'
+        ' returns is also lowered afresh, and a difference raises. A process'
+        ' that used the cache with it set and verified no lowering exits with'
+        ' status 3.'
+    ),
+)
+
 jax_pallas_auto_assign_collective_ids = enum_state(
     name='jax_pallas_auto_assign_collective_ids',
     enum_values=['no', 'yes', 'override'],
