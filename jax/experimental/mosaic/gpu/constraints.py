@@ -682,15 +682,20 @@ def _is_supported_smem_transfer(
     strides: tuple[int, ...],
     bitwidth: int,
     optimized: bool,
+    arch: utils.Arch,
 ) -> bool:
   """Whether SMEM with `smem_layout` transfers to or from registers in `reg_layout`.
 
-  The answer depends on its arguments alone, but deriving it plans the transfer
-  in a throwaway function, about a millisecond a call. Layout inference asks it
-  of the same transfers on every reduction of its search, tens of thousands of
-  times for a kernel with a few SMEM refs whose transforms are unknown, so it is
-  computed once per transfer.
+  The answer depends on its arguments and the target, `arch` (the module's,
+  `utils.get_arch`, which planning the transfer reads again: transposed 8-bit
+  transfers are Blackwell's alone), but deriving it plans the transfer in a
+  throwaway function, about a millisecond a call. Layout inference asks it of
+  the same transfers on every reduction of its search, tens of thousands of times
+  for a kernel with a few SMEM refs whose transforms are unknown, so it is
+  computed once per transfer and target: one process compiling a layout for two
+  targets reads each target's own answer.
   """
+  del arch  # A key alone: planning the transfer reads the module's target.
   tiling_transform = smem_layout.tiling
   swizzle = smem_layout.swizzle
 
@@ -755,7 +760,7 @@ class IsTransferableSmemRegisters(IsTransferable):
   ) -> bool:
     return _is_supported_smem_transfer(
         smem_layout, reg_layout, self.shape, self.strides, self.bitwidth,
-        self.optimized,
+        self.optimized, utils.get_arch(),
     )
 
   def _constant_holds(self) -> bool:

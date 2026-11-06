@@ -26,6 +26,7 @@ from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import tcgen05
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import numpy as np
 
 config.parse_flags_with_absl()
@@ -602,6 +603,37 @@ class ConstraintSystemTest(parameterized.TestCase):
     )
     self.assertEqual(reg_to_smem.holds(), holds)
     self.assertEqual(smem_to_reg.holds(), holds)
+
+  @parameterized.parameters(((9, 0), (10, 0)), ((10, 0), (9, 0)), (None, (10, 0)))
+  def test_a_transfer_its_target_decides_is_read_for_each_target_in_one_process(
+      self, first, second
+  ):
+    # Transposed 8-bit transfers are Blackwell's alone: one process asking for
+    # one target, then the other, reads each target's own answer, in either
+    # order, though the check is computed once per transfer and target.
+    cs._is_supported_smem_transfer.cache_clear()
+    smem_layout = cs.SMEMTransforms(lc.TileTransform((64, 64)), None)
+    reg_layout = cs.RegisterLayout(fa.WGMMA_LAYOUT_8BIT)
+
+    def holds(arch):
+      constraint = cs.IsTransferableSmemRegisters(
+          smem_layout, reg_layout, (128, 128), (1, 128), bitwidth=8,
+          optimized=False,
+      )
+      if arch is None:
+        # No module: the target is the device's (`utils.get_arch`).
+        return constraint.holds()
+      module = ir.Module.create()
+      i32 = ir.IntegerType.get_signless(32)
+      module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch[0])
+      module.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, arch[1])
+      with ir.InsertionPoint(module.body):
+        return constraint.holds()
+
+    blackwell = lambda arch: (arch or (mgpu_utils.get_arch().major,))[0] >= 10
+    self.assertEqual(
+        [holds(first), holds(second)], [blackwell(first), blackwell(second)]
+    )
 
   def test_untiled_swizzled_smem_is_not_transferable_for_strided_layout(self):
     reg_layout = cs.RegisterLayout(mgpu.WGStridedFragLayout((128, 128), vec_size=4))
