@@ -29,6 +29,7 @@ from jax._src import sharding_impls
 from jax._src.interpreters import mlir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
+from jax._src.pallas.mosaic_gpu import lowering_cache
 from jax.experimental.mosaic import gpu as mgpu
 import jax.numpy as jnp
 import numpy as np
@@ -176,7 +177,8 @@ def mpmd_map_mgpu_lowering_rule(
   # here we bind them straight from the mesh.
   from jax._src.pallas import mpmd  # pyrefly: ignore[import-cycle]
   with mpmd.mpmd_map_tracing_context(mesh, (*meshes, *external_meshes)):
-    lowering_result = lowering.lower_unpipelined_jaxpr_to_module(
+    lowering_result = lowering_cache.lower_unpipelined_jaxpr_to_module(
+        ctx,
         mesh,
         jax_mesh,
         jaxpr,
