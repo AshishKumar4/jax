@@ -115,6 +115,20 @@ class OwnLayout(gpu_core.SomeLayout):
     return plgpu.Layout.WGMMA.to_mgpu()
 
 
+def installed_layout(size, power, params, scale):
+  """A kernel with a param of a class a user's installed package defines."""
+  del power, params
+  import user_layouts  # pylint: disable=g-import-not-at-top
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((64, size), jnp.float32),
+      num_threads=1, thread_name="wg")
+  def kernel(x_ref, o_ref):
+    o_ref[...] = plgpu.layout_cast(x_ref[...], user_layouts.InstalledLayout()) * scale
+
+  return kernel
+
+
 def own_layout(size, power, params, scale):
   """A kernel with a param of a class no sealed file defines."""
   del power, params

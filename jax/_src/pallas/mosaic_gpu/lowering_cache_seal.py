@@ -73,11 +73,18 @@ class Origin(enum.Enum):
   EXTENSION = "extension"
   # The interpreter's and its standard library: the Python version is in every key.
   STANDARD = "standard"
-  # A file of another installed distribution (NumPy, ml_dtypes, ...): its version
-  # is in the key.
+  # A file of a distribution JAX itself requires (`DEPENDENCIES`): its version is
+  # in the key. Another installed package's code is a user's (UNKNOWN): the key
+  # names a class of it by its name and fields alone, not by what its methods
+  # read, which the lowering may call.
   THIRD_PARTY = "third party"
   # Anything else: a file of the user's, a module made at run time.
   UNKNOWN = "unknown"
+
+
+DEPENDENCIES = frozenset({"numpy", "ml-dtypes"})
+"""The installed distributions, by normalized name, whose classes and functions a
+key may name by their module and version: those JAX's lowering takes values of."""
 
 
 class Unsealed(Exception):
@@ -173,7 +180,7 @@ class Seal:
     if top in sys.stdlib_module_names and _in_standard_library(file):
       return Origin.STANDARD, None
     dist = _distribution_of(top, file)
-    if dist is not None:
+    if dist is not None and _normalize_distribution(dist[0]) in DEPENDENCIES:
       return Origin.THIRD_PARTY, dist
     return Origin.UNKNOWN, None
 
@@ -273,9 +280,10 @@ class Seal:
     """The identity of a function, by the file it is defined in.
 
     A function of a file of the sealed installation is its code
-    (`code_identity`). One of the standard library or of an installed package is
-    named by the module that owns it (the package's version is part of every
-    key). Any other (a function a user wrote, code made at run time) has none.
+    (`code_identity`). One of the standard library or of a distribution JAX
+    requires (`DEPENDENCIES`) is named by the module that owns it (the
+    distribution's version is part of every key). Any other (a function a user
+    wrote, installed or not, code made at run time) has none.
     """
     code = fn.__code__
     if self.holds(code.co_filename):
@@ -285,13 +293,14 @@ class Seal:
         module.partition(".")[0] in sys.stdlib_module_names):
       return _framed(b"standard", module.encode(), fn.__qualname__.encode())
     dist = _distribution_of(module.partition(".")[0], code.co_filename)
-    if dist is not None:
+    if dist is not None and _normalize_distribution(dist[0]) in DEPENDENCIES:
       return _framed(
           b"installed", dist[0].encode(), dist[1].encode(), module.encode(),
           fn.__qualname__.encode(), str(code.co_firstlineno).encode())
     raise NotSealed(
         f"{code.co_qualname} is defined in {code.co_filename}, which is no file"
-        " of the sealed installation, the standard library or an installed package"
+        " of the sealed installation, the standard library or a distribution JAX"
+        " requires"
     )
 
   # -- classes
@@ -302,10 +311,10 @@ class Seal:
     A class is named by its module and its qualified name, and is the object its
     module holds under that name. Its module must be a file of the sealed
     installation (the class is then the code the seal hashes), a compiled module
-    of it, the standard library or an installed package (NumPy, ml_dtypes, ...,
+    of it, the standard library or a distribution JAX requires (`DEPENDENCIES`,
     whose version is part of every key). A class a user defined (its module is
-    one of theirs), one made inside a function, or one that its module does not
-    hold under its name has no identity.
+    one of theirs, installed or not), one made inside a function, or one that its
+    module does not hold under its name has no identity.
     """
     qualname = cls.__qualname__
     module = sys.modules.get(cls.__module__)
@@ -315,7 +324,8 @@ class Seal:
     if origin is Origin.UNKNOWN:
       raise NotSealed(
           f"the class {cls.__module__}.{qualname} is of a module that is no file of"
-          " the sealed installation, the standard library or an installed package"
+          " the sealed installation, the standard library or a distribution JAX"
+          " requires"
       )
     if origin is not Origin.EXTENSION:
       # (A class of a compiled module may be called what its Python wrapper

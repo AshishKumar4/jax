@@ -79,6 +79,19 @@ def _bits(b):
   return struct.unpack("<d", struct.pack("<Q", b))[0]
 
 
+@dataclasses.dataclass(frozen=True)
+class PjitFunction:
+  """A class of a jitted function's name, wrapping a sealed function, whose own
+  state differs: its name makes it no jitted function."""
+  __wrapped__: object
+  disabled: bool
+
+
+class nb_func:  # pylint: disable=invalid-name
+  """A class of nanobind's function's name and module."""
+  __module__ = "nanobind"
+
+
 def cases():
   o1, o2, o3, o4 = object(), object(), object(), object()
   f32 = np.dtype(np.float32)
@@ -134,7 +147,17 @@ def cases():
       ("primitives of one name that two sealed modules hold", lax.add_p,
        sealed_rules.add_a_p, "different"),
       ("a primitive no sealed module holds", _unsealed_add_p, _unsealed_add_p, "uncacheable"),
+      ("a class named as a jitted function", PjitFunction(lax.add, False),
+       PjitFunction(lax.add, True), "uncacheable"),
+      ("a class named as nanobind's function", nb_func(), nb_func(), "uncacheable"),
+      ("a class of an installed package jax does not require",
+       _installed_layout(), _installed_layout(), "uncacheable"),
   ]
+
+
+def _installed_layout():
+  import user_layouts  # pylint: disable=g-import-not-at-top
+  return user_layouts.InstalledLayout()
 
 
 def run():
