@@ -267,3 +267,41 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     assert run(origin, "rev-parse", "release/0.12.0.1.post41") == run(origin, "rev-parse",
                                                                      "v0.12.0.1-cache-key-pool-fingerprints")
     assert not any(call[:2] == ["run", "watch"] for call in json.loads(calls.read_text())[count:])
+
+
+def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_path, monkeypatch):
+    """`rebase` carries OLD's stack onto jax-vNEW as one commit a family, each family's repairs (`fixup!`) folded
+    into it in order, a family jax-vNEW holds dropped, and one release commit versioned NEW.post1 last, however many
+    post releases OLD's stack grew through (row 3689)."""
+    def run(*args: str) -> str:
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=tmp_path, check=True,
+                              capture_output=True, text=True).stdout
+
+    def commit(files: dict[str, str], message: str) -> None:
+        for name, text in files.items():
+            (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / name).write_text(text)
+        run("add", "-A")
+        run("commit", "-qm", message)
+
+    unset = "_version: str = '0.12.0'\n_release_version: str | None = None\n"
+    run("init", "-q", "-b", "main")
+    commit({"jax/version.py": unset, "jax/a.py": "a\n", "jax/b.py": "b\n"}, "jax 0.12.0")
+    run("tag", "jax-v0.12.0")
+    run("checkout", "-q", "-b", "v0.12.0-cache-key-pool-fingerprints")
+    commit({"jax/a.py": "a fixed\n"}, "[stack] fix-a: a is fixed")
+    commit({"jax/version.py": unset.replace("None = None", 'None = "0.12.0.post1"')}, "Release 0.12.0.post1: fix-a")
+    commit({"jax/b.py": "b fixed\n"}, "[stack] fix-b: b is fixed")
+    commit({"jax/a.py": "a fixed again\n"}, "fixup! [stack] fix-a: a is fixed")
+    commit({"jax/version.py": unset.replace("None = None", 'None = "0.12.0.post2"')}, "Release 0.12.0.post2: fix-b")
+    run("checkout", "-q", "main")
+    commit({"jax/version.py": unset.replace("0.12.0", "0.12.1"), "jax/b.py": "b fixed\n"}, "jax 0.12.1: b fixed")
+    run("tag", "jax-v0.12.1")
+    monkeypatch.chdir(tmp_path)
+    assert patch_stack.rebase("0.12.0", "0.12.1") == 0
+    subjects = run("log", "--format=%s", "jax-v0.12.1..v0.12.1-cache-key-pool-fingerprints").splitlines()
+    assert subjects == ["Release 0.12.1.post1: the stack carried from 0.12.0 onto jax-v0.12.1, a commit a family",
+                        "[stack] fix-a: a is fixed"]
+    assert run("show", "v0.12.1-cache-key-pool-fingerprints:jax/a.py") == "a fixed again\n"
+    assert '_release_version: str | None = "0.12.1.post1"' in run(
+        "show", "v0.12.1-cache-key-pool-fingerprints:jax/version.py")

@@ -12,23 +12,25 @@ release to the next.
 (vX.Y.Z-cache-key-pool-fingerprints) and prints the newest stack's release and the newest release, where
 that release has no stack yet; nothing where it has.
 
-`rebase` takes the commits of vOLD-cache-key-pool-fingerprints past the tag jax-vOLD and applies each, in
-order, onto jax-vNEW as vNEW-cache-key-pool-fingerprints. The stack holds each post release's commits in the order
-they were released, as dew/release.sh grows each release forward from the last: a carried patch family's, a
-repair of one, and the release commit that sets its version:
+`rebase` takes the commits of vOLD-cache-key-pool-fingerprints past the tag jax-vOLD and folds them onto jax-vNEW as
+vNEW-cache-key-pool-fingerprints, a new branch, so nothing moves backwards. The stack holds each post release's
+commits in the order they were released, as dew/release.sh grows each release forward from the last: a carried patch
+family's (`[stack] FAMILY: ...`), a repair of one (`fixup! [stack] FAMILY: ...`), and the release commit that sets its
+version. The new branch holds one commit a family, then one release commit (row 3689):
 
-- a commit whose change jax-vNEW already holds is dropped: an equal patch (`git cherry`), or one whose
-  fix applies as nothing;
-- its fix is applied as a three-way merge, and where it sets the build's version (jax/version.py's
-  `_release_version`), version.py is jax-vNEW's with the commit's lines in place of that line, the
-  version NEW.postN, N counting the version-setting commits kept, so each build sorts after the
-  release it patches and satisfies `jax>=NEW`;
-- OLD in each message, and in version.py's comment, becomes NEW; each keeps its author and dates, and
-  names the commit it was taken from.
+- a commit whose change jax-vNEW already holds is dropped: an equal patch (`git cherry`), or one whose fix applies
+  as nothing; a family whose every commit is dropped leaves the stack;
+- each family's commits are applied in the order they came, each as a three-way merge, and committed as one under
+  its first commit's message, author and date, naming every commit it was taken from; a commit named for no family
+  is a family of its own;
+- the release commit's version.py is jax-vNEW's with the newest release commit's lines in place of its
+  `_release_version` line, the version NEW.post1, so the build sorts after the release it patches and satisfies
+  `jax>=NEW`;
+- OLD in each message, and in version.py's comment, becomes NEW.
 
-It prints one line a commit (`kept`, `dropped` and why) and exits 0 with the branch made; 2 where a commit
-does not apply, after printing its conflict and leaving no branch; 3 where every fix was dropped, so only
-version commits would remain and the fork has nothing left to carry for NEW.
+It prints one line a commit (`kept` into its family, `dropped` and why) and one a family committed, and exits 0 with
+the branch made; 2 where a commit does not apply, after printing its conflict and leaving no branch; 3 where every fix
+was dropped, so only a release commit would remain and the fork has nothing left to carry for NEW.
 
 `tests` prints the test files the stack checked out adds or changes over jax-vRELEASE: each fix's own
 regressions, which the workflow runs, with the API they change, before it pushes or publishes a stack.
@@ -58,6 +60,8 @@ FORK = "https://github.com/AshishKumar4/jax.git"
 TAG = re.compile(r"refs/tags/jax-v(\d+(?:\.\d+){2,3})$")
 STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints$")
 PLUGINS = re.compile(r"refs/tags/plugin-(\d+(?:\.\d+){2,3})\.post(\d+)$")
+FAMILY = re.compile(r"^(?:fixup! )?\[stack\] ([^:]+):")
+"""A stack commit's family, from its subject: a family's patch, or a repair of it (`fixup!`)."""
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -113,51 +117,74 @@ def versioned(old: str, new: str, commit: str, post: int) -> str:
     return pristine.replace("\n_release_version: str | None = None\n", f"\n{lines}\n")
 
 
+def committed(message: str, author: str, date: str, taken: list[str]) -> str:
+    """The index committed under `message`, by `author` at `date`, naming the commits it was `taken` from; its
+    short sha."""
+    with tempfile.TemporaryDirectory() as scratch:
+        written = Path(scratch) / "message"
+        written.write_text(f"{message.rstrip()}\n\n(cherry picked from commit {', '.join(taken)})\n")
+        git("commit", "-q", "--no-verify", "-F", str(written), f"--author={author}", f"--date={date}")
+    return git("rev-parse", "--short=9", "HEAD").strip()
+
+
 def rebase(old: str, new: str) -> int:
     commits = git("rev-list", "--reverse", f"jax-v{old}..{branch(old)}").split()
     held = upstreamed(old, new)
     target = branch(new)
     git("checkout", "-q", "--detach", f"jax-v{new}")
-    posts, fixes = 0, 0
+    # Each family's commits in the order they came, the families in the order each began; the newest release
+    # commit, whose version.py lines the new release keeps.
+    families: dict[str, list[str]] = {}
+    release = None
     for commit in commits:
-        title = git("log", "-1", "--format=%s", commit).strip()
-        if commit in held:
-            print(f"dropped {commit[:9]} (jax-v{new} holds the same patch): {title}")
-            continue
         paths = git("diff", "--name-only", f"{commit}^", commit).split()
-        fix = [path for path in paths if path != str(VERSION)]
-        if fix:
-            # The fix applied as a three-way merge; the version is written apart, each commit's own.
+        if str(VERSION) in paths:
+            release = commit
+            if paths == [str(VERSION)]:
+                continue
+        named = FAMILY.match(git("log", "-1", "--format=%s", commit))
+        families.setdefault(named.group(1) if named else commit, []).append(commit)
+    fixes = 0
+    for family, members in families.items():
+        taken = []
+        for commit in members:
+            title = git("log", "-1", "--format=%s", commit).strip()
+            if commit in held:
+                print(f"dropped {commit[:9]} (jax-v{new} holds the same patch): {title}")
+                continue
+            fix = [path for path in git("diff", "--name-only", f"{commit}^", commit).split() if path != str(VERSION)]
+            # The fix applied as a three-way merge, onto the family's commits before it.
             patch = git("diff", "--binary", f"{commit}^", commit, "--", *fix)
             applied = subprocess.run(["git", "apply", "--3way", "--index"], input=patch, capture_output=True,
-                                     text=True)
+                                     text=True, check=False)
             if applied.returncode != 0:
                 print(f"conflict {commit[:9]}: {title}\n{applied.stderr}{git('diff', check=False)}")
                 git("reset", "-q", "--hard")
                 return 2
-            if not git("diff", "--cached", "--name-only").strip():
-                print(f"dropped {commit[:9]} (applies as nothing on jax-v{new}): {title}")
-                continue
-            fixes += 1
-        message = git("log", "-1", "--format=%B", commit).replace(old, new)
-        if str(VERSION) in paths:
-            posts += 1
-            VERSION.write_text(versioned(old, new, commit, posts))
-            git("add", str(VERSION))
-            message = re.sub(rf"{re.escape(new)}\.post\d+", f"{new}.post{posts}", message)
-        author = git("log", "-1", "--format=%an <%ae>", commit).strip()
-        date = git("log", "-1", "--format=%aD", commit).strip()
-        with tempfile.TemporaryDirectory() as scratch:
-            written = Path(scratch) / "message"
-            written.write_text(f"{message.rstrip()}\n\n(cherry picked from commit {commit})\n")
-            git("commit", "-q", "--no-verify", "-F", str(written), f"--author={author}", f"--date={date}")
-        print(f"kept {commit[:9]} as {git('rev-parse', '--short=9', 'HEAD').strip()}: {title}")
-    if fixes == 0:
-        print(f"jax-v{new} holds every fix: nothing left to carry")
+            print(f"kept {commit[:9]} into {family}: {title}")
+            taken.append(commit)
+        if not git("diff", "--cached", "--name-only").strip():
+            print(f"dropped {family} (applies as nothing on jax-v{new})")
+            continue
+        first = members[0]
+        message = git("log", "-1", "--format=%B", first).replace(old, new)
+        author = git("log", "-1", "--format=%an <%ae>", first).strip()
+        date = git("log", "-1", "--format=%aD", first).strip()
+        print(f"{family} as {committed(message, author, date, taken)}")
+        fixes += 1
+    if fixes == 0 or release is None:
+        print(f"jax-v{new} holds every fix: nothing left to carry" if fixes == 0 else
+              f"{branch(old)} holds no release commit to version {new}'s stack by")
         git("checkout", "-q", "--detach", f"jax-v{new}")
         return 3
+    VERSION.write_text(versioned(old, new, release, 1))
+    git("add", str(VERSION))
+    author = git("log", "-1", "--format=%an <%ae>", release).strip()
+    date = git("log", "-1", "--format=%aD", release).strip()
+    message = f"Release {new}.post1: the stack carried from {old} onto jax-v{new}, a commit a family"
+    print(f"release as {committed(message, author, date, [release])}")
     git("checkout", "-q", "-B", target)
-    print(f"{target} at {git('rev-parse', 'HEAD').strip()}, version {new}.post{posts}")
+    print(f"{target} at {git('rev-parse', 'HEAD').strip()}, version {new}.post1")
     return 0
 
 
