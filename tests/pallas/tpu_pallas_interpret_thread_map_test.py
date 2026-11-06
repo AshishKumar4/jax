@@ -83,6 +83,26 @@ class InterpretThreadMapTest(jtu.JaxTestCase):
       jax.block_until_ready(thread_map(f, 4, jnp.int32(0), x))
     self.assertCountEqual([int(value) for value in seen], [0, 1, 2, 3])
 
+  def test_thread_map_keeps_unused_args_beside_device_inputs(self):
+    # Each thread's body runs with every argument it was traced with, those
+    # it does not read between those it does, beside a captured device
+    # constant: each thread reads its live inputs, whatever the unused ones.
+    seen = []
+    scale = jnp.arange(4, dtype=jnp.float32) * 3
+
+    def f(core_index, token, x, unused, y):
+      del unused
+      jax.experimental.io_callback(
+          seen.append, (), x[0] + y[1] + scale[1] + core_index, ordered=True)
+      return token
+
+    x = jax.device_put(jnp.arange(3, dtype=jnp.float32), jax.devices()[0])
+    unused = jnp.ones((5,), jnp.float32)
+    y = jnp.full((2,), 10.0, jnp.float32)
+    jax.block_until_ready(thread_map(f, 4, jnp.int32(0), x, unused, y))
+    self.assertCountEqual([float(value) for value in seen],
+                          [13.0, 14.0, 15.0, 16.0])
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
