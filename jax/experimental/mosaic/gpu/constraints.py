@@ -674,6 +674,18 @@ class IsTransferableTmemRegisters(IsTransferable):
     return f"IsTransferableTmemRegisters({self.source} ⟶ {self.target})"
 
 
+def _target() -> utils.Arch:
+  """The target a transfer check plans for: the one the module stating it names
+  (`utils.get_arch`), else, with no insertion point or one inside an op no module
+  holds yet (a kernel body layout inference reads before it is placed), the one
+  `utils.get_arch` infers with no module: the compile-only mesh's device, else the
+  attached one."""
+  try:
+    return utils.get_arch()
+  except ValueError:  # No module above the insertion point: detached, or none.
+    return utils.Arch(*utils._infer_arch())
+
+
 @functools.cache
 def _is_supported_smem_transfer(
     smem_layout: SMEMTransforms,
@@ -765,7 +777,7 @@ class IsTransferableSmemRegisters(IsTransferable):
   ) -> bool:
     return _is_supported_smem_transfer(
         smem_layout, reg_layout, self.shape, self.strides, self.bitwidth,
-        self.optimized, utils.get_arch(),
+        self.optimized, _target(),
     )
 
   def _constant_holds(self) -> bool:
