@@ -1014,19 +1014,20 @@ def _pjit_state_discharge_rule(
 @register_discharge_rule(custom_derivatives.custom_jvp_call_p)
 def custom_jvp_call_discharge(ctx: DischargeContext, *args, call_jaxpr,
                               jvp_jaxpr_fun, num_consts, symbolic_zeros):
-  # Discharge happens after all AD is done, so we can discard the AD rules, as
-  # custom_vjp_call's does: a custom_jvp whose primal makes and frees its own refs
-  # (a kernel's in-place outputs) inside a jit discharges with that jit.
-  del jvp_jaxpr_fun, num_consts, symbolic_zeros
-  dis_closed_jaxpr = discharge_state(call_jaxpr, strip_memory_space=ctx.strip_memory_space)
-  dis_jaxpr, dis_consts = dis_closed_jaxpr, dis_closed_jaxpr.consts
-  outs = _eval_jaxpr_ad_error(dis_jaxpr, dis_consts, args)
-  out_vals, ref_vals = split_list(outs, [len(call_jaxpr.out_avals)])
-  ref_vals_ = iter(ref_vals)
-  new_invals = [next(ref_vals_) if isinstance(aval, AbstractRef) else None
-                for aval in ctx.in_avals]
-  assert next(ref_vals_, None) is None
-  return new_invals, out_vals
+  # A custom_jvp whose primal makes and frees refs of its own (a kernel's
+  # in-place outputs) keeps its signature once they discharge: the call is
+  # rebound on the discharged primal with its custom JVP as it was, so a
+  # discharge before AD (`_run_state_jvp`'s) keeps the rule's tangents. A ref
+  # argument would change the signature its JVP takes, so it stays refused.
+  if any(isinstance(aval, AbstractRef) for aval in ctx.in_avals):
+    raise NotImplementedError(
+        "custom_jvp_call discharges the refs its primal makes, not ref arguments")
+  discharged = discharge_state(call_jaxpr, strip_memory_space=ctx.strip_memory_space)
+  params = dict(call_jaxpr=discharged, jvp_jaxpr_fun=jvp_jaxpr_fun,
+                num_consts=num_consts, symbolic_zeros=symbolic_zeros)
+  call = custom_derivatives.custom_jvp_call_p
+  out_vals = call.bind(*args, **call.get_bind_params(params))
+  return [None] * len(args), out_vals
 
 
 @register_discharge_rule(custom_derivatives.custom_vjp_call_p)

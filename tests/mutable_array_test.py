@@ -507,6 +507,19 @@ class MutableArrayTest(jtu.JaxTestCase):
     self.assertAllClose(jax.jit(jax.vmap(doubled))(x[None]), 2 * x[None])
     self.assertAllClose(jax.jvp(jax.jit(doubled), (x,), (x,))[1], 2 * x)
 
+  def test_custom_jvp_taking_a_ref_stays_refused_under_discharge(self):
+    @jax.custom_jvp
+    def read(x_ref):
+      return x_ref[...]
+    read.defjvp(lambda primals, tangents: (read(*primals), tangents[0]))
+
+    def f(x):
+      x_ref = core.new_ref(x)
+      return read(x_ref)
+
+    with self.assertRaisesRegex(NotImplementedError, "not ref arguments"):
+      jax.jit(f)(jnp.arange(3.))
+
   @parameterized.parameters([False, True])
   def test_custom_vjp_grad_stats_plumbing(self, jit):
 
