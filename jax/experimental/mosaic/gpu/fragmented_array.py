@@ -1794,8 +1794,19 @@ class FragmentedArray:
 
   def __neg__(self):
     if isinstance(self.mlir_dtype, ir.FloatType):
+      # A float instruction, as `abs` emits one: LLVM expands `fneg` of a vector
+      # of registers into a sign-bit `xor`, an integer op that ptxas (12.9)
+      # folds through a WGMMA accumulator's value before the MMA, dropping the
+      # MMA and storing -0.0.
+      negf = arith.negf
+      if isinstance(self.mlir_dtype, ir.F32Type):
+        negf = self._lift_fast_instr("neg.f32")
+      elif isinstance(self.mlir_dtype, ir.F16Type):
+        negf = self._lift_fast_packed_instr("neg.f16x2", "neg.f16")
+      elif isinstance(self.mlir_dtype, ir.BF16Type):
+        negf = self._lift_fast_packed_instr("neg.bf16x2", "neg.bf16")
       # -(a + b) = (-a) + (-b)
-      return self._pointwise(arith.negf, distributes_over=("add",))
+      return self._pointwise(negf, distributes_over=("add",))
     elif isinstance(self.mlir_dtype, ir.IntegerType):
       if utils.bitwidth(self.mlir_dtype) == 8:
         if (arch := utils.get_arch()) != utils.RUBIN:
@@ -2194,6 +2205,11 @@ class FragmentedArray:
   def copysign(self, other: FragmentedArray) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError
+    if isinstance(self.mlir_dtype, ir.F32Type):
+      # PTX's float instruction (`__neg__`'s reason): `copysign.f32 d, a, b`
+      # takes a's sign and b's magnitude.
+      signed = self._lift_fast_instr("copysign.f32")
+      return self._pointwise(lambda x, y: signed(y, x), other)
     return self._pointwise(mlir_math.copysign, other)
 
   def exp(self, *, approx: bool = False) -> FragmentedArray:
