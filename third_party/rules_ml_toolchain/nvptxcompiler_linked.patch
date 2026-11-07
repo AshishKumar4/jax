@@ -14,3 +14,15 @@ diff -r a/gpu/cuda/build_templates/cuda_nvcc.BUILD.tpl b/gpu/cuda/build_template
 +    %{comment}),
      visibility = ["//visibility:public"],
  )
+diff -r a/gpu/cuda/BUILD.tpl b/gpu/cuda/BUILD.tpl
+--- a/gpu/cuda/BUILD.tpl	2026-11-07 00:37:14.890773201 -0600
++++ b/gpu/cuda/BUILD.tpl	2026-11-07 00:37:14.900914650 -0600
+@@ -75,7 +75,7 @@
+             "@cuda_cupti//:header_list",
+             "@cuda_nvml//:header_list",
+             "@cuda_nvjitlink//:header_list",
+-           ] + (["@cuda_crt//:header_list"] if _cudart_version and int(_cudart_version)>=13 else []),
++           ] + (["@cuda_crt//:header_list", "@cuda_nvptxcompiler//:header_list"] if _cudart_version and int(_cudart_version)>=13 else []),
+     deps = [":cccl_headers",
+             ":cudart_headers",
+             ":cublas_headers",
