@@ -857,14 +857,17 @@ def emit_python_callback(
 
   # First we apply checks to ensure output shapes and dtypes match the expected
   # ones.
+  callback_x64 = config.enable_x64.value
+
   def _wrapped_callback(*args):
-    out_vals = callback(*args)
-    if len(out_vals) != len(result_avals):
-      raise RuntimeError(
-          "Mismatched number of outputs from callback. "
-          "Expected: {}, Actual: {}".format(len(result_avals), len(out_vals)))
-    # Handle Python literals, and custom arrays, e.g., tf.Tensor.
-    out_vals = tuple(dtypes.canonicalize_value(np.asarray(a)) for a in out_vals)
+    with config.enable_x64(callback_x64):
+      out_vals = callback(*args)
+      if len(out_vals) != len(result_avals):
+        raise RuntimeError(
+            "Mismatched number of outputs from callback. "
+            "Expected: {}, Actual: {}".format(len(result_avals), len(out_vals)))
+      # Handle Python literals, and custom arrays, e.g., tf.Tensor.
+      out_vals = tuple(dtypes.canonicalize_value(np.asarray(a)) for a in out_vals)
     for i, (out_val, out_aval) in enumerate(zip(out_vals, result_avals)):
       if out_val.shape != out_aval.shape:
         raise RuntimeError(

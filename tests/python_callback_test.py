@@ -16,6 +16,7 @@ import collections
 import contextlib
 import functools
 import logging
+import concurrent.futures
 import threading
 import time
 import traceback
@@ -1266,6 +1267,27 @@ class IOCallbackTest(jtu.JaxTestCase):
   def tearDown(self):
     super().tearDown()
     dispatch.runtime_tokens.clear()
+
+  def test_io_callback_keeps_its_lowerings_x64_on_another_thread(self):
+    # A float64 callback compiled under enable_x64 and run where the executing
+    # thread has x64 off returns float64, not a float32 its own dtype check
+    # refuses (Dew ledger 4750).
+    def cb(value):
+      return np.int32(0), np.asarray(value, dtype=np.float64)
+
+    def f(value):
+      return io_callback(
+          cb, (jax.ShapeDtypeStruct((), np.int32),
+               jax.ShapeDtypeStruct((), np.float64)),
+          value, ordered=True)[1]
+
+    with jax.enable_x64(True):
+      operand = jnp.asarray(1.25, dtype=jnp.float64)
+      compiled = jax.jit(f).lower(operand).compile()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+      result = pool.submit(compiled, operand).result()
+    self.assertEqual(np.asarray(result).dtype, np.float64)
+    self.assertEqual(float(result), 1.25)
 
   def test_io_callback_can_mutate_state(self):
     x = 0
