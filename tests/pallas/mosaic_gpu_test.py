@@ -1355,7 +1355,11 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       steps = blocks + lax.axis_index("x") if dynamic else blocks
 
       def step(_, x_smem, carry):
-        return carry + x_smem[...]
+        # Read in the carry's layout: a TMA-filled slot (Hopper's) holds no
+        # layout of its own, as a cp.async-filled one does.
+        return carry + plgpu.load(
+            x_smem, layout=plgpu.Layout.WGMMA, optimized=False
+        )
 
       total = plgpu.emit_pipeline(
           step,
