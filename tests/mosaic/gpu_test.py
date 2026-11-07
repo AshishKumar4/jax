@@ -36,6 +36,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir import passmanager
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import cf
+from jax._src.lib.mlir.dialects import func
 from jax._src.lib.mlir.dialects import gpu
 from jax._src.lib.mlir.dialects import llvm
 from jax._src.lib.mlir.dialects import scf
@@ -259,6 +260,59 @@ class TestCase(parameterized.TestCase):
       yield stdout
       # We need to cudaDeviceSynchronize to make sure printfs are flushed.
       mosaic_gpu_lib._mosaic_gpu_ext._sync_all_devices()
+
+
+class TMEMTransferTest(parameterized.TestCase):
+  """A TMEM load's instructions, as it emits them: no GPU needed."""
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(mlir.make_ir_context())
+    mgpu_dialect.register_dialect(ir.Context.current)
+    self.enter_context(ir.Location.unknown())
+
+  def _transfers(self, tmem_layout, reg_layout, shape, dtype, **load):
+    """The `.xN` count of each `tcgen05.ld` a load of `shape` from TMEM in
+    `tmem_layout` to `reg_layout` emits."""
+    module = ir.Module.create()
+    i32 = ir.IntegerType.get_signless(32)
+    with ir.InsertionPoint(module.body):
+      @func.FuncOp.from_py_func(i32)
+      def _load(address):
+        tmem = tcgen05.TMEMRef(address, shape, utils.dtype_to_ir_type(dtype),
+                               tmem_layout)
+        tmem.load(reg_layout, **load)
+    return [int(n) for n in re.findall(r"tcgen05\.ld\S*\.x(\d+)", str(module))]
+
+  @parameterized.named_parameters(
+      ("default", lambda: (tcgen05.tmem_default_layout(1), tcgen05.LAYOUT,
+                           (128, 128), jnp.float32, 4)),
+      ("native", lambda: (tcgen05.tmem_default_layout(1),
+                          tcgen05.TMEM_NATIVE_LAYOUT, (128, 128), jnp.float32,
+                          1)),
+      ("m64_collective", lambda: (tcgen05.tmem_m64_collective_layout(128),
+                                  tcgen05.fa_m64_collective_layout(128),
+                                  (64, 128), jnp.float32, 4)),
+  )
+  def test_each_transfer_moves_at_most_max_registers(self, case):
+    tmem_layout, reg_layout, shape, dtype, per_transfer = case()
+    grouped = self._transfers(tmem_layout, reg_layout, shape, dtype)
+    narrow = self._transfers(tmem_layout, reg_layout, shape, dtype,
+                             max_registers=2 * per_transfer)
+    self.assertGreater(max(grouped), 2)
+    self.assertLessEqual(max(narrow), 2)
+    self.assertEqual(sum(narrow), sum(grouped))
+
+  def test_a_transfer_count_is_a_power_of_two(self):
+    # 12 registers at 4 a transfer allow 3; tcgen05.ld takes .x1, .x2, .x4, ...
+    counts = self._transfers(tcgen05.tmem_default_layout(1), tcgen05.LAYOUT,
+                             (128, 128), jnp.float32, max_registers=12)
+    self.assertEqual(set(counts), {2})
+
+  def test_a_limit_below_one_transfer_is_refused(self):
+    with self.assertRaisesRegex(ValueError, "max_registers=2"):
+      self._transfers(tcgen05.tmem_default_layout(1), tcgen05.LAYOUT,
+                      (128, 128), jnp.float32, max_registers=2)
 
 
 class Sm90ATestCase(TestCase, jtu.CudaArchSpecificTest):
@@ -1668,6 +1722,31 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
         mgpu.TMEM(x.shape, dtype, layout=tmem_layout),
     )(x)
     np.testing.assert_array_equal(x, y)
+
+  @parameterized.parameters([(jnp.float32, 1), (jnp.float16, 2)])
+  def test_half_lane_load_with_narrow_transfers(self, dtype, packing):
+    # A load whose transfers move at most 4 registers each (x1) reads what
+    # the default grouped load reads.
+    n = 160
+    reg_layout = fa.WGMMA_LAYOUT
+    tmem_layout = tcgen05.tmem_half_lane_layout(n, packing)
+    m = tmem_layout.base_tile_shape[0]
+
+    def kernel(ctx, input, outputs, tmem):
+      del ctx
+      grouped, narrow = outputs
+      tmem.store(fa.FragmentedArray.load_untiled(input, layout=reg_layout, optimized=False))
+      tcgen05.commit_tmem()
+      tmem.load(reg_layout).store_untiled(grouped, optimized=False)
+      tmem.load(reg_layout, max_registers=4).store_untiled(narrow, optimized=False)
+
+    x = self.prng.uniform(-1, 1, (m, n)).astype(dtype)
+    grouped, narrow = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), x, (x, x),
+        mgpu.TMEM(x.shape, dtype, layout=tmem_layout),
+    )(x)
+    np.testing.assert_array_equal(grouped, x)
+    np.testing.assert_array_equal(narrow, grouped)
 
   @parameterized.parameters([
       (jnp.float32, 1),
