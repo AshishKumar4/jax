@@ -5,7 +5,10 @@
 # one a CUDA, as it names no Python. Both are the native packages Dew patches: a patch to Mosaic GPU's compile path
 # reaches a kernel only through the PJRT plugin (post42 built the CUDA plugin alone, and its kernels still compiled
 # through stock PJRT's nvJitLink); jax is this fork's Python and jaxlib stays the stock release the commit posts.
-# Bazel builds them with JAX's hermetic C++,
+# The PJRT plugin links CUDA's PTX compiler library (libnvptxcompiler, XLA's enable_libnvptxcompiler_support), so
+# Mosaic GPU's compile, whose nvJitLink the fork turns off, assembles a kernel's PTX in process, not through ptxas as
+# a subprocess, whole-program as ptxas did, so setmaxnreg is still honoured (row 3569: post45's subprocess cost a
+# cold step of about 10 kernels 0.75 s). Bazel builds them with JAX's hermetic C++,
 # CUDA and Python toolchains (ci_linux_<machine>_cudaN, as JAX's CI builds its own) and reads and writes Dew's remote
 # cache, so a JAX version's cold build is paid once and a patch change rebuilds in minutes.
 #
@@ -63,6 +66,7 @@ for python in $pythons; do
     python3 build/build.py build --wheels="$wheels" --cuda_major_version="$cuda" --python_version="$python" \
       --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
+      --bazel_options=--@xla//xla/stream_executor/cuda:enable_libnvptxcompiler_support=true \
       --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
     [ "$code" = 0 ] || { tail -40 "$out/plugin-cp${python/./}-cuda$cuda.log"; exit "$code"; }
