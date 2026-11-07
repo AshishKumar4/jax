@@ -529,6 +529,14 @@ class CacheKeyTest(jtu.JaxTestCase):
       key4 = cache_key.get(computation, devices, compile_options, backend)
       self.assertEqual(key1, key4)
 
+      # A process's autotune policy keys no other program than its compile.
+      os.environ["XLA_FLAGS"] = (
+          "--xla_gpu_autotune_level=0"
+          " --xla_gpu_require_complete_aot_autotune_results=true"
+      )
+      key_policy = cache_key.get(computation, devices, compile_options, backend)
+      self.assertEqual(key1, key_policy)
+
       # Test flags given on command line
       del os.environ["XLA_FLAGS"]
       sys.argv.append("--xla_gpu_autotune_level=0")
