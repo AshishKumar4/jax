@@ -405,6 +405,9 @@ xla_flags_to_exclude_from_cache_key = [
     "--xla_gpu_cuda_data_dir",
     "--xla_gpu_experimental_autotune_cache_mode",
     "--xla_gpu_per_fusion_autotune_cache_dir",
+    # Whether a compile may autotune where the autotune cache has no pick: a
+    # process's policy, as the cache's mode is, not what it compiles.
+    "--xla_gpu_require_complete_aot_autotune_results",
     "--xla_tpu_compiler_variant",
 ]
 
@@ -454,6 +457,7 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   # here.
   debug_options.xla_gpu_cuda_data_dir = ""
   debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
+  debug_options.xla_gpu_require_complete_aot_autotune_results = False
   # LINT.ThenChange(:xla_flags)
 
   compile_options_copy.env_option_overrides = [

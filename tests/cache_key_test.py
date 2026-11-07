@@ -75,6 +75,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     debug_options.xla_dump_disable_metadata = True
     debug_options.xla_dump_hlo_pipeline_re = "xyzzy"
     debug_options.xla_gpu_experimental_autotune_cache_mode = 2
+    debug_options.xla_gpu_require_complete_aot_autotune_results = True
     hash2 = self.get_hashed_value(
         cache_key._hash_serialized_compile_options, compile_options
     )
@@ -528,6 +529,14 @@ class CacheKeyTest(jtu.JaxTestCase):
       )
       key4 = cache_key.get(computation, devices, compile_options, backend)
       self.assertEqual(key1, key4)
+
+      # A process's autotune policy keys no other program than its compile.
+      os.environ["XLA_FLAGS"] = (
+          "--xla_gpu_autotune_level=0"
+          " --xla_gpu_require_complete_aot_autotune_results=true"
+      )
+      key_policy = cache_key.get(computation, devices, compile_options, backend)
+      self.assertEqual(key1, key_policy)
 
       # Test flags given on command line
       del os.environ["XLA_FLAGS"]
