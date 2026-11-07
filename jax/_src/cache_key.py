@@ -29,6 +29,7 @@ from jax import version as jax_version_module
 from jax._src import config
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
+from jax._src.lib import cuda_versions
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir import passmanager as pm
@@ -473,7 +474,24 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
-  _hash_string(hash_obj, backend.platform_version)
+  _hash_string(hash_obj, _platform_version(backend))
+
+
+def _platform_version(backend) -> str:
+  """The platform version a live client of `backend`'s devices states.
+
+  A compile-only GPU client (over a deserialized topology: a host compiling
+  ahead for its own GPUs) states its devices' kind, which the accelerator
+  config keys already, where a live client states the CUDA runtime its plugin
+  loads ("cuda 13040", cudaRuntimeGetVersion, which a runtime newer than the
+  plugin's build states apart from it); keyed as the live client states it, a
+  compile ahead writes the entries a live run on that host reads.
+  """
+  if not isinstance(backend, _jax.CompileOnlyPyClient) or backend.platform != "gpu":
+    return backend.platform_version
+  if cuda_versions is None:  # a ROCm topology's client
+    return backend.platform_version
+  return f"cuda {cuda_versions.cuda_runtime_get_version()}"
 
 
 def jax_version() -> str:
