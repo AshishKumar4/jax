@@ -2646,11 +2646,14 @@ def _wgmma_accumulator_deref_lowering(
     llvm_dialect.inline_asm(
         void, [], f"wgmma.wait_group.sync.aligned {int(wait_n)};", "", has_side_effects=True,
     )
-  return (
-      acc.value
-      if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane
-      else acc
-  )
+  # The accumulator's registers are WGMMA's in-out operands from its issue on and
+  # hold its result only past the wait, which is an asm with no register operands:
+  # LLVM may schedule a pure use of them (a negation, a cast) above it, reading
+  # them before the MMA lands. An optimization barrier, a side-effecting asm that
+  # redefines the registers, stays after the wait, and every use reads its results.
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    return mgpu.optimization_barrier(acc.value)
+  return mgpu.dialect.optimization_barrier([acc])
 
 
 # This primitive stores a value into a WGMMA accumulator ref. It is the

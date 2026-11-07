@@ -6374,6 +6374,37 @@ class PallasCallSm90ATest(PallasSm90ATest):
         res, jnp.matmul(a, b, precision="high"), rtol=1e-3
     )
 
+  def test_wgmma_accumulator_read_is_ordered_after_the_wait(self):
+    # A pure op on the accumulator's value (a negation) must read the MMA's
+    # result: the wait has no register operands, so without an ordering of the
+    # read's registers after it, LLVM may form the negation before the MMA lands.
+    def kernel(a_ref, b_ref, o_ref):
+      def scope(acc_ref):
+        plgpu.wgmma(acc_ref, a_ref, b_ref)
+        return -acc_ref[...]
+      plgpu.store(
+          o_ref,
+          pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32)),
+          optimized=False,
+      )
+
+    key1, key2 = jax.random.split(jax.random.key(7), 2)
+    a = jax.random.randint(key1, (64, 128), -2, 3).astype(jnp.bfloat16)
+    b = jax.random.randint(key2, (128, 128), -2, 3).astype(jnp.bfloat16)
+
+    transforms = self.default_transforms(dtype=jnp.bfloat16)
+    res = self.pallas_call(
+        kernel,
+        in_specs=[
+            plgpu.BlockSpec(transforms=transforms),
+            plgpu.BlockSpec(transforms=transforms),
+        ],
+        out_shape=jax.ShapeDtypeStruct((64, 128), jnp.float32),
+    )(a, b)
+    np.testing.assert_array_equal(
+        res, -jnp.matmul(a, b, preferred_element_type=jnp.float32)
+    )
+
   @parameterized.parameters(jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2)
   def test_wgmma_registers_8bit(self, input_dtype):
     if jnp.issubdtype(input_dtype, jnp.integer):
