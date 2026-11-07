@@ -1648,6 +1648,31 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     )(x)
     np.testing.assert_array_equal(x, y)
 
+  @parameterized.parameters([(jnp.float32, 1), (jnp.float16, 2)])
+  def test_half_lane_load_with_narrow_transfers(self, dtype, packing):
+    # A load whose transfers move at most 4 registers each (x1) reads what
+    # the default grouped load reads.
+    n = 160
+    reg_layout = fa.WGMMA_LAYOUT
+    tmem_layout = tcgen05.tmem_half_lane_layout(n, packing)
+    m = tmem_layout.base_tile_shape[0]
+
+    def kernel(ctx, input, outputs, tmem):
+      del ctx
+      grouped, narrow = outputs
+      tmem.store(fa.FragmentedArray.load_untiled(input, layout=reg_layout, optimized=False))
+      tcgen05.commit_tmem()
+      tmem.load(reg_layout).store_untiled(grouped, optimized=False)
+      tmem.load(reg_layout, max_registers=4).store_untiled(narrow, optimized=False)
+
+    x = self.prng.uniform(-1, 1, (m, n)).astype(dtype)
+    grouped, narrow = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), x, (x, x),
+        mgpu.TMEM(x.shape, dtype, layout=tmem_layout),
+    )(x)
+    np.testing.assert_array_equal(grouped, x)
+    np.testing.assert_array_equal(narrow, grouped)
+
   @parameterized.parameters([
       (jnp.float32, 1),
       (jnp.float16, 1),
