@@ -1,0 +1,70 @@
+--- a/third_party/xnnpack/workspace.bzl
++++ b/third_party/xnnpack/workspace.bzl
+@@ -21,8 +21,8 @@
+     # LINT.IfChange
+     tf_http_archive(
+         name = "XNNPACK",
+-        sha256 = "cb485a0fe76dec243568ec6ce6c0b75e18909ed7df5459921b46eaada332fe8f",
+-        strip_prefix = "XNNPACK-0a66ebb5817fce48df605451444dcfc27a5e4ee4",
+-        urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/0a66ebb5817fce48df605451444dcfc27a5e4ee4.zip"),
++        sha256 = "58f9075b23a627f39c4e84805f21c76e7ce8f31f75fcb322a0fb80b6bee6b55b",
++        strip_prefix = "XNNPACK-0e7357e2667e96b263f3bbac95223311372acc29",
++        urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/0e7357e2667e96b263f3bbac95223311372acc29.zip"),
+     )
+     # LINT.ThenChange(//tensorflow/lite/tools/cmake/modules/xnnpack.cmake)
+--- a/xla/backends/cpu/tests/ynn_fusion_test.cc
++++ b/xla/backends/cpu/tests/ynn_fusion_test.cc
+@@ -71,6 +71,53 @@
+         hlo_text, ErrorSpec{/*aabs=*/tolerance, /*arel=*/tolerance}));
+   }
+ };
++
++TEST_P(YnnFusionTest, BatchedDotBroadcastPackingAfterReduction) {
++  // A reduction and two products of a scalar broadcast shared one YNN
++  // subgraph. Copy aliasing gives the broadcast zero strides. Matrix packing
++  // must honor both strides, including when a dot produces the left operand.
++  constexpr absl::string_view kModuleStr = R"(
++    HloModule broadcast_packing
++
++    sum {
++      a = $dtype[] parameter(0)
++      b = $dtype[] parameter(1)
++      ROOT out = $dtype[] add(a, b)
++    }
++
++    fused {
++      a = $dtype[2,4,64,64,32] parameter(0)
++      b = $dtype[2,4,64,64,32] parameter(1)
++      q = $dtype[2,4,64,32] parameter(2)
++      w = $dtype[2,4,64,64] parameter(3)
++      u = $dtype[2,4,64,32] parameter(4)
++      zero = $dtype[] constant(0)
++      state = $dtype[2,4,32,32] broadcast(zero), dimensions={}
++      terms = $dtype[2,4,64,64,32] multiply(a, b)
++      scores = $dtype[2,4,64,64] reduce(terms, zero), dimensions={4}, to_apply=sum
++      memory = $dtype[2,4,64,32] dot(q, state), lhs_batch_dims={0,1},
++        rhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_contracting_dims={2}
++      weights = $dtype[2,4,64,32] dot(w, q), lhs_batch_dims={0,1},
++        rhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_contracting_dims={2}
++      correction = $dtype[2,4,64,32] dot(weights, state), lhs_batch_dims={0,1},
++        rhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_contracting_dims={2}
++      values = $dtype[2,4,64,32] subtract(u, correction)
++      local = $dtype[2,4,64,32] dot(scores, values), lhs_batch_dims={0,1},
++        rhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_contracting_dims={2}
++      ROOT out = $dtype[2,4,64,32] add(memory, local)
++    }
++
++    ENTRY entry {
++      a = $dtype[2,4,64,64,32] parameter(0)
++      b = $dtype[2,4,64,64,32] parameter(1)
++      q = $dtype[2,4,64,32] parameter(2)
++      w = $dtype[2,4,64,64] parameter(3)
++      u = $dtype[2,4,64,32] parameter(4)
++      ROOT out = $dtype[2,4,64,32] fusion(a, b, q, w, u), kind=kCustom,
++        calls=fused, backend_config={"fusion_config": {kind: "__ynn_fusion"}}
++    })";
++  RunTest(kModuleStr);
++}
+ 
+ TEST_P(YnnFusionTest, AddAndMultiply) {
+   constexpr absl::string_view kModuleStr = R"(

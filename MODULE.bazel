@@ -51,6 +51,10 @@ archive_override(
         # A small dot with the F16_F16_F32 algorithm, which XLA:GPU supports, is strength-reduced to a multiply its
         # algorithm helper has no case for: "Unsupported dot precision algorithm: 4" (Dew ledger 1691).
         "//third_party:xla/f16_dot_strength_reduction.patch",
+        # XNNPACK's matrix packer at XLA's pin drops a stride, so a zero-stride (broadcast) operand Slinky aliases
+        # is over-read past its scalar: XLA:CPU returns garbage or NaN (Dew ledger 1701). Its fix, XNNPACK
+        # 0e7357e2, is the first pin past it.
+        "//third_party:xla/ynn_broadcast_packing.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
