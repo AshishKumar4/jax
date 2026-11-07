@@ -1,6 +1,8 @@
+diff --git a/xla/backends/gpu/transforms/gemm_fusion.cc b/xla/backends/gpu/transforms/gemm_fusion.cc
+index dc4300a..21b5fd4 100644
 --- a/xla/backends/gpu/transforms/gemm_fusion.cc
 +++ b/xla/backends/gpu/transforms/gemm_fusion.cc
-@@ -738,6 +738,15 @@
+@@ -738,6 +738,15 @@ HloInstruction* CreateBitcastWithShape(Shape shape,
        HloInstruction::CreateBitcast(shape, &new_operand));
  }
  
@@ -16,7 +18,7 @@
  // Holds a module of the search space surrounding a dot instruction in order to
  // create an optimal fusion.
  class FusionSearchSpace {
-@@ -974,7 +983,7 @@
+@@ -974,7 +983,7 @@ absl::StatusOr<HloInstruction*> FusionSearchSpace::HoistBitcast(
        break;
      }
      default: {
@@ -25,7 +27,7 @@
          return instr;
        }
        // bitcast(op(a, b)) -> op(bitcast(a), bitcast(b))
-@@ -1080,7 +1089,7 @@
+@@ -1080,7 +1089,7 @@ absl::StatusOr<HloInstruction*> FusionSearchSpace::SinkBitcast(
        return SinkBitcast(new_bitcast);
      }
      default: {
@@ -34,9 +36,11 @@
          return instr;
        }
        // Sink past elementwise users.
+diff --git a/xla/backends/gpu/transforms/gemm_fusion_test.cc b/xla/backends/gpu/transforms/gemm_fusion_test.cc
+index accf48e..9793900 100644
 --- a/xla/backends/gpu/transforms/gemm_fusion_test.cc
 +++ b/xla/backends/gpu/transforms/gemm_fusion_test.cc
-@@ -184,6 +184,35 @@
+@@ -184,6 +184,35 @@ ENTRY e {
                                     m::Bitcast(m::Parameter()))));
  }
  
