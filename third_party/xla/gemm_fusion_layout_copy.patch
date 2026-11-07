@@ -1,0 +1,74 @@
+--- a/xla/backends/gpu/transforms/gemm_fusion.cc
++++ b/xla/backends/gpu/transforms/gemm_fusion.cc
+@@ -738,6 +738,15 @@
+       HloInstruction::CreateBitcast(shape, &new_operand));
+ }
+ 
++// A logical elementwise copy can permute physical storage. Commuting a
++// bitcast through that copy with one shared layout erases its permutation.
++bool IsStorageOrderPreservingElementwise(const HloInstruction* instruction) {
++  return instruction->IsElementwise() &&
++         (instruction->opcode() != HloOpcode::kCopy ||
++          ShapeUtil::Equal(instruction->shape(),
++                           instruction->operand(0)->shape()));
++}
++
+ // Holds a module of the search space surrounding a dot instruction in order to
+ // create an optimal fusion.
+ class FusionSearchSpace {
+@@ -974,7 +983,7 @@
+       break;
+     }
+     default: {
+-      if (!operand->IsElementwise()) {
++      if (!IsStorageOrderPreservingElementwise(operand)) {
+         return instr;
+       }
+       // bitcast(op(a, b)) -> op(bitcast(a), bitcast(b))
+@@ -1080,7 +1089,7 @@
+       return SinkBitcast(new_bitcast);
+     }
+     default: {
+-      if (!user->IsElementwise()) {
++      if (!IsStorageOrderPreservingElementwise(user)) {
+         return instr;
+       }
+       // Sink past elementwise users.
+--- a/xla/backends/gpu/transforms/gemm_fusion_test.cc
++++ b/xla/backends/gpu/transforms/gemm_fusion_test.cc
+@@ -184,6 +184,35 @@
+                                    m::Bitcast(m::Parameter()))));
+ }
+ 
++TEST_F(GemmFusionTestV2, BitcastIsNotHoistedAboveALayoutChangingCopy) {
++  // The copy permutes storage, {0,1} to {1,0}: hoisting the bitcast above it,
++  // as above an elementwise op, would leave the copy an identity and read the
++  // parameter's storage in the wrong order (a ragged dot's adjoint, Dew ledger
++  // 1691).
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
++HloModule m
++
++ENTRY e {
++  p0 = f32[2,5,3]{2,1,0} parameter(0)
++  p1 = f32[4,3]{0,1} parameter(1)
++  c1 = f32[4,3]{1,0} copy(p1)
++  b1 = f32[2,2,3]{2,1,0} bitcast(c1)
++  ROOT d = f32[2,5,2]{2,1,0} dot(p0, b1),
++    lhs_batch_dims={0}, lhs_contracting_dims={2},
++    rhs_batch_dims={0}, rhs_contracting_dims={2}
++})"));
++  ASSERT_TRUE(GemmFusion(device_info_).Run(module.get()).ok());
++  bool permutes = false;
++  for (const HloComputation* computation : module->computations()) {
++    for (const HloInstruction* instruction : computation->instructions()) {
++      permutes |= instruction->opcode() == HloOpcode::kCopy &&
++                  !(instruction->shape().layout() ==
++                    instruction->operand(0)->shape().layout());
++    }
++  }
++  EXPECT_TRUE(permutes) << module->ToString();
++}
++
+ TEST_F(GemmFusionTestV2, BitcastIsHoistedAboveBroadcast) {
+   ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+ HloModule m
