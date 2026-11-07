@@ -4259,7 +4259,11 @@ async_load_tmem_p.multiple_results = True
 
 @overload
 def async_load_tmem(
-    src: _Ref, *, layout: SomeLayout | None = ..., reduce: None = ...
+    src: _Ref,
+    *,
+    layout: SomeLayout | None = ...,
+    reduce: None = ...,
+    max_registers: int = ...,
 ) -> jax.Array:
   ...
 
@@ -4270,6 +4274,7 @@ def async_load_tmem(
     *,
     layout: SomeLayout | None = ...,
     reduce: Literal["max", "min", "absmax", "absmin"] = ...,
+    max_registers: int = ...,
 ) -> tuple[jax.Array, jax.Array]:
   ...
 
@@ -4279,6 +4284,7 @@ def async_load_tmem(
     *,
     layout: SomeLayout | None = None,
     reduce: Literal["max", "min", "absmax", "absmin"] | None = None,
+    max_registers: int = 32,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Performs an asynchronous load from the TMEM array.
 
@@ -4306,6 +4312,10 @@ def async_load_tmem(
     reduce: The optional reduction operation to perform on the loaded data. If
       specified, the function returns an extra array, obtained by reducing the
       loaded data along the last dimension.
+    max_registers: The most registers one TMEM transfer instruction may move
+      (32, the hardware's widest grouping, by default). Grouped transfers
+      allocate their registers together; a kernel that spills around its TMEM
+      loads can ask for narrower ones.
   """
   src, src_transforms = state_primitives.get_ref_and_transforms(
       src, None, "async_load_tmem"
@@ -4314,7 +4324,11 @@ def async_load_tmem(
       src_transforms
   )
   results = async_load_tmem_p.bind(
-      src, *flat_src_transforms, tree=src_transforms_treedef, reduce=reduce
+      src,
+      *flat_src_transforms,
+      tree=src_transforms_treedef,
+      reduce=reduce,
+      max_registers=max_registers,
   )
   if reduce is None:
     [result] = results
@@ -4330,8 +4344,13 @@ def async_load_tmem(
 
 @async_load_tmem_p.def_effectful_abstract_eval
 def _async_load_tmem_abstract_eval(
-    src, *avals_flat, tree, reduce: tcgen05.LoadReduceOp | None = None
+    src,
+    *avals_flat,
+    tree,
+    reduce: tcgen05.LoadReduceOp | None = None,
+    max_registers: int = 32,
 ):
+  del max_registers
   if src.memory_space != gpu_core.MemorySpace.TMEM:
     raise ValueError("Async load only supports TMEM refs")
   val_aval, effects = state_primitives._get_abstract_eval(
@@ -4355,6 +4374,7 @@ def _async_load_tmem_lowering_rule(
     *leaves,
     tree,
     reduce: Literal["max", "min", "absmax", "absmin"] | None = None,
+    max_registers: int = 32,
 ):
   assert isinstance(x_ref, tcgen05.TMEMRef)
   x_aval = ctx.avals_in[0]
@@ -4374,7 +4394,12 @@ def _async_load_tmem_lowering_rule(
   if isinstance(ctx.out_layout_hint, mgpu.TiledLayout):
     layout_hint = ctx.out_layout_hint
   is_signed = mgpu_utils.is_signed(ctx.avals_out[0].dtype)
-  res = x_tmem.load(layout=layout_hint, is_signed=is_signed, reduce=reduce)
+  res = x_tmem.load(
+      layout=layout_hint,
+      is_signed=is_signed,
+      reduce=reduce,
+      max_registers=max_registers,
+  )
   return (res,) if reduce is None else res
 
 
@@ -4387,6 +4412,7 @@ def _async_load_tmem_lowering_rule_wg(
     *leaves,
     tree,
     reduce: tcgen05.LoadReduceOp | None = None,
+    max_registers: int = 32,
 ):
   assert isinstance(x_ref, ir.Value)
   assert isinstance(x_ref.type, ir.MemRefType)
@@ -4425,8 +4451,16 @@ def _async_load_tmem_lowering_rule_wg(
         reduce_attr = mgpu.dialect.TMEMLoadReduction.AbsMax
       case _:
         raise ValueError(f"Unsupported load reduce operation: {orig_reduce}")
-    return tuple(mgpu.dialect.async_load_tmem(x_tmem, reduce=reduce_attr))  # type: ignore
-  return (mgpu.dialect.async_load_tmem(x_tmem),)
+    results = mgpu.dialect.async_load_tmem(x_tmem, reduce=reduce_attr)  # type: ignore
+  else:
+    results = [mgpu.dialect.async_load_tmem(x_tmem)]
+  if max_registers != 32:
+    # A discardable attribute, which the op's lowering reads (no field of the
+    # dialect's own).
+    results[0].owner.attributes["max_registers"] = ir.IntegerAttr.get(
+        ir.IntegerType.get_signless(32), max_registers
+    )
+  return tuple(results)
 
 
 wait_load_tmem_p = jax_core.Primitive("wait_load_tmem")

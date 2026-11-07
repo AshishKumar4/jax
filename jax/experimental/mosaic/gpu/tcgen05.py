@@ -1416,6 +1416,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = ...,
       is_signed: bool | None = ...,
       reduce: None = ...,
+      max_registers: int = ...,
   ) -> fa.FragmentedArray:
     ...
 
@@ -1425,6 +1426,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = ...,
       is_signed: bool | None = ...,
       reduce: LoadReduceOp = ...,
+      max_registers: int = ...,
   ) -> tuple[fa.FragmentedArray, fa.FragmentedArray]:
     ...
 
@@ -1433,6 +1435,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = None,
       is_signed: bool | None = None,
       reduce: LoadReduceOp | None = None,  # Reduction operator for the minor dimension.
+      max_registers: int = 32,  # The most registers a transfer moves (`_transfer_32xcols`).
   ) -> fa.FragmentedArray | tuple[fa.FragmentedArray, fa.FragmentedArray]:
     packing = self.packing
     bitwidth = utils.bitwidth(self.dtype)
@@ -1490,7 +1493,7 @@ class TMEMRef:
         )
       reduced_reg = None
       registers = _load_32xcols(
-          self.address, columns, self.dtype, packing
+          self.address, columns, self.dtype, packing, max_registers
       ).T.reshape(regs_shape)
     elif layout == self.layout.as_tiled_layout() and packing * bitwidth == 32:
       # TODO(apaszke): We raise NotImplemented here because technically for some
@@ -1503,7 +1506,8 @@ class TMEMRef:
       assert len(layout.base_tile_shape) == 2
       cols = math.prod(regs_shape) * packing
       flat_registers, reduced_reg = _load_32xcols_native(
-          self.address, cols, self.dtype, packing, packing, reduce=None
+          self.address, cols, self.dtype, packing, packing, reduce=None,
+          max_registers=max_registers,
       )
       assert reduced_reg is None
       registers = flat_registers.reshape(regs_shape)
@@ -1515,7 +1519,8 @@ class TMEMRef:
         or (bitwidth == 32 and layout.vector_length == 2)
     ):
       flat_registers, reduced_reg = _load_32xcols_native(
-          self.address, columns, self.dtype, packing, TMEM_NATIVE_LAYOUT.vector_length, reduce=reduce
+          self.address, columns, self.dtype, packing, TMEM_NATIVE_LAYOUT.vector_length, reduce=reduce,
+          max_registers=max_registers,
       )
       registers = flat_registers.reshape(regs_shape)
     elif (
@@ -1528,7 +1533,7 @@ class TMEMRef:
       reduced_reg = None
       # Load half the columns, since they are folded over lanes.
       raw_registers = _load_32xcols(
-          self.address, columns // 2, self.dtype, packing
+          self.address, columns // 2, self.dtype, packing, max_registers
       )
       assert raw_registers.shape[0] == 4
       registers = np.concatenate([raw_registers[:2], raw_registers[2:]], axis=1)
@@ -1544,7 +1549,7 @@ class TMEMRef:
       regs_shape = layout.registers_shape(self.shape)
       # We take half the columns, because they are split over halves of TMEM.
       registers = _load_32xcols(
-          self.address, columns // 2, self.dtype, packing
+          self.address, columns // 2, self.dtype, packing, max_registers
       ).reshape(regs_shape)
     else:
       raise ValueError(
@@ -1662,6 +1667,7 @@ def _transfer_32xcols(
     atom_shape: tuple[int, int],
     tmem_packing: int,
     reg_packing: int,
+    max_registers: int = 32,
 ) -> Iterator[tuple[ir.Value, int, int, slice]]:
   """Generates a sequence of parameters for a given TMEM read or write.
 
@@ -1674,6 +1680,10 @@ def _transfer_32xcols(
       16-bit, we expect that each transfer actually involves double the number
       of physical columns.
     reg_packing: The number of elements that fit in a single 32-bit register.
+    max_registers: The most registers a single transfer instruction may move.
+      Grouped transfers (.x2 and wider) allocate their registers together,
+      which can make ptxas spill a kernel that holds many values across them;
+      a smaller limit issues more, narrower transfers.
   """
   i32 = ir.IntegerType.get_signless(32)
   atom_rows, atom_cols = atom_shape
@@ -1684,8 +1694,15 @@ def _transfer_32xcols(
   num_row_steps = 32 // atom_rows
   # We artificially lower the instr_num compared to its limits, because higher
   # values can lead to register spills..
-  max_num = 1 << (total_num.bit_length() - 1)  # power of 2 <= than total_num
-  max_num = min(max_num, 32 // regs_per_instr)
+  if max_registers < regs_per_instr:
+    raise ValueError(
+        f"A transfer of {atom_rows}x{atom_cols} moves {regs_per_instr} registers"
+        f" at least, more than max_registers={max_registers}"
+    )
+  # A transfer's count is a power of two (.x1, .x2, .x4, ...), at most the
+  # transfers left and at most the registers allowed.
+  max_num = min(total_num, max_registers // regs_per_instr)
+  max_num = 1 << (max_num.bit_length() - 1)
   for lane_step in range(num_row_steps):
     addr_row = arith.addi(base_addr, utils.c((lane_step * atom_rows) << 16, i32))
     num_processed = 0
@@ -1792,7 +1809,9 @@ def _store_32xcols_native(base_addr, vector_regs, tmem_packing) -> None:
     _tmem_store(addr_row_col, "32x32b", instr_num, regs_slice, unpack)
 
 
-def _load_32xcols(base_addr, cols, dtype, tmem_packing) -> np.ndarray:
+def _load_32xcols(
+    base_addr, cols, dtype, tmem_packing, max_registers: int = 32
+) -> np.ndarray:
   i32 = ir.IntegerType.get_signless(32)
   vec_ty = ir.VectorType.get((2,), dtype)
   reg_packing = 32 // utils.bitwidth(dtype)
@@ -1809,7 +1828,9 @@ def _load_32xcols(base_addr, cols, dtype, tmem_packing) -> np.ndarray:
 
   vector_regs = np.ndarray((4, cols // 8), dtype=object)
 
-  it = _transfer_32xcols(base_addr, cols, (16, 8), tmem_packing, reg_packing)
+  it = _transfer_32xcols(
+      base_addr, cols, (16, 8), tmem_packing, reg_packing, max_registers
+  )
   c0 = arith.constant(i32, 0)
   c1 = arith.constant(i32, 1)
   for addr_row_col, instr_num, lane_step, num_slice in it:
@@ -1842,7 +1863,8 @@ def _load_32xcols(base_addr, cols, dtype, tmem_packing) -> np.ndarray:
 
 
 def _load_32xcols_native(
-    base_addr, cols, dtype, tmem_packing, vector_length, reduce: LoadReduceOp | None
+    base_addr, cols, dtype, tmem_packing, vector_length, reduce: LoadReduceOp | None,
+    max_registers: int = 32,
 ) -> tuple[np.ndarray, ir.Value | None]:
   i32 = ir.IntegerType.get_signless(32)
   vec_ty = ir.VectorType.get((vector_length,), dtype)
@@ -1861,7 +1883,9 @@ def _load_32xcols_native(
       )
     pack = False
 
-  it = _transfer_32xcols(base_addr, cols, load_atom_shape, tmem_packing, reg_packing)
+  it = _transfer_32xcols(
+      base_addr, cols, load_atom_shape, tmem_packing, reg_packing, max_registers
+  )
   c0 = arith.constant(i32, 0)
   c1 = arith.constant(i32, 1)
   regs = [None] * (cols // reg_packing)
