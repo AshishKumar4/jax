@@ -1365,6 +1365,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = ...,
       is_signed: bool | None = ...,
       reduce: None = ...,
+      max_registers: int = ...,
   ) -> fa.FragmentedArray:
     ...
 
@@ -1374,6 +1375,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = ...,
       is_signed: bool | None = ...,
       reduce: LoadReduceOp = ...,
+      max_registers: int = ...,
   ) -> tuple[fa.FragmentedArray, fa.FragmentedArray]:
     ...
 
@@ -1382,6 +1384,7 @@ class TMEMRef:
       layout: fa.TiledLayout | None = None,
       is_signed: bool | None = None,
       reduce: LoadReduceOp | None = None,  # Reduction operator for the minor dimension.
+      max_registers: int = 32,  # The most registers a transfer moves (`_transfer_32xcols`).
   ) -> fa.FragmentedArray | tuple[fa.FragmentedArray, fa.FragmentedArray]:
     packing = self.packing
     bitwidth = utils.bitwidth(self.dtype)
@@ -1477,7 +1480,7 @@ class TMEMRef:
       reduced_reg = None
       # Load half the columns, since they are folded over lanes.
       raw_registers = _load_32xcols(
-          self.address, columns // 2, self.dtype, packing
+          self.address, columns // 2, self.dtype, packing, max_registers
       )
       assert raw_registers.shape[0] == 4
       registers = np.concatenate([raw_registers[:2], raw_registers[2:]], axis=1)
@@ -1611,6 +1614,7 @@ def _transfer_32xcols(
     atom_shape: tuple[int, int],
     tmem_packing: int,
     reg_packing: int,
+    max_registers: int = 32,
 ) -> Iterator[tuple[ir.Value, int, int, slice]]:
   """Generates a sequence of parameters for a given TMEM read or write.
 
@@ -1623,6 +1627,10 @@ def _transfer_32xcols(
       16-bit, we expect that each transfer actually involves double the number
       of physical columns.
     reg_packing: The number of elements that fit in a single 32-bit register.
+    max_registers: The most registers a single transfer instruction may move.
+      Grouped transfers (.x2 and wider) allocate their registers together,
+      which can make ptxas spill a kernel that holds many values across them;
+      a smaller limit issues more, narrower transfers.
   """
   i32 = ir.IntegerType.get_signless(32)
   atom_rows, atom_cols = atom_shape
@@ -1634,7 +1642,7 @@ def _transfer_32xcols(
   # We artificially lower the instr_num compared to its limits, because higher
   # values can lead to register spills..
   max_num = 1 << (total_num.bit_length() - 1)  # power of 2 <= than total_num
-  max_num = min(max_num, 32 // regs_per_instr)
+  max_num = max(1, min(max_num, max_registers // regs_per_instr))
   for lane_step in range(num_row_steps):
     addr_row = arith.addi(base_addr, utils.c((lane_step * atom_rows) << 16, i32))
     num_processed = 0
@@ -1741,7 +1749,9 @@ def _store_32xcols_native(base_addr, vector_regs, tmem_packing) -> None:
     _tmem_store(addr_row_col, "32x32b", instr_num, regs_slice, unpack)
 
 
-def _load_32xcols(base_addr, cols, dtype, tmem_packing) -> np.ndarray:
+def _load_32xcols(
+    base_addr, cols, dtype, tmem_packing, max_registers: int = 32
+) -> np.ndarray:
   i32 = ir.IntegerType.get_signless(32)
   vec_ty = ir.VectorType.get((2,), dtype)
   reg_packing = 32 // utils.bitwidth(dtype)
@@ -1758,7 +1768,9 @@ def _load_32xcols(base_addr, cols, dtype, tmem_packing) -> np.ndarray:
 
   vector_regs = np.ndarray((4, cols // 8), dtype=object)
 
-  it = _transfer_32xcols(base_addr, cols, (16, 8), tmem_packing, reg_packing)
+  it = _transfer_32xcols(
+      base_addr, cols, (16, 8), tmem_packing, reg_packing, max_registers
+  )
   c0 = arith.constant(i32, 0)
   c1 = arith.constant(i32, 1)
   for addr_row_col, instr_num, lane_step, num_slice in it:

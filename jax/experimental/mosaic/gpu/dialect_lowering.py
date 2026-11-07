@@ -2664,6 +2664,11 @@ def _async_load_tmem_op_lowering_rule(
   out_layout = layouts_lib.from_layout_attr(out_layout_attr)
   assert isinstance(out_layout, fa.TiledLayout)
   element_type = ir.MemRefType(op.source.type).element_type
+  max_registers = (
+      ir.IntegerAttr(op.attributes["max_registers"]).value
+      if "max_registers" in op.attributes
+      else 32
+  )
   if op.reduce is not None:
     reduce_str = cast(
         tcgen05.LoadReduceOp, str(mgpu.TMEMLoadReduction(op.reduce.value))  # pyrefly: ignore[missing-attribute]
@@ -2673,14 +2678,16 @@ def _async_load_tmem_op_lowering_rule(
       reduce_str = reduce_str[-3:]
     else:
       is_signed = None
-    loaded, reduced = tmem_ref.load(out_layout, is_signed, reduce=reduce_str)
+    loaded, reduced = tmem_ref.load(
+        out_layout, is_signed, reduce=reduce_str, max_registers=max_registers
+    )
     return [
         fragmented_array_to_ir(loaded, op.results[0].type),
         fragmented_array_to_ir(reduced, op.results[1].type),
     ]
   else:
     is_signed = _default_is_signed(element_type)
-    arr = tmem_ref.load(out_layout, is_signed)
+    arr = tmem_ref.load(out_layout, is_signed, max_registers=max_registers)
     return [fragmented_array_to_ir(arr, op.results[0].type)]
 
 
