@@ -34,6 +34,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -80,16 +81,39 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
       ptx_str.substr(end_pos).str());
 }
 
+// The compute capability an object's PTX is compiled for: its NVVM target's
+// chip, which `nvvm-attach-target` set from the compile's own capability
+// ("sm_90a" is 9.0 with accelerated features). Read per object, not fixed when
+// the pass is registered: a process compiles for several GPUs in turn (a host
+// compiling ahead for another's), and a capability fixed at registration
+// assembles every later compile's PTX for the first's.
+absl::StatusOr<se::CudaComputeCapability> ObjectCapability(
+    mlir::gpu::ObjectAttr object) {
+  auto target = mlir::dyn_cast<mlir::NVVM::NVVMTargetAttr>(object.getTarget());
+  if (!target) {
+    return absl::InvalidArgumentError("Expected an NVVM target.");
+  }
+  llvm::StringRef chip = target.getChip();
+  using FeatureExtension = se::CudaComputeCapability::FeatureExtension;
+  FeatureExtension extension = chip.consume_back("a")
+                                   ? FeatureExtension::kAcceleratedFeatures
+                                   : FeatureExtension::kNone;
+  int version = 0;
+  if (!chip.consume_front("sm_") || chip.getAsInteger(10, version)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unexpected NVVM target chip: ", target.getChip().str()));
+  }
+  return se::CudaComputeCapability(version / 10, version % 10, extension);
+}
+
 class AssemblyToBinaryPass
     : public jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp> {
  public:
   using jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp>::Pass;
 
-  AssemblyToBinaryPass(
-      const se::cuda::CompilationProvider* compilation_provider,
-      se::CudaComputeCapability cc)
-      : compilation_provider_(std::move(compilation_provider)),
-        cc_(std::move(cc)) {}
+  explicit AssemblyToBinaryPass(
+      const se::cuda::CompilationProvider* compilation_provider)
+      : compilation_provider_(compilation_provider) {}
 
   static constexpr llvm::StringLiteral kArgumentName =
       "mosaic-gpu-assembly-to-binary";
@@ -139,8 +163,13 @@ class AssemblyToBinaryPass
       ptx_str = *ptx_str_or;
       dump_ptx_if_enabled();
 
+      absl::StatusOr<se::CudaComputeCapability> cc = ObjectCapability(object);
+      if (!cc.ok()) {
+        binary.emitOpError(cc.status().message());
+        return mlir::WalkResult::interrupt();
+      }
       absl::StatusOr<se::cuda::Assembly> sass_or =
-          compilation_provider_->Compile(cc_, ptx_str, compilation_options);
+          compilation_provider_->Compile(*cc, ptx_str, compilation_options);
       if (!sass_or.ok()) {
         binary.emitOpError(sass_or.status().message());
         return mlir::WalkResult::interrupt();
@@ -180,19 +209,15 @@ class AssemblyToBinaryPass
 
  private:
   const se::cuda::CompilationProvider* compilation_provider_;
-  se::CudaComputeCapability cc_;
 };
 
 }  // namespace
 
 void registerAssemblyToBinaryPass(
-    const se::cuda::CompilationProvider* compilation_provider,
-    const se::CudaComputeCapability& cc) {
-  ::mlir::registerPass(
-      [compilation_provider, cc]() -> std::unique_ptr<::mlir::Pass> {
-        return std::make_unique<AssemblyToBinaryPass>(compilation_provider,
-                                                      std::move(cc));
-      });
+    const se::cuda::CompilationProvider* compilation_provider) {
+  ::mlir::registerPass([compilation_provider]() -> std::unique_ptr<::mlir::Pass> {
+    return std::make_unique<AssemblyToBinaryPass>(compilation_provider);
+  });
 }
 
 }  // namespace gpu
