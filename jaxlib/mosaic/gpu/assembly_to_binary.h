@@ -17,16 +17,15 @@ limitations under the License.
 #define JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 
 #include "xla/stream_executor/cuda/compilation_provider.h"
-#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 
 namespace mosaic {
 namespace gpu {
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
-// `gpu.binary` ops wrapping a CUBIN binary.
+// `gpu.binary` ops wrapping a CUBIN binary, each for the compute capability its
+// object's NVVM target names.
 void registerAssemblyToBinaryPass(
-    const stream_executor::cuda::CompilationProvider* compilation_provider,
-    const stream_executor::CudaComputeCapability& cc);
+    const stream_executor::cuda::CompilationProvider* compilation_provider);
 
 }  // namespace gpu
 }  // namespace mosaic
