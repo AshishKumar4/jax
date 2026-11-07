@@ -6388,7 +6388,8 @@ class PallasCallSm90ATest(PallasSm90ATest):
         return acc_ref[...]
       acc = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
       plgpu.store(o_ref, -acc, optimized=False)
-      plgpu.store(s_ref, jnp.copysign(jnp.full_like(acc, 2.0), acc), optimized=False)
+      # sign's lowering takes copysign(1, acc) where acc is nonzero.
+      plgpu.store(s_ref, jnp.sign(acc), optimized=False)
 
     key1, key2 = jax.random.split(jax.random.key(7), 2)
     a = jax.random.randint(key1, (64, 128), -2, 3).astype(jnp.bfloat16)
@@ -6406,7 +6407,7 @@ class PallasCallSm90ATest(PallasSm90ATest):
     )(a, b)
     product = jnp.matmul(a, b, preferred_element_type=jnp.float32)
     np.testing.assert_array_equal(negated, -product)
-    np.testing.assert_array_equal(signed, jnp.copysign(2.0, product))
+    np.testing.assert_array_equal(signed, jnp.sign(product))
 
   @parameterized.parameters(jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2)
   def test_wgmma_registers_8bit(self, input_dtype):
