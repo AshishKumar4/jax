@@ -48,6 +48,9 @@ archive_override(
         # sides, so a copy that permutes storage becomes an identity: a ragged dot's adjoint read its cotangent
         # transposed (Dew ledger 1691).
         "//third_party:xla/gemm_fusion_layout_copy.patch",
+        # A small dot with the F16_F16_F32 algorithm, which XLA:GPU supports, is strength-reduced to a multiply its
+        # algorithm helper has no case for: "Unsupported dot precision algorithm: 4" (Dew ledger 1691).
+        "//third_party:xla/f16_dot_strength_reduction.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
