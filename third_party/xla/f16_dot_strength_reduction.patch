@@ -1,6 +1,8 @@
+diff --git a/xla/service/gpu/matmul_utils.cc b/xla/service/gpu/matmul_utils.cc
+index 8d23be9..4e8735b 100644
 --- a/xla/service/gpu/matmul_utils.cc
 +++ b/xla/service/gpu/matmul_utils.cc
-@@ -1247,6 +1247,24 @@
+@@ -1247,6 +1247,24 @@ absl::StatusOr<HloInstruction*> MakeMultiplyForDotPrecisionAlgorithm(
      HloInstruction* lhs, HloInstruction* rhs,
      const PrecisionConfig::Algorithm& algorithm) {
    switch (algorithm) {
@@ -25,9 +27,11 @@
      case PrecisionConfig::ALG_DOT_BF16_BF16_F32:
        return DotAlgorithmRewriter::MakeMultiplyForBF16BF16F32(lhs, rhs);
      case PrecisionConfig::ALG_DOT_BF16_BF16_F32_X3:
+diff --git a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
+index 621f781..917457f 100644
 --- a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
 +++ b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
-@@ -191,6 +191,37 @@
+@@ -191,6 +191,37 @@ ENTRY entry {
    EXPECT_TRUE(filecheck_result);
  }
  
