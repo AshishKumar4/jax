@@ -7499,6 +7499,13 @@ def _ragged_dot_general_lower(
       return operand
     return hlo.OptimizationBarrierOp([operand]).result
 
+  if mode == RaggedDotMode.RAGGED_NONCONTRACTING:
+    # A contracting ragged dot's adjoint is a noncontracting one whose RHS is
+    # the nonlinear cotangent: XLA:GPU fuses its producer into this dot's
+    # input, reading the reduced [b, g, m, n] buffer as [b, g * n, m] with
+    # the m, n permutation lost.
+    rhs = fenced(rhs)
+
   def prefix_first(operand, aval, prefix, dimensions):
     permutation = tuple(prefix) + tuple(remaining(range(aval.ndim), prefix))
     if permutation != tuple(range(aval.ndim)):

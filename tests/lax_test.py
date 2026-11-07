@@ -5522,6 +5522,9 @@ class RaggedTest(jtu.JaxTestCase):
     if (precision in (lax.DotAlgorithmPreset.F16_F16_F32, lax.DotAlgorithmPreset.BF16_BF16_F32)
         and jtu.test_device_matches(["cpu"])):
       self.skipTest("CPU does not support these named algorithms with 16-bit results")
+    if (precision == lax.DotAlgorithmPreset.F16_F16_F32
+        and jtu.test_device_matches(["gpu"])):
+      self.skipTest("GPU small-dot lowering does not support F16_F16_F32")
     residual = 2.0 ** (-jnp.finfo(dtype).nmant - 1)
     with config.use_shardy_partitioner(shardy):
       x = jnp.asarray([[[[1, residual], [-1, 0]]]], dtype)
