@@ -189,5 +189,35 @@ class InterpretDistributedTest(jtu.JaxTestCase):
     self.assertFalse(mosaic_interpret.get_races().races_found)
 
 
+  @jtu.parameterized.parameters(2, 4)
+  def test_kernel_with_barrier_under_shard_map(self, num_devices):
+    # Each device copies its shard through a barrier of its own; one device's
+    # kernel ends while another's still holds its barrier.
+    def kernel(x_ref, o_ref, smem, barrier):
+      plgpu.copy_gmem_to_smem(x_ref, smem, barrier)
+      plgpu.barrier_wait(barrier)
+      o_ref[...] = smem[...] + 1.0
+
+    def body(x):
+      return plgpu.kernel(
+          kernel,
+          out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          scratch_types=[
+              plgpu.SMEM(x.shape, x.dtype),
+              plgpu.Barrier(num_arrivals=1),
+          ],
+          interpret=InterpretParams(),
+      )(x)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:num_devices], ['x'])
+    x = jnp.arange(num_devices * 128 * 64, dtype=jnp.float32).reshape(-1, 64)
+    x = jax.device_put(x, jax.sharding.NamedSharding(mesh, P('x')))
+    f = jax.jit(
+        jax.shard_map(body, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+    )
+    for _ in range(2):
+      np.testing.assert_array_equal(f(x), x + 1.0)
+
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
