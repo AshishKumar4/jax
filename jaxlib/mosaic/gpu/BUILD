@@ -297,6 +297,24 @@ cc_library(
 )
 
 cc_library(
+    name = "capture",
+    srcs = ["capture.cc"],
+    hdrs = ["capture.h"],
+    deps = [
+        ":launch_config",
+        "//jaxlib/cuda:cuda_vendor",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@local_config_cuda//cuda:cuda_headers",
+    ],
+)
+
+cc_library(
     name = "custom_call",
     srcs = ["custom_call.cc"],
     linkopts = if_oss(
@@ -310,6 +328,7 @@ cc_library(
         "ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS=1",
     ],
     deps = [
+        ":capture",
         ":dump",
         ":launch_config",
         ":mosaic_gpu_cc_proto",
@@ -386,6 +405,7 @@ cc_library(
         "@tsl//tsl/platform:path",
         "@tsl//tsl/profiler/lib:traceme",
         "@xla//xla:executable_run_options",
+        "@xla//xla:primitive_util",
         "@xla//xla:status_macros",
         "@xla//xla:util",
         "@xla//xla/backends/cpu:target_machine_options",
