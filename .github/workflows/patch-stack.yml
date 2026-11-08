@@ -215,9 +215,11 @@ jobs:
         run: |
           # A stack that patches native code (jaxlib/, jax_plugins/) reaches a kernel only through its own CUDA and
           # PJRT plugins (post42 shipped the plugin's patch alone, and kernels compiled through stock PJRT): the
-          # set publishes whole or not at all, from the plugin release of the stack's version. A post release of
-          # Python fixes alone ships jax alone beside the plugins of the earlier one whose native code it holds
-          # (`patch_stack.py plugins`), which the index lists already and Dew's pins name.
+          # set publishes whole or not at all, from the plugin release whose native code the stack holds
+          # (`patch_stack.py plugins`): the stack's own version's, or, for a post release of Python fixes alone,
+          # the earlier one's, whose files the index lists already are kept as they are, so a machine an earlier
+          # publish left out (`machines`) is added by the next (2026-11-08: post67's aarch64 plugins, built after
+          # its x86_64 publish, reached the index with post68's).
           if git -C jax diff --quiet "jax-v$RELEASE" HEAD -- jaxlib jax_plugins; then
             echo "no native patch: jax alone"
             exit 0
@@ -228,12 +230,10 @@ jobs:
             echo "::error::no plugin release holds $version's native code: build plugin-$version (dew/build_plugin.sh)"
             exit 1
           fi
-          if [ "$plugins" != "plugin-$version" ]; then
-            echo "$version's native code is $plugins's: jax alone, beside those plugins"
-            exit 0
-          fi
+          echo "$version's native code is $plugins's"
+          version=${plugins#plugin-}
           mkdir -p native
-          gh release download "plugin-$version" --repo "${{ github.repository }}" --dir native --pattern "*.whl"
+          gh release download "$plugins" --repo "${{ github.repository }}" --dir native --pattern "*.whl"
           missing=()
           for cuda in $CUDAS; do
             for machine in $MACHINES; do
