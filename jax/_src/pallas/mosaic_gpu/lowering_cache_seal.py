@@ -30,6 +30,16 @@ and ``Seal.code_identity`` a code object of the installation by its file, its
 line, its name and a hash of what it does (two lambdas of one file and one name
 are two). A class or function that no such module owns has no identity, which
 makes what holds it uncacheable.
+
+A process may declare packages of its own sealed by their source
+(``JAX_PALLAS_LOWERING_CACHE_SOURCES``, their top-level names separated by
+commas): each declared package's every Python file is hashed once, and its
+code, classes and primitives are named as the installation's are, with the
+digest of the package's whole tree in their identity. An entry that holds such
+code is then read by a process of the same tree alone; one that holds none is
+unaffected. The declaration is the process's statement that the package's code
+a lowering runs (an ``inline_mgpu`` body) reads nothing but its arguments, its
+closure and the package's code.
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ import concurrent.futures
 import enum
 import hashlib
 import importlib.metadata
+import importlib.util
 import os
 import re
 import struct
@@ -78,9 +89,16 @@ class Origin(enum.Enum):
   # names a class of it by its name and fields alone, not by what its methods
   # read, which the lowering may call.
   THIRD_PARTY = "third party"
+  # A Python file of a package the process declares sealed by its source
+  # (`SOURCES_VARIABLE`): the digest of its whole tree is in the identity.
+  SOURCE = "source"
   # Anything else: a file of the user's, a module made at run time.
   UNKNOWN = "unknown"
 
+
+SOURCES_VARIABLE = "JAX_PALLAS_LOWERING_CACHE_SOURCES"
+"""The environment variable that names the packages a process declares sealed by
+their source: their top-level names, separated by commas."""
 
 DEPENDENCIES = frozenset({"numpy", "ml-dtypes"})
 """The installed distributions, by normalized name, whose classes and functions a
@@ -107,6 +125,8 @@ class Seal:
       seconds: float, file_count: int, byte_count: int,
       hashes: dict[str, str] | None = None,
       verified_modules: frozenset[str] = frozenset(),
+      sources: dict[str, tuple[str, str]] | None = None,
+      source_digests: dict[str, bytes] | None = None,
   ):
     # The sha256 of the distributions' RECORDs; None if unsealed.
     self.digest = digest
@@ -126,6 +146,10 @@ class Seal:
     self._verified = set(verified_modules)
     self._verify_lock = threading.Lock()
     self._relative: dict[str, str | None] = {}
+    # The declared source packages' files (`SOURCES_VARIABLE`), each by its path
+    # to its package and its name in it, and each package's tree digest.
+    self._sources = sources or {}
+    self.source_digests = source_digests or {}
     # By id, with the code kept, as code objects compare by value and not by file.
     self._code_identities: dict[int, tuple[types.CodeType, bytes]] = {}
     # What a module is, by name and the module the name was found to be.
@@ -146,6 +170,17 @@ class Seal:
 
   def holds(self, file: str | None) -> bool:
     return self.relative(file) is not None
+
+  def source(self, file: str | None) -> tuple[str, str] | None:
+    """The declared source package `file` is of and its name in it, if any."""
+    if not file:
+      return None
+    return (self._sources.get(os.path.normpath(file))
+            or self._sources.get(os.path.realpath(file)))
+
+  def source_identity(self, package: str) -> bytes:
+    """A declared source package's identity: its name and its tree's digest."""
+    return _framed(b"source", package.encode(), self.source_digests[package])
 
   def module_origin(self, name: str) -> tuple[Origin, tuple[str, str] | None]:
     """Whose code the module `name` is, and the distribution (name, version) if
@@ -177,6 +212,9 @@ class Seal:
     if self.holds(file):
       return (Origin.EXTENSION if file.endswith(EXTENSION_SUFFIXES)
               else Origin.SEALED), None
+    source = self.source(file)
+    if source is not None:
+      return Origin.SOURCE, (source[0], self.source_digests[source[0]].hex())
     if top in sys.stdlib_module_names and _in_standard_library(file):
       return Origin.STANDARD, None
     dist = _distribution_of(top, file)
@@ -251,7 +289,8 @@ class Seal:
     if memo is not None and memo[0] is code:
       return memo[1]
     relative = self.relative(code.co_filename)
-    if relative is None:
+    source = None if relative is not None else self.source(code.co_filename)
+    if relative is None and source is None:
       raise NotSealed(
           f"{code.co_qualname} is defined in {code.co_filename}, which the"
           " sealed installation does not hold"
@@ -269,9 +308,11 @@ class Seal:
         code.co_exceptiontable,
         self._constant(code.co_consts),
     ))
+    where = (relative.encode() if source is None else
+             self.source_identity(source[0]) + source[1].encode())
     identity = _framed(
-        relative.encode(), str(code.co_firstlineno).encode(),
-        code.co_name.encode(), body.digest(),
+        where, str(code.co_firstlineno).encode(), code.co_name.encode(),
+        body.digest(),
     )
     self._code_identities[id(code)] = (code, identity)
     return identity
@@ -282,11 +323,12 @@ class Seal:
     A function of a file of the sealed installation is its code
     (`code_identity`). One of the standard library or of a distribution JAX
     requires (`DEPENDENCIES`) is named by the module that owns it (the
-    distribution's version is part of every key). Any other (a function a user
-    wrote, installed or not, code made at run time) has none.
+    distribution's version is part of every key). One of a declared source
+    package is its code, with the package's tree digest. Any other (a function a
+    user wrote, installed or not, code made at run time) has none.
     """
     code = fn.__code__
-    if self.holds(code.co_filename):
+    if self.holds(code.co_filename) or self.source(code.co_filename):
       return self.code_identity(code)
     module = fn.__module__ or ""
     if _in_standard_library(code.co_filename) and (
@@ -313,7 +355,8 @@ class Seal:
     installation (the class is then the code the seal hashes), a compiled module
     of it, the standard library or a distribution JAX requires (`DEPENDENCIES`,
     whose version is part of every key). A class a user defined (its module is
-    one of theirs, installed or not), one made inside a function, or one that its
+    one of theirs, installed or not, but a declared source package's, whose tree
+    digest is in its identity), one made inside a function, or one that its
     module does not hold under its name has no identity.
     """
     qualname = cls.__qualname__
@@ -484,11 +527,49 @@ def _compute_seal() -> Seal:
       return unsealed(
           f"module {name} is {file}, which no installed RECORD lists"
       )
+  sources, source_digests, problem = _sources(
+      os.environ.get(SOURCES_VARIABLE, ""))
+  if problem is not None:
+    return unsealed(problem)
   return Seal(
       manifest.digest(), None, sealed_files,
       time.perf_counter() - start, len(entries), total_bytes,
-      hashes, frozenset(verified),
+      hashes, frozenset(verified), sources=sources, source_digests=source_digests,
   )
+
+
+def _sources(declared: str) -> tuple[dict[str, tuple[str, str]], dict[str, bytes], str | None]:
+  """The declared source packages' files and tree digests (`SOURCES_VARIABLE`).
+
+  Each package is found where an import would find it; its every Python file is
+  hashed, and its digest is the hash of its files' names and hashes in order. A
+  package that is declared and not found, or a namespace package (no one tree),
+  is a declaration the process cannot keep, and unseals it.
+  """
+  files: dict[str, tuple[str, str]] = {}
+  digests: dict[str, bytes] = {}
+  for package in sorted({p.strip() for p in declared.split(",") if p.strip()}):
+    spec = importlib.util.find_spec(package)
+    locations = list(spec.submodule_search_locations or ()) if spec else []
+    if spec is None or spec.origin is None or len(locations) != 1:
+      return {}, {}, (
+          f"the declared source package {package!r} is no one importable tree")
+    root = os.path.realpath(locations[0])
+    tree = hashlib.sha256()
+    for directory, subdirectories, names in os.walk(root):
+      subdirectories.sort()
+      for name in sorted(names):
+        if not name.endswith(".py"):
+          continue
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        with open(path, "rb") as f:
+          digest = hashlib.sha256(f.read()).digest()
+        tree.update(_framed(relative.encode(), digest))
+        files[os.path.normpath(path)] = (package, relative)
+        files[os.path.realpath(path)] = (package, relative)
+    digests[package] = tree.digest()
+  return files, digests, None
 
 
 _lock = threading.RLock()
