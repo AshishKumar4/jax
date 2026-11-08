@@ -15,6 +15,7 @@
 import contextlib
 import functools
 import io
+import pickle
 import re
 import unittest
 from absl.testing import absltest, parameterized
@@ -67,6 +68,25 @@ class JaxAotTest(jtu.JaxTestCase):
     verify_serialization(
         jax.pmap(lambda x: x * x).lower(
             np.zeros((len(jax.devices()), 4), dtype=np.float32)))
+
+  def test_deserialized_outputs_type_as_fresh_outputs(self):
+    # A deserialized executable's outputs carry the abstract values a fresh one's do, their layout
+    # `AutoLayout` itself, so a jit traced over either reads one aval and lowers one program.
+    from jax._src.layout import AutoLayout
+
+    f = jax.jit(lambda x: (x * 2, x.sum()))
+    x = jnp.arange(8, dtype=jnp.float32)
+    compiled = f.lower(x).compile()
+    serialized, in_tree, out_tree = serialize(compiled)
+    loaded = deserialize_and_load(serialized, in_tree, out_tree)(x)
+    fresh = compiled(x)
+    for got, want in zip(loaded, fresh):
+      self.assertIs(jax.typeof(got).layout, AutoLayout)
+      self.assertEqual(jax.typeof(got), jax.typeof(want))
+    self.assertIs(pickle.loads(pickle.dumps(AutoLayout)), AutoLayout)
+    g = jax.jit(lambda a, b: (jnp.where(b > 0, a, 1), jnp.where(b > 0, a, 0)))
+    self.assertEqual(g.lower(loaded[1], fresh[1]).as_text(),
+                     g.lower(fresh[1], fresh[1]).as_text())
 
   def test_topology_jit_serialize(self):
     try:

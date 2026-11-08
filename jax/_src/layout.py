@@ -34,6 +34,11 @@ Shape = tuple[int, ...]
 class AutoLayoutSingleton:
   def __repr__(self):
     return "AutoLayout"
+
+  def __reduce__(self):
+    # Pickled by reference, so an unpickled abstract value (a deserialized executable's outputs,
+    # `serialize_executable`) holds `AutoLayout` itself and interns as a fresh trace's does.
+    return "AutoLayout"
 AutoLayout = AutoLayoutSingleton()
 
 
