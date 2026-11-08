@@ -113,6 +113,9 @@ _EVENT_PREFIX = "/jax/pallas/mosaic_gpu/lowering_cache/"
 _CONTROLS = frozenset({
     "jax_pallas_lowering_cache_dir",
     "jax_pallas_lowering_cache_verify",
+    # What a process can name, not what a lowering reads: an entry that holds a
+    # declared package's code carries its tree's digest (`sealing.SOURCES_VARIABLE`).
+    "jax_pallas_lowering_cache_sources",
 })
 
 _ENVIRONMENT_PATTERN = re.compile(r"^(JAX|XLA|MOSAIC|NVSHMEM|CUDA|TRITON)")

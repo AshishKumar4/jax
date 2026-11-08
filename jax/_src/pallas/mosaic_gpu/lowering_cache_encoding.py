@@ -71,7 +71,8 @@ class _PrimitiveHolders:
   process made) has no identity a key could name, and its kernels are not cached.
   A primitive held under several names (re-exported) is identified by the first
   of the ``jax._src`` modules' by name, which every process that has the primitive
-  has loaded.
+  has loaded. One a module of a declared source package holds is identified with
+  that package's tree digest (``Seal.source_identity``).
   """
 
   def __init__(self):
@@ -83,9 +84,10 @@ class _PrimitiveHolders:
     seal = sealing.seal()
     holders: dict[int, list[tuple[str, str, jax_core.Primitive]]] = {}
     for module_name, module in list(sys.modules.items()):
-      if module_name.partition(".")[0] not in sealing.SEALED_MODULE_ROOTS:
-        continue
-      if module is None or not seal.holds(getattr(module, "__file__", None)):
+      file = getattr(module, "__file__", None)
+      sealed = (module_name.partition(".")[0] in sealing.SEALED_MODULE_ROOTS
+                and module is not None and seal.holds(file))
+      if not sealed and (module is None or seal.source(file) is None):
         continue
       for attribute, value in list(vars(module).items()):
         if isinstance(value, jax_core.Primitive):
@@ -595,8 +597,11 @@ class Encoder:
     if held is None:
       raise Uncacheable(
           f"the primitive {prim.name} is held by no module of the sealed"
-          " installation")
-    return seq(b"Ph", [string(held[0]), string(held[1])])
+          " installation or of a declared source package")
+    module = sys.modules.get(held[0])
+    source = sealing.seal().source(getattr(module, "__file__", None))
+    tree = [] if source is None else [sealing.seal().source_identity(source[0])]
+    return seq(b"Ph", [string(held[0]), string(held[1]), *tree])
 
   def _primitive(self, prim: jax_core.Primitive, depth: int) -> bytes:
     is_call = prim in eval_jaxpr_lib.call_primitives
