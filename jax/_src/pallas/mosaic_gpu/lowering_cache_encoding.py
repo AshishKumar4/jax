@@ -176,6 +176,13 @@ class Encoder:
     self._anonymous: dict[int, int] = {}
     self._anonymous_objects: list[object] = []
     self._class_identities: dict[type, bytes] = {}
+    # The encodings of the interned avals and the dtypes met, by id, and the
+    # objects, which keep each id from being another's: a jaxpr's equations
+    # read the same few avals thousands of times (their encoding was over half
+    # of a key's time), and an object's encoding is the same each time it is
+    # met, its anonymous axis names numbered when it was first met.
+    self._encoded: dict[int, bytes] = {}
+    self._encoded_objects: list[object] = []
 
   # -- entry points
 
@@ -221,7 +228,7 @@ class Encoder:
     if isinstance(x, enum.Enum):
       return self._enum(x, depth)
     if isinstance(x, np.dtype):
-      return self._np_dtype(x)
+      return self._once(x, self._np_dtype)
     if isinstance(x, (np.generic, np.ndarray)):
       return self._numpy_value(x)
     if t in jax_literals.typed_scalar_types:
@@ -248,6 +255,8 @@ class Encoder:
       ])
     aval_encoder = _AVAL_ENCODERS.get(t)
     if aval_encoder is not None:
+      if t is jax_core.ShapedArray:  # interned: one object a value
+        return self._once(x, lambda aval: aval_encoder(self, aval, depth))
       return aval_encoder(self, x, depth)
     if isinstance(x, jax_core.AbstractValue):
       raise Uncacheable(
@@ -319,6 +328,14 @@ class Encoder:
     raise Uncacheable(f"{t.__module__}.{t.__qualname__} has no encoding")
 
   # -- helpers
+
+  def _once(self, x: Any, encode: Callable[[Any], bytes]) -> bytes:
+    """`encode(x)`, once an immutable object `x`."""
+    found = self._encoded.get(id(x))
+    if found is None:
+      found = self._encoded[id(x)] = encode(x)
+      self._encoded_objects.append(x)
+    return found
 
   def _class(self, cls: type, what: str) -> bytes:
     """A class a sealed module defines, by what it is (see `Seal.class_identity`)."""
