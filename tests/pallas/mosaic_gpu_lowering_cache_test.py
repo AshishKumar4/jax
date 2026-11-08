@@ -170,6 +170,33 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEqual(again["events"], ["hit"])
     self.assertEqual(again["normalized"], base["normalized"])
 
+  def test_what_no_lowering_reads_is_no_input_of_the_key(self):
+    # A process's own settings: its compilation cache and its client's
+    # allocations. Processes differing in them alone share their lowerings.
+    base = self.lower()
+    self.assertEqual(base["events"], ["miss"])
+    flags = os.environ.get("XLA_FLAGS", "")  # the children's own, kept
+    unread = {
+        "the client's share of memory": dict(env={
+            "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.3",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}),
+        "the compilation cache's directory": dict(env={
+            "JAX_COMPILATION_CACHE_DIR": str(self.tmp / "elsewhere")}),
+        "what the compilation cache keeps": dict(config={
+            "jax_persistent_cache_min_compile_time_secs": 7.0}),
+        "XLA's autotuning cache": dict(env={"XLA_FLAGS": (
+            f"{flags} --xla_gpu_per_fusion_autotune_cache_dir=/tmp/picks")}),
+    }
+    for name, change in unread.items():
+      with self.subTest(name):
+        self.assertEqual(self.lower(**change)["events"], ["hit"])
+    # Another XLA flag beside the cache's directory is still read.
+    read = self.lower(env={"XLA_FLAGS": (
+        f"{flags} --xla_gpu_per_fusion_autotune_cache_dir=/tmp/picks"
+        " --xla_gpu_enable_command_buffer=")})
+    self.assertEqual(read["events"], ["miss"])
+    self.assertLen(self.entries(), 2)
+
   def test_what_the_process_answers_of_nvshmem_is_an_input_of_the_key(self):
     # Where the answer is all that differs: the environment of the two NVSHMEM
     # runs is one, and only a file's existence is another.
