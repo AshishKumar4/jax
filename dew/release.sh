@@ -73,7 +73,10 @@ git -C "$work" push -q --atomic "--force-with-lease=refs/heads/release/$new:" or
 # From here a failure leaves both branches at the composed release, unpublished: its run's log says why, and
 # `gh workflow run patch-stack.yml -R AshishKumar4/jax --ref dew -f publish=RELEASE` publishes it again.
 token=release-$new-$(date +%s)-$$
-gh workflow run patch-stack.yml -R AshishKumar4/jax --ref dew -f "publish=$release" -f "token=$token"
+# MACHINES, where set, the machines whose plugins it ships so far (patch-stack.yml's `machines`): the rest keep their
+# earlier ones until the same release is published again with every machine.
+gh workflow run patch-stack.yml -R AshishKumar4/jax --ref dew -f "publish=$release" -f "token=$token" \
+  ${MACHINES:+-f "machines=$MACHINES"}
 run=
 for _ in $(seq 60); do
   run=$(gh run list -R AshishKumar4/jax --workflow patch-stack.yml -L 20 --json databaseId,displayTitle \

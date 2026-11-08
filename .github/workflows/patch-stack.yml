@@ -34,6 +34,9 @@ on:
       token:
         description: "a token the run's name carries, by which a dispatcher (dew/release.sh) finds its own run"
         required: false
+      machines:
+        description: "with `publish`, the machines whose native wheels it ships (default: every one, \"x86_64 aarch64\"); a machine left out keeps its earlier plugins, which a later publish of the same release adds beside"
+        required: false
 
 run-name: ${{ inputs.token && format('patch stack {0}', inputs.token) || 'patch stack' }}
 
@@ -181,7 +184,10 @@ jobs:
       # The native projects a stack with native patches ships beside jax, each built for every supported Python
       # (the plugins; the PJRT plugins name none) on each machine (dew/build_plugin.sh).
       PYTHONS: "cp312 cp313 cp314"
-      MACHINES: "x86_64 aarch64"
+      # Every machine's, unless `machines` names those built so far (Main, 2026-11-08: post67's x86_64 set staged ahead
+      # of its aarch64 one, which Lambda had no GH200 to build); the index keeps what it lists, so publishing the
+      # same release again with every machine adds the rest.
+      MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
       CUDAS: "12 13"
     steps:
       - uses: actions/checkout@v4
