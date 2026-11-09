@@ -678,9 +678,10 @@ class Primitive:
   ref_allocating: bool = False
   # set for primitives that run a program on their operands one for one and
   # return its results, which XLA inlines into the caller (a jit's call, which
-  # its CallInliner inlines; a checkpoint's, a custom derivative's primal and an
-  # evaluated jaxpr, which lower to their program in place): an analysis of a
-  # jaxpr reads such an equation as its program, with no call boundary.
+  # its CallInliner inlines; a checkpoint's, a custom derivative's primal, a
+  # custom vmap's and an evaluated jaxpr, which lower to their program in
+  # place): an analysis of a jaxpr reads such an equation as its program, with
+  # no call boundary.
   inlined_call: bool = False
   # set for primitives each of whose output entries reads its operands' entries
   # at its own index and nothing else (each operand of the output's shape, or a
