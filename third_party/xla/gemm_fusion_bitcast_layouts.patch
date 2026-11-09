@@ -1,0 +1,51 @@
+diff --git a/xla/backends/gpu/transforms/BUILD b/xla/backends/gpu/transforms/BUILD
+index 1400e534d2..12e52871a2 100644
+--- a/xla/backends/gpu/transforms/BUILD
++++ b/xla/backends/gpu/transforms/BUILD
+@@ -2196,8 +2196,11 @@ xla_cc_test(
+     deps = [
+         ":gemm_fusion",
+         "//xla:autotuning_proto_cc",
++        "//xla:literal",
++        "//xla:literal_util",
+         "//xla:xla_data_proto_cc",
+         "//xla:xla_proto_cc",
++        "//xla/hlo/evaluator:hlo_evaluator",
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/testlib:filecheck",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+diff --git a/xla/backends/gpu/transforms/gemm_fusion.cc b/xla/backends/gpu/transforms/gemm_fusion.cc
+index 96cbeba64d..3b8ead37b6 100644
+--- a/xla/backends/gpu/transforms/gemm_fusion.cc
++++ b/xla/backends/gpu/transforms/gemm_fusion.cc
+@@ -988,6 +988,15 @@ absl::StatusOr<HloInstruction*> FusionSearchSpace::HoistBitcast(
+       if (!operand->IsElementwise()) {
+         return instr;
+       }
++      // Elementwise operations preserve logical indices, not necessarily
++      // physical offsets. In particular, a layout-changing copy cannot be
++      // commuted with a bitcast using the same shape for every operand.
++      if (absl::c_any_of(operand->operands(), [&](HloInstruction* arg) {
++            return !ShapeUtil::EqualIgnoringElementType(operand->shape(),
++                                                        arg->shape());
++          })) {
++        return instr;
++      }
+       // bitcast(op(a, b)) -> op(bitcast(a), bitcast(b))
+       std::vector<HloInstruction*> new_operands;
+       for (HloInstruction* arg : operand->operands()) {
+@@ -1094,6 +1103,14 @@ absl::StatusOr<HloInstruction*> FusionSearchSpace::SinkBitcast(
+       if (!user->IsElementwise()) {
+         return instr;
+       }
++      // As in HoistBitcast, logical elementwise semantics do not justify
++      // commuting a bitcast across a change in physical layout.
++      if (absl::c_any_of(user->operands(), [&](HloInstruction* arg) {
++            return !ShapeUtil::EqualIgnoringElementType(user->shape(),
++                                                        arg->shape());
++          })) {
++        return instr;
++      }
+       // Sink past elementwise users.
+       // op(bitcast(a), b) -> bitcast(op(a, bitcast(b)))
+       std::vector<HloInstruction*> new_operands;
