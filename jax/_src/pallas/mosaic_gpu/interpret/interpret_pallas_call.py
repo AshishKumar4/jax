@@ -26,6 +26,7 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic.interpret import thread_map
 from jax._src.pallas.mosaic.interpret import utils as interpret_utils
 from jax._src.pallas.mosaic_gpu import core as mosaic_gpu_core
+from jax._src.pallas.mosaic_gpu.interpret import functional
 from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks
 from jax._src.pallas.mosaic_gpu.interpret import jaxpr_interpret
 from jax._src.pallas.mosaic_gpu.interpret import shared_memory as memory
@@ -377,6 +378,20 @@ def interpret_pallas_call(
   )
   num_blocks_per_cluster = math.prod(cluster_dims)
   device_info = jaxpr_interpret.DeviceInfo()
+
+  if functional.eligible(jaxpr, grid_mapping, num_threads_per_block,
+                         cluster_dims, device_info.num_devices,
+                         interpret_params):
+    return functional.interpret(
+        *args,
+        jaxpr=jaxpr,
+        grid_mapping=grid_mapping,
+        mesh=mesh,
+        input_output_aliases=input_output_aliases,
+        interpret_params=interpret_params,
+        grid_dims=grid_dims,
+        device_axes=device_info.axis_indices,
+    )
 
   device = memory.Device(jnp.int32(device_info.device_id))
 
