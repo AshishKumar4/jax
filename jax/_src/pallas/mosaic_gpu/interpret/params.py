@@ -45,6 +45,15 @@ class InterpretGPUParams(interpret_params.SharedInterpretParams):
       in fact spawn separate threads for executing TMA memory transfers, but a
       separate vector clock is maintained for each TMA thread.
       Default: 1.
+    functional: Whether a kernel of one thread a block, in clusters of one
+      block, on one device, runs as one JAX program (`functional.py`): its
+      buffers arrays, its loads and stores indexing, no callback per access.
+      False (the default) always uses the simulated memory, whose barrier and
+      out-of-bounds diagnostics name the misuse; None runs a kernel the
+      functional interpreter can run so and any other on the simulated memory;
+      True makes a kernel it cannot run an error. Race detection
+      (`detect_races`) always uses the simulated memory.
+      Default: False.
     logging_mode: Logging mode for GPU interpret mode.
     inline_mgpu: control how interpret mode handles inline MGPU usage. Either
       "error" or "ignore", since in general it's not possible to simulate MGPU
@@ -52,6 +61,7 @@ class InterpretGPUParams(interpret_params.SharedInterpretParams):
   """
 
   num_tma_threads_per_device: int = 5
+  functional: bool | None = False
   logging_mode: interpret_params.LoggingMode | None = None
   inline_mgpu: str = "error"
 

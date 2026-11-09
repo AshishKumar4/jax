@@ -174,6 +174,99 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
     np.testing.assert_array_equal(_kernel(x), x)
 
+  @jtu.parameterized.parameters(True, False)
+  def test_functional_interpreter_agrees_with_simulated_memory(self, grid):
+    # One thread a block: a grid of blocks, each copying its slice through
+    # SMEM, scaled, with a loop and a branch.
+    def body(x_ref, o_ref, smem):
+      i = jax.lax.axis_index('b') if grid else 0
+      smem[...] = plgpu.load(x_ref.at[pl.ds(i * 16, 16)])
+
+      def step(j, total):
+        return total + jnp.where(j % 2 == 0, smem[...], -smem[...])
+
+      o_ref[pl.ds(i * 16, 16)] = jax.lax.fori_loop(0, 3, step, smem[...] * 0)
+
+    def kernel(functional):
+      return functools.partial(
+          plgpu.kernel,
+          out_type=jax.ShapeDtypeStruct((64, 8), jnp.float32),
+          grid=(4,) if grid else (),
+          grid_names=('b',) if grid else (),
+          scratch_types=dict(smem=plgpu.SMEM((16, 8), jnp.float32)),
+          interpret=InterpretParams(functional=functional),
+      )(body)
+
+    x = jnp.arange(64 * 8, dtype=jnp.float32).reshape(64, 8)
+    functional = jax.jit(kernel(True))(x)
+    simulated = jax.jit(kernel(False))(x)
+    np.testing.assert_array_equal(functional, simulated)
+
+  def test_functional_interpreter_leaves_unwritten_memory_nan(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32),
+        interpret=InterpretParams(functional=True),
+    )
+    def _kernel(o_ref):
+      o_ref[0] = jnp.zeros((8,), jnp.float32)
+
+    out = jax.jit(_kernel)()
+    np.testing.assert_array_equal(out[0], 0)
+    self.assertTrue(np.isnan(out[1:]).all())
+
+  def test_functional_interpreter_raises_on_an_out_of_bounds_read(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((8,), jnp.float32),
+        interpret=InterpretParams(functional=True),
+    )
+    def _kernel(x_ref, n_ref, o_ref):
+      o_ref[...] = x_ref[pl.ds(n_ref[0], 8)]
+
+    with self.assertRaisesRegex(Exception, 'Out-of-bounds'):
+      jax.block_until_ready(jax.jit(_kernel)(
+          jnp.zeros((8,), jnp.float32), jnp.array([4], jnp.int32)))
+
+  def test_functional_interpreter_copies_through_tma_past_gmem_as_the_hardware(self):
+    # A TMA load past its GMEM source reads zeros; a TMA store past its GMEM
+    # destination drops the overhang.
+    x = jnp.arange(6, dtype=jnp.int32).reshape((3, 2))
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((3, 2), jnp.int32),
+        interpret=InterpretParams(functional=True),
+        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((4, 2), jnp.int32)),
+    )
+    def _kernel(start_ref, in_gmem, out_gmem, barrier, smem):
+      # Starts read at run time: a static start past the end is refused when
+      # the kernel is traced.
+      plgpu.copy_gmem_to_smem(in_gmem.at[pl.ds(start_ref[0], 4)], smem, barrier)
+      plgpu.barrier_wait(barrier)
+      smem[...] = smem[...] + 10
+      plgpu.commit_smem()
+      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(start_ref[1], 4)])
+      plgpu.wait_smem_to_gmem(0)
+
+    np.testing.assert_array_equal(
+        jax.jit(_kernel)(jnp.array([1, 0], jnp.int32), x),
+        np.array([[12, 13], [14, 15], [10, 10]], np.int32))
+
+  def test_functional_interpreter_refuses_a_block_of_two_threads(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((2,), jnp.int32),
+        num_threads=2,
+        thread_name='x',
+        interpret=InterpretParams(functional=True),
+    )
+    def _kernel(o_ref):
+      o_ref[jax.lax.axis_index('x')] = 1
+
+    with self.assertRaisesRegex(NotImplementedError, '2 threads a block'):
+      jax.jit(_kernel)()
+
   def test_load(self):
     @functools.partial(
         plgpu.kernel,
