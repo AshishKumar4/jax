@@ -6127,6 +6127,21 @@ class PallasCallWGTest(
       )
 
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_dump_to_with_a_named_kind_dumps_that_kind_alone(self):
+    x = jnp.ones((64, 64), dtype=jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct(x.shape, x.dtype))
+    def kernel(x_gmem, o_gmem):
+      o_gmem[...] = plgpu.load(x_gmem, optimized=False)
+
+    with tempfile.TemporaryDirectory() as dump_dir:
+      with jtu.set_env(MOSAIC_GPU_DUMP_TO=dump_dir, MOSAIC_GPU_DUMP_PTX="1"):
+        jax.jit(kernel).lower(x).compile()
+      files = os.listdir(dump_dir)
+      self.assertTrue(any(f.endswith(".ptx") for f in files), files)
+      self.assertFalse(any(f.endswith("_layout_inference.txt") for f in files), files)
+
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   @parameterized.parameters(None, plgpu.TraceScope.WARP, plgpu.TraceScope.WARPGROUP)
   def test_dump_resources(self, profile_trace_scope):
     x = jax.ShapeDtypeStruct((64, 64), jnp.float32)
