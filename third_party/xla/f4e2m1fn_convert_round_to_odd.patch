@@ -1,0 +1,52 @@
+diff --git a/xla/service/elemental_ir_emitter.cc b/xla/service/elemental_ir_emitter.cc
+index f75d0b826c..ad12a1f975 100644
+--- a/xla/service/elemental_ir_emitter.cc
++++ b/xla/service/elemental_ir_emitter.cc
+@@ -283,6 +283,36 @@ llvm::Value* EmitF8e4m3b11fnuzToF16(llvm::Value* f8_value, llvm::Module* module,
+   return f16_value;
+ }
+ 
++// Converts `value` to F16 rounding to odd, so a second rounding to a narrower
++// type (F4E2M1FN) rounds as one rounding of `value` would. Rounding to nearest
++// here rounds twice: F32 -0.25004873 becomes F16 -0.25, a tie that F4E2M1FN
++// breaks to -0.0, where -0.25004873 itself rounds to -0.5.
++llvm::Value* EmitToF16RoundToOdd(llvm::Value* value, llvm::IRBuilderBase* b) {
++  llvm::Type* f16_type = b->getHalfTy();
++  llvm::Type* i16_type = b->getInt16Ty();
++  llvm::Value* nearest = b->CreateFPTrunc(value, f16_type);
++  llvm::Value* back = b->CreateFPExt(nearest, value->getType());
++  // Exact (or NaN, whose F16 stays NaN however its last bit is set).
++  llvm::Value* inexact = b->CreateFCmpONE(back, value);
++  llvm::Value* bits = b->CreateBitCast(nearest, i16_type);
++  llvm::Value* odd = b->CreateICmpNE(
++      b->CreateAnd(bits, llvm::ConstantInt::get(i16_type, 1)),
++      llvm::ConstantInt::get(i16_type, 0));
++  // The other neighbour lies away from zero where the nearest is smaller in
++  // magnitude than `value`, else toward it: one step of the magnitude's bits.
++  auto abs = [&](llvm::Value* x) {
++    return llvm_ir::EmitCallToIntrinsic(llvm::Intrinsic::fabs, {x},
++                                        {x->getType()}, b);
++  };
++  llvm::Value* outward = b->CreateFCmpOLT(abs(back), abs(value));
++  llvm::Value* other = b->CreateSelect(
++      outward, b->CreateAdd(bits, llvm::ConstantInt::get(i16_type, 1)),
++      b->CreateSub(bits, llvm::ConstantInt::get(i16_type, 1)));
++  llvm::Value* rounded = b->CreateSelect(b->CreateAnd(inexact, b->CreateNot(odd)),
++                                         other, bits);
++  return b->CreateBitCast(rounded, f16_type);
++}
++
+ absl::StatusOr<llvm::Value*> EmitF16ToF4e2m1fn(llvm::Value* f16_value,
+                                                llvm::IRBuilderBase* b) {
+   auto i8_const = [&](int val) {
+@@ -950,9 +980,7 @@ absl::StatusOr<llvm::Value*> ElementalIrEmitter::EmitFloatUnaryOp(
+       if (to_type == F4E2M1FN) {
+         // Cast to F16 first. Casts to F4E2M1FN must be from F16.
+         if (from_type != F16) {
+-          operand_value = b_->CreateFPCast(
+-              operand_value,
+-              llvm_ir::PrimitiveTypeToIrType(F16, module_->getContext()));
++          operand_value = EmitToF16RoundToOdd(operand_value, b_);
+         }
+         return EmitF16ToF4e2m1fn(operand_value, b_);
+       }

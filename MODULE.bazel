@@ -42,6 +42,9 @@ archive_override(
         # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
         # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+        # XLA:CPU's legacy elemental emitter (a hoisted small while loop's) converted F32 to F4E2M1FN through an
+        # F16 rounded to nearest, rounding twice: round to odd there (Dew ledger: the promotion's f4 cells).
+        "//third_party:xla/f4e2m1fn_convert_round_to_odd.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],

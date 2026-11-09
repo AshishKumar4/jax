@@ -365,6 +365,17 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "f4e2m1fn_convert_test",
+    srcs = ["f4e2m1fn_convert_test.py"],
+    enable_backends = ["cpu"],
+    deps = py_deps([
+        "absl/testing",
+        "ml_dtypes",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "gpu_memory_flags_test_no_preallocation",
     srcs = ["gpu_memory_flags_test.py"],
     enable_backends = ["gpu"],
