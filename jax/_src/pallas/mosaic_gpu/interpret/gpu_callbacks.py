@@ -48,6 +48,13 @@ def is_gmem_memory_space(space: mosaic_gpu_core.MemorySpace | None) -> bool:
 
 _shared_memory: memory.GPUSharedMemory | None = None
 _shared_memory_init_lock = threading.Lock()
+# Signalled when `_shared_memory` is cleared. A kernel's interpretation admits
+# its own devices to the live shared memory and no more: the initialization of
+# another kernel (one running concurrently, e.g. a second execution of a program
+# under asynchronous dispatch, or from another Python thread) waits until the
+# live one is cleaned up, rather than joining (and corrupting) its memory.
+_shared_memory_cleared = threading.Condition(_shared_memory_init_lock)
+_shared_memory_devices_joined = 0
 _races: GPURaceDetectionState | None = None
 
 
@@ -57,9 +64,11 @@ def _get_shared_memory() -> memory.GPUSharedMemory:
 
 
 def _clear_shared_memory():
-  global _shared_memory
-  with _shared_memory_init_lock:
+  global _shared_memory, _shared_memory_devices_joined
+  with _shared_memory_cleared:
     _shared_memory = None
+    _shared_memory_devices_joined = 0
+    _shared_memory_cleared.notify_all()
 
 
 def get_races() -> GPURaceDetectionState:
@@ -80,10 +89,12 @@ def reset_gpu_interpret_mode_state():
   clean-up did not run (e.g. because interpreting the kernel was interrupted),
   the shared state must be reset before any further kernels are interpreted.
   """
-  global _shared_memory, _races
-  with _shared_memory_init_lock:
+  global _shared_memory, _races, _shared_memory_devices_joined
+  with _shared_memory_cleared:
     _shared_memory = None
     _races = None
+    _shared_memory_devices_joined = 0
+    _shared_memory_cleared.notify_all()
 
 
 TOKEN_SHAPE_DTYPE = jax.ShapeDtypeStruct((), jnp.int32)
@@ -165,14 +176,23 @@ def _initialize_shared_memory(
     num_blocks_per_cluster: jax.Array,
     interpret_params: InterpretGPUParams,
 ):
-  global _shared_memory, _races
+  global _shared_memory, _races, _shared_memory_devices_joined
 
   num_gpus_as_int = int(num_gpus)
   num_threads_per_block_as_int = int(num_threads_per_block)
   num_blocks_per_cluster_as_int = int(num_blocks_per_cluster)
   del num_gpus, num_threads_per_block, num_blocks_per_cluster
 
-  with _shared_memory_init_lock:
+  with _shared_memory_cleared:
+    # Every device of the live kernel has joined its memory: this
+    # initialization is another kernel's, which waits for the live one's
+    # clean-up.
+    while (
+        _shared_memory is not None
+        and _shared_memory_devices_joined >= _shared_memory.num_devices
+    ):
+      _shared_memory_cleared.wait()
+    _shared_memory_devices_joined += 1
     if _shared_memory is None:
       _races = GPURaceDetectionState(on_race=interpret_params.on_race)
       _shared_memory = memory.GPUSharedMemory(
