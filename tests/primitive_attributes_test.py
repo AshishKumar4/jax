@@ -26,6 +26,7 @@ from jax._src import test_util as jtu
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import special
 from jax._src.random import threefry2x32
+import jax.custom_batching
 import jax.numpy as jnp
 
 jax.config.parse_flags_with_absl()
@@ -121,12 +122,18 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
       return body(x)
     custom_vjp.defvjp(lambda x: (body(x), None), lambda _, g: (g,))
 
+    @jax.custom_batching.custom_vmap
+    def custom_vmap(x):
+      return body(x)
+    custom_vmap.def_vmap(lambda size, batched, x: (jax.vmap(body)(x), batched[0]))
+
     program = jax.make_jaxpr(body)(jnp.ones(4))
     calls = {
         "jit": jax.jit(body),
         "checkpoint": jax.checkpoint(body),
         "custom_jvp": custom_jvp,
         "custom_vjp": custom_vjp,
+        "custom_vmap": custom_vmap,
         "closed_call": lambda x: core.closed_call_p.bind(x, call_jaxpr=program)[0],
     }
     for name, call in calls.items():
