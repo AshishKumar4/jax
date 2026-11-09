@@ -676,6 +676,17 @@ class Primitive:
   skip_canonicalization: bool = False
   # set for primitives that allocate references
   ref_allocating: bool = False
+  # set for primitives that run a program on their operands one for one and
+  # return its results, which XLA inlines into the caller (a jit's call, which
+  # its CallInliner inlines; a checkpoint's, a custom derivative's primal and an
+  # evaluated jaxpr, which lower to their program in place): an analysis of a
+  # jaxpr reads such an equation as its program, with no call boundary.
+  inlined_call: bool = False
+  # set for primitives each of whose output entries reads its operands' entries
+  # at its own index and nothing else (each operand of the output's shape, or a
+  # scalar read at every index), so an analysis of a jaxpr's entries carries an
+  # index through it unchanged.
+  elementwise: bool = False
   is_effectful = None
 
   def __init__(self, name: str):
@@ -3427,6 +3438,7 @@ def dim_value_aval() -> AbstractValue:
 # transformation rules live in partial_eval.py and lax/eval_jaxpr.py.
 eval_jaxpr_p = Primitive('eval_jaxpr')
 eval_jaxpr_p.multiple_results = True
+eval_jaxpr_p.inlined_call = True
 eval_jaxpr_p.def_impl(lambda *args, call_jaxpr, **_: jaxpr_as_fun(call_jaxpr)(*args))
 eval_jaxpr_p.def_effectful_abstract_eval(
     lambda *_, call_jaxpr, **__: (call_jaxpr.out_avals, positional_effects(call_jaxpr)))
