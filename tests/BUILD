@@ -365,6 +365,16 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "gpu_gemm_fusion_layout_test",
+    srcs = ["gpu_gemm_fusion_layout_test.py"],
+    enable_backends = ["gpu"],
+    deps = py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "gpu_memory_flags_test_no_preallocation",
     srcs = ["gpu_memory_flags_test.py"],
     enable_backends = ["gpu"],
