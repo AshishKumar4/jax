@@ -47,51 +47,59 @@ def _marked():
   return sorted(found, key=lambda p: p.name)
 
 
-def _operands(primitive, rng):
-  """A shape (2, 3) operand set the primitive binds, its outputs, or None."""
+def _drawn(count, dtype, rng):
+  if dtype is np.bool_:
+    return [rng.random((2, 3)) > 0.5 for _ in range(count)]
+  if dtype is np.complex64:
+    return [(rng.uniform(0.1, 0.9, (2, 3)) + 1j * rng.uniform(0.1, 0.9, (2, 3))).astype(dtype)
+            for _ in range(count)]
+  if np.issubdtype(dtype, np.integer):
+    low = 0 if dtype is np.uint32 else -5
+    return [rng.integers(low, 6, (2, 3)).astype(dtype) for _ in range(count)]
+  return [rng.uniform(0.1, 0.9, (2, 3)).astype(dtype) for _ in range(count)]
+
+
+def _bound(primitive, rng):
+  """Operands of shape (2, 3) the primitive binds, a second draw of them, and its parameters; or None."""
   params = _PARAMS.get(primitive.name, {})
-  extras = ({}, {"accuracy": None})
-  for count, dtype, extra in itertools.product((1, 2, 3, 4), _DTYPES, extras):
-    if dtype is np.bool_:
-      operands = [rng.random((2, 3)) > 0.5 for _ in range(count)]
-    elif dtype is np.complex64:
-      operands = [(rng.uniform(0.1, 0.9, (2, 3)) + 1j * rng.uniform(0.1, 0.9, (2, 3))).astype(dtype)
-                  for _ in range(count)]
-    elif np.issubdtype(dtype, np.integer):
-      operands = [rng.integers(0 if dtype is np.uint32 else -5, 6, (2, 3)).astype(dtype) for _ in range(count)]
-    else:
-      operands = [rng.uniform(0.1, 0.9, (2, 3)).astype(dtype) for _ in range(count)]
-    if primitive.name == "select_n":
-      operands[0] = operands[0].astype(np.bool_) if count == 3 else operands[0]
+  for count, dtype, extra in itertools.product((1, 2, 3, 4), _DTYPES, ({}, {"accuracy": None})):
+    draws = _drawn(count, dtype, rng), _drawn(count, dtype, rng)
     try:
-      outs = primitive.bind(*map(jnp.asarray, operands), **params, **extra)
+      primitive.bind(*map(jnp.asarray, draws[0]), **params, **extra)
     except Exception:  # pylint: disable=broad-except
       continue
-    return operands, {**params, **extra}, outs
+    return draws, {**params, **extra}
   return None
 
 
 class PrimitiveAttributesTest(jtu.JaxTestCase):
 
   def test_an_elementwise_primitive_reads_each_output_entry_at_its_own_index(self):
-    # Each output entry equals the primitive applied to its operands' entries at
-    # that index alone (bound on scalars); a marked primitive no operands bind
-    # fails, so the test reads every one it marks.
+    # An output entry is unchanged where every operand's entries at the other
+    # indices are drawn again: it reads its own index's entries alone. A marked
+    # primitive no operands bind fails, so the test reads every one it marks.
     rng = np.random.default_rng(0)
     unbound = []
     for primitive in _marked():
-      made = _operands(primitive, rng)
+      made = _bound(primitive, rng)
       if made is None:
         unbound.append(primitive.name)
         continue
-      operands, params, outs = made
-      outs = outs if primitive.multiple_results else [outs]
+      (first, second), params = made
+
+      def outputs(operands, primitive=primitive, params=params):
+        outs = primitive.bind(*map(jnp.asarray, operands), **params)
+        return [np.asarray(out) for out in (outs if primitive.multiple_results else [outs])]
+
+      kept = outputs(first)
       for index in np.ndindex(2, 3):
-        alone = primitive.bind(*(jnp.asarray(o[index]) for o in operands), **params)
-        alone = alone if primitive.multiple_results else [alone]
-        for whole, entry in zip(outs, alone, strict=True):
-          np.testing.assert_array_equal(np.asarray(whole)[index], np.asarray(entry),
-                                        err_msg=f"{primitive.name} at {index}")
+        mixed = []
+        for one, other in zip(first, second, strict=True):
+          entry = np.array(other)
+          entry[index] = one[index]
+          mixed.append(entry)
+        for whole, alone in zip(kept, outputs(mixed), strict=True):
+          np.testing.assert_array_equal(whole[index], alone[index], err_msg=f"{primitive.name} at {index}")
     self.assertEqual(unbound, [])
 
   def test_a_reduction_contraction_or_permutation_is_not_elementwise(self):
