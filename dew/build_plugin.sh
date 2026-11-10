@@ -17,9 +17,9 @@
 # VERSION is every wheel's version: the commit's jax release (`_version`) and a suffix Bazel and the wheel
 # builder both name the wheel with (ML_WHEEL_VERSION_SUFFIX; the commit's own _release_version unset in the
 # build tree, so the builder takes the same suffix). DEW_BAZEL_TOKEN_FILE holds the
-# cache's bazel-scope token (default bazel.token beside this script), which Bazel reads through a credential
-# helper when it calls the cache, so no rc file or command line holds it (JAX's .bazelrc announces every rc line
-# it reads); DEW_BAZEL_CACHE is the cache's URL. OUT receives the wheels (dist/), their sha256 list
+# cache's bazel-scope token (else DEW_BAZEL_TOKEN, else bazel.token beside this script), which Bazel reads through
+# a credential helper when it calls the cache, so no rc file or command line holds it (JAX's .bazelrc announces every
+# rc line it reads); DEW_BAZEL_CACHE is the cache's URL. OUT receives the wheels (dist/), their sha256 list
 # (wheels.sha256), each build's log and seconds (builds.tsv) and the commit built (commit.txt).
 set -euo pipefail
 ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
@@ -28,6 +28,12 @@ token_file=${DEW_BAZEL_TOKEN_FILE:-$here/bazel.token}
 cache=${DEW_BAZEL_CACHE:-https://dew-bazel.ashishkmr472.workers.dev/bazel}
 tree=$(mktemp -d /tmp/dew-plugin-XXXX)
 trap 'rm -rf "$tree"' EXIT
+# On armada (a `build` job, dew/plugin_jobs.py) the token is the secret DEW_BAZEL_TOKEN in the environment, kept in
+# a file of the build's own for the credential helper; a file named explicitly wins.
+if [ -z "${DEW_BAZEL_TOKEN_FILE:-}" ] && [ -n "${DEW_BAZEL_TOKEN:-}" ]; then
+  token_file="$tree/token"
+  (umask 077 && printf %s "$DEW_BAZEL_TOKEN" > "$token_file")
+fi
 mkdir -p "$out/dist"
 # Fetched by name or sha alike (git clone --branch takes no sha), then checked out detached.
 git init -q "$tree/jax"
