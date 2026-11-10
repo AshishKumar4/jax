@@ -442,25 +442,28 @@ class CacheKeyTest(jtu.JaxTestCase):
 
   def test_kernels_key_alike_from_threads_sharing_one_context(self):
     # Programs lowered back to back on a thread share one MLIR context
-    # (`mlir.make_ir_context`), which another thread's lowerings may share too:
-    # threads keying programs whose Mosaic GPU kernels need unregistered
-    # dialects key each as one thread alone keys it, none failing to read its
-    # kernel.
-    with ir.Context() as kernel_ctx, ir.Location.unknown():
-      kernel_ctx.allow_unregistered_dialects = True
-      kernel = ir.Module.parse(
-          "module {\n"
-          '  "stable_mosaic_gpu.func"() ({\n'
-          '    "stable_mosaic_gpu.return"() : () -> () '
-          'loc("/home/ubuntu/s/trees/0/src/kernels.py":3:5)\n'
-          "  }) : () -> ()\n"
-          "}\n")
-      out = io.BytesIO()
-      kernel.operation.write_bytecode(out, desired_version=0)
-      body = out.getvalue()
+    # (`mlir.make_ir_context`), which takes no lock, and a compile keys them on
+    # threads of their own at once: each keyed on 16 threads, its kernel its
+    # own (so its stripped kernel is an attribute no other key makes), as one
+    # thread alone keys it, the shared context neither read in a state
+    # another key half wrote nor left allowing unregistered dialects.
+    def kernel(name):
+      with ir.Context() as kernel_ctx, ir.Location.unknown():
+        kernel_ctx.allow_unregistered_dialects = True
+        kernel = ir.Module.parse(
+            "module {\n"
+            f'  "stable_mosaic_gpu.func"() ({{\n'
+            '    "stable_mosaic_gpu.return"() : () -> () '
+            'loc("/home/ubuntu/s/trees/0/src/kernels.py":3:5)\n'
+            f'  }}) {{sym_name = "{name}"}} : () -> ()\n'
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        return out.getvalue()
 
+    bodies = [kernel(f"kernel_{index}") for index in range(256)]
     with mlir.make_ir_context() as ctx, ir.Location.unknown():
-      def program():
+      def program(body):
         module = ir.Module.parse(
             "module {\n"
             "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
@@ -475,9 +478,7 @@ class CacheKeyTest(jtu.JaxTestCase):
              "kernel_hash": ir.StringAttr.get(hashlib.sha256(body).digest())})
         return module
 
-      alone = cache_key._canonicalize_ir(program(), False)
-      self.assertFalse(ctx.allow_unregistered_dialects)
-      programs = [program() for _ in range(1024)]
+      programs = [program(body) for body in bodies]
 
     def keyed(module):
       return cache_key._canonicalize_ir(module, False)
@@ -491,7 +492,9 @@ class CacheKeyTest(jtu.JaxTestCase):
         keys = list(pool.map(keyed, programs))
     finally:
       sys.setswitchinterval(interval)
-    self.assertEqual(keys, [alone] * len(programs))
+    self.assertEqual(keys, [keyed(module) for module in programs])
+    self.assertLen(set(keys), len(programs))
+    self.assertFalse(ctx.allow_unregistered_dialects)
 
   def test_triton_kernels_differing_in_a_property_key_apart(self):
     # Pallas Triton writes its kernels at the default bytecode version, which

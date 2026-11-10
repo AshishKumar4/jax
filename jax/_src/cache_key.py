@@ -33,6 +33,7 @@ from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
 from jax._src.lib import cuda_versions
 from jax._src.lib import xla_client
+from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir import passmanager as pm
 import numpy as np
@@ -328,20 +329,53 @@ def _triton_dialect(ctx: ir.Context) -> bool:
 
 
 def _serialize_ir(m: ir.Module, ignore_custom_partitioning: bool) -> bytes:
-  output = io.BytesIO()
   if ignore_custom_partitioning:
     m = _remove_custom_partitioning_callbacks(
         type_cast(ir.Module, m.operation.clone(ip=False))
     )
-  m.operation.write_bytecode(file=output)
-  return output.getvalue()
+  return _bytecode(m)
+
+
+def _own_copy(serialized: bytes) -> ir.Module | None:
+  """The module `serialized` holds read into a context of its own, which a key
+  may write; None where it does not parse there (an operation of a dialect only
+  its own context registers).
+
+  A module's own context is its lowering thread's (`mlir.make_ir_context`), in
+  which that thread lowers on while another compiles the module, and a compile
+  that keys programs one thread lowered on threads of their own keys them at
+  once: canonicalizing creates operations and attributes (a clone, its unknown
+  locations, each stripped kernel's attribute), and in the shared context,
+  which takes no lock, two keys at once corrupted it (a thread faulted reading
+  an attribute there, Dew's PROMOGPU-0936eb755-PART8of9). Writing its
+  bytecode reads it alone.
+  """
+  context = mlir._create_ir_context()  # pylint: disable=protected-access
+  context.allow_unregistered_dialects = True
+  with context:
+    try:
+      return ir.Module.parse(serialized)
+    except ir.MLIRError:
+      return None
+
+
+def _bytecode(m: ir.Module) -> bytes:
+  out = io.BytesIO()
+  m.operation.write_bytecode(file=out)
+  return out.getvalue()
 
 
 def _canonicalize_ir(
     m_original: ir.Module, ignore_custom_partitioning: bool
 ) -> bytes:
-  with m_original.context:
-    m = type_cast(ir.Module, m_original.operation.clone(ip=False))
+  """`m_original` without its debug info, its kernels' included, serialized,
+  canonicalized in a context of its own (`_own_copy`); as it is written where
+  it does not parse there, its debug info kept."""
+  serialized = _bytecode(m_original)
+  m = _own_copy(serialized)
+  if m is None:
+    return serialized
+  with m.context, ir.Location.unknown():
     passes = pm.PassManager.parse(
         "builtin.module(strip-debuginfo)"
     )
@@ -355,7 +389,12 @@ def _canonicalize_ir(
 
 def _hash_computation(hash_obj, module, ignore_custom_partitioning: bool):
   if config.compilation_cache_include_metadata_in_key.value:
-    canonical_ir = _serialize_ir(module, ignore_custom_partitioning)
+    own = _own_copy(_bytecode(module)) if ignore_custom_partitioning else None
+    if own is None:
+      canonical_ir = _bytecode(module)
+    else:
+      with own.context:
+        canonical_ir = _serialize_ir(own, ignore_custom_partitioning)
   else:
     canonical_ir = _canonicalize_ir(module, ignore_custom_partitioning)
   hash_obj.update(canonical_ir)
