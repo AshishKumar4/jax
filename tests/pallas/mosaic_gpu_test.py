@@ -530,6 +530,19 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     elif asked == "approximate":
       self.assertIn(fast, out())
 
+  def test_is_finite(self):
+    # A hook keeping the finite values of a row and zeroing the rest.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.float32)
+    )
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      o_ref[...] = jnp.where(jnp.isfinite(x), x, 0.0)
+
+    x = np.arange(256, dtype=np.float32) - 128
+    x[[3, 50, 100, 200]] = [np.inf, -np.inf, np.nan, np.finfo(np.float32).max]
+    np.testing.assert_array_equal(kernel(x), np.where(np.isfinite(x), x, 0.0))
+
   @parameterized.parameters(False, True)
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_sqrt(self, approx_math):
