@@ -246,6 +246,34 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
       with self.subTest(primitive=name):
         self.assertFalse(any(getattr(primitive, c) for c in classes))
 
+  def test_a_rearranging_primitive_only_moves_entries(self):
+    # Distinct odd values with no exact sum or product among them in float32: every output entry of a
+    # rearrangement is one of them, or the pad's fill (-7.0), which no input holds.
+    x = (jnp.arange(24.0) * 2 + 1).reshape(2, 3, 4) * np.float32(1.0000001)
+    programs = [
+        lambda: x.reshape(6, 4), lambda: jnp.squeeze(x[:1], 0), lambda: jnp.broadcast_to(x, (2, 2, 3, 4)),
+        lambda: jnp.transpose(x, (2, 0, 1)), lambda: jnp.flip(x, 1), lambda: x[:, 1:3],
+        lambda: jax.lax.dynamic_slice(x, (0, 1, 1), (1, 2, 2)),
+        lambda: jax.lax.dynamic_update_slice(x, x[:1, :1, :1] * 0 + x[1, 2, 3], (0, 0, 0)),
+        lambda: x[:, jnp.array([2, 0])], lambda: jnp.concatenate([x, x], 1),
+        lambda: jax.lax.pad(x, np.float32(-7.0), [(1, 0, 0), (0, 1, 1), (0, 0, 0)]),
+        lambda: jnp.split(x, 2, 2)[1],
+    ]
+    allowed = set(np.asarray(x).ravel().tolist()) | {-7.0}
+    seen = set()
+    for program in programs:
+      rearranging = [e.primitive for e in jax.make_jaxpr(program)().eqns if e.primitive.rearranges]
+      with self.subTest(primitives=[p.name for p in rearranging]):
+        self.assertTrue(rearranging)
+        self.assertLessEqual(set(np.asarray(jax.jit(program)()).ravel().tolist()), allowed)
+        seen |= set(rearranging)
+    self.assertGreaterEqual(len(seen), 12)
+    # Arithmetic and rounding are not rearrangements: an add, a convert, a dot.
+    for program in (lambda: x + 1, lambda: x.astype(jnp.bfloat16), lambda: x.reshape(6, 4) @ x.reshape(4, 6)):
+      for e in jax.make_jaxpr(program)().eqns:
+        if e.primitive.name in ("add", "convert_element_type", "dot_general"):
+          self.assertFalse(e.primitive.rearranges, e.primitive.name)
+
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.lax.fori_loop(0, 3, lambda _, y: y * 2, x))(1.0)
     self.assertFalse(jaxpr.eqns[-1].primitive.inlined_call)
