@@ -33,7 +33,7 @@ def _calls(lowered) -> list[ir.DictAttr]:
           if (op.name == "stablehlo.custom_call"
               and ir.StringAttr(op.attributes["call_target_name"]).value
               == custom_call_targets.MOSAIC_GPU):
-            found.append(ir.DictAttr(op.attributes["backend_config"]))
+            found.append(ir.DictAttr(op.attributes["mhlo.backend_config"]))
           walk(op)
 
   walk(lowered.compiler_ir("stablehlo").operation)
