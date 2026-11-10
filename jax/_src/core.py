@@ -709,6 +709,12 @@ class Primitive:
   # up to it (or from it, `reverse`): cumsum, cumprod, cummax, cummin and
   # cumlogsumexp.
   cumulative: bool = False
+  # set for primitives that only move entries: each output entry one operand's
+  # entry, or a fill the parameters state, with no arithmetic and no rounding
+  # (a reshape, a broadcast, a transpose, a slice or its update, a gather, a
+  # concatenation, a pad, a split), so an analysis may count them free and know
+  # they cannot round.
+  rearranges: bool = False
   # set for primitives that write their updates into a copy of their operand at
   # the indices their scatter dimension numbers place them (a scatter, or one
   # that combines each update with the entry it lands on).

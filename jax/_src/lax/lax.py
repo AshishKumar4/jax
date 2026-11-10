@@ -7812,6 +7812,7 @@ broadcast_in_dim_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'broadcast_in_dim'),
     ur_rule=_broadcast_in_dim_ur_rule,
     memory_space_rule=_broadcast_in_dim_memory_space_rule)
+broadcast_in_dim_p.rearranges = True
 broadcast_in_dim_p.def_impl(partial(dispatch.apply_primitive, broadcast_in_dim_p))
 ad.primitive_jvps[broadcast_in_dim_p] = _broadcast_in_dim_jvp_rule
 ad.primitive_transposes[broadcast_in_dim_p] = _broadcast_in_dim_transpose_rule
@@ -8050,6 +8051,7 @@ concatenate_p = standard_primitive(
     sharding_rule=_concatenate_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'concatenate'),
     ur_rule=_concatenate_ur_rule)
+concatenate_p.rearranges = True
 ad.deflinear2(concatenate_p, _concatenate_transpose_rule)
 ad.primitive_transposes[concatenate_p] = _concatenate_transpose_rule
 batching.primitive_batchers[concatenate_p] = _concatenate_batch_rule
@@ -8338,6 +8340,7 @@ def _split_vma_rule(operand, *, sizes, axis):
   return [out_vma] * len(out_shapes)
 
 split_p = core.Primitive('split')
+split_p.rearranges = True
 split_p.multiple_results = True
 split_p.def_abstract_eval(
     partial(standard_multi_result_abstract_eval, split_p, _split_shape_rule,
@@ -8433,6 +8436,7 @@ pad_p = standard_primitive(_pad_shape_rule, _pad_dtype_rule, 'pad',
                            sharding_rule=_pad_sharding_rule,
                            vma_rule=partial(core.standard_vma_rule, 'pad'),
                            ur_rule=_pad_ur_rule)
+pad_p.rearranges = True
 ad.deflinear2(pad_p, _pad_transpose)
 batching.primitive_batchers[pad_p] = _pad_batch_rule
 
@@ -8507,6 +8511,7 @@ squeeze_p = standard_primitive(
     sharding_rule=_squeeze_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'squeeze'),
     ur_rule=_squeeze_ur_rule, layout_rule=_squeeze_layout_rule)
+squeeze_p.rearranges = True
 ad.deflinear2(squeeze_p, _squeeze_transpose_rule)
 batching.primitive_batchers[squeeze_p] = _squeeze_batch_rule
 
@@ -8930,6 +8935,7 @@ reshape_p = standard_primitive(
     sharding_rule=_reshape_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'reshape'),
     ur_rule=_reshape_ur_rule, layout_rule=_reshape_layout_rule)
+reshape_p.rearranges = True
 ad.deflinear2(reshape_p, _reshape_transpose_rule)
 batching.fancy_primitive_batchers[reshape_p] = _reshape_batch_rule
 mlir.register_lowering(reshape_p, _reshape_lower)
@@ -8962,6 +8968,7 @@ def _rev_batch_rule(batched_args, batch_dims, *, dimensions):
 rev_p = standard_primitive(_rev_shape_rule, input_dtype, 'rev',
                            sharding_rule=_rev_sharding_rule,
                            vma_rule=partial(core.standard_vma_rule, 'rev'))
+rev_p.rearranges = True
 ad.deflinear2(rev_p, lambda t, _, dimensions: [rev(t, dimensions)])
 batching.primitive_batchers[rev_p] = _rev_batch_rule
 
@@ -9017,6 +9024,7 @@ transpose_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'transpose'),
     ur_rule=_transpose_ur_rule,
     layout_rule=_transpose_layout_rule)
+transpose_p.rearranges = True
 ad.deflinear2(transpose_p,
               lambda t, _, permutation: [transpose(t, np.argsort(permutation))])
 batching.primitive_batchers[transpose_p] = _transpose_batch_rule
