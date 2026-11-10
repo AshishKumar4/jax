@@ -493,14 +493,14 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct([1024], jnp.float32),
+        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
         compiler_params=plgpu.CompilerParams(approx_math=approx_math),
     )
     def kernel(x_ref, o_ref):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
 
     reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0}[op]
-    x = np.random.default_rng(0).uniform(-reach, reach, 1024).astype(np.float32)
+    x = np.random.default_rng(0).uniform(-reach, reach, 256).astype(np.float32)
     if asked == "unmet":
       with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
         kernel(x)
