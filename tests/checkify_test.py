@@ -636,6 +636,42 @@ class CheckifyTransformTests(jtu.JaxTestCase):
       self.assertIsNotNone(failed.get())
       self.assertIn("x must be above -1", failed.get())
 
+  @parameterized.product(construct=["scan", "while", "cond"],
+                         nested=[False, True])
+  def test_a_check_in_a_shard_map_in_a_loop_or_a_cond(self, construct, nested):
+    # A check under a shard_map (nested in another, over the mesh's other
+    # axis) in a loop's body or a cond's branch: the shard_map's errors, one a
+    # shard, carried as the scalar error the loop or cond was given.
+    mesh = jtu.create_mesh((2, 2), ("a", "b"))
+
+    def checked(y):
+      checkify.check(jnp.all(y > 0.0), "y must be positive")
+      return y * 2.0
+
+    mapped = jax.shard_map(checked, mesh=mesh, in_specs=P("a", "b"),
+                           out_specs=P("a", "b"))
+    if nested:
+      inner = jax.shard_map(checked, mesh=mesh, in_specs=P("b"),
+                            out_specs=P("b"), axis_names={"b"})
+      mapped = jax.shard_map(inner, mesh=mesh, in_specs=P("a"),
+                             out_specs=P("a"), axis_names={"a"})
+
+    def f(x):
+      if construct == "scan":
+        return lax.scan(lambda c, _: (mapped(c), None), x, length=2)[0]
+      if construct == "while":
+        return lax.while_loop(lambda c: c[0] < 2,
+                              lambda c: (c[0] + 1, mapped(c[1])), (0, x))[1]
+      return lax.cond(x[0, 0] > -100.0, mapped, lambda y: y, x)
+
+    x = jnp.arange(1.0, 17.0).reshape(4, 4)
+    error, out = jax.jit(checkify.checkify(f))(x)
+    error.throw()
+    self.assertArraysEqual(out, x * (2.0 if construct == "cond" else 4.0))
+    failed, _ = jax.jit(checkify.checkify(f))(x - 5.0)
+    self.assertIsNotNone(failed.get())
+    self.assertIn("y must be positive", failed.get())
+
   def test_empty_enabled_errors(self):
     def multi_errors(x):
       x = x/0         # DIV
