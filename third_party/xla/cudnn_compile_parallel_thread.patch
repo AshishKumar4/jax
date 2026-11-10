@@ -1,0 +1,154 @@
+diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
+index bf6c3dc3af..0580f1faff 100644
+--- a/xla/backends/gpu/codegen/BUILD
++++ b/xla/backends/gpu/codegen/BUILD
+@@ -96,6 +96,7 @@ xla_test(
+         "//xla/service:dump",
+         "//xla/service:hlo_module_config",
+         "//xla/service:pattern_matcher",
++        "//xla/service/gpu:cublas_cudnn",
+         "//xla/service/gpu:cudnn_support_utils",
+         "//xla/service/gpu:ir_emission_utils",
+         "//xla/stream_executor:device_description",
+@@ -107,6 +108,7 @@ xla_test(
+         "//xla/tests:hlo_interpreter_reference_mixin",
+         "//xla/tsl/platform:env",
+         "//xla/tsl/platform:test",
++        "@com_google_absl//absl/algorithm:container",
+         "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
+diff --git a/xla/backends/gpu/codegen/cudnn_test.cc b/xla/backends/gpu/codegen/cudnn_test.cc
+index 7a4baf3097..0400395c90 100644
+--- a/xla/backends/gpu/codegen/cudnn_test.cc
++++ b/xla/backends/gpu/codegen/cudnn_test.cc
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include <tuple>
+ #include <utility>
+ 
++#include "absl/algorithm/container.h"
+ #include "absl/log/check.h"
+ #include "absl/status/status.h"
+ #include "absl/status/status_macros.h"
+@@ -39,12 +40,16 @@ limitations under the License.
+ #include "xla/comparison_util.h"
+ #include "xla/debug_options_flags.h"
+ #include "xla/error_spec.h"
++#include "xla/hlo/ir/hlo_computation.h"
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_module.h"
+ #include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/hlo/testlib/filecheck.h"
+ #include "xla/hlo/testlib/pattern_matcher_gmock.h"
+ #include "xla/hlo/testlib/verified_hlo_module.h"
+ #include "xla/primitive_util.h"
+ #include "xla/service/dump.h"
++#include "xla/service/gpu/cublas_cudnn.h"
+ #include "xla/service/gpu/cudnn_support_utils.h"
+ #include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/service/hlo_module_config.h"
+@@ -417,6 +422,57 @@ ENTRY e {
+                             ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+ }
+ 
++class CuDnnFusionStreamAnnotationTest : public CuDnnFusionExecutionTest {
++ public:
++  DebugOptions GetDebugOptionsForTest() const override {
++    DebugOptions debug_options =
++        CuDnnFusionExecutionTest::GetDebugOptionsForTest();
++    debug_options.set_xla_gpu_experimental_stream_annotation(true);
++    return debug_options;
++  }
++};
++
++TEST_F(CuDnnFusionStreamAnnotationTest,
++       FusionInStreamAnnotatedCallExecutesCorrectly) {
++  constexpr absl::string_view kHloText = R"(
++fusion1 {
++  p0 = f32[32,96] parameter(0)
++  p1 = f32[96,64] parameter(1)
++  ROOT r = f32[32,64] dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++annotated {
++  p0 = f32[32,96] parameter(0)
++  p1 = f32[96,64] parameter(1)
++  ROOT f = f32[32,64] fusion(p0, p1), kind=kCustom, calls=fusion1,
++    backend_config={"fusion_backend_config": {kind: "__cudnn$fusion"}}
++}
++
++ENTRY e {
++  p0 = f32[32,96] parameter(0)
++  p1 = f32[96,64] parameter(1)
++  ROOT c = f32[32,64] call(p0, p1), to_apply=annotated,
++    frontend_attributes={_xla_stream_annotation="1",inlineable="false"}
++})";
++
++  // The stream-annotated call is wrapped into an async computation on the
++  // parallel execution thread, so the cuDNN fusion must be compiled there.
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
++                       GetOptimizedModule(kHloText));
++  ASSERT_TRUE(absl::c_any_of(
++      optimized->computations(), [](const HloComputation* computation) {
++        return computation->execution_thread() ==
++                   HloInstruction::kParallelExecutionThread &&
++               absl::c_any_of(computation->instructions(),
++                              [](const HloInstruction* instruction) {
++                                return IsCudnnFusion(*instruction);
++                              });
++      }));
++
++  EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
++}
++
+ TEST_F(CuDnnFusionFileCheckTest, VectorTensorMultiplicationWorksCorrectly) {
+   const std::string kHloText = R"(
+ f {
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index 35607b5e5b..ebf0f297ef 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -2554,6 +2554,7 @@ cc_library(
+         "@com_google_absl//absl/base:core_headers",
+         "@com_google_absl//absl/base:nullability",
+         "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/container:flat_hash_set",
+         "@com_google_absl//absl/log",
+         "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/status",
+diff --git a/xla/service/gpu/nvptx_compiler.cc b/xla/service/gpu/nvptx_compiler.cc
+index f9fdb58bcf..5694970887 100644
+--- a/xla/service/gpu/nvptx_compiler.cc
++++ b/xla/service/gpu/nvptx_compiler.cc
+@@ -28,6 +28,7 @@ limitations under the License.
+ 
+ #include "absl/algorithm/container.h"
+ #include "absl/base/call_once.h"
++#include "absl/container/flat_hash_set.h"
+ #include "absl/log/check.h"
+ #include "absl/log/log.h"
+ #include "absl/status/status.h"
+@@ -416,15 +417,17 @@ absl::Status NVPTXCompiler::RunCudnnCompilerPasses(
+   });
+   const se::DeviceDescription& gpu_device_info =
+       gpu_target_config.device_description;
++  // Stream-annotated calls are wrapped into async computations on the parallel
++  // execution thread, and their cuDNN graphs must be compiled as well.
++  const absl::flat_hash_set<absl::string_view> execution_threads = {
++      HloInstruction::kMainExecutionThread,
++      HloInstruction::kParallelExecutionThread};
+   CuDnnFusionCompiler fusion_compiler(dnn_support, gpu_device_info,
+                                       *dnn_compiled_graphs);
+-  ABSL_RETURN_IF_ERROR(
+-      fusion_compiler.Run(module, {HloInstruction::kMainExecutionThread})
+-          .status());
++  ABSL_RETURN_IF_ERROR(fusion_compiler.Run(module, execution_threads).status());
+   CuDnnCustomCallCompiler call_compiler(dnn_support, gpu_device_info,
+                                         *dnn_compiled_graphs);
+-  return call_compiler.Run(module, {HloInstruction::kMainExecutionThread})
+-      .status();
++  return call_compiler.Run(module, execution_threads).status();
+ }
+ 
+ namespace {
