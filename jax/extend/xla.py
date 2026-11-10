@@ -20,6 +20,7 @@
 from jax._src.hlo_reader import (
     Instruction as Instruction,
     instructions as instructions,
+    module_from_text as module_from_text,
 )
 from jax._src.xla_transform import (
     PipelineStage as PipelineStage,
