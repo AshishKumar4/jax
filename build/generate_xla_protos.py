@@ -35,7 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def pinned_xla() -> str:
   with open(os.path.join(ROOT, "MODULE.bazel")) as f:
     module = f.read()
-  match = re.search(r'name = "xla",.*?commit = "([0-9a-f]{40})"', module, re.S)
+  match = re.search(r'module_name = "xla",.*?strip_prefix = "xla-([0-9a-f]{40})"', module, re.S)
   if match is None:
     sys.exit("MODULE.bazel pins no XLA commit")
   return match.group(1)
