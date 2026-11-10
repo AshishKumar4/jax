@@ -29,6 +29,13 @@ for path in "$@" conftest.py pytest.ini; do
     copied="$copied$directory "
   fi
 done
+# The checkout's sources a test holds the wheel to, none of them a module the wheel installs: its build scripts and
+# its .proto files (tests/mosaic_gpu_records_test.py: the schema jax ships against the mosaic_gpu.proto the CUDA
+# plugin is built from, described by build/generate_xla_protos.py).
+if [ -d "$checkout/build" ]; then
+  cp -r "$checkout/build" "$apart/build"
+fi
+(cd "$checkout" && find . -name '*.proto' -not -path './.git/*' -exec cp --parents {} "$apart" \;)
 # The wheel's top-level modules, from its RECORD (the dist-info and data directories aside).
 modules=$("$python" -c '
 import sys, zipfile
