@@ -1,0 +1,45 @@
+diff --git a/xla/stream_executor/cuda/cuda_dnn.cc b/xla/stream_executor/cuda/cuda_dnn.cc
+index aa9135b252..c56ac17ffc 100644
+--- a/xla/stream_executor/cuda/cuda_dnn.cc
++++ b/xla/stream_executor/cuda/cuda_dnn.cc
+@@ -3951,9 +3951,39 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> GetExecPlanFromHeuristics(
+              << ". absl::Status of final plan: " << CudnnStatusToString(status);
+ }
+ 
++// The execution plan of the first engine cuDNN's heuristics give `op_graph`
++// whose plan needs no workspace. A convolution compiled with no algorithm (the
++// autotuner's default, algo_id -1, which a deviceless compile keeps: it runs
++// no candidate) reaches the runtime with no workspace allocated, so an engine
++// that needs none runs it.
++static absl::StatusOr<cudnn_frontend::ExecutionPlan> UnallocatedExecutionPlan(
++    const CudnnHandle& cudnn, cudnn_frontend::OperationGraph& op_graph) {
++  cudnn_frontend::EngineConfigList engine_configs;
++  cudnn_frontend::get_heuristics_list<2>(
++      {"heuristics_instant", "heuristics_fallback"}, op_graph, allowAllConfig,
++      engine_configs, true);
++  for (const auto& engine_config : engine_configs) {
++    cudnn_frontend::ExecutionPlan plan =
++        cudnn_frontend::ExecutionPlanBuilder()
++            .setHandle(cudnn.handle())
++            .setEngineConfig(engine_config, op_graph.getTag())
++            .build();
++    if (plan.get_status() == CUDNN_STATUS_SUCCESS &&
++        plan.getWorkspaceSize() == 0) {
++      return plan;
++    }
++  }
++  return absl::NotFoundError(absl::StrCat(
++      "No cuDNN engine of the ", engine_configs.size(),
++      " its heuristics give runs ", op_graph.getTag(), " without workspace"));
++}
++
+ static absl::StatusOr<cudnn_frontend::ExecutionPlan> RebuildExecutionPlan(
+     const CudnnHandle& cudnn, const dnn::AlgorithmDesc& desc,
+-    const cudnn_frontend::OperationGraph& op_graph) {
++    cudnn_frontend::OperationGraph& op_graph) {
++  if (desc.algo_id() < 0) {
++    return UnallocatedExecutionPlan(cudnn, op_graph);
++  }
+   // Errors encountered when building a cuDNN operation graph are surfaced in an
+   // unprecedented and innovative way: they're written into a field of the
+   // contained engine object, but then clobbered by the object's move
