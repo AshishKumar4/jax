@@ -339,6 +339,7 @@ pytype_strict_library(
         ":api",
         ":batching",
         ":core",
+        ":custom_call_targets",
         ":effects",
         ":ffi",
         ":mlir",
@@ -357,6 +358,7 @@ pytype_strict_library(
         ":batching",
         ":config",
         ":core",
+        ":custom_call_targets",
         ":dtypes",
         ":effects",
         ":ffi",
@@ -445,6 +447,19 @@ pytype_strict_library(
 pytype_strict_library(
     name = "custom_call_targets",
     srcs = ["custom_call_targets.py"],
+    visibility = ["//jax:internal"],
+)
+
+pytype_strict_library(
+    name = "hlo_reader",
+    srcs = ["hlo_reader.py"],
+    visibility = ["//jax:internal"],
+    deps = [":xla_protos"],
+)
+
+pytype_strict_library(
+    name = "xla_protos",
+    srcs = ["xla_protos.py"],
     visibility = ["//jax:internal"],
 )
 

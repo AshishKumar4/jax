@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import effects
 from jax._src import ffi
@@ -236,17 +237,11 @@ def _buffer_callback_lowering(
   if len(ctx.module_context.platforms) > 1:
     raise NotImplementedError("multi-platform lowering for buffer_callback")
   platform = ctx.module_context.platforms[0]
-  target_name = {
-      "cpu": "xla_buffer_python_cpu_callback",
-      "cuda": "xla_buffer_python_gpu_callback",
-      "rocm": "xla_buffer_python_gpu_callback",
-      "oneapi": "xla_buffer_python_gpu_callback",
-  }.get(platform)
-  if target_name is None:
+  device = {"cpu": "cpu", "cuda": "gpu", "rocm": "gpu", "oneapi": "gpu"}.get(platform)
+  if device is None:
     raise ValueError(f"`buffer_callback` not supported on {platform} backend.")
-
-  if command_buffer_compatible and platform in ("cuda", "rocm", "oneapi"):
-    target_name += "_cmd_buffer"
+  target_name = custom_call_targets.BUFFER_CALLBACK[
+      (device, bool(command_buffer_compatible) and device == "gpu")]
 
   def wrapped_callback(exec_ctx, *args: Any):
     args_in, args_out = util.split_list(args, [in_tree.num_leaves])

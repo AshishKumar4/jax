@@ -32,6 +32,22 @@ TPU_CUSTOM_CALL: Final = "tpu_custom_call"
 ALLOCATE_BUFFER: Final = "AllocateBuffer"
 """An uninitialized buffer (`lax.empty`)."""
 
+PYTHON_CALLBACK: Final = {
+    ("cpu", False): "xla_ffi_python_cpu_callback",
+    ("gpu", False): "xla_ffi_python_gpu_callback",
+    ("cpu", True): "xla_ffi_partitioned_python_cpu_callback",
+    ("gpu", True): "xla_ffi_partitioned_python_gpu_callback",
+}
+"""A Python callback (`pure_callback`, `io_callback`, `debug.callback`) by its device kind and whether it is
+partitioned (jax._src.callback)."""
+
+BUFFER_CALLBACK: Final = {
+    ("cpu", False): "xla_buffer_python_cpu_callback",
+    ("gpu", False): "xla_buffer_python_gpu_callback",
+    ("gpu", True): "xla_buffer_python_gpu_callback_cmd_buffer",
+}
+"""A buffer callback (jax._src.buffer_callback) by its device kind and whether a command buffer may hold it."""
+
 THREEFRY2X32: Final = {"cuda": "cu_threefry2x32_ffi", "rocm": "hip_threefry2x32_ffi",
                        "oneapi": "oneapi_threefry2x32_ffi"}
 """The threefry2x32 hash's FFI kernel by GPU platform (jax._src.random.threefry2x32)."""
