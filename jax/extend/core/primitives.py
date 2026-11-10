@@ -29,7 +29,8 @@ from jax._src.callback import (
 
 from jax._src.core import (
   call_p as call_p,
-  closed_call_p as closed_call_p
+  closed_call_p as closed_call_p,
+  pvary_p as pvary_p,
 )
 
 from jax._src.lax.eval_jaxpr import (
@@ -223,14 +224,18 @@ from jax._src.lax.fft import (
 )
 
 from jax._src.lax.parallel import (
+  all_gather_invariant_p as all_gather_invariant_p,
   all_gather_p as all_gather_p,
   all_to_all_p as all_to_all_p,
   axis_index_p as axis_index_p,
+  pbroadcast_p as pbroadcast_p,
   pmax_p as pmax_p,
   pmin_p as pmin_p,
   ppermute_p as ppermute_p,
+  psum_invariant_p as psum_invariant_p,
   psum_p as psum_p,
   ragged_all_to_all_p as ragged_all_to_all_p,
+  reduce_scatter_p as reduce_scatter_p,
 )
 
 from jax._src.lax.ann import (
