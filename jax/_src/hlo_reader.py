@@ -1,0 +1,74 @@
+# Copyright 2026 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""A compiled HLO module's instructions read through XLA's own schema (hlo.proto at the pinned XLA,
+jax._src.xla_protos) from the module's serialization: each instruction's opcode, its custom-call target and the
+computations it calls, by name. The module is decoded once; protobuf, which jax does not otherwise need, is
+imported on first use."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+import functools
+from typing import Any, NamedTuple
+
+
+class Instruction(NamedTuple):
+  """An instruction of a module (`instructions`): the computation holding it, its name and opcode, its
+  custom-call target (None where it is no custom call), the computations it calls (a fusion's, a while
+  loop's body and condition, a conditional's branches, a call's), by name, and the instruction as XLA's
+  schema holds it (`proto`, an `xla.HloInstructionProto`: its shape, operands, dimension numbers and
+  backend config, which the fields above do not name)."""
+
+  computation: str
+  name: str
+  opcode: str
+  custom_call_target: str | None
+  called: tuple[str, ...]
+  proto: Any
+
+
+@functools.cache
+def _module_class() -> Any:
+  try:
+    from google.protobuf import descriptor_pb2
+    from google.protobuf import descriptor_pool
+    from google.protobuf import message_factory
+  except ImportError as error:
+    raise ImportError("reading an HLO module's instructions needs the protobuf package") from error
+  from jax._src import xla_protos
+
+  # A pool of its own: another library's copy of these files (xla/xla_data.proto) in the default pool
+  # does not meet it.
+  pool = descriptor_pool.DescriptorPool()
+  for file in descriptor_pb2.FileDescriptorSet.FromString(xla_protos.FILE_DESCRIPTOR_SET).file:
+    pool.Add(file)
+  return message_factory.GetMessageClass(pool.FindMessageTypeByName("xla.HloModuleProto"))
+
+
+def instructions(module: Any) -> Iterator[Instruction]:
+  """Each instruction of `module`, computation by computation in the module's order: an HLO module (a
+  compiled executable's `hlo_modules()`, a lowering's `compiler_ir("hlo")`) or its serialized
+  HloModuleProto."""
+  if isinstance(module, (bytes, bytearray, memoryview)):
+    serialized = bytes(module)
+  else:
+    serialized = module.as_serialized_hlo_module_proto()
+  proto = _module_class().FromString(serialized)
+  names = {computation.id: computation.name for computation in proto.computations}
+  for computation in proto.computations:
+    for instruction in computation.instructions:
+      yield Instruction(
+          computation.name, instruction.name, instruction.opcode,
+          instruction.custom_call_target if instruction.opcode == "custom-call" else None,
+          tuple(names[called] for called in instruction.called_computation_ids), instruction)
