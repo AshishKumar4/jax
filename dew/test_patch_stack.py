@@ -133,6 +133,12 @@ def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_cod
     assert patch_stack.plugins("0.12.0.1.post45") == "plugin-0.12.0.1.post45"
     commit({"jax/core.py": "post47"}, "post47")
     assert patch_stack.plugins("0.12.0.1.post47") == "plugin-0.12.0.1.post45"
+    # The schema generator, run by hand to write jax/_src's modules and read by no build, changes no plugin; a
+    # build script does.
+    commit({"build/generate_xla_protos.py": "post48"}, "post48")
+    assert patch_stack.plugins("0.12.0.1.post48") == "plugin-0.12.0.1.post45"
+    commit({"build/build.py": "post49"}, "post49")
+    assert patch_stack.plugins("0.12.0.1.post49") == ""
 
 
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
