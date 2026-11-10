@@ -62,6 +62,11 @@ STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints
 PLUGINS = re.compile(r"refs/tags/plugin-(\d+(?:\.\d+){2,3})\.post(\d+)$")
 FAMILY = re.compile(r"^(?:fixup! )?\[stack\] ([^:]+):")
 """A stack commit's family, from its subject: a family's patch, or a repair of it (`fixup!`)."""
+PYTHON_ONLY = ("jax/", "tests/", "docs/", "build/generate_xla_protos.py")
+"""What a post release changes and still ships plugins built from an earlier one's native code (`plugins`): jax's
+Python package, its tests, its docs, and build/generate_xla_protos.py, which is run by hand to write jax/_src's
+schema modules (xla_protos.py, mosaic_gpu_protos.py) and which no Bazel target, build/build.py or
+dew/build_plugin.sh reads (post77's kernel-record schema)."""
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -80,7 +85,7 @@ def tests(release: str) -> list[str]:
 def plugins(version: str) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
-    commit HEAD differs from only in jax's Python package, its tests and its docs (jax/, tests/, docs/), so its
+    commit HEAD differs from only in `PYTHON_ONLY` (jax's Python package, its tests, its docs), so its
     plugins are built from HEAD's own native code, as a post release of Python fixes alone is (Main, 2026-11-03:
     post46's two Mosaic GPU fixes; post63's lowering cache, whose Pallas changelog entry is a doc); "" where neither
     is. A dev build's (X.postN.devM) is never one: the index never listed it."""
@@ -93,8 +98,8 @@ def plugins(version: str) -> str:
         if found == int(post):
             return tag.removeprefix("refs/tags/")
         git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
-        if not git("diff", "--name-only", tag, "HEAD", "--", ".", ":(exclude)jax/", ":(exclude)tests/",
-                   ":(exclude)docs/").strip():
+        if not git("diff", "--name-only", tag, "HEAD", "--", ".",
+                   *(f":(exclude){path}" for path in PYTHON_ONLY)).strip():
             return tag.removeprefix("refs/tags/")
     return ""
 
