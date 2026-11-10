@@ -3222,6 +3222,14 @@ def _log2_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   return math_dialect.log2(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
+@register_lowering_rule(lax.is_finite_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.is_finite_p, mgpu.LoweringSemantics.Warpgroup)
+def _is_finite_lowering_rule(ctx: LoweringRuleContext, x):
+  """Whether `x` is finite: its magnitude below infinity, an ordered
+  comparison a NaN fails."""
+  return _lower_fun(lambda x: lax.abs(x) < jnp.array(jnp.inf, x.dtype))(ctx, x)
+
+
 @register_lowering_rule(lax.abs_p, mgpu.LoweringSemantics.Lane)
 def _abs_lowering_rule(ctx: LoweringRuleContext, x):
   [x_aval] = ctx.avals_in
