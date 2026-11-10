@@ -43,6 +43,12 @@ archive_override(
         # A bitcast commuted across a layout-changing copy in GEMM fusion drops the copy's permutation, so a
         # Triton GEMM fusion reads its operand permuted (Dew ledger 5275; upstream a22dec8093, PR #51630).
         "//third_party:xla/gemm_fusion_bitcast_layouts.patch",
+        # A cuDNN call in a computation on the parallel execution thread (compute_on, a stream-annotated call)
+        # compiles its graph as one on the main thread does (upstream 4caba817d8, PR #50350).
+        "//third_party:xla/cudnn_compile_parallel_thread.patch",
+        # A compile with no device and cuDNN's deviceless compilation off fails at a cuDNN call, rather than
+        # returning an executable whose cuDNN thunk finds no serialized graph at load (upstream ecc9e27f91).
+        "//third_party:xla/cudnn_uncompiled_fails.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
