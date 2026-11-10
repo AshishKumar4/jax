@@ -224,6 +224,52 @@ class JaxAotTest(jtu.JaxTestCase):
       self.assertEqual(result.sharding.device_set, set(jax.devices('tpu')))
       self.assertArraysEqual(result, x_np * x_np + 1.0)
 
+  @jtu.run_on_devices('cuda')
+  @jtu.thread_unsafe_test()
+  def test_a_compile_only_client_writes_the_cache_and_reads_nothing_back(self):
+    # A compile-only client's compile writes its entry and, compiling again,
+    # reads none back (an entry deserializes only as a loaded executable, which
+    # needs a client with devices): a second compile is a miss, never an
+    # error; the attached GPU's run reads the entry.
+    compilation_cache.reset_cache()
+    self.addCleanup(compilation_cache.reset_cache)
+    cache_dir = self.create_tempdir().full_path
+    target_config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
+    with (
+        config.enable_compilation_cache(True),
+        config.raise_persistent_cache_errors(True),
+        config.persistent_cache_min_compile_time_secs(0),
+        config.persistent_cache_min_entry_size_bytes(0),
+        config.compilation_cache_dir(cache_dir),
+    ):
+      events = []
+      monitoring.register_event_listener(events.append)
+      self.addCleanup(monitoring.unregister_event_listener, events.append)
+
+      @jax.jit
+      def fn(x):
+        return x * x + 1.0
+
+      aot_topo = topologies.get_topology_desc(
+          platform="cuda", target_config=target_config, topology="1x1x1")
+      self.assertEqual(
+          aot_topo.devices[0].client.runtime_type, "compile_only_runtime")
+      aot_mesh = topologies.make_mesh(aot_topo, (1,), ("x",))
+      x_shape = jax.ShapeDtypeStruct(
+          shape=(16, 16), dtype=jnp.float32,
+          sharding=jax.sharding.NamedSharding(aot_mesh, P("x")))
+      for _ in range(2):
+        fn.clear_cache()
+        fn.lower(x_shape).compile()
+      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 2)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 0)
+
+      fn.clear_cache()
+      x_np = np.arange(256, dtype=np.float32).reshape(16, 16)
+      result = fn(jax.device_put(x_np, jax.devices()[0]))
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
+      self.assertArraysEqual(result, x_np * x_np + 1.0)
+
   def test_lower_as_text_with_and_without_debug_info(self):
     def my_function(x):
       return jnp.sin(x)
