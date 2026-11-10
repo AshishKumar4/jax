@@ -1213,6 +1213,55 @@ class LaunchContext:
       return utils.getelementptr(tma_desc, [byte_offset], i8)
     return tma_desc
 
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: ir.Value | None,
+  ) -> tuple[tuple[MemRefTransform, ...], ir.Value | None]:
+    """A TMA copy's tiling dropped where it does not divide the GMEM ref.
+
+    A tiled view of the GMEM ref (`TileTransform`) splits each tiled dimension
+    into its tiles, which a TMA descriptor bounds dimension by dimension, so a
+    dimension its tiling does not divide has no tiled view whose bounds are the
+    array's: a tile past its end would read the next row's elements. Where the
+    copy's slice holds one tile along every tiled dimension but the first, its
+    tiled SMEM layout `(..., n, 1, ..., 1, t0, t1, ...)` is the row-major
+    `(..., n * t0, t1, ...)`, so the copy is described untiled, with the
+    array's true extents: TMA zero-fills the elements a load reads past them
+    and drops those a store writes past them. Returns the GMEM transforms with
+    the tiling dropped and the SMEM ref reshaped untiled where that holds, else
+    both as they were.
+    """
+    if (
+        len(gmem_transform) != 1
+        or not isinstance(tiling := gmem_transform[0], TileTransform)
+        or tiling.rounding is not None
+        or any(isinstance(s, fa.FragmentedArray) for s in gmem_slice)
+    ):
+      return gmem_transform, smem_ref
+    _, slice_shape, is_squeezed = utils.parse_indices(
+        gmem_slice, ir.MemRefType(gmem_ref.type).shape, check_oob=False
+    )
+    gmem_shape = [
+        d for d, squeezed in zip(ir.MemRefType(gmem_ref.type).shape, is_squeezed)
+        if not squeezed
+    ]
+    logical = [
+        d for d, squeezed in zip(slice_shape, is_squeezed) if not squeezed
+    ]
+    rank = len(tiling.tiling)
+    tiled = list(zip(gmem_shape[-rank:], logical[-rank:], tiling.tiling))
+    if not any(g > t and g % t for g, _, t in tiled):
+      return gmem_transform, smem_ref
+    if any(s % t for _, s, t in tiled) or any(s != t for _, s, t in tiled[1:]):
+      return gmem_transform, smem_ref
+    untiled = (*logical[:-rank], logical[-rank], *tiling.tiling[1:])
+    if smem_ref is not None:
+      smem_ref = utils.memref_reshape(smem_ref, untiled)
+    return (), smem_ref
+
   def _prepare_async_copy(
       self,
       untransformed_gmem_ref: ir.Value,
@@ -1653,6 +1702,15 @@ class LaunchContext:
 
     if collective and untransformed_gmem_ref is dst_ref:
       raise ValueError("Only GMEM -> SMEM copies can be collective")
+
+    if implementation == AsyncCopyImplementation.TMA:
+      gmem_transform, smem_ref = self._untile_partial(
+          untransformed_gmem_ref, gmem_slice, gmem_transform, smem_ref
+      )
+      if untransformed_gmem_ref is src_ref:
+        dst_ref = smem_ref
+      else:
+        src_ref = smem_ref
 
     (
         slice_shape,
@@ -2682,6 +2740,9 @@ class LaunchContext:
       gmem_slice = (gmem_slice,)
 
     impl =  AsyncCopyImplementation.TMA
+    gmem_transform, _ = self._untile_partial(
+        gmem_ref, gmem_slice, gmem_transform, None
+    )
     (
         slice_shape,
         _,

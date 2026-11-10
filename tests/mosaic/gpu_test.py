@@ -5957,6 +5957,73 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     y_mut[:shape[0], :shape[1]] = 0
     np.testing.assert_array_equal(y_mut, np.zeros_like(y_mut))
 
+  @parameterized.product(swizzle=(None, 128))
+  def test_tma_load_over_a_partial_tiled_dimension(self, swizzle):
+    # A [44, 200] array tiled (8, 64), neither dimension a multiple of its tile:
+    # its last column tile, 64 rows from row 0, holds the array's 44 rows of 8
+    # columns, and zeros past the array's true extents.
+    dtype = jnp.float16
+    shape = (44, 200)
+    tiling = (8, (swizzle or 128) // jnp.dtype(dtype).itemsize)
+    rows, start = 64, shape[1] // tiling[1] * tiling[1]
+    tiled = jax.ShapeDtypeStruct((rows // tiling[0], 1, *tiling), dtype)
+    def kernel(ctx, src, dst, smem):
+      tmp, barrier = smem
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          swizzle=swizzle,
+          gmem_transform=mgpu.TileTransform(tiling),
+          gmem_slice=(ds(0, rows), ds(start, tiling[1])),
+          barrier=barrier,
+      )
+      barrier.wait()
+      copy(tmp, dst, swizzle=swizzle)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    y = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), x, tiled, (tiled, mgpu.Barrier(1)),
+    )(x).reshape(rows, tiling[1])
+    want = np.zeros((rows, tiling[1]), dtype)
+    want[:shape[0], :shape[1] - start] = x[:, start:]
+    np.testing.assert_array_equal(y, want)
+
+  @parameterized.product(swizzle=(None, 128))
+  def test_tma_store_over_a_partial_tiled_dimension(self, swizzle):
+    # The [44, 200] array loaded and stored back a column tile at a time, its
+    # partial last tile last: the zeros that tile holds past the array's true
+    # extents are dropped, where written they would land on the next row's
+    # first columns, so the array comes back whole.
+    dtype = jnp.float16
+    shape = (44, 200)
+    tiling = (8, (swizzle or 128) // jnp.dtype(dtype).itemsize)
+    rows, count = 64, -(-shape[1] // tiling[1])
+    tiles = jax.ShapeDtypeStruct((count, rows // tiling[0], 1, *tiling), dtype)
+    def kernel(ctx, src, dst, smem):
+      tmp, barriers = smem
+      for j in range(count):
+        ctx.async_copy(
+            src_ref=src,
+            dst_ref=memref_slice(tmp, j),
+            swizzle=swizzle,
+            gmem_transform=mgpu.TileTransform(tiling),
+            gmem_slice=(ds(0, rows), ds(j * tiling[1], tiling[1])),
+            barrier=barriers[j],
+        )
+      for j in range(count):
+        barriers[j].wait()
+        ctx.async_copy(
+            src_ref=memref_slice(tmp, j),
+            dst_ref=dst,
+            swizzle=swizzle,
+            gmem_transform=mgpu.TileTransform(tiling),
+            gmem_slice=(ds(0, rows), ds(j * tiling[1], tiling[1])),
+        )
+        ctx.await_async_copy(0)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    smem = (tiles, mgpu.Barrier(1, num_barriers=count))
+    y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, smem)(x)
+    np.testing.assert_array_equal(y, x)
+
   @parameterized.product(small_dim=(0, 1),)
   def test_tma_small_tile_store(self, small_dim):
     if small_dim == 0:
