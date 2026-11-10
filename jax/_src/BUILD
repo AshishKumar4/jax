@@ -480,6 +480,19 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "mosaic_gpu_records",
+    srcs = ["mosaic_gpu_records.py"],
+    visibility = ["//jax:internal"],
+    deps = [":mosaic_gpu_protos"],
+)
+
+pytype_strict_library(
+    name = "mosaic_gpu_protos",
+    srcs = ["mosaic_gpu_protos.py"],
+    visibility = ["//jax:internal"],
+)
+
+pytype_strict_library(
     name = "compilation_cache_interface",
     srcs = ["compilation_cache_interface.py"],
     deps = [":util"],
