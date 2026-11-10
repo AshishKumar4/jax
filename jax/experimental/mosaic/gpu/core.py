@@ -32,6 +32,7 @@ import weakref
 
 import jax
 from jax._src import core as jax_core
+from jax._src import custom_call_targets
 from jax._src import dtypes
 from jax._src import lib
 from jax._src import mesh as mesh_lib
@@ -400,7 +401,7 @@ def _mosaic_gpu_lowering_rule(
       mlir.aval_to_ir_type(ctx.module_context, aval) for aval in ctx.avals_out
   ])
   return mlir.custom_call(
-      call_target_name="mosaic_gpu_v2",
+      call_target_name=custom_call_targets.MOSAIC_GPU,
       result_types=result_types,
       operands=args,
       operand_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_in],

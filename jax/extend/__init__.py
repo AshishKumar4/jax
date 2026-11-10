@@ -39,6 +39,7 @@ Breaking changes will be announced via the
 from jax.extend import (
     backend as backend,
     core as core,
+    custom_call_targets as custom_call_targets,
     linear_util as linear_util,
     lowering as lowering,
     mlir as mlir,

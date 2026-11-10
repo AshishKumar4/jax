@@ -27,6 +27,7 @@ from typing import cast as type_cast
 
 from jax import version as jax_version_module
 from jax._src import config
+from jax._src import custom_call_targets
 from jax._src import xla_bridge
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
@@ -203,7 +204,7 @@ def _strip_mosaic_debug_info(m: ir.Module) -> None:
         op.name != "stablehlo.custom_call"
         or "call_target_name" not in op.attributes
         or op.attributes["call_target_name"]
-        != ir.StringAttr.get("tpu_custom_call")
+        != ir.StringAttr.get(custom_call_targets.TPU_CUSTOM_CALL)
     ):
       return ir.WalkResult.ADVANCE
     bc = json.loads(ir.StringAttr(op.attributes["backend_config"]).value)
@@ -346,9 +347,9 @@ def _canonicalize_ir(
     )
     passes.run(m.operation)
     _strip_mosaic_debug_info(m)
-    _strip_kernel_debug_info(m, "__gpu$xla.gpu.triton", "ir",
+    _strip_kernel_debug_info(m, custom_call_targets.TRITON, "ir",
                              dialect=_triton_dialect)
-    _strip_kernel_debug_info(m, "mosaic_gpu_v2", "module", digest="kernel_hash")
+    _strip_kernel_debug_info(m, custom_call_targets.MOSAIC_GPU, "module", digest="kernel_hash")
     return _serialize_ir(m, ignore_custom_partitioning)
 
 

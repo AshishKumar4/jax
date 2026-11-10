@@ -30,6 +30,7 @@ from jax._src import api
 from jax._src import cloud_tpu_init
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import sharding_impls
 from jax._src.frozen_dict import FrozenDict
@@ -473,7 +474,7 @@ def _tpu_custom_call_lowering(
   # TODO(b/536052236): Always use core_ids after 2026-11-06.
   use_core_ids = not ctx.is_forward_compat()
   call = mlir.custom_call(
-      "tpu_custom_call",
+      custom_call_targets.TPU_CUSTOM_CALL,
       result_types=result_types,
       operands=in_nodes,
       backend_config=config.to_json(use_core_ids=use_core_ids),

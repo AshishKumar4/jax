@@ -32,6 +32,7 @@ from jax._src import ad_util
 from jax._src import api
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import custom_derivatives
 from jax._src import dispatch
 from jax._src import dtypes
@@ -1171,8 +1172,8 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     *_GPU_FFI_KERNELS,
     "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
     "annotate_device_placement",
-    "cu_threefry2x32_ffi",
-    "hip_threefry2x32_ffi",
+    custom_call_targets.THREEFRY2X32["cuda"],
+    custom_call_targets.THREEFRY2X32["rocm"],
     # Triton IR does not guarantee stability.
     # "__gpu$xla.gpu.triton",
     # eigh on TPU
@@ -1184,9 +1185,9 @@ _CUSTOM_CALL_TARGETS_GUARANTEED_STABLE = {
     # ApproxTopK on TPU
     "ApproxTopK", "stablehlo.dynamic_approx_top_k",
     "tf.call_tf_function",  # From jax2tf.call_tf(func, call_tf_graph=True)
-    "tpu_custom_call",  # Pallas/TPU kernels
-    "AllocateBuffer",  # lax.empty implementation
-    "mosaic_gpu_v2",  # Pallas Mosaic GPU kernels
+    custom_call_targets.TPU_CUSTOM_CALL,  # Pallas/TPU kernels
+    custom_call_targets.ALLOCATE_BUFFER,  # lax.empty implementation
+    custom_call_targets.MOSAIC_GPU,  # Pallas Mosaic GPU kernels
     # TODO(burmako): maintain backwards compatibility for these, until they
     # are upstreamed to StableHLO.
     # See https://github.com/openxla/stablehlo/issues/8.
