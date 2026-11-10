@@ -264,9 +264,13 @@ class JaxAotTest(jtu.JaxTestCase):
       self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 2)
       self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 0)
 
+      # The attached GPU's run of the same program (its operand sharded alike
+      # over a mesh of its device) reads the entry.
       fn.clear_cache()
+      gpu_mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
       x_np = np.arange(256, dtype=np.float32).reshape(16, 16)
-      result = fn(jax.device_put(x_np, jax.devices()[0]))
+      result = fn(jax.device_put(
+          x_np, jax.sharding.NamedSharding(gpu_mesh, P("x"))))
       self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
       self.assertArraysEqual(result, x_np * x_np + 1.0)
 
