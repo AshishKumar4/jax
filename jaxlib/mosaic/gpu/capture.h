@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "third_party/gpus/cuda/include/cuda.h"
 #include "jaxlib/mosaic/gpu/launch_config.h"
 
@@ -69,6 +70,17 @@ absl::Status CaptureLaunch(std::string_view kernel_name,
                            const MosaicKernelSpec& spec,
                            const std::vector<CapturedBuffer>& operands,
                            absl::FunctionRef<absl::Status()> launch);
+
+// Writes a launch's spec with no device: `spec` as the kernel's host function
+// filled it over `operands`, each `data` a host buffer holding its contents
+// before the launch, into <root>/<pid>-<seq>-<kernel>/, the directory it
+// returns. No buffer outside the operands is captured (a pointer into none
+// fails it), and no "expect": the launch never ran. `sm` the target it was
+// compiled for (sm_90a, sm_100a).
+absl::StatusOr<std::string> CaptureDeviceless(
+    std::string_view kernel_name, std::string_view gpu_binary,
+    std::string_view sm, const MosaicKernelSpec& spec,
+    const std::vector<CapturedBuffer>& operands, std::string_view root);
 
 }  // namespace gpu
 }  // namespace mosaic
