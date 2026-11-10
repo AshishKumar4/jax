@@ -652,8 +652,9 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     mapped = jax.shard_map(checked, mesh=mesh, in_specs=P("a", "b"),
                            out_specs=P("a", "b"))
     if nested:
-      inner = jax.shard_map(checked, mesh=mesh, in_specs=P("b"),
-                            out_specs=P("b"), axis_names={"b"})
+      # The inner shard_map's mesh the outer's body's context, axis "a" manual.
+      inner = jax.shard_map(checked, in_specs=P("b"), out_specs=P("b"),
+                            axis_names={"b"})
       mapped = jax.shard_map(inner, mesh=mesh, in_specs=P("a"),
                              out_specs=P("a"), axis_names={"a"})
 
