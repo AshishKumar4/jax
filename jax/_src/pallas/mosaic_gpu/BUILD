@@ -281,6 +281,7 @@ pytype_strict_library(
     srcs = ["torch.py"],
     deps = [
         "//jax",
+        "//jax/_src:custom_call_targets",
         "//jax/_src:dtypes",
         "//jax/_src:util",
         "//jax/_src/lib",
