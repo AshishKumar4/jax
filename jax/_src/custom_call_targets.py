@@ -48,6 +48,9 @@ BUFFER_CALLBACK: Final = {
 }
 """A buffer callback (jax._src.buffer_callback) by its device kind and whether a command buffer may hold it."""
 
-THREEFRY2X32: Final = {"cuda": "cu_threefry2x32_ffi", "rocm": "hip_threefry2x32_ffi",
-                       "oneapi": "oneapi_threefry2x32_ffi"}
+THREEFRY2X32: Final = {
+    "cuda": "cu_threefry2x32_ffi",
+    "rocm": "hip_threefry2x32_ffi",
+    "oneapi": "oneapi_threefry2x32_ffi",
+}
 """The threefry2x32 hash's FFI kernel by GPU platform (jax._src.random.threefry2x32)."""
