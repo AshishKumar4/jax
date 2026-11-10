@@ -42,8 +42,12 @@ KERNEL = textwrap.dedent("""
       ctx.async_copy(src_ref=tmp, dst_ref=dst, swizzle=128)
       ctx.await_async_copy(0)
 
+    from jax._src.interpreters import mlir as jax_mlir
+
     x = np.arange(64 * 64, dtype=np.float16).reshape(64, 64)
-    launch = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, (x, mgpu.Barrier(1)))
+    with jax_mlir.make_ir_context(), ir.Location.unknown():
+      launch = mgpu.as_gpu_kernel(
+          kernel, (1, 1, 1), (128, 1, 1), x, x, (x, mgpu.Barrier(1)))
 """)
 
 
