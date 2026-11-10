@@ -1147,6 +1147,13 @@ LIBDEVICE_EXP_ATOL = 2.5 * 2.0**-149
 # ulp, a subnormal result within the subnormal ulp.
 EXACT_EXP_BOUND = (1.0, 2.0**-23)
 EXACT_EXP_ATOL = 2.0**-149
+# The f32 hyperbolic tangent's two forms, alike: tanh.approx.f32 within a
+# relative 2^-11 over the whole range, subnormal results kept (the PTX ISA's
+# tanh notes), so 2^-11 / 2^-24 ulps; libdevice's tanhf within 2 ulp of the
+# correctly rounded result over the full range (the CUDA C++ Programming
+# Guide's single-precision table, 12.9).
+APPROX_TANH_BOUND = (2.0**13, 2.0**-11)
+LIBDEVICE_TANH_BOUND = (2.5, 2.5 * 2.0**-23)
 # ln 2 split for Cody and Waite's reduction: its leading bits, whose product
 # with an integer under 2^8 is exact, and the rest.
 _LN2_HI = 0.693145751953125

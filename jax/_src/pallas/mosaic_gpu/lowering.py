@@ -2971,14 +2971,31 @@ def _sqrt_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
 @register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Warpgroup)
 def _tanh_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
+  """tanh in the form `accuracy` asks: none, or `AccuracyMode.DEFAULT`, the
+  kernel's `approx_math`; `AccuracyMode.HIGHEST` libdevice's, the most
+  accurate there is; a `lax.Tolerance` tanh.approx where its bound meets it,
+  else libdevice's where that one's does, else an error."""
   [x_aval] = ctx.avals_in
+  approx = ctx.module_ctx.approx_math
+  if accuracy is not None and accuracy != lax.AccuracyMode.DEFAULT:
+    if x_aval.dtype != jnp.float32:
+      raise NotImplementedError(f"accuracy for tanh of {x_aval.dtype}")
+    if accuracy == lax.AccuracyMode.HIGHEST:
+      approx = False
+    # tanh.approx's relative bound holds below the normal floats too.
+    elif _meets(accuracy, fa.APPROX_TANH_BOUND, 0.0):
+      approx = True
+    elif _meets(accuracy, fa.LIBDEVICE_TANH_BOUND, fa.LIBDEVICE_EXP_ATOL):
+      approx = False
+    else:
+      raise ValueError(
+          "No f32 tanh meets the tolerance"
+          f" (atol={accuracy.atol}, rtol={accuracy.rtol},"
+          f" ulps={accuracy.ulps}): libdevice's is within 2.5 ulps"
+      )
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    return _ensure_fa(x, x_aval.dtype).tanh(approx=ctx.module_ctx.approx_math)
-  fastmath = (
-      arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
-  )
+    return _ensure_fa(x, x_aval.dtype).tanh(approx=approx)
+  fastmath = arith_dialect.FastMathFlags.afn if approx else None
   return math_dialect.tanh(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
@@ -3030,6 +3047,14 @@ mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS][lax.logistic_p] = _lower_fun(
 mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][lax.logistic_p] = _lower_fun(
     _logistic
 )
+
+
+ACCURACY_HONOURED = frozenset({
+    lax.exp_p, lax.exp2_p, lax.logistic_p, lax.tanh_p
+})
+"""The primitives whose lowering here takes the form their `accuracy` asks
+(`_exp_form`, `_logistic`, `_tanh_lowering_rule`); every other one with an
+`accuracy` parameter refuses a stated one."""
 
 
 def _meets(

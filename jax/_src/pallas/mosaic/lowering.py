@@ -682,6 +682,12 @@ def ir_constant(x: Any, mlir_type: ir.Type | None = None) -> ir.Value:
   raise NotImplementedError(x.dtype)
 
 
+ACCURACY_HONOURED: frozenset = frozenset()
+"""The primitives whose lowering here takes the form their `accuracy` asks:
+none, as every Mosaic TPU lowering with an `accuracy` parameter has one form
+and no bound stated for it, so refuses a stated accuracy."""
+
+
 lowering_rules: dict[tpu_core.CoreType, dict[jax_core.Primitive, Callable]]
 lowering_rules = {kernel_type: {} for kernel_type in tpu_core.CoreType}
 skip_mlir_conversions = set()
