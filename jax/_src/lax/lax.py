@@ -4496,6 +4496,7 @@ def unop(result_dtype, accepted_dtypes, name, supports_narrow_ints=True,
       ur_rule=partial(unop_ur_rule, name) if ur_rule is None else ur_rule,
       layout_rule=unop_layout_rule)
   batching.defvectorized(prim)
+  prim.elementwise = True
   return prim
 
 standard_unop = partial(unop, _identity)
@@ -4659,6 +4660,7 @@ def naryop(result_dtype, accepted_dtypes, name, allow_extended_dtype=False,
       ur_rule=partial(nary_ur_rule, name) if ur_rule is None else ur_rule,
       layout_rule=layout_rule)
   batching.defbroadcasting(prim)
+  prim.elementwise = True
   return prim
 standard_naryop = partial(naryop, input_dtype)
 
@@ -5423,6 +5425,7 @@ integer_pow_p = standard_primitive(
   _attrgetter('shape'), _integer_pow_dtype_rule, 'integer_pow',
   sharding_rule=_attrgetter('sharding'), vma_rule=lambda x, **_: x.mat.varying)
 batching.defvectorized(integer_pow_p)
+integer_pow_p.elementwise = True
 ad.defjvp(integer_pow_p, _integer_pow_jvp)
 
 def _integer_pow(x, *, y):
@@ -5908,6 +5911,7 @@ convert_element_type_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'convert_element_type'),
     ur_rule=_convert_element_type_ur_rule,
     layout_rule=_convert_element_type_layout_rule)
+convert_element_type_p.elementwise = True
 
 # TODO(dougalm): I'm overriding bind_with_trace here because that's the closest thing to
 # the old "custom bind" but it might not be the best way to do this.
@@ -7940,6 +7944,7 @@ def _clamp_batch_rule(batched_args, batch_dims, **params):
 clamp_p = standard_primitive(_clamp_shape_rule, _clamp_dtype_rule, 'clamp',
                              sharding_rule=_clamp_sharding_rule,
                              vma_rule=partial(core.standard_vma_rule, 'clamp'))
+clamp_p.elementwise = True
 ad.defjvp(clamp_p,
           lambda g, min, operand, max:
           select(bitwise_and(gt(min, operand), lt(min, max)),
@@ -9217,6 +9222,7 @@ select_n_p = standard_primitive(
     weak_type_rule=_select_weak_type_rule, sharding_rule=_select_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'select_n'),
     ur_rule=_select_ur_rule)
+select_n_p.elementwise = True
 ad.primitive_jvps[select_n_p] = _select_jvp
 ad.primitive_transposes[select_n_p] = _select_transpose_rule
 batching.fancy_primitive_batchers[select_n_p] = _select_batch_rule
@@ -9707,6 +9713,7 @@ reduce_precision_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'reduce_precision'),
     ur_rule=_reduce_precision_ur_rule,
     memory_space_rule=_reduce_precision_memory_space_rule)
+reduce_precision_p.elementwise = True
 ad.deflinear(reduce_precision_p, lambda t, **kwargs: [reduce_precision_p.bind(t, **kwargs)])
 batching.defvectorized(reduce_precision_p)
 
@@ -10253,6 +10260,7 @@ def _copy_impl(prim, *args, **kwargs):
 # For that reason we don't simplify it out of jaxprs (e.g. for jit invariance).
 # It's used in jnp.array(x, copy=True), which is the user-facing API.
 copy_p = core.Primitive('copy')
+copy_p.elementwise = True
 copy_p.def_impl(partial(_copy_impl, copy_p))
 copy_p.def_abstract_eval(lambda x: x)
 
