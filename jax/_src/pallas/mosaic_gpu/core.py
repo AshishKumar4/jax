@@ -135,6 +135,9 @@ class CompilerParams:
     skip_device_barrier: If True, skips the cross-device barrier before kernel
       launch. Improper use of this flag can lead to race conditions. !!!Use with
       caution!!! Defaults to False.
+    metadata: What the caller states of this kernel's launch (an identity, a
+      resource decision), opaque to Mosaic, kept in the compiled call's
+      serialization (MosaicGpuKernelProto.caller_metadata).
     is_multi_process: If True, indicates that the kernel runs in a multi-process
       environment and performs cross-process device communication. This is
       mostly needed when compiling distributed-over-processes code with an
@@ -166,6 +169,7 @@ class CompilerParams:
   skip_device_barrier: bool = False
   is_multi_process: bool = False
   collective_id: int | None = None
+  metadata: bytes = b""
   min_blocks_per_sm: int = 1
 
   def __post_init__(self):
