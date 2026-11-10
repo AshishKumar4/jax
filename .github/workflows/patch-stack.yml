@@ -52,7 +52,9 @@ env:
   # they pass. JAX's test cases set their checks for each test whatever JAX_ENABLE_CHECKS says (on, or off as
   # TransferGuardTest sets them), so they run once.
   TESTS: tests/api_test.py
-  TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy
+  # protobuf as Dew installs it beside every wheel of the stack: the stack's HLO reader (jax.extend.xla) reads
+  # an HLO module's instructions through it (0.12.0.1.post74's publish: its tests could not import it).
+  TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy protobuf
 
 defaults:
   run:
