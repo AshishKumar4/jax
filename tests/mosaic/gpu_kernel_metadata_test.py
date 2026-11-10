@@ -17,7 +17,6 @@ from absl.testing import absltest
 import jax
 from jax._src import test_util as jtu
 from jax._src.lib.mlir import ir
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import custom_call_targets
 import jax.numpy as jnp
@@ -44,11 +43,11 @@ def _calls(lowered) -> list[ir.DictAttr]:
 class KernelMetadataTest(jtu.JaxTestCase):
 
   def _lowered(self, **params):
-    def kernel(x_ref, o_ref):
+    def body(x_ref, o_ref):
       o_ref[...] = x_ref[...] + 1.0
 
-    call = pl.pallas_call(
-        kernel, out_shape=jax.ShapeDtypeStruct((128,), jnp.float32),
+    call = plgpu.kernel(
+        body, out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
         compiler_params=plgpu.CompilerParams(**params))
     return jax.jit(call).trace(jnp.ones(128, jnp.float32)).lower(
         lowering_platforms=("cuda",))
