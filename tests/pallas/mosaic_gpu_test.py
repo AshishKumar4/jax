@@ -496,16 +496,19 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         "unmet": (lax.Tolerance(rtol=2.0**-30), None),
     }[asked]
 
-    # A kernel of its own name a case, so each compiles, and dumps, its PTX:
-    # cases lowering to one module would share a compiled kernel.
-    @functools.partial(
-        self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
-        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-        name=f"accuracy_{op}_{asked}_{int(approx_math)}",
-    )
     def kernel(x_ref, o_ref):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
+
+    # A kernel of its own name a case, so each compiles, and dumps, its PTX:
+    # cases lowering to one module would share a compiled kernel.
+    kernel.__name__ = kernel.__qualname__ = (
+        f"accuracy_{op}_{asked}_{int(approx_math)}"
+    )
+    kernel = self.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+    )
 
     reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0, "tanh": 10.0}[op]
     x = np.random.default_rng(0).uniform(-reach, reach, 256).astype(np.float32)
