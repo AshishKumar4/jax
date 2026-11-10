@@ -6942,75 +6942,52 @@ class FragmentedArrayTest(TestCase):
     x = np.arange(m * n, dtype=np.float32).reshape(m, n) * 0.25 - 64.0
     np.testing.assert_array_equal(result, np_op(x))
 
+  @parameterized.product(op=["exp", "exp2"], exact=[False, True])
   @jtu.ignore_warning(message="overflow encountered", category=RuntimeWarning)
   @jtu.ignore_warning(message="underflow encountered", category=RuntimeWarning)
-  def test_exp2_is_exact_without_approx(self, m=128, n=256):
-    """`exp2(approx=False)` on f32 is within one ulp of 2^x at fractional
-    inputs (`ex2.approx`'s error reaches about two, which NVPTX selects for
-    `math.exp2`), its subnormal results within one subnormal step, and its
-    special values IEEE's."""
+  def test_exponential_without_approx_holds_its_bound(
+      self, op, exact, m=128, n=256
+  ):
+    """`exp` and `exp2` without `approx` on f32, as libdevice's expf and exp2f
+    (the default) or the exact series (`exact`): within their bound's ulps of
+    the exact result (`fragmented_array.LIBDEVICE_EXP_BOUND`,
+    `EXACT_EXP_BOUND`) at fractional inputs over the whole range, subnormal
+    results within the bound's absolute error, special values IEEE's."""
+    fa = mgpu.fragmented_array
+    ulps, _ = fa.EXACT_EXP_BOUND if exact else fa.LIBDEVICE_EXP_BOUND
+    atol = fa.EXACT_EXP_ATOL if exact else fa.LIBDEVICE_EXP_ATOL
     def kernel(ctx, src, dst, _):
       del ctx
       x = mgpu.FragmentedArray.load_strided(src)
-      x.exp2(approx=False).store_untiled(dst, optimized=False)
+      getattr(x, op)(exact=exact).store_untiled(dst, optimized=False)
 
     shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
     run = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), shape, shape, ())
     rng = np.random.default_rng(0)
-    swept = np.linspace(-149.9, 127.99, m * n - 12).astype(np.float32)
-    specials = np.array([np.inf, -np.inf, np.nan, 128.0, 127.0, -150.0, -149.0,
-                         -126.0, 0.0, -0.0, 200.0, -1000.0], np.float32)
+    # The inputs whose results span the floats, past both ends.
+    low, high = (-103.9, 88.7) if op == "exp" else (-149.9, 127.99)
+    truth_of = np.exp if op == "exp" else np.exp2
+    swept = np.linspace(low, high, m * n - 12).astype(np.float32)
+    specials = np.array([np.inf, -np.inf, np.nan, high + 0.5, high - 0.5,
+                         low - 0.5, low + 1, -87.3 if op == "exp" else -126.0,
+                         0.0, -0.0, 200.0, -1000.0], np.float32)
     for x in (np.concatenate([swept, specials]),
               rng.uniform(-30, 30, m * n).astype(np.float32)):
       x = x.reshape(m, n)
       result = np.asarray(run(x), np.float64)
-      truth = np.exp2(x.astype(np.float64))
+      truth = truth_of(x.astype(np.float64))
       normal = (truth >= 2.0**-126) & (truth < np.finfo(np.float32).max)
       ulp = np.spacing(truth.astype(np.float32)).astype(np.float64)
       self.assertLessEqual(
-          np.max(np.abs(result[normal] - truth[normal]) / ulp[normal]), 1.0)
+          np.max(np.abs(result[normal] - truth[normal]) / ulp[normal]), ulps)
       subnormal = (truth > 0) & (truth < 2.0**-126)
       self.assertLessEqual(
           np.max(np.abs(result[subnormal] - truth[subnormal]), initial=0.0),
-          2.0**-149)
+          atol)
       rest = ~normal & ~subnormal
       np.testing.assert_array_equal(
           result[rest], truth.astype(np.float32).astype(np.float64)[rest])
 
-  @jtu.ignore_warning(message="overflow encountered", category=RuntimeWarning)
-  @jtu.ignore_warning(message="underflow encountered", category=RuntimeWarning)
-  def test_exp_is_exact_without_approx(self, m=128, n=256):
-    """`exp(approx=False)` on f32 is within one ulp of e^x at fractional
-    inputs (NVPTX lowers `math.exp` through `ex2.approx.ftz`, about two ulp and
-    its subnormals flushed), its subnormal results within one subnormal step,
-    and its special values IEEE's."""
-    def kernel(ctx, src, dst, _):
-      del ctx
-      x = mgpu.FragmentedArray.load_strided(src)
-      x.exp(approx=False).store_untiled(dst, optimized=False)
-
-    shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
-    run = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), shape, shape, ())
-    rng = np.random.default_rng(0)
-    swept = np.linspace(-103.9, 88.7, m * n - 11).astype(np.float32)
-    specials = np.array([np.inf, -np.inf, np.nan, 89.0, 88.72, -104.0, -103.97,
-                         0.0, -0.0, 1000.0, -1000.0], np.float32)
-    for x in (np.concatenate([swept, specials]),
-              rng.uniform(-20, 20, m * n).astype(np.float32)):
-      x = x.reshape(m, n)
-      result = np.asarray(run(x), np.float64)
-      truth = np.exp(x.astype(np.float64))
-      normal = (truth >= 2.0**-126) & (truth < np.finfo(np.float32).max)
-      ulp = np.spacing(truth.astype(np.float32)).astype(np.float64)
-      self.assertLessEqual(
-          np.max(np.abs(result[normal] - truth[normal]) / ulp[normal]), 1.0)
-      subnormal = (truth > 0) & (truth < 2.0**-126)
-      self.assertLessEqual(
-          np.max(np.abs(result[subnormal] - truth[subnormal]), initial=0.0),
-          2.0**-149)
-      rest = ~normal & ~subnormal
-      np.testing.assert_array_equal(
-          result[rest], truth.astype(np.float32).astype(np.float64)[rest])
 
   def test_select(self, m=64, n=32):
 
