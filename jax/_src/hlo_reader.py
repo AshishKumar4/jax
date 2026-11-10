@@ -44,12 +44,9 @@ class Instruction(NamedTuple):
 
 @functools.cache
 def _module_class() -> Any:
-  try:
-    from google.protobuf import descriptor_pb2
-    from google.protobuf import descriptor_pool
-    from google.protobuf import message_factory
-  except ImportError as error:
-    raise ImportError("reading an HLO module's instructions needs the protobuf package") from error
+  from google.protobuf import descriptor_pb2
+  from google.protobuf import descriptor_pool
+  from google.protobuf import message_factory
   from jax._src import xla_protos
 
   # A pool of its own: another library's copy of these files (xla/xla_data.proto) in the default pool
