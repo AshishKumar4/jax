@@ -501,9 +501,11 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
 
     # A module of its own a case, so each compiles, and dumps, its PTX: a
-    # stated tolerance decides the form whatever `approx_math` says, and cases
-    # lowering to one module share one compiled kernel, its PTX dumped once.
-    size = 128 if approx_math else 256
+    # stated tolerance decides the form whatever `approx_math` says (and tanh's
+    # HIGHEST is its default's form), and cases lowering to one module share
+    # one compiled kernel, its PTX dumped once.
+    asks = ["highest", "approximate", "default", "unmet"]
+    size = 32 * (1 + 2 * asks.index(asked) + approx_math)
     kernel = self.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct([size], jnp.float32),
