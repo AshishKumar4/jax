@@ -505,15 +505,15 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     # HIGHEST is its default's form), and cases lowering to one module share
     # one compiled kernel, its PTX dumped once.
     asks = ["highest", "approximate", "default", "unmet"]
-    size = 32 * (1 + 2 * asks.index(asked) + approx_math)
+    shape = (1 + 2 * asks.index(asked) + approx_math, 128)
     kernel = self.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct([size], jnp.float32),
+        out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
         compiler_params=plgpu.CompilerParams(approx_math=approx_math),
     )
 
     reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0, "tanh": 10.0}[op]
-    x = np.random.default_rng(0).uniform(-reach, reach, size).astype(np.float32)
+    x = np.random.default_rng(0).uniform(-reach, reach, shape).astype(np.float32)
     if asked == "unmet":
       with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
         kernel(x)
