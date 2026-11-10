@@ -21,6 +21,10 @@ message MosaicGpuKernelProto {
   bool uses_xla_collective_metadata = 14;
   bool skip_device_barrier = 15;
   optional int64 collective_id = 16;
+  // What the kernel's caller stated of its launch (an identity, a resource
+  // decision), opaque to Mosaic: the custom call's `metadata` attribute, kept
+  // with the compiled call so a reader of a serialized executable finds it.
+  bytes caller_metadata = 17;
 
   reserved 6;
   reserved "init_func_name";

@@ -1135,6 +1135,9 @@ struct CustomCallResources {
   bool uses_xla_collective_metadata = false;
   bool skip_device_barrier = false;
   std::optional<int64_t> collective_id;
+  // The custom call's `metadata` attribute: its caller's statement of the
+  // launch, one per call (calls of one kernel share `kernel`, not this).
+  std::string metadata;
 
   static absl::StatusOr<std::string> Serialize(
       const CustomCallResources& resources);
@@ -1171,6 +1174,7 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
   if (resources.collective_id.has_value()) {
     kernel_proto.set_collective_id(*resources.collective_id);
   }
+  kernel_proto.set_caller_metadata(resources.metadata);
   return kernel_proto.SerializeAsString();
 }
 
@@ -1189,6 +1193,7 @@ CustomCallResources::Deserialize(absl::string_view data) {
   }
   std::memcpy(resources->hash.data(), kernel_proto.kernel_hash().data(),
               sizeof(KernelHash));
+  resources->metadata = kernel_proto.caller_metadata();
 
   if (kernel_proto.version() != 5) {
     return absl::InternalError(absl::StrCat(
@@ -1336,6 +1341,8 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
   bool skip_device_barrier =
       attrs.get<bool>("skip_device_barrier").value_or(false);
   absl::StatusOr<int64_t> collective_id = attrs.get<int64_t>("collective_id");
+  const std::string_view metadata =
+      attrs.get<std::string_view>("metadata").value_or("");
   std::vector<int64_t> xla_replica_ids;
   std::vector<bool> symmetric_memory_parameters;
   if (uses_xla_collective_metadata) {
@@ -1355,6 +1362,7 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
       // barrier semaphores.
       .collective_id = collective_id.ok() ? std::make_optional(*collective_id)
                                           : std::nullopt,
+      .metadata = std::string(metadata),
   });
 }
 
@@ -2067,6 +2075,8 @@ XLA_FFI_DEFINE_HANDLER(kMosaicGpuPrepare, MosaicGpuPrepare,
 // - xla_replica_ids (required if uses_xla_collective_metadata is true)
 // - symmetric_memory_parameters (optional)
 // - collective_id (optional, enables barrier semaphores)
+// - metadata (optional): the caller's statement of the launch, kept in the
+//   serialized call (MosaicGpuKernelProto.caller_metadata).
 XLA_FFI_DEFINE_HANDLER(kMosaicGPUInstantiate, InstantiateResources,
                        ffi::Ffi::BindInstantiate()
                            .Ctx<ffi::TargetGpuComputeCapability>()
