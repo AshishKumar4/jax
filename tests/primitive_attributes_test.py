@@ -205,6 +205,8 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         self.assertIs(getattr(exported, name), primitive)
     self.assertIs(pl.program_id_p, pallas_primitives.program_id_p)
     self.assertIs(pl.num_programs_p, pallas_primitives.num_programs_p)
+    self.assertIs(pl.load_p, pallas_primitives.load_p)
+    self.assertIs(pl.swap_p, pallas_primitives.swap_p)
 
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.lax.fori_loop(0, 3, lambda _, y: y * 2, x))(1.0)
