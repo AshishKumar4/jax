@@ -5,10 +5,11 @@
 
 A plugin build holds no GPU: Bazel's CUDA toolchain is hermetic and Dew's remote cache serves its objects, so a build
 is minutes of CPU (Main and the owner, 2026-11-08 and 2026-11-10: post67's to post73's builds held an exclusive A100
-and the GH200 only because a job file was copied). The x86_64 wheels build on armada's CPUs (`kind: build`), the
-cache's token the armada secret DEW_BAZEL_TOKEN. The aarch64 wheels need an aarch64 host, which only the held GH200 is:
-its job shares the node (never `exclusive`, no `gpus`), its CPUs capped (`taskset`) and declared (`cpus`) so other
-work keeps the rest, its token staged from bazel.token beside this script (gitignored)."""
+and the GH200 only because a job file was copied). Each machine's job shares a node of its machine, an A100's for
+x86_64 and the held GH200 for aarch64 (never `exclusive`, no `gpus`), its CPUs capped (`taskset`) and declared
+(`cpus`) so other work keeps the rest, the cache's token staged from bazel.token beside this script (gitignored): an
+armada task's disk holds no Bazel output base beside uv's cache (2026-11-10: post74's x86_64 build ran out of space
+fetching its external repositories)."""
 
 from __future__ import annotations
 
@@ -30,10 +31,9 @@ def jobs(version: str, sha: str) -> dict:
               "measures": f"{version}'s CUDA and PJRT plugins, every Python and CUDA, for its machine"}
     build = f"bash $SESSION/extra/build_plugin.sh {sha} {version} \"$OUT\""
     return {"note": f"{version}'s plugin builds (dew/plugin_jobs.py): no GPU held", "jobs": [
-        {"name": f"PLUGIN-{tag}-x86_64", "kind": "build", "minutes": 120, "secrets": ["DEW_BAZEL_TOKEN"],
-         **common, "run": build},
-        {"name": f"PLUGIN-{tag}-aarch64", "kind": "program", "gpu": "gh200", "cpus": CORES, "minutes": 120,
-         **common, "run": f"DEW_BAZEL_TOKEN_FILE=$SESSION/extra/bazel.token taskset -c 0-{CORES - 1} {build}"},
+        {"name": f"PLUGIN-{tag}-{machine}", "kind": "correctness", "gpu": gpu, "cpus": CORES, "minutes": 120,
+         **common, "run": f"DEW_BAZEL_TOKEN_FILE=$SESSION/extra/bazel.token taskset -c 0-{CORES - 1} {build}"}
+        for machine, gpu in (("x86_64", "a100"), ("aarch64", "gh200"))
     ]}
 
 
