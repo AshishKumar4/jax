@@ -459,7 +459,7 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     )
 
   @parameterized.product(
-      op=["exp", "exp2"],
+      op=["exp", "exp2", "logistic"],
       asked=["highest", "approximate", "unmet"],
       approx_math=[False, True],
   )
@@ -473,8 +473,16 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     # the hardware's form meets takes it (ex2.approx) and is within its bound;
     # a tolerance no form meets is refused.
     lax_op = getattr(lax, op)
-    bound = {"exp": mgpu.fragmented_array.APPROX_EXP_BOUND,
-             "exp2": mgpu.fragmented_array.APPROX_EXP2_BOUND}[op]
+    fa = mgpu.fragmented_array
+    # The logistic's relative bound is its exponential's plus its sum's and
+    # quotient's rounding (2^-23), in ulps that times 2^24.
+    logistic = lambda b: ((b[1] + 2.0**-23) * 2.0**24, b[1] + 2.0**-23)
+    bound, exact = {
+        "exp": (fa.APPROX_EXP_BOUND, fa.EXACT_EXP_BOUND),
+        "exp2": (fa.APPROX_EXP2_BOUND, fa.EXACT_EXP_BOUND),
+        "logistic": (logistic(fa.APPROX_EXP_BOUND),
+                     logistic(fa.EXACT_EXP_BOUND)),
+    }[op]
     accuracy = {
         "highest": lax.AccuracyMode.HIGHEST,
         "approximate": lax.Tolerance(
@@ -491,19 +499,23 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     def kernel(x_ref, o_ref):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
 
-    reach = 87.0 if op == "exp" else 125.0
+    reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0}[op]
     x = np.random.default_rng(0).uniform(-reach, reach, 1024).astype(np.float32)
     if asked == "unmet":
-      with self.assertRaisesRegex(ValueError, "No f32 exponential meets"):
+      with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
         kernel(x)
       return
     with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
       y = np.asarray(jax.block_until_ready(kernel(x)), np.float64)
-    truth = (np.exp if op == "exp" else np.exp2)(x.astype(np.float64))
+    truth = {
+        "exp": np.exp,
+        "exp2": np.exp2,
+        "logistic": lambda v: 1 / (1 + np.exp(-v)),
+    }[op](x.astype(np.float64))
     ulps = np.abs(y - truth) / np.spacing(truth.astype(np.float32))
     if asked == "highest":
       self.assertNotIn("ex2.approx", out())
-      self.assertLessEqual(ulps.max(), mgpu.fragmented_array.EXACT_EXP_BOUND[0])
+      self.assertLessEqual(ulps.max(), exact[0])
     else:
       self.assertIn("ex2.approx", out())
       self.assertLessEqual(ulps.max(), bound[0])
