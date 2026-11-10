@@ -2983,10 +2983,41 @@ def _tanh_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
 
 
 def _logistic(x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
+  """The logistic as `select(x >= 0, 1, e) / (1 + e)` with `e = e^-|x|`, its
+  exponential the form that meets `accuracy`.
+
+  The sum and the quotient each round once (half an ulp, a relative 2^-24
+  each), and the exponential's relative error reaches the result at most
+  whole (scaled by `1 / (1 + e)` or `e / (1 + e)`), so the logistic's
+  relative bound is its exponential's plus 2^-23, and its ulps that times
+  2^24 (an ulp is at least 2^-24 of a float). A result under 2^-126 (x past
+  -87.3) is the exponential's subnormal, which the exact form keeps and the
+  approximate one flushes, so a tolerance of the approximate asks an `atol`
+  of 2^-126.
+  """
+  if accuracy is not None and accuracy != lax.AccuracyMode.DEFAULT:
+    if x.dtype != jnp.float32:
+      raise NotImplementedError(f"accuracy for logistic of {x.dtype}")
+    if accuracy != lax.AccuracyMode.HIGHEST:
+      flushed = fa.APPROX_FLUSHED_ATOL
+      composed = lambda bound: (
+          (bound[1] + 2.0**-23) * 2.0**24, bound[1] + 2.0**-23
+      )
+      if _meets(accuracy, composed(fa.APPROX_EXP_BOUND), flushed):
+        accuracy = lax.Tolerance(
+            atol=flushed, ulps=math.ceil(fa.APPROX_EXP_BOUND[0])
+        )
+      elif _meets(accuracy, composed(fa.EXACT_EXP_BOUND), flushed):
+        accuracy = lax.AccuracyMode.HIGHEST
+      else:
+        raise ValueError(
+            "No f32 logistic meets the tolerance"
+            f" (atol={accuracy.atol}, rtol={accuracy.rtol},"
+            f" ulps={accuracy.ulps}): the exact exponential's is within 4 ulps"
+            " and 2^-126"
+        )
   one = lax.full_like(x, 1)
-  e = lax.exp(-lax.abs(x))
+  e = lax.exp(-lax.abs(x), accuracy=accuracy)
   return lax.select(x >= 0, one, e) / (one + e)
 
 
