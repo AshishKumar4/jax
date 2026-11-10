@@ -15,6 +15,7 @@
 
 from absl.testing import absltest
 import jax
+from jax._src import config
 from jax._src import test_util as jtu
 from jax._src.lib.mlir import ir
 from jax.extend import custom_call_targets
@@ -39,16 +40,17 @@ def _targets(lowered) -> set[str]:
 
 class CustomCallTargetsTest(jtu.JaxTestCase):
 
-  def test_an_empty_array_lowers_to_the_named_allocation(self):
-    lowered = jax.jit(lambda: jax.lax.empty((4,), jnp.float32)).lower()
+  def test_an_empty_array_lowers_to_the_named_allocation_on_a_gpu(self):
+    lowered = jax.jit(lambda: jax.lax.empty((4,), jnp.float32)).trace().lower(lowering_platforms=("cuda",))
     self.assertIn(custom_call_targets.ALLOCATE_BUFFER, _targets(lowered))
 
-  def test_a_gpu_threefry_lowers_to_its_platforms_named_kernel(self):
-    for platform in ("cuda", "rocm"):
-      with self.subTest(platform):
-        lowered = jax.jit(lambda: jax.random.bits(jax.random.key(0, impl="threefry2x32"), (8,))).trace().lower(
-            lowering_platforms=(platform,))
-        self.assertIn(custom_call_targets.THREEFRY2X32[platform], _targets(lowered))
+  def test_a_gpu_threefry_kernel_lowers_to_its_platforms_named_kernel(self):
+    with config.threefry_gpu_kernel_lowering(True):
+      for platform in ("cuda", "rocm"):
+        with self.subTest(platform):
+          lowered = jax.jit(lambda: jax.random.bits(jax.random.key(0, impl="threefry2x32"), (8,))).trace().lower(
+              lowering_platforms=(platform,))
+          self.assertIn(custom_call_targets.THREEFRY2X32[platform], _targets(lowered))
 
   def test_exports_stable_list_names_the_targets_by_their_constants(self):
     from jax._src.export import _export
