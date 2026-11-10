@@ -57,6 +57,7 @@ from jax._src.pallas.primitives import debug_print as debug_print
 from jax._src.pallas.primitives import delay as delay
 from jax._src.pallas.primitives import DeviceIdType as _deprecated_DeviceIdType
 from jax._src.pallas.primitives import get_global as get_global
+from jax._src.pallas.primitives import load_p as load_p
 from jax._src.pallas.primitives import multiple_of as multiple_of
 from jax._src.pallas.primitives import num_programs as num_programs
 from jax._src.pallas.primitives import num_programs_p as num_programs_p
@@ -67,6 +68,7 @@ from jax._src.pallas.primitives import run_scoped as run_scoped
 from jax._src.pallas.primitives import semaphore_read as semaphore_read
 from jax._src.pallas.primitives import semaphore_signal as semaphore_signal
 from jax._src.pallas.primitives import semaphore_wait as semaphore_wait
+from jax._src.pallas.primitives import swap_p as swap_p
 from jax._src.pallas.utils import align_to as align_to
 from jax._src.pallas.utils import cdiv as cdiv
 from jax._src.pallas.utils import next_power_of_2 as next_power_of_2
