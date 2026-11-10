@@ -49,6 +49,10 @@ archive_override(
         # A compile with no device and cuDNN's deviceless compilation off fails at a cuDNN call, rather than
         # returning an executable whose cuDNN thunk finds no serialized graph at load (upstream ecc9e27f91).
         "//third_party:xla/cudnn_uncompiled_fails.patch",
+        # A compile with no device fails at a cuDNN convolution none of its configs chose an algorithm for,
+        # rather than giving it the default's engine -1, which fails its first run with CUDNN_STATUS_BAD_PARAM
+        # (Dew's FS-DEVICELESS-CASES-h100).
+        "//third_party:xla/cudnn_conv_deviceless_fails.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
