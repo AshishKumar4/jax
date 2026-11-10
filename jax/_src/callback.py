@@ -23,6 +23,7 @@ from typing import Any, cast
 from jax._src import api
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
@@ -895,8 +896,7 @@ def emit_python_callback(
     return outputs, token, None
 
   device = "gpu" if platform in {"cuda", "rocm", "oneapi"} else "cpu"
-  partition = "_partitioned" if partitioned else ""
-  call_target_name = f"xla_ffi{partition}_python_{device}_callback"
+  call_target_name = custom_call_targets.PYTHON_CALLBACK[(device, bool(partitioned))]
   if token:
     callback_without_token = _wrapped_callback
     def _wrapped_callback(token, *args):
