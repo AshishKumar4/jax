@@ -640,6 +640,23 @@ class Primitive:
   # scalar read at every index), so an analysis of a jaxpr's entries carries an
   # index through it unchanged.
   elementwise: bool = False
+  # set for primitives that act on each position of their operands' shared
+  # leading shape alone, the positions of every operand aligned (a key's split or
+  # bits, a polynomial, a bitcast): their batching rule maps the primitive over
+  # the batched positions (`batching.defvectorized`, `defbroadcasting`).
+  positionwise: bool = False
+  # set for primitives that reduce their operand over the axes their `axes`
+  # parameter names (a sum, a max, an argmax): `batching.defreducer`'s.
+  reduces: bool = False
+  # set for primitives that reduce their operand cumulatively along the axis
+  # their `axis` parameter names, each output entry the reduction of the entries
+  # up to it (or from it, `reverse`): cumsum, cumprod, cummax, cummin and
+  # cumlogsumexp.
+  cumulative: bool = False
+  # set for primitives that write their updates into a copy of their operand at
+  # the indices their scatter dimension numbers place them (a scatter, or one
+  # that combines each update with the entry it lands on).
+  scatters: bool = False
   is_effectful = None
 
   def __init__(self, name: str):
