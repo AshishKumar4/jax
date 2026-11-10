@@ -43,6 +43,7 @@ def _emit_mosaic_gpu_custom_call(
     debug_info,
     cost_estimate: Any = None,
     skip_device_barrier: bool = False,
+    metadata: bytes = b"",
 ):
   module = lowering_result.module
   new_avals_in = list(ctx.avals_in)
@@ -76,6 +77,7 @@ def _emit_mosaic_gpu_custom_call(
       # False until we add get_barrier_semaphore() feature.
       use_custom_barrier=False,
       skip_device_barrier=skip_device_barrier,
+      metadata=metadata,
   )
   if (prof_spec := lowering_result.profiler_spec) is not None:
     *outs, prof_buffer = outs
@@ -199,4 +201,5 @@ def mpmd_map_mgpu_lowering_rule(
       jaxpr.debug_info,
       cost_estimate=cost_estimate,
       skip_device_barrier=gpu_params.skip_device_barrier,
+      metadata=gpu_params.metadata,
   )
