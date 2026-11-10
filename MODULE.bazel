@@ -40,6 +40,10 @@ archive_override(
         # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
         # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+        # A compile with no device fails at a cuDNN convolution none of its configs chose an algorithm for,
+        # rather than giving it the default's engine -1, which fails its first run with CUDNN_STATUS_BAD_PARAM
+        # (Dew's FS-DEVICELESS-CASES-h100).
+        "//third_party:xla/cudnn_conv_deviceless_fails.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
