@@ -6909,6 +6909,40 @@ class FragmentedArrayTest(TestCase):
       np.testing.assert_array_equal(
           result[rest], truth.astype(np.float32).astype(np.float64)[rest])
 
+  @jtu.ignore_warning(message="overflow encountered", category=RuntimeWarning)
+  @jtu.ignore_warning(message="underflow encountered", category=RuntimeWarning)
+  def test_exp_is_exact_without_approx(self, m=128, n=256):
+    """`exp(approx=False)` on f32 is within one ulp of e^x at fractional
+    inputs (NVPTX lowers `math.exp` through `ex2.approx.ftz`, about two ulp and
+    its subnormals flushed), its subnormal results within one subnormal step,
+    and its special values IEEE's."""
+    def kernel(ctx, src, dst, _):
+      del ctx
+      x = mgpu.FragmentedArray.load_strided(src)
+      x.exp(approx=False).store_untiled(dst, optimized=False)
+
+    shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
+    run = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), shape, shape, ())
+    rng = np.random.default_rng(0)
+    swept = np.linspace(-103.9, 88.7, m * n - 11).astype(np.float32)
+    specials = np.array([np.inf, -np.inf, np.nan, 89.0, 88.72, -104.0, -103.97,
+                         0.0, -0.0, 1000.0, -1000.0], np.float32)
+    for x in (np.concatenate([swept, specials]),
+              rng.uniform(-20, 20, m * n).astype(np.float32)):
+      x = x.reshape(m, n)
+      result = np.asarray(run(x), np.float64)
+      truth = np.exp(x.astype(np.float64))
+      normal = (truth >= 2.0**-126) & (truth < np.finfo(np.float32).max)
+      ulp = np.spacing(truth.astype(np.float32)).astype(np.float64)
+      self.assertLessEqual(
+          np.max(np.abs(result - truth)[normal] / ulp[normal]), 1.0)
+      subnormal = (truth > 0) & (truth < 2.0**-126)
+      self.assertLessEqual(
+          np.max(np.abs(result - truth)[subnormal], initial=0.0), 2.0**-149)
+      rest = ~normal & ~subnormal
+      np.testing.assert_array_equal(
+          result[rest], truth.astype(np.float32).astype(np.float64)[rest])
+
   def test_select(self, m=64, n=32):
 
     def kernel(ctx, dst, _):
