@@ -6901,10 +6901,11 @@ class FragmentedArrayTest(TestCase):
       normal = (truth >= 2.0**-126) & (truth < np.finfo(np.float32).max)
       ulp = np.spacing(truth.astype(np.float32)).astype(np.float64)
       self.assertLessEqual(
-          np.max(np.abs(result - truth)[normal] / ulp[normal]), 1.0)
+          np.max(np.abs(result[normal] - truth[normal]) / ulp[normal]), 1.0)
       subnormal = (truth > 0) & (truth < 2.0**-126)
       self.assertLessEqual(
-          np.max(np.abs(result - truth)[subnormal], initial=0.0), 2.0**-149)
+          np.max(np.abs(result[subnormal] - truth[subnormal]), initial=0.0),
+          2.0**-149)
       rest = ~normal & ~subnormal
       np.testing.assert_array_equal(
           result[rest], truth.astype(np.float32).astype(np.float64)[rest])
@@ -6935,10 +6936,11 @@ class FragmentedArrayTest(TestCase):
       normal = (truth >= 2.0**-126) & (truth < np.finfo(np.float32).max)
       ulp = np.spacing(truth.astype(np.float32)).astype(np.float64)
       self.assertLessEqual(
-          np.max(np.abs(result - truth)[normal] / ulp[normal]), 1.0)
+          np.max(np.abs(result[normal] - truth[normal]) / ulp[normal]), 1.0)
       subnormal = (truth > 0) & (truth < 2.0**-126)
       self.assertLessEqual(
-          np.max(np.abs(result - truth)[subnormal], initial=0.0), 2.0**-149)
+          np.max(np.abs(result[subnormal] - truth[subnormal]), initial=0.0),
+          2.0**-149)
       rest = ~normal & ~subnormal
       np.testing.assert_array_equal(
           result[rest], truth.astype(np.float32).astype(np.float64)[rest])
