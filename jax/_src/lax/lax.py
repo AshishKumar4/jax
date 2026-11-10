@@ -8166,6 +8166,7 @@ stack_p = standard_primitive(
     sharding_rule=_stack_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'stack'),
     ur_rule=_stack_ur_rule)
+stack_p.rearranges = True
 ad.deflinear2(stack_p, _stack_transpose_rule)
 mlir.register_lowering(stack_p, _stack_lower)
 
@@ -8258,6 +8259,7 @@ def _unstack_batch_rule(batched_args, batch_dims, *, axis):
   return results, (out_bdim,) * len(results)
 
 unstack_p = core.Primitive('unstack')
+unstack_p.rearranges = True
 unstack_p.multiple_results = True
 unstack_p.def_abstract_eval(
     partial(standard_multi_result_abstract_eval, unstack_p, _unstack_shape_rule,
@@ -9232,6 +9234,7 @@ select_n_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'select_n'),
     ur_rule=_select_ur_rule)
 select_n_p.elementwise = True
+select_n_p.rearranges = True
 ad.primitive_jvps[select_n_p] = _select_jvp
 ad.primitive_transposes[select_n_p] = _select_transpose_rule
 batching.fancy_primitive_batchers[select_n_p] = _select_batch_rule
@@ -9880,6 +9883,7 @@ def _sort_batch_rule(batched_args, batch_dims, *, dimension, is_stable, num_keys
 
 
 sort_p = Primitive('sort')
+sort_p.rearranges = True
 sort_p.multiple_results = True
 sort_p.def_impl(partial(dispatch.apply_primitive, sort_p))
 sort_p.def_abstract_eval(_sort_abstract_eval)
@@ -10270,6 +10274,7 @@ def _copy_impl(prim, *args, **kwargs):
 # It's used in jnp.array(x, copy=True), which is the user-facing API.
 copy_p = core.Primitive('copy')
 copy_p.elementwise = True
+copy_p.rearranges = True
 copy_p.def_impl(partial(_copy_impl, copy_p))
 copy_p.def_abstract_eval(lambda x: x)
 

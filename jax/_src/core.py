@@ -712,8 +712,10 @@ class Primitive:
   # set for primitives that only move entries: each output entry one operand's
   # entry, or a fill the parameters state, with no arithmetic and no rounding
   # (a reshape, a broadcast, a transpose, a slice or its update, a gather, a
-  # concatenation, a pad, a split), so an analysis may count them free and know
-  # they cannot round.
+  # concatenation, a pad, a split, a stack or an unstack, a copy, a select's
+  # pick among its cases, a sort's permutation), so an analysis may count them
+  # free and know they cannot round. An iota is none: its entries are computed
+  # from their indices, rounded in a float dtype past its mantissa.
   rearranges: bool = False
   # set for primitives that write their updates into a copy of their operand at
   # the indices their scatter dimension numbers place them (a scatter, or one
