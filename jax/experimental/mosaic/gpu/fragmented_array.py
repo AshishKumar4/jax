@@ -1124,6 +1124,22 @@ _NON_DECREASING_DISTRIBUTES_OVER = ("max", "min")
 # the Taylor series to degree 7, whose truncation is under 2^-27 of the result
 # there (about 0.06 ulp), highest degree first (Horner's form).
 _EXP_TERMS = tuple(1.0 / math.factorial(k) for k in range(7, -1, -1))
+# The f32 exponentials' error bounds over results that are normal floats, as
+# (ulps, relative), which a requested tolerance is held to (Pallas Mosaic GPU's
+# `accuracy`), and what a result below them gets.
+# ex2.approx.ftz.f32 is within 2 ulp of the correctly rounded 2^x over its
+# whole range (the PTX ISA's ex2 notes), so 2.5 of the exact one, and flushes a
+# subnormal result to zero, an absolute error under 2^-126.
+APPROX_EXP2_BOUND = (2.5, 2.5 * 2.0**-23)
+APPROX_FLUSHED_ATOL = 2.0**-126
+# e^x through it (`exp(approx=True)`, 2^(x log2(e)) with log2(e) and the product
+# each rounded to f32) adds a relative |x| 2^-23, at most 89 * 2^-23 where e^x
+# is a normal float (|x| under 88.7), up to 178 ulps more.
+APPROX_EXP_BOUND = (2.5 + 178, 2.5 * 2.0**-23 + 89 * 2.0**-23)
+# The exact forms (`_exact_exp_f32`, `_exact_exp2_f32`) are within an ulp, a
+# subnormal result within the subnormal ulp.
+EXACT_EXP_BOUND = (1.0, 2.0**-23)
+EXACT_EXP_ATOL = 2.0**-149
 # ln 2 split for Cody and Waite's reduction: its leading bits, whose product
 # with an integer under 2^8 is exact, and the rest.
 _LN2_HI = 0.693145751953125
