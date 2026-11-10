@@ -39,13 +39,25 @@ class HloReaderTest(jtu.JaxTestCase):
     self.assertEqual([i.custom_call_target for i in found if i.opcode == "custom-call"],
                      [custom_call_targets.ALLOCATE_BUFFER])
     self.assertEqual(loop.proto.name, loop.name)
+    # The loop is in the entry; its body and condition are not, and each has one root.
+    self.assertTrue(loop.entry)
+    for called in loop.called:
+      inside = [i for i in found if i.computation == called]
+      self.assertFalse(any(i.entry for i in inside))
+      self.assertEqual(sum(i.root for i in inside), 1)
+    # An instruction's operands are instructions of its own computation, the loop's its carried tuple.
+    by_name = {(i.computation, i.name): i for i in found}
+    for instruction in found:
+      for operand in instruction.operands:
+        self.assertIn((instruction.computation, operand), by_name)
+    self.assertLen(loop.operands, 1)
 
   def test_a_compiled_module_reads_as_its_serialization_does(self):
     compiled = jax.jit(_step).lower(jnp.ones(8)).compile()
     (module,) = compiled.runtime_executable().hlo_modules()
     from_module = list(jex_xla.instructions(module))
     from_bytes = list(jex_xla.instructions(module.as_serialized_hlo_module_proto()))
-    self.assertEqual([i[:5] for i in from_module], [i[:5] for i in from_bytes])
+    self.assertEqual([i[:8] for i in from_module], [i[:8] for i in from_bytes])
     text = module.to_string()
     for instruction in from_module:
       self.assertIn(instruction.name, text)
