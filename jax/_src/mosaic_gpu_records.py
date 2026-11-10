@@ -44,12 +44,13 @@ def kernel_record(serialized: bytes) -> Any | None:
   such record: it does not parse as one, or holds a field the schema does not name, or names no kernel
   (no binary, no function)."""
   from google.protobuf.message import DecodeError
+  from google.protobuf.unknown_fields import UnknownFieldSet
 
   record = _record_class()()
   try:
     record.ParseFromString(serialized)
   except DecodeError:
     return None
-  if record.UnknownFields() or not record.gpu_binary or not record.kernel_name:
+  if len(UnknownFieldSet(record)) or not record.gpu_binary or not record.kernel_name:
     return None
   return record
