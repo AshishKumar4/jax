@@ -1120,6 +1120,45 @@ def _int_pow(x: ir.Value, n: int) -> ir.Value:
 _NON_DECREASING_DISTRIBUTES_OVER = ("max", "min")
 
 
+# 2^f for f in [-1/2, 1/2]: the Taylor series of exp(f ln 2) to degree 7,
+# whose truncation is under 2^-30 there, highest degree first (Horner's form).
+_EXP2_TERMS = tuple(math.log(2.0) ** k / math.factorial(k) for k in range(7, -1, -1))
+
+
+def _exact_exp2_f32(x: ir.Value) -> ir.Value:
+  """`2 ** x` for an f32 scalar or vector `x`, within about one ulp.
+
+  `x = n + f` with `n` the nearest integer and `f` in [-1/2, 1/2]: `2^f` a
+  polynomial (`_EXP2_TERMS`), scaled by `2^n` as two exact powers of two built
+  from their exponent bits, so a result in the subnormal range rounds once.
+  Past 128 it is `inf`, under -152 zero, and a NaN stays NaN.
+  """
+  ty = x.type
+  i32 = ir.IntegerType.get_signless(32)
+  int_ty = ir.VectorType.get(ir.VectorType(ty).shape, i32) if isinstance(ty, ir.VectorType) else i32
+  # Clamped so the scale's halves stay in f32's normal exponents; the bounds
+  # are outside the range where the result is neither inf nor zero.
+  clamped = arith.minimumf(arith.maximumf(x, c(-160.0, ty)), c(130.0, ty))
+  n = mlir_math.roundeven(clamped)
+  f = arith.subf(clamped, n)
+  poly = c(_EXP2_TERMS[0], ty)
+  for term in _EXP2_TERMS[1:]:
+    poly = mlir_math.fma(poly, f, c(term, ty))
+  k = arith.fptosi(int_ty, n)
+  half = arith.shrsi(k, c(1, int_ty))
+  rest = arith.subi(k, half)
+
+  def power(e):
+    # `2^e` for e in [-126, 127]: the biased exponent in place.
+    bits = arith.shli(arith.addi(e, c(127, int_ty)), c(23, int_ty))
+    return arith.bitcast(ty, bits)
+
+  result = arith.mulf(arith.mulf(poly, power(half)), power(rest))
+  # NaN in, NaN out (the clamp of a NaN is unspecified).
+  is_nan = arith.cmpf(arith.CmpFPredicate.UNO, x, x)
+  return arith.select(is_nan, x, result)
+
+
 def _can_splat_unreduced(value: ir.Value, op: str) -> bool:
   # Each unreduced thread holds a partial result, so splatting `value`
   # across them would contribute it once per thread when the reduction is
@@ -2234,6 +2273,10 @@ class FragmentedArray:
       if not isinstance(self.mlir_dtype, ir.F32Type):
         raise NotImplementedError(self.mlir_dtype)
       exp2f = self._lift_fast_instr("ex2.approx.ftz.f32")
+    elif isinstance(self.mlir_dtype, ir.F32Type):
+      # NVPTX selects `ex2.approx.f32` for `math.exp2` on f32 (its error up to
+      # about 2 ulp), so the exact form is computed here.
+      exp2f = _exact_exp2_f32
     return self._pointwise(
         exp2f, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
     )
