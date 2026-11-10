@@ -500,19 +500,18 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     def kernel(x_ref, o_ref):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
 
-    # A kernel of its own name a case, so each compiles, and dumps, its PTX:
-    # cases lowering to one module would share a compiled kernel.
-    kernel.__name__ = kernel.__qualname__ = (
-        f"accuracy_{op}_{asked}_{int(approx_math)}"
-    )
+    # A module of its own a case, so each compiles, and dumps, its PTX: a
+    # stated tolerance decides the form whatever `approx_math` says, and cases
+    # lowering to one module share one compiled kernel, its PTX dumped once.
+    size = 128 if approx_math else 256
     kernel = self.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
+        out_shape=jax.ShapeDtypeStruct([size], jnp.float32),
         compiler_params=plgpu.CompilerParams(approx_math=approx_math),
     )
 
     reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0, "tanh": 10.0}[op]
-    x = np.random.default_rng(0).uniform(-reach, reach, 256).astype(np.float32)
+    x = np.random.default_rng(0).uniform(-reach, reach, size).astype(np.float32)
     if asked == "unmet":
       with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
         kernel(x)
@@ -527,11 +526,13 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     }[op](x.astype(np.float64))
     ulps = np.abs(y - truth) / np.spacing(truth.astype(np.float32))
     self.assertLessEqual(ulps.max(), bound[0])
+    ptx = out()
+    self.assertIn(".entry", ptx)  # This case's own kernel compiled here.
     fast = "tanh.approx" if op == "tanh" else "ex2.approx"
     if asked == "highest" and op != "tanh":
-      self.assertNotIn(fast, out())
+      self.assertNotIn(fast, ptx)
     elif asked == "approximate":
-      self.assertIn(fast, out())
+      self.assertIn(fast, ptx)
 
   def test_is_finite(self):
     # A hook keeping the finite values of a row and zeroing the rest.
