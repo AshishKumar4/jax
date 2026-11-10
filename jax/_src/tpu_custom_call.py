@@ -30,6 +30,7 @@ from jax._src import api
 from jax._src import cloud_tpu_init
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import sharding_impls
 from jax._src.frozen_dict import FrozenDict
@@ -473,7 +474,7 @@ def _tpu_custom_call_lowering(
       and cloud_tpu_init.is_libtpu_at_least("0.0.50")
   )
   call = mlir.custom_call(
-      "tpu_custom_call",
+      custom_call_targets.TPU_CUSTOM_CALL,
       result_types=result_types,
       operands=in_nodes,
       backend_config=config.to_json(use_core_ids=use_core_ids),

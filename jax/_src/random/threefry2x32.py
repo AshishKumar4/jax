@@ -21,6 +21,7 @@ import numpy as np
 from jax._src import api
 from jax._src import config as config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import ffi
@@ -191,7 +192,7 @@ _threefry2x32_cpu_lowering_rule = mlir.lower_fun(
     multiple_results=True)
 
 
-def _threefry2x32_gpu_lowering_rule(ctx, k1, k2, x1, x2, *, target_name_prefix):
+def _threefry2x32_gpu_lowering_rule(ctx, k1, k2, x1, x2, *, platform):
   if not config.threefry_gpu_kernel_lowering.value:  # back to default lowering
     return _threefry2x32_lowering_rule(ctx, k1, k2, x1, x2)
 
@@ -207,8 +208,7 @@ def _threefry2x32_gpu_lowering_rule(ctx, k1, k2, x1, x2, *, target_name_prefix):
                                  broadcast_dimensions=range(rank - len(aval.shape), rank))
 
   sub_ctx = ctx.replace(avals_in=(aval_out,) * 4)
-  rule = ffi.ffi_lowering(
-      f"{target_name_prefix}_threefry2x32_ffi")
+  rule = ffi.ffi_lowering(custom_call_targets.THREEFRY2X32[platform])
   return rule(sub_ctx, _broadcast(k1, k1_aval), _broadcast(k2, k2_aval),
               _broadcast(x1, x1_aval), _broadcast(x2, x2_aval))
 
@@ -224,17 +224,17 @@ mlir.register_lowering(
     threefry2x32_p, _threefry2x32_cpu_lowering_rule, platform='cpu')
 mlir.register_lowering(
     threefry2x32_p,
-    partial(_threefry2x32_gpu_lowering_rule, target_name_prefix='cu'),
+    partial(_threefry2x32_gpu_lowering_rule, platform='cuda'),
     platform='cuda',
     inline=False)
 mlir.register_lowering(
     threefry2x32_p,
-    partial(_threefry2x32_gpu_lowering_rule, target_name_prefix='hip'),
+    partial(_threefry2x32_gpu_lowering_rule, platform='rocm'),
     platform='rocm',
     inline=False)
 mlir.register_lowering(
     threefry2x32_p,
-    partial(_threefry2x32_gpu_lowering_rule, target_name_prefix='oneapi'),
+    partial(_threefry2x32_gpu_lowering_rule, platform='oneapi'),
     platform='oneapi',
     inline=False)
 

@@ -34,6 +34,7 @@ from jax._src import api_util
 from jax._src import array
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
@@ -10726,7 +10727,7 @@ def _empty_custom_call_lower(ctx, *, shape, dtype, out_sharding):
       [mlir.ir.RankedTensorType.get(
           list(phys_aval.shape), mlir.dtype_to_ir_type(phys_aval.dtype))],
       [],
-      call_target_name=mlir.ir.StringAttr.get("AllocateBuffer"),
+      call_target_name=mlir.ir.StringAttr.get(custom_call_targets.ALLOCATE_BUFFER),
       has_side_effect=mlir.ir.BoolAttr.get(False),
   )
   assert len(custom_call_op.results) == 1
