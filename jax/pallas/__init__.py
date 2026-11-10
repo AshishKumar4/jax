@@ -58,7 +58,9 @@ from jax._src.pallas.primitives import delay as delay
 from jax._src.pallas.primitives import get_global as get_global
 from jax._src.pallas.primitives import multiple_of as multiple_of
 from jax._src.pallas.primitives import num_programs as num_programs
+from jax._src.pallas.primitives import num_programs_p as num_programs_p
 from jax._src.pallas.primitives import program_id as program_id
+from jax._src.pallas.primitives import program_id_p as program_id_p
 from jax._src.pallas.primitives import run_scoped as run_scoped
 from jax._src.pallas.primitives import semaphore_read as semaphore_read
 from jax._src.pallas.primitives import semaphore_signal as semaphore_signal

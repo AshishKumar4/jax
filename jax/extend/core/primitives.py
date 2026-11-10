@@ -22,6 +22,11 @@ from jax._src.ad_checkpoint import (
 
 from jax._src.ad_util import stop_gradient_p as stop_gradient_p
 
+from jax._src.callback import (
+  io_callback_p as io_callback_p,
+  pure_callback_p as pure_callback_p,
+)
+
 from jax._src.core import (
   call_p as call_p,
   closed_call_p as closed_call_p
@@ -33,12 +38,21 @@ from jax._src.lax.eval_jaxpr import (
   register_call_primitive_rules as register_call_primitive_rules,
 )
 
+from jax._src.custom_batching import custom_vmap_p as custom_vmap_p
+
 from jax._src.custom_derivatives import (
   custom_jvp_call_p as custom_jvp_call_p,
   custom_vjp_call_p as custom_vjp_call_p,
 )
 
+from jax._src.debugging import (
+  debug_callback_p as debug_callback_p,
+  debug_print_p as debug_print_p,
+)
+
 from jax._src.dispatch import device_put_p as device_put_p
+
+from jax._src.ffi import ffi_call_p as ffi_call_p
 
 from jax._src.interpreters.ad import (
   add_jaxvals_p as add_jaxvals_p,
@@ -145,6 +159,7 @@ from jax._src.lax.lax import (
   transpose_p as transpose_p,
   xor_p as xor_p,
   empty2_p as empty2_p,
+  ragged_dot_general_p as ragged_dot_general_p,
 )
 
 from jax._src.lax.special import (
@@ -201,6 +216,8 @@ from jax._src.lax.control_flow import (
   while_p as while_p,
 )
 
+from jax._src.lax.control_flow.conditionals import platform_index_p as platform_index_p
+
 from jax._src.lax.fft import (
   fft_p as fft_p,
 )
@@ -252,6 +269,7 @@ from jax._src.lax.linalg import (
 
 from jax._src.pjit import (
     jit_p as jit_p,
+    reshard_p as reshard_p,
     sharding_constraint_p as sharding_constraint_p,
 )
 
@@ -260,14 +278,22 @@ from jax._src.random.prng import (
   random_fold_in_p as random_fold_in_p,
   random_seed_p as random_seed_p,
   random_split_p as random_split_p,
+  random_unwrap_p as random_unwrap_p,
+  random_wrap_p as random_wrap_p,
 )
 from jax._src.random.threefry2x32 import (
   threefry2x32_p as threefry2x32_p,
 )
 
-from jax._src.random.core import random_gamma_p as random_gamma_p
+from jax._src.random.core import (
+  random_clone_p as random_clone_p,
+  random_gamma_p as random_gamma_p,
+)
+
+from jax._src.shard_map import shard_map_p as shard_map_p
 
 from jax._src.state.primitives import (
+  addupdate_p as addupdate_p,
   get_p as get_p,
   swap_p as swap_p,
 )
