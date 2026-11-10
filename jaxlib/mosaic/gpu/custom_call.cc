@@ -1123,6 +1123,9 @@ struct CustomCallResources {
   // custom call operation.
   std::array<DeviceState, kMaxLocalDevices> device_states;
   KernelHash hash;
+  // The custom call's `metadata` attribute: its caller's statement of the
+  // launch, one per call (calls of one kernel share `kernel`, not this).
+  std::string metadata;
 
   static absl::StatusOr<std::string> Serialize(
       const CustomCallResources& resources);
@@ -1147,6 +1150,7 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
   kernel_proto.set_kernel_name(kernel->kernel_name);
   kernel_proto.set_smem_bytes(kernel->smem_bytes);
   kernel_proto.set_cluster_size(kernel->cluster_size);
+  kernel_proto.set_caller_metadata(resources.metadata);
   return kernel_proto.SerializeAsString();
 }
 
@@ -1165,6 +1169,7 @@ CustomCallResources::Deserialize(absl::string_view data) {
   }
   std::memcpy(resources->hash.data(), kernel_proto.kernel_hash().data(),
               sizeof(KernelHash));
+  resources->metadata = kernel_proto.caller_metadata();
 
   if (kernel_proto.version() != 4) {
     return absl::InternalError(absl::StrCat(
@@ -1209,6 +1214,8 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
                    attrs.get<std::string_view>("kernel_hash"));
   ASSIGN_OR_RETURN(std::string_view module,
                    attrs.get<std::string_view>("module"));
+  const std::string_view metadata =
+      attrs.get<std::string_view>("metadata").value_or("");
   if (use_custom_barrier) {
     return absl::UnimplementedError("Custom barrier is not supported on GPUs.");
   }
@@ -1231,8 +1238,8 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
   if (kernel->is_nvshmem_used) {
     return absl::UnimplementedError("NVSHMEM is not supported in XLA.");
   }
-  return std::make_unique<CustomCallResources>(
-      CustomCallResources{.kernel = kernel, .hash = hash});
+  return std::make_unique<CustomCallResources>(CustomCallResources{
+      .kernel = kernel, .hash = hash, .metadata = std::string(metadata)});
 }
 
 absl::StatusOr<std::vector<ffi::AnyBuffer>> GetBuffers(
@@ -1966,6 +1973,8 @@ XLA_FFI_DEFINE_HANDLER(
 // - use_custom_barrier
 // - skip_device_barrier (optional)
 // - uses_xla_collective_metadata (optional)
+// - metadata (optional): the caller's statement of the launch, kept in the
+//   serialized call (MosaicGpuKernelProto.caller_metadata).
 XLA_FFI_DEFINE_HANDLER(
     kMosaicGpuExecute, MosaicGpuExecute,
     ffi::Ffi::BindExecute()

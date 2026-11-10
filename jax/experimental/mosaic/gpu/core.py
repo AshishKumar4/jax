@@ -236,7 +236,14 @@ def _mosaic_gpu_lowering_rule(
     cost_estimate: Any = None,
     use_custom_barrier: bool = False,
     skip_device_barrier: bool = False,
+    metadata: bytes = b"",
 ):
+  """`module` as XLA's Mosaic GPU custom call.
+
+  `metadata`, where given, is the caller's statement of the launch (an
+  identity, a resource decision), opaque to Mosaic and kept in the compiled
+  call's serialization (MosaicGpuKernelProto.caller_metadata).
+  """
   axis_context = ctx.module_context.axis_context
   replica_ids = []
   if is_multi_device_module := _has_communication(module):
@@ -336,6 +343,8 @@ def _mosaic_gpu_lowering_rule(
           launch_context.uses_collective_metadata(module)
       ),
   )
+  if metadata:
+    backend_config["metadata"] = ir.StringAttr.get(metadata)
   if cost_estimate is not None:
     backend_config["cost_estimate_json"] = ir.StringAttr.get(
         json.dumps(dataclasses.asdict(cost_estimate))

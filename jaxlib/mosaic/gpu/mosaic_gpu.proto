@@ -16,6 +16,10 @@ message MosaicGpuKernelProto {
   string kernel_name = 9;
   int32 smem_bytes = 10;
   int32 cluster_size = 11;
+  // What the kernel's caller stated of its launch (an identity, a resource
+  // decision), opaque to Mosaic: the custom call's `metadata` attribute, kept
+  // with the compiled call so a reader of a serialized executable finds it.
+  bytes caller_metadata = 12;
 
   reserved 6;
   reserved "init_func_name";
