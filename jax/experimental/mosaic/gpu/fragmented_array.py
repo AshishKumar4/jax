@@ -1124,20 +1124,27 @@ _NON_DECREASING_DISTRIBUTES_OVER = ("max", "min")
 # the Taylor series to degree 7, whose truncation is under 2^-27 of the result
 # there (about 0.06 ulp), highest degree first (Horner's form).
 _EXP_TERMS = tuple(1.0 / math.factorial(k) for k in range(7, -1, -1))
-# The f32 exponentials' error bounds over results that are normal floats, as
-# (ulps, relative), which a requested tolerance is held to (Pallas Mosaic GPU's
-# `accuracy`), and what a result below them gets.
-# ex2.approx.ftz.f32 is within 2 ulp of the correctly rounded 2^x over its
-# whole range (the PTX ISA's ex2 notes), so 2.5 of the exact one, and flushes a
-# subnormal result to zero, an absolute error under 2^-126.
+# The f32 exponentials' three forms, each with its error bound over results
+# that are normal floats as (ulps, relative) of the exact result, which a
+# requested tolerance is held to (Pallas Mosaic GPU's `accuracy`), and what a
+# result below them gets.
+# The hardware's (`approx=True`): ex2.approx.ftz.f32 is within 2 ulp of the
+# correctly rounded 2^x over its whole range (the PTX ISA's ex2 notes), so 2.5
+# of the exact one, and flushes a subnormal result to zero, an absolute error
+# under 2^-126; e^x through it (2^(x log2(e)), log2(e) and the product each
+# rounded to f32) adds a relative |x| 2^-23, at most 89 * 2^-23 where e^x is a
+# normal float (|x| under 88.7), up to 178 ulps more.
 APPROX_EXP2_BOUND = (2.5, 2.5 * 2.0**-23)
-APPROX_FLUSHED_ATOL = 2.0**-126
-# e^x through it (`exp(approx=True)`, 2^(x log2(e)) with log2(e) and the product
-# each rounded to f32) adds a relative |x| 2^-23, at most 89 * 2^-23 where e^x
-# is a normal float (|x| under 88.7), up to 178 ulps more.
 APPROX_EXP_BOUND = (2.5 + 178, 2.5 * 2.0**-23 + 89 * 2.0**-23)
-# The exact forms (`_exact_exp_f32`, `_exact_exp2_f32`) are within an ulp, a
-# subnormal result within the subnormal ulp.
+APPROX_FLUSHED_ATOL = 2.0**-126
+# The default (neither): `math.exp` and `math.exp2`, which NVVM lowers to
+# libdevice's expf and exp2f, each within 2 ulp of the correctly rounded result
+# over the full range, subnormal results included (the CUDA C++ Programming
+# Guide's single-precision table, 12.9), so 2.5 of the exact one.
+LIBDEVICE_EXP_BOUND = (2.5, 2.5 * 2.0**-23)
+LIBDEVICE_EXP_ATOL = 2.5 * 2.0**-149
+# The exact one (`exact=True`: `_exact_exp_f32`, `_exact_exp2_f32`): within an
+# ulp, a subnormal result within the subnormal ulp.
 EXACT_EXP_BOUND = (1.0, 2.0**-23)
 EXACT_EXP_ATOL = 2.0**-149
 # ln 2 split for Cody and Waite's reduction: its leading bits, whose product
@@ -2305,7 +2312,11 @@ class FragmentedArray:
       return self._pointwise(lambda x, y: signed(y, x), other)
     return self._pointwise(mlir_math.copysign, other)
 
-  def exp(self, *, approx: bool = False) -> FragmentedArray:
+  def exp(
+      self, *, approx: bool = False, exact: bool = False
+  ) -> FragmentedArray:
+    """e^x: the hardware's form with `approx`, within an ulp with `exact` (f32),
+    else libdevice's expf (the bounds above `_exp_series`)."""
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError
     if approx:
@@ -2315,14 +2326,20 @@ class FragmentedArray:
       return self._pointwise(
           mulf, log2e, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
       ).exp2(approx=True)
-    # NVPTX lowers `math.exp` on f32 through `ex2.approx.ftz.f32` (about 2 ulp,
-    # subnormals flushed), so the exact form is computed here.
-    expf = _exact_exp_f32 if isinstance(self.mlir_dtype, ir.F32Type) else mlir_math.exp
+    expf = mlir_math.exp
+    if exact:
+      if not isinstance(self.mlir_dtype, ir.F32Type):
+        raise NotImplementedError(self.mlir_dtype)
+      expf = _exact_exp_f32
     return self._pointwise(
         expf, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
     )
 
-  def exp2(self, *, approx: bool = False) -> FragmentedArray:
+  def exp2(
+      self, *, approx: bool = False, exact: bool = False
+  ) -> FragmentedArray:
+    """2^x: the hardware's form with `approx`, within an ulp with `exact`
+    (f32), else libdevice's exp2f (the bounds above `_exp_series`)."""
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError
     exp2f = mlir_math.exp2
@@ -2330,9 +2347,9 @@ class FragmentedArray:
       if not isinstance(self.mlir_dtype, ir.F32Type):
         raise NotImplementedError(self.mlir_dtype)
       exp2f = self._lift_fast_instr("ex2.approx.ftz.f32")
-    elif isinstance(self.mlir_dtype, ir.F32Type):
-      # NVPTX selects `ex2.approx.f32` for `math.exp2` on f32 (its error up to
-      # about 2 ulp), so the exact form is computed here.
+    elif exact:
+      if not isinstance(self.mlir_dtype, ir.F32Type):
+        raise NotImplementedError(self.mlir_dtype)
       exp2f = _exact_exp2_f32
     return self._pointwise(
         exp2f, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER

@@ -460,35 +460,38 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
   @parameterized.product(
       op=["exp", "exp2", "logistic"],
-      asked=["highest", "approximate", "unmet"],
+      asked=["highest", "approximate", "default", "unmet"],
       approx_math=[False, True],
   )
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_an_exponential_takes_the_accuracy_it_states(
       self, op, asked, approx_math
   ):
-    # Over f32 inputs whose results span the normal floats: an exponential
-    # asking for HIGHEST is within an ulp of float64's, with no approximate
-    # instruction, whatever the kernel's approx_math; one stating a tolerance
-    # the hardware's form meets takes it (ex2.approx) and is within its bound;
-    # a tolerance no form meets is refused.
+    # Over f32 inputs whose results span the normal floats, whatever the
+    # kernel's approx_math: HIGHEST takes the exact form, within an ulp, with
+    # no approximate instruction; a tolerance the hardware's form meets takes
+    # it (ex2.approx), within its bound; one only libdevice's meets (no flushed
+    # subnormals) takes that, within its bound; one no form meets is refused.
     lax_op = getattr(lax, op)
     fa = mgpu.fragmented_array
     # The logistic's relative bound is its exponential's plus its sum's and
     # quotient's rounding (2^-23), in ulps that times 2^24.
     logistic = lambda b: ((b[1] + 2.0**-23) * 2.0**24, b[1] + 2.0**-23)
-    bound, exact = {
-        "exp": (fa.APPROX_EXP_BOUND, fa.EXACT_EXP_BOUND),
-        "exp2": (fa.APPROX_EXP2_BOUND, fa.EXACT_EXP_BOUND),
-        "logistic": (logistic(fa.APPROX_EXP_BOUND),
-                     logistic(fa.EXACT_EXP_BOUND)),
-    }[op]
-    accuracy = {
-        "highest": lax.AccuracyMode.HIGHEST,
-        "approximate": lax.Tolerance(
-            atol=2.0**-126, ulps=math.ceil(bound[0])
-        ),
-        "unmet": lax.Tolerance(rtol=2.0**-30),
+    approximate = {"exp": fa.APPROX_EXP_BOUND, "exp2": fa.APPROX_EXP2_BOUND,
+                   "logistic": logistic(fa.APPROX_EXP_BOUND)}[op]
+    default = (logistic(fa.LIBDEVICE_EXP_BOUND) if op == "logistic"
+               else fa.LIBDEVICE_EXP_BOUND)
+    exact = (logistic(fa.EXACT_EXP_BOUND) if op == "logistic"
+             else fa.EXACT_EXP_BOUND)
+    accuracy, bound = {
+        "highest": (lax.AccuracyMode.HIGHEST, exact),
+        "approximate": (lax.Tolerance(
+            atol=2.0**-126, ulps=math.ceil(approximate[0])), approximate),
+        # A logistic's tiny results ask an atol of every form (`_logistic`).
+        "default": (lax.Tolerance(
+            atol=2.0**-126 if op == "logistic" else 0.0,
+            ulps=math.ceil(default[0])), default),
+        "unmet": (lax.Tolerance(rtol=2.0**-30), None),
     }[asked]
 
     @functools.partial(
@@ -513,12 +516,11 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         "logistic": lambda v: 1 / (1 + np.exp(-v)),
     }[op](x.astype(np.float64))
     ulps = np.abs(y - truth) / np.spacing(truth.astype(np.float32))
+    self.assertLessEqual(ulps.max(), bound[0])
     if asked == "highest":
       self.assertNotIn("ex2.approx", out())
-      self.assertLessEqual(ulps.max(), exact[0])
-    else:
+    elif asked == "approximate":
       self.assertIn("ex2.approx", out())
-      self.assertLessEqual(ulps.max(), bound[0])
 
   @parameterized.parameters(False, True)
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
