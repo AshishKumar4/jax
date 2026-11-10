@@ -897,6 +897,7 @@ jit_p = core.Primitive("jit")
 jit_p.is_effectful = lambda params: bool(params['jaxpr'].effects)
 jit_p.multiple_results = True
 jit_p.inlined_call = True
+jit_p.transparent_call = True
 jit_p.skip_canonicalization = True
 
 def _is_high(*_, jaxpr, **__) -> bool:

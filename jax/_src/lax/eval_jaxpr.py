@@ -154,6 +154,8 @@ def register_call_primitive_rules(
   remat.rules[prim] = partial(_eval_jaxpr_remat, prim)
   discharge.register_discharge_rule(prim)(partial(discharge._eval_jaxpr_discharge_rule, prim))
   if name is not None:
+    # Lowered to a call of its body, which XLA inlines: an inlined call.
+    prim.inlined_call = True
     lowering_rule = partial(
         mlir.core_call_lowering, name=name, inline_jax_late=inline_jax_late)
     mlir.register_lowering(prim, lowering_rule, cacheable=False)
