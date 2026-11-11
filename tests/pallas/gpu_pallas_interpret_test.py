@@ -270,6 +270,87 @@ class InterpretTest(jtu.JaxTestCase):
         jax.jit(_kernel)(jnp.array([1, 0], jnp.int32), x),
         np.array([[12, 13], [14, 15], [10, 10]], np.int32))
 
+  def test_functional_interpreter_copies_through_tma_before_gmem_as_the_hardware(self):
+    # A TMA window starting before its GMEM buffer reads zeros there and drops
+    # what it would store there, never wrapping round to the buffer's end.
+    x = jnp.arange(6, dtype=jnp.int32).reshape((3, 2))
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((3, 2), jnp.int32),
+        interpret=InterpretParams(functional=True),
+        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((4, 2), jnp.int32)),
+    )
+    def _kernel(start_ref, in_gmem, out_gmem, barrier, smem):
+      plgpu.copy_gmem_to_smem(in_gmem.at[pl.ds(start_ref[0], 4)], smem, barrier)
+      plgpu.barrier_wait(barrier)
+      smem[...] = smem[...] + 10
+      plgpu.commit_smem()
+      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(start_ref[1], 4)])
+      plgpu.wait_smem_to_gmem(0)
+
+    np.testing.assert_array_equal(
+        jax.jit(_kernel)(jnp.array([-1, -1], jnp.int32), x),
+        np.array([[10, 11], [12, 13], [14, 15]], np.int32))
+
+  @jtu.parameterized.parameters(True, False)
+  def test_functional_interpreter_copies_gmem_to_smem_only_where_its_predicate_holds(
+      self, predicate):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((4,), jnp.int32),
+        interpret=InterpretParams(functional=True),
+        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((4,), jnp.int32)),
+    )
+    def _kernel(flag_ref, x_ref, o_ref, barrier, smem):
+      smem[...] = jnp.full((4,), -1, jnp.int32)
+      plgpu.commit_smem()
+      plgpu.copy_gmem_to_smem(x_ref, smem, barrier, predicate=flag_ref[0] == 1)
+      plgpu.barrier_wait(barrier)
+      o_ref[...] = smem[...]
+
+    x = jnp.arange(4, dtype=jnp.int32)
+    np.testing.assert_array_equal(
+        jax.jit(_kernel)(jnp.array([int(predicate)], jnp.int32), x),
+        x if predicate else np.full((4,), -1, np.int32))
+
+  def test_functional_interpreter_keeps_a_while_conditions_writes(self):
+    # The condition runs before each step and once more to end the loop: each
+    # run's write to SMEM stays.
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((1,), jnp.int32),
+        interpret=InterpretParams(functional=True),
+        scratch_types=dict(count=plgpu.SMEM((1,), jnp.int32)),
+    )
+    def _kernel(o_ref, count):
+      count[0] = 0
+
+      def keep_going(i):
+        count[0] = count[0] + 1
+        return i < 3
+
+      jax.lax.while_loop(keep_going, lambda i: i + 1, 0)
+      o_ref[0] = count[0]
+
+    np.testing.assert_array_equal(jax.jit(_kernel)(), np.array([4], np.int32))
+
+  def test_functional_interpreter_raises_on_a_while_conditions_out_of_bounds_read(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((1,), jnp.int32),
+        interpret=InterpretParams(functional=True),
+    )
+    def _kernel(x_ref, n_ref, o_ref):
+      def keep_going(i):
+        return jnp.sum(x_ref[pl.ds(n_ref[0], 8)]) + i < 0
+
+      o_ref[0] = jax.lax.while_loop(keep_going, lambda i: i + 1, 0)
+
+    with self.assertRaisesRegex(Exception, 'Out-of-bounds'):
+      jax.block_until_ready(jax.jit(_kernel)(
+          jnp.zeros((8,), jnp.int32), jnp.array([4], jnp.int32)))
+
   def test_functional_interpreter_refuses_a_block_of_two_threads(self):
     @functools.partial(
         plgpu.kernel,
