@@ -711,14 +711,6 @@ def _decoded_access(mesh_location, allocation_key_as_array, transforms, *rest):
   )
 
 
-def _static_thread(thread: memory.Thread | None) -> memory.Thread | None:
-  """`thread`, which an access's callback is handed as it is: a thread of the
-  interpreter is of Python ints (`_kernel`'s, a warp map's)."""
-  if any(not isinstance(leaf, int) for leaf in jax.tree.leaves(thread)):
-    raise TypeError(f"an access's thread {thread} is traced")
-  return thread
-
-
 @fail_on_exception
 def _get(
     token: jax.Array,
@@ -806,13 +798,15 @@ def call_get(
   )
   return callback.io_callback_numpy_inputs(
       functools.partial(
-          _get, access=access, thread=_static_thread(thread),
-          source_info=source_info, input_name=input_name,
+          _get, access=access, source_info=source_info, input_name=input_name
       ),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
       access.operands(),
       clock,
+      # Its own operand, rebuilt before the access decodes the rest, so a
+      # failure there is its thread's (`fail_on_exception`).
+      thread=thread,
   )
 
 @fail_on_exception
@@ -898,16 +892,14 @@ def call_swap(
       (mesh_location, allocation_key_as_array, transforms), _decoded_access
   )
   return callback.io_callback_numpy_inputs(
-      functools.partial(
-          _swap, access=access, thread=_static_thread(thread),
-          source_info=source_info,
-      ),
+      functools.partial(_swap, access=access, source_info=source_info),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
       access.operands(),
       val,
       mask,
       clock=clock,
+      thread=thread,
   )
 
 
