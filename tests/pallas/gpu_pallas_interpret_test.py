@@ -286,11 +286,11 @@ class InterpretTest(jtu.JaxTestCase):
       plgpu.barrier_wait(barrier)
       smem[...] = smem[...] + 10
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(0, 4)])
+      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(start_ref[1], 4)])
       plgpu.wait_smem_to_gmem(0)
 
     np.testing.assert_array_equal(
-        jax.jit(_kernel)(jnp.array([-1], jnp.int32), x),
+        jax.jit(_kernel)(jnp.array([-1, 0], jnp.int32), x),
         np.array([[10, 10], [10, 11], [12, 13]], np.int32))
 
   def test_functional_interpreter_stores_through_tma_before_gmem_as_the_hardware(self):
