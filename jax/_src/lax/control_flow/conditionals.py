@@ -493,9 +493,9 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     in_batched  = [True] * len(branches[0].in_avals)
     out_batched = [True] * len(branches[0].out_avals)
 
-    branches_batched = [
-        batching.batch_jaxpr(jaxpr, axis_data, in_batched, out_batched)[0]
-        for jaxpr in branches]
+    branches_batched, branches_out_bat = unzip2(
+        batching.batch_jaxpr(jaxpr, axis_data, in_batched, out_batched)
+        for jaxpr in branches)
 
     branch_outs = []
     for i, jaxpr in enumerate(branches_batched):
@@ -505,7 +505,8 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
       ops_ = [_bcast_select(predicate, x, lax.stop_gradient(x)) for x in ops]
       branch_outs.append(core.jaxpr_as_fun(jaxpr)(*ops_))
     out = [_bcast_select_n(index, *outs) for outs in zip(*branch_outs)]
-    return out, [0 if b else None for b in out_batched]
+    return out, batching.staged_dims([0 if b else None for b in out_batched],
+                                     *branches_out_bat)
   else:
     ops_bat = [d is not None for d in op_dims]
     ops = [batching.moveaxis(x, d, 0) if b else x
@@ -519,7 +520,8 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
         batching.batch_jaxpr(jaxpr, axis_data, ops_bat, out_bat)[0]
         for jaxpr in branches)
 
-    out_dims = [0 if b else None for b in out_bat]
+    out_dims = batching.staged_dims([0 if b else None for b in out_bat],
+                                    *branches_out_bat)
     out = cond_p.bind(index, *ops, branches=branches_batched,
                       **params)
     return out, out_dims

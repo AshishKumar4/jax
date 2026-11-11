@@ -507,7 +507,7 @@ def _match_axes_jaxpr(f, store, axis_data, out_axes_dest, out_axes, trace, in_ax
     out_axes_dest = [out_axis_dest] * len(out_axes)
   out_vals = map(partial(matchaxis, axis_data), out_axes, out_axes_dest, out_vals)
   out_batched = [dst is not None for dst in out_axes_dest]
-  store.store(out_batched)
+  store.store(_BatchDims(out_batched, _staged_custom_jvps(out_axes)))
   return out_vals
 
 @lu.transformation2
@@ -538,6 +538,22 @@ class _BatchDims(list):
   def __init__(self, dims, staged_custom_jvps):
     super().__init__(dims)
     self.staged_custom_jvps = staged_custom_jvps
+
+def _staged_custom_jvps(dims) -> list:
+  """Each output's staged custom_jvp, where its batched body gave one."""
+  return list(getattr(dims, 'staged_custom_jvps', [None] * len(dims)))
+
+def staged_dims(dims, *bodies) -> _BatchDims:
+  """`dims`, a primitive's output axes, with each mapped output's staged
+  custom_jvp from the first of its batched `bodies` (`batch_jaxpr`'s flags or
+  axes) that gives one: a staged custom_jvp output batched through a call or a
+  control flow primitive is refused as shared as it is through a direct jit."""
+  marks = [_staged_custom_jvps(body) for body in bodies]
+  return _BatchDims(dims, [
+      None if d is None else next(
+          (mark[i] for mark in marks if i < len(mark) and mark[i] is not None),
+          None)
+      for i, d in enumerate(dims)])
 
 @lu.transformation_with_aux2
 def _batch_custom_jvp_outputs(f, store, axis_data, out_dims, is_jvp, *args):
