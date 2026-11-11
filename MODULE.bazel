@@ -53,6 +53,10 @@ archive_override(
         # too, which the compile set (a backward's force_deterministic under deterministic ops): otherwise its
         # thunk's fingerprint names no serialized graph (Dew ledger 5322).
         "//third_party:xla/cudnn_graph_cache_hit_config.patch",
+        # Under deterministic ops the autotuner keeps no Triton backend, yet GEMM fusion still made Triton GEMM
+        # fusions, which cuBLAS through fission took only for physically sequential batch dimensions and never
+        # with no device: 'No supported config found for HLO' (Dew's GPU tier at 475913063, FS-TRITON-DET).
+        "//third_party:xla/deterministic_ops_gemm_fusion.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
