@@ -44,7 +44,10 @@ The contract is the one of JAX's persistent compilation cache:
 * *A value the encoder cannot encode exactly bypasses the cache, counted as
   ``uncacheable``:* a class, enum, pytree node or aval no sealed module owns (a
   user's layout class), a primitive no sealed module holds, a mutable container.
-  So does a lowering that profiles or dumps.
+  So does a lowering that profiles, or that dumps as it runs (its passes' IR, its
+  layout inference's constraint system). Every other dump (the resource
+  estimate, PTX, ptxas's log, SASS) is made as the lowered module is called or
+  compiled, of a hit's module as of a fresh one's.
 * *A process that changes JAX's internals is out of contract.* Rebinding a
   function or a method of JAX, replacing what a class or a module defines,
   writing into a rule's closure or a partial's keywords, or changing any of that
@@ -139,6 +142,9 @@ _UNREAD_FLAGS = frozenset({
 })
 _UNREAD_VARIABLES = re.compile(
     r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_)")
+# What a lowering dumps and where: none changes the lowering, and one that
+# dumps as it runs is not cached (`_eligible`).
+_DUMP_VARIABLES = re.compile(r"^MOSAIC_GPU_DUMP")
 # XLA_FLAGS' cache directories, each its job's own; every other flag a
 # lowering may read (NVSHMEM's, `is_nvshmem_available`) stays keyed.
 _UNREAD_XLA_FLAGS = re.compile(
@@ -151,7 +157,7 @@ def _keyed_environment() -> dict[str, str]:
   keyed = {}
   for name, value in os.environ.items():
     if (not _ENVIRONMENT_PATTERN.match(name) or name.lower() in _CONTROLS
-        or _UNREAD_VARIABLES.match(name)):
+        or _UNREAD_VARIABLES.match(name) or _DUMP_VARIABLES.match(name)):
       continue
     if name == "XLA_FLAGS":
       # Flags that are all unread are none: as if XLA_FLAGS were unset.
@@ -160,7 +166,6 @@ def _keyed_environment() -> dict[str, str]:
         continue
     keyed[name] = value
   return keyed
-_DUMP_ENVIRONMENT_PREFIX = "MOSAIC_GPU_DUMP"
 _DUMP_BASENAME = "mosaic_gpu.dump_basename"
 
 
@@ -251,12 +256,14 @@ def _gather_inputs(jax_mesh: Any) -> mgpu_lowering_inputs.LoweringInputs:
     raise encoding.Uncacheable(f"a lowering input cannot be read: {e!r}") from e
 
 
-def _eligible(params: gpu_core.CompilerParams) -> None:
+def _eligible(params: gpu_core.CompilerParams, context: ir.Context) -> None:
   if params.profile_space:
     raise encoding.Uncacheable("a profiling lowering names a path of this process")
-  for name in os.environ:
-    if name.startswith(_DUMP_ENVIRONMENT_PREFIX):
-      raise encoding.Uncacheable(f"{name} dumps this lowering")
+  # The process's dump options, as Mosaic GPU reads them for any module.
+  dumps = mgpu.dialect.get_or_set_dump_options(
+      ir.Module.create(ir.Location.unknown(context)))
+  if dumps.mlir_passes or dumps.constraint_system:
+    raise encoding.Uncacheable("this lowering dumps its passes as it runs")
 
 
 def _key(
@@ -438,7 +445,7 @@ def lower_unpipelined_jaxpr_to_module(
     if code.digest is None:
       raise sealing.Unsealed(code.reason)
     code.verify_loaded()
-    _eligible(params)
+    _eligible(params, ctx.module_context.context)
     inputs = _gather_inputs(jax_mesh)
     dispatch = registries_lib.current()
     key = _key(

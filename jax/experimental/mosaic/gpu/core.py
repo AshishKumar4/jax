@@ -221,9 +221,9 @@ def _memory_spaces_attr_value(indices: Sequence[int]) -> str:
 
 
 RESOURCES_ATTR = "mosaic_gpu.resources"
-"""A module attribute holding a resource estimate to dump with its kernel's
-name and hash, once the module is lowered to its custom call (Pallas sets it
-where MOSAIC_GPU_DUMP_RESOURCES asks for the estimate)."""
+"""A module attribute holding its kernel's resource estimate (Pallas sets it),
+dumped with the kernel's name and hash once the module is lowered to its custom
+call, where MOSAIC_GPU_DUMP_RESOURCES asks for it."""
 
 
 def _mosaic_gpu_lowering_rule(
@@ -290,9 +290,9 @@ def _mosaic_gpu_lowering_rule(
       ir_version=FWD_COMPAT_IR_VERSION if ctx.is_forward_compat() else None,
   )
 
-  # A resource estimate to dump (`RESOURCES_ATTR`) is no part of the kernel: it
-  # leaves the module before the hash, and is dumped with the hash that names
-  # its kernel.
+  # A resource estimate (`RESOURCES_ATTR`) is no part of the kernel: it leaves
+  # the module before the hash, and is dumped with the hash that names its
+  # kernel.
   resources = None
   if RESOURCES_ATTR in module.operation.attributes:
     resources = ir.StringAttr(module.operation.attributes[RESOURCES_ATTR]).value
@@ -327,12 +327,13 @@ def _mosaic_gpu_lowering_rule(
 
   if resources is not None:
     dump_options = dialect.get_or_set_dump_options(module)
-    name = ir.StringAttr(module.operation.attributes["sym_name"]).value
-    utils.dump_to_file_or_stdout(
-        f"{name} {kernel_id.hex()} {resources}",
-        f"{dump_options.module_basename}.resources.txt",
-        dump_options.dump_path,
-    )
+    if dump_options.resources:
+      name = ir.StringAttr(module.operation.attributes["sym_name"]).value
+      utils.dump_to_file_or_stdout(
+          f"{name} {kernel_id.hex()} {resources}",
+          f"{dump_options.module_basename}.resources.txt",
+          dump_options.dump_path,
+      )
 
   backend_config: dict[str, ir.Attribute] = dict(
       kernel_hash=ir.StringAttr.get(kernel_id),
