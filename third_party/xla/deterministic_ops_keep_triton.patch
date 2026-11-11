@@ -1,0 +1,153 @@
+From ee1bd59f75978745b835c7b4d23dd059dc424104 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Wed, 11 Nov 2026 13:18:04 -0600
+Subject: [PATCH] [XLA:GPU] Deterministic ops keep the autotuner's Triton
+ backend
+
+ConfigAssignerPass dropped the Triton backend under deterministic ops where
+--xla_gpu_experimental_deterministic_ops_triton was 'off', which a client's
+DebugOptions state by default, while GemmFusion still made Triton GEMM
+fusions: with no device, a fusion that cuBLAS through fission refused (batch
+dimensions not physically sequential, or no device to enumerate configs on)
+found no config ('No supported config found for HLO'). TritonBackend refuses
+split-k, so a Triton GEMM fusion's sums are ordered: the backend stays. A
+fusion's first compilable config is then Triton's, the CUDA backends ordered
+cuDNN, Triton, cuBLASLt, fission (cuDNN GEMM fusion off by default), with a
+device as with none; the flag is no longer read, as its help says.
+---
+ xla/backends/gpu/tests/BUILD                  |  1 +
+ xla/backends/gpu/tests/dot_deterministic.hlo  | 19 +++++++++++
+ xla/debug_options_flags.cc                    |  9 +++--
+ .../gpu/autotuning/config_assigner_pass.cc    | 11 +++----
+ .../autotuning/config_assigner_pass_test.cc   | 33 +++++++++----------
+ 5 files changed, 44 insertions(+), 29 deletions(-)
+ create mode 100644 xla/backends/gpu/tests/dot_deterministic.hlo
+
+diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
+index a58cfc9b37..cee6b337bb 100644
+--- a/xla/backends/gpu/tests/BUILD
++++ b/xla/backends/gpu/tests/BUILD
+@@ -754,6 +754,7 @@ lit_test_suite_for_gpus(
+             "bitcast-convert.hlo",
+             "calling_convention.hlo",
+             "dot_bf16.hlo",
++            "dot_deterministic.hlo",
+             "kernel_reuse.hlo",
+             "memory_bandwidth_fusion.hlo",
+             "offload_scan_output.hlo",
+diff --git a/xla/backends/gpu/tests/dot_deterministic.hlo b/xla/backends/gpu/tests/dot_deterministic.hlo
+new file mode 100644
+index 0000000000..7803644306
+--- /dev/null
++++ b/xla/backends/gpu/tests/dot_deterministic.hlo
+@@ -0,0 +1,19 @@
++// RUN: %if !IS_ROCM %{ hlo-opt %s --platform=gpu --stage=hlo --xla_gpu_target_config_filename=%S/../target_config/specs/h100_sxm.txtpb --xla_gpu_deterministic_ops=true --xla_gpu_experimental_deterministic_ops_triton=off --xla_gpu_autotune_level=0 | FileCheck %s %}
++// RUN: %if !IS_ROCM %{ hlo-opt %s --platform=gpu --stage=hlo --xla_gpu_target_config_filename=%S/../target_config/specs/h100_sxm.txtpb --xla_gpu_deterministic_ops=true --xla_gpu_experimental_deterministic_ops_triton=unchecked --xla_gpu_autotune_level=0 | FileCheck %s %}
++// RUN: %if !IS_ROCM %{ hlo-opt %s --platform=gpu --stage=hlo --xla_gpu_target_config_filename=%S/../target_config/specs/h100_sxm.txtpb --xla_gpu_exclude_nondeterministic_ops=true --xla_gpu_autotune_level=0 | FileCheck %s %}
++
++// Deterministic ops keep the Triton backend whatever its mode states, under
++// either flag: a batched dot whose batch dimension sits between the others,
++// which cuBLAS through fission takes only once its layout is normalized,
++// compiles with no device as a Triton fusion.
++
++// CHECK-NOT: __cublas
++// CHECK: __triton
++
++HloModule batched_dot
++
++ENTRY e {
++  a = f32[128,8,16]{2,1,0} parameter(0)
++  b = f32[8,16,128]{2,1,0} parameter(1)
++  ROOT d = f32[8,128,128]{2,1,0} dot(a, b), lhs_batch_dims={1}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}, operand_precision={highest,highest}
++}
+diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
+index 136cc100db..78a90c68c7 100644
+--- a/xla/debug_options_flags.cc
++++ b/xla/debug_options_flags.cc
+@@ -4145,11 +4145,10 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+       "xla_gpu_experimental_deterministic_ops_triton",
+       setter_for_xla_gpu_experimental_deterministic_ops_triton,
+       /*default_value_for_display=*/"off",
+-      "Controls whether Triton is enabled when deterministic ops are requested "
+-      "(--xla_gpu_deterministic_ops or "
+-      "--xla_gpu_exclude_nondeterministic_ops). "
+-      "Supported modes: 'off' (default) and 'unchecked' (enables Triton and "
+-      "skips correctness checks)."));
++      "Not read: deterministic ops (--xla_gpu_deterministic_ops or "
++      "--xla_gpu_exclude_nondeterministic_ops) keep Triton whatever it states, "
++      "a Triton GEMM taking no split-k (ConfigAssignerPass::GetEnabledBackends). "
++      "Modes: 'off' and 'unchecked'."));
+   flag_list->push_back(tsl::Flag(
+       "xla_gpu_require_exact_blas_lt_algorithm",
+       bool_setter_for(
+diff --git a/xla/service/gpu/autotuning/config_assigner_pass.cc b/xla/service/gpu/autotuning/config_assigner_pass.cc
+index 9f74558f3d..c63b346b9c 100644
+--- a/xla/service/gpu/autotuning/config_assigner_pass.cc
++++ b/xla/service/gpu/autotuning/config_assigner_pass.cc
+@@ -489,12 +489,11 @@ std::vector<autotuner::Backend> GetEnabledBackendTypes(
+         autotuner::Backend::BLOCK_LEVEL_EMITTER);
+   }
+ 
+-  if ((debug_options.xla_gpu_exclude_nondeterministic_ops() ||
+-       debug_options.xla_gpu_deterministic_ops()) &&
+-      debug_options.xla_gpu_experimental_deterministic_ops_triton() ==
+-          DebugOptions::DETERMINISTIC_OPS_TRITON_MODE_OFF) {
+-    disabled_autotune_backends.push_back(autotuner::Backend::TRITON);
+-  }
++  // Deterministic ops keep the Triton backend: TritonBackend refuses split-k,
++  // so a Triton GEMM fusion's sums are ordered and repeat. Its mode
++  // (--xla_gpu_experimental_deterministic_ops_triton) is not read here: a
++  // client's DebugOptions state 'off' by default, which dropped the backend
++  // while GEMM fusion still made fusions that only it compiles with no device.
+ 
+   if (!debug_options.xla_gpu_experimental_enable_tensor_ir()) {
+     disabled_autotune_backends.push_back(autotuner::Backend::TENSOR_IR);
+diff --git a/xla/service/gpu/autotuning/config_assigner_pass_test.cc b/xla/service/gpu/autotuning/config_assigner_pass_test.cc
+index fb03da0977..ff929fe660 100644
+--- a/xla/service/gpu/autotuning/config_assigner_pass_test.cc
++++ b/xla/service/gpu/autotuning/config_assigner_pass_test.cc
+@@ -786,26 +786,23 @@ TEST_F(AutotunerFlagsTest, GetEnabledBackendsRespectsDeterminism) {
+         /*thread_pool=*/nullptr, &mlir_context_pool);
+   };
+ 
+-  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<CodegenBackend>> backends,
+-                       get_enabled_backends());
+-  for (const auto& backend : backends) {
+-    EXPECT_NE(backend->backend(), autotuner::Backend::TRITON);
+-    EXPECT_NE(backend->backend(), autotuner::Backend::NATIVE_EMITTER);
+-    EXPECT_NE(backend->backend(), autotuner::Backend::BLOCK_LEVEL_EMITTER);
+-  }
+-
+-  debug_options.set_xla_gpu_experimental_deterministic_ops_triton(
+-      DebugOptions::DETERMINISTIC_OPS_TRITON_MODE_UNCHECKED);
+-  ASSERT_OK_AND_ASSIGN(backends, get_enabled_backends());
+-  bool has_triton = false;
+-  for (const auto& backend : backends) {
+-    if (backend->backend() == autotuner::Backend::TRITON) {
+-      has_triton = true;
++  // Triton (no split-k, so ordered sums) is kept whatever the mode states; the
++  // native and block-level emitters are not.
++  for (auto mode : {DebugOptions::DETERMINISTIC_OPS_TRITON_MODE_OFF,
++                    DebugOptions::DETERMINISTIC_OPS_TRITON_MODE_UNCHECKED}) {
++    debug_options.set_xla_gpu_experimental_deterministic_ops_triton(mode);
++    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<CodegenBackend>> backends,
++                         get_enabled_backends());
++    bool has_triton = false;
++    for (const auto& backend : backends) {
++      if (backend->backend() == autotuner::Backend::TRITON) {
++        has_triton = true;
++      }
++      EXPECT_NE(backend->backend(), autotuner::Backend::NATIVE_EMITTER);
++      EXPECT_NE(backend->backend(), autotuner::Backend::BLOCK_LEVEL_EMITTER);
+     }
+-    EXPECT_NE(backend->backend(), autotuner::Backend::NATIVE_EMITTER);
+-    EXPECT_NE(backend->backend(), autotuner::Backend::BLOCK_LEVEL_EMITTER);
++    EXPECT_TRUE(has_triton);
+   }
+-  EXPECT_TRUE(has_triton);
+ }
+ 
+ TEST_F(AutotunerFlagsTest, GetEnabledBackendsRespectsTensorIrFlag) {
+-- 
+2.53.0
+
