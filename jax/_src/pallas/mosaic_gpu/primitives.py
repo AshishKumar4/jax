@@ -4331,6 +4331,27 @@ def _token_of(value: mgpu.FragmentedArray) -> ir.Value:
   return register
 
 
+def _registers_at_thread_indices(
+    ref: ir.Value, layout: mgpu.TiledLayout, dtype
+) -> mgpu.FragmentedArray:
+  """`ref` (untransformed) in `layout`, each register one vector load at its
+  first element's index (`TiledLayout.thread_idxs`): the thread's index read
+  once, each register's offset from it a constant."""
+  if not isinstance(layout, mgpu.TiledLayout):
+    raise NotImplementedError(f"A load after a value takes a tiled layout, not {layout}.")
+  ref_ty = ir.MemRefType(ref.type)
+  shape = tuple(ref_ty.shape)
+  vector_ty = layout.registers_element_type(ref_ty.element_type)
+  registers = np.empty(layout.registers_shape(shape), dtype=object)
+  for place, index in zip(
+      np.ndindex(registers.shape), layout.thread_idxs(shape), strict=True
+  ):
+    registers[place] = vector_dialect.load(vector_ty, ref, list(index))
+  return mgpu.FragmentedArray(
+      _registers=registers, _layout=layout, _is_signed=mgpu_utils.is_signed(dtype)
+  )
+
+
 def _load_after_lane(ctx, x_ref, *leaves, tree, optimized=True, after=None):
   token = leaves[-1]
   token = lowering._ensure_fa(token, ctx.avals_in[-1].dtype)
@@ -4349,12 +4370,7 @@ def _load_after_wg(ctx, x_ref, *leaves, tree, optimized=True, after=None):
   def body(launch_ctx, token, ref):
     del launch_ctx
     with mgpu_utils.thread_idx_after(_token_of(token)):
-      return mgpu.FragmentedArray.load_untiled(
-          ref,
-          layout=layout.to_mgpu(),
-          is_signed=mgpu_utils.is_signed(out_aval.dtype),
-          optimized=optimized,
-      )
+      return _registers_at_thread_indices(ref, layout.to_mgpu(), out_aval.dtype)
 
   # The transforms' tree over their own leaves: a placeholder that reads as a
   # static dimension would turn a dynamic slice's start static, one leaf less.
