@@ -438,10 +438,30 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
       self.assertEqual(run["events"], ["uncacheable"], run)
     self.assertEmpty(self.entries())
 
-  def test_a_dumping_lowering_is_uncacheable(self):
-    run = self.lower(env={"MOSAIC_GPU_DUMP_PTX": "1"})
-    self.assertEqual(run["events"], ["uncacheable"], run)
+  def test_a_lowering_dumping_its_passes_is_uncacheable(self):
+    passes = self.tmp / "passes"
+    passes.mkdir()
+    for dumps in ({"MOSAIC_GPU_DUMP_MLIR_PASSES": "1"},
+                  {"MOSAIC_GPU_DUMP_CONSTRAINT_SYSTEM": "1"},
+                  {}):  # MOSAIC_GPU_DUMP_TO alone dumps every kind.
+      with self.subTest(str(dumps)):
+        run = self.lower(env={**dumps, "MOSAIC_GPU_DUMP_TO": str(passes)})
+        self.assertEqual(run["events"], ["uncacheable"], run)
     self.assertEmpty(self.entries())
+
+  def test_a_hit_dumps_the_resource_estimate_a_dumping_miss_dumps(self):
+    dumping = {"MOSAIC_GPU_DUMP_RESOURCES": "1"}
+    plain = self.lower()  # The entry made by a process that dumps nothing.
+    hit = self.run_child(env=dumping)
+    self.cache_dir = self.tmp / "another_cache"
+    self.cache_dir.mkdir()
+    miss = self.run_child(env=dumping)
+    (hit_run,), (miss_run,) = hit["runs"], miss["runs"]
+    self.assertEqual([plain["events"], hit_run["events"], miss_run["events"]],
+                     [["miss"], ["hit"], ["miss"]])
+    self.assertEqual(hit_run["normalized"], miss_run["normalized"])
+    self.assertTrue(miss["_printed"])
+    self.assertEqual(hit["_printed"], miss["_printed"])
 
   def test_default_compiler_params_are_cacheable(self):
     # None, as `plgpu.kernel` is called without compiler_params, and the
