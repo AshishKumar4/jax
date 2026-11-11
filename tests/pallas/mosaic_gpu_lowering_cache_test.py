@@ -450,21 +450,16 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEmpty(self.entries())
 
   def test_a_hit_dumps_the_resource_estimate_its_miss_dumped(self):
-    def dumping(name):
-      (self.tmp / name).mkdir()
-      return {"MOSAIC_GPU_DUMP_RESOURCES": "1",
-              "MOSAIC_GPU_DUMP_TO": str(self.tmp / name)}
-
-    miss = self.lower(env=dumping("miss"))
+    dumping = {"MOSAIC_GPU_DUMP_RESOURCES": "1"}
+    miss = self.run_child(env=dumping)
     plain = self.lower()  # A process that dumps nothing shares the entry.
-    hit = self.lower(env=dumping("hit"))
-    self.assertEqual([miss["events"], plain["events"], hit["events"]],
+    hit = self.run_child(env=dumping)
+    (miss_run,), (hit_run,) = miss["runs"], hit["runs"]
+    self.assertEqual([miss_run["events"], plain["events"], hit_run["events"]],
                      [["miss"], ["hit"], ["hit"]])
-    self.assertEqual(hit["normalized"], miss["normalized"])
-    (missed,), (hits,) = (
-        [dump.read_text() for dump in (self.tmp / name).glob("*.resources.txt")]
-        for name in ("miss", "hit"))
-    self.assertEqual(hits, missed)
+    self.assertEqual(hit_run["normalized"], miss_run["normalized"])
+    self.assertTrue(miss["_printed"])
+    self.assertEqual(hit["_printed"], miss["_printed"])
 
   def test_default_compiler_params_are_cacheable(self):
     # None, as `plgpu.kernel` is called without compiler_params, and the
