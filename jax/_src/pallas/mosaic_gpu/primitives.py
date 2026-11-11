@@ -3621,6 +3621,43 @@ def set_max_registers(n: int, *, action: Literal["increase", "decrease"]):
   set_max_registers_p.bind(n=n, action=action)
 
 
+fresh_axis_index_p = jax_core.Primitive("fresh_axis_index")
+
+
+@fresh_axis_index_p.def_abstract_eval
+def _fresh_axis_index_abstract_eval(*, axis_name):
+  del axis_name
+  return jax_core.ShapedArray((), jnp.int32)
+
+
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, *gpu_core.WGxWARP_SEMANTICS)
+def _fresh_axis_index_lowering(
+    ctx: lowering.LoweringRuleContext, *, axis_name
+):
+  return lowering.axis_index(ctx, axis_name, fresh=True)
+
+
+def fresh_axis_index(axis_name: Hashable) -> jax.Array:
+  """``lax.axis_index(axis_name)``, a grid axis's read from the hardware where it
+  is used.
+
+  The read is side-effecting, so the compiler neither merges it with another
+  read of the coordinate nor moves it: no value derived from an earlier read is
+  held live to this use. A kernel that forms a late address from its program's
+  coordinate (an output row stored after a long loop, a role's after its
+  ``set_max_registers``) reads it here rather than holding the first read's.
+  Interpreted, it is ``lax.axis_index``.
+  """
+  return fresh_axis_index_p.bind(axis_name=axis_name)
+
+
 commit_smem_p = jax_core.Primitive("commit_smem")
 commit_smem_p.multiple_results = True
 
