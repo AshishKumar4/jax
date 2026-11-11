@@ -4319,10 +4319,10 @@ def _token_of(value: mgpu.FragmentedArray) -> ir.Value:
   the first element of its first register."""
   i32 = ir.IntegerType.get_signless(32)
   register = value.registers.flat[0]
-  if ir.VectorType.isinstance(register.type):
+  if isinstance(register.type, ir.VectorType):
     register = vector_dialect.extract(register, [], [0])
   width = mgpu_utils.bitwidth(register.type)
-  if not ir.IntegerType.isinstance(register.type):
+  if not isinstance(register.type, ir.IntegerType):
     register = arith_dialect.bitcast(ir.IntegerType.get_signless(width), register)
   if width < 32:
     return arith_dialect.extui(i32, register)
