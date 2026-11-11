@@ -66,6 +66,9 @@ archive_override(
         # fusions, which cuBLAS through fission took only for physically sequential batch dimensions and never
         # with no device: 'No supported config found for HLO' (Dew's GPU tier at 475913063, FS-TRITON-DET).
         "//third_party:xla/deterministic_ops_gemm_fusion.patch",
+        # Deterministic ops keep Triton's GEMMs by default (no split-k, so ordered sums): dropping them routed every
+        # fused dot to cuBLASLt, whose small batched f32 chain did not repeat its bits on an A100 (row 5389).
+        "//third_party:xla/deterministic_ops_triton_kept.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
