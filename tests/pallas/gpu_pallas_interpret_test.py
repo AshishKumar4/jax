@@ -404,6 +404,24 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
     np.testing.assert_array_equal(_kernel(x), x * 2)
 
+  def test_load_after_a_value_is_an_ordinary_load(self):
+    # Interpreted, the value a load waits for addresses nothing.
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32),
+        interpret=InterpretParams(),
+    )
+    def _kernel(x_ref, o_ref):
+      token = plgpu.load(x_ref)
+      o_ref[...] = plgpu.load(
+          x_ref,
+          layout=plgpu.Layout.WGMMA,
+          after=(token, plgpu.Layout.WGMMA),
+      ) * 2
+
+    x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
+    np.testing.assert_array_equal(_kernel(x), x * 2)
+
   def test_load_participates_in_race_detection(self):
     def _kernel(x_ref, o_ref, smem):
       thread_idx = jax.lax.axis_index('t')

@@ -377,7 +377,9 @@ class _Interpreter:
     if p is primitives.program_id_p:
       return jnp.int32(0)
     if p in (state_primitives.get_p, gpu_primitives.load_p):
-      return self.read(invals[0], jax.tree.unflatten(params["tree"], invals[1:]))
+      # A load after a value (`after`) takes it last, which addresses nothing.
+      tree = params["tree"]
+      return self.read(invals[0], jax.tree.unflatten(tree, invals[1:1 + tree.num_leaves]))
     if p in (state_primitives.swap_p, gpu_primitives.store_p):
       old = self.write(invals[0], jax.tree.unflatten(params["tree"], invals[2:]), invals[1])
       return [] if p is gpu_primitives.store_p else old

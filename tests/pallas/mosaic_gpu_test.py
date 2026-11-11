@@ -4366,6 +4366,29 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(), np.broadcast_to(coordinates[..., None], (*grid, len(grid), 128))
     )
 
+  def test_a_load_after_a_value_reads_as_a_load(self):
+    # A load after a value reads the same elements as an ordinary load; its
+    # addresses go through two butterfly shuffles of the value each thread
+    # holds, an ordinary load's through none.
+    layout = plgpu.Layout.WGMMA
+
+    def shuffles(after):
+      @self.kernel(out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32))
+      def kernel(x_ref, o_ref):
+        token = plgpu.load(x_ref, layout=layout) * 3
+        loaded = plgpu.load(
+            x_ref, layout=layout, after=(token, layout) if after else None
+        )
+        o_ref[...] = loaded + token
+
+      x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
+      with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
+        np.testing.assert_array_equal(kernel(x), x * 4)
+      return ptx().count("shfl.sync.bfly")
+
+    self.assertEqual(shuffles(False), 0)
+    self.assertGreaterEqual(shuffles(True), 2)
+
   def test_fresh_axis_index_reads_at_each_use(self):
     # Each fresh read is its own: none is merged with another, so the PTX reads
     # the coordinate once more for each one more.

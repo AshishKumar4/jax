@@ -16,6 +16,7 @@
 
 from collections.abc import Iterator, Sequence
 import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -581,7 +582,41 @@ def _3d_to_1d_idx(dim_idx_fn, dim_size_fn):
   return idx
 
 
-thread_idx = functools.partial(_3d_to_1d_idx, gpu.thread_id, gpu.block_dim)
+_THREAD_IDX_AFTER = contextvars.ContextVar("_THREAD_IDX_AFTER", default=None)
+
+
+@contextlib.contextmanager
+def thread_idx_after(token: ir.Value):
+  """Within the context, `thread_idx` depends on `token` (a 32-bit integer each
+  thread holds): the same index, computed through two butterfly shuffles of a
+  value mixed with `token`, so code addressed by it cannot be scheduled before
+  `token` is computed. Outside it, `thread_idx` is unchanged."""
+  previous = _THREAD_IDX_AFTER.set([token, None])
+  try:
+    yield
+  finally:
+    _THREAD_IDX_AFTER.reset(previous)
+
+
+def thread_idx():
+  index = _3d_to_1d_idx(gpu.thread_id, gpu.block_dim)
+  after = _THREAD_IDX_AFTER.get()
+  if after is None:
+    return index
+  token, formed = after
+  if formed is not None:
+    # One dependent index a context, its shuffles once however many reads use it.
+    return formed
+  i32 = ir.IntegerType.get_signless(32)
+  thread = arith.index_cast(i32, index)
+  # Lane l reads lane l ^ 31's (t ^ b) and b: their XOR is lane l ^ 31's t,
+  # which is t ^ 31 (a block's threads are numbered along x, a warp's 32
+  # consecutive), so one more XOR with 31 gives t back exactly.
+  mixed = shfl_bfly(arith.xori(thread, token), 31)
+  shuffled = shfl_bfly(token, 31)
+  thread = arith.xori(arith.xori(mixed, shuffled), c(31, i32))
+  after[1] = arith.index_cast(ir.IndexType.get(), thread)
+  return after[1]
 block_idx = functools.partial(_3d_to_1d_idx, gpu.block_id, gpu.grid_dim)
 
 

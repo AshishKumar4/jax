@@ -4302,9 +4302,9 @@ load_p = jax_core.Primitive("load")
 
 
 @load_p.def_effectful_abstract_eval
-def _load_abstract_eval(src, *avals_flat, tree, optimized):
-  del optimized  # Unused.
-  transforms = list(tree.unflatten(avals_flat))
+def _load_abstract_eval(src, *avals_flat, tree, optimized, after=None):
+  del optimized, after  # Unused.
+  transforms = list(tree.unflatten(avals_flat[:tree.num_leaves]))
   if not transforms or not isinstance(transforms[-1], indexing.NDIndexer):
     tref_aval = state.transform_type(transforms, src)
     assert isinstance(tref_aval, state_types.AbstractRef)
@@ -4314,22 +4314,102 @@ def _load_abstract_eval(src, *avals_flat, tree, optimized):
   return out_ty.inner_aval, {state.ReadEffect(0)}
 
 
+def _token_of(value: mgpu.FragmentedArray) -> ir.Value:
+  """A 32-bit integer each thread holds that depends on `value`: the bits of
+  the first element of its first register."""
+  i32 = ir.IntegerType.get_signless(32)
+  register = value.registers.flat[0]
+  if ir.VectorType.isinstance(register.type):
+    register = vector_dialect.extract(register, [], [0])
+  width = mgpu_utils.bitwidth(register.type)
+  if not ir.IntegerType.isinstance(register.type):
+    register = arith_dialect.bitcast(ir.IntegerType.get_signless(width), register)
+  if width < 32:
+    return arith_dialect.extui(i32, register)
+  if width > 32:
+    return arith_dialect.trunci(i32, register)
+  return register
+
+
+def _load_after_lane(ctx, x_ref, *leaves, tree, optimized=True, after=None):
+  token = leaves[-1]
+  token = lowering._ensure_fa(token, ctx.avals_in[-1].dtype)
+  ctx = dataclasses.replace(ctx, avals_in=ctx.avals_in[:-1])
+  with mgpu_utils.thread_idx_after(_token_of(token)):
+    return lowering._get_lowering_rule(
+        ctx, x_ref, *leaves[:-1], tree=tree, optimized=optimized
+    )
+
+
+def _load_after_wg(ctx, x_ref, *leaves, tree, optimized=True, after=None):
+  token, transforms = leaves[-1], leaves[:-1]
+  token_layout, layout = after
+  out_aval = ctx.avals_out[0]
+
+  def body(launch_ctx, token, ref):
+    del launch_ctx
+    with mgpu_utils.thread_idx_after(_token_of(token)):
+      return mgpu.FragmentedArray.load_untiled(
+          ref,
+          layout=layout.to_mgpu(),
+          is_signed=mgpu_utils.is_signed(out_aval.dtype),
+          optimized=optimized,
+      )
+
+  _, pytree_ref_transforms = jax.tree.flatten(
+      [None, tree.unflatten(range(tree.num_leaves))]
+  )
+  ctx = dataclasses.replace(
+      ctx, avals_in=(ctx.avals_in[-1], ctx.avals_in[0], *ctx.avals_in[1:-1])
+  )
+  return _inline_mgpu_lowering_rule_wg_semantics(
+      ctx,
+      token,
+      x_ref,
+      *transforms,
+      mgpu_fn=body,
+      flat_arg_types=(token_layout, RefType()),
+      flat_ret_ty=(ShapeDtypeStruct(out_aval.shape, out_aval.dtype, layout=layout),),
+      pytree_args=jax.tree.structure((0, 0)),
+      pytree_ref_transforms=pytree_ref_transforms,
+      pytree_ret_ty=jax.tree.structure(0),
+  )
+
+
+def _load_lowering(lane: bool):
+  plain = lowering._get_lowering_rule if lane else lowering._get_lowering_rule_wg
+  dependent = _load_after_lane if lane else _load_after_wg
+
+  def rule(ctx, x_ref, *leaves, tree, optimized=True, after=None):
+    if after is None:
+      return plain(ctx, x_ref, *leaves, tree=tree, optimized=optimized)
+    return dependent(
+        ctx, x_ref, *leaves, tree=tree, optimized=optimized, after=after
+    )
+
+  return rule
+
+
 lowering.register_lowering_rule(load_p, mgpu.LoweringSemantics.Lane)(
-    lowering._get_lowering_rule
+    _load_lowering(lane=True)
 )
 lowering.register_lowering_rule(load_p, *gpu_core.LANExWARP_SEMANTICS)(
-    lowering._get_lowering_rule
+    _load_lowering(lane=True)
 )
 lowering.register_lowering_rule(load_p, mgpu.LoweringSemantics.Warpgroup)(
-    lowering._get_lowering_rule_wg
+    _load_lowering(lane=False)
 )
 lowering.register_lowering_rule(load_p, *gpu_core.WGxWARP_SEMANTICS)(
-    lowering._get_lowering_rule_wg
+    _load_lowering(lane=False)
 )
 
 
 def load(
-    src: _Ref, *, layout: SomeLayout | None = None, optimized: bool = True
+    src: _Ref,
+    *,
+    layout: SomeLayout | None = None,
+    optimized: bool = True,
+    after: tuple[jax.Array, SomeLayout] | None = None,
 ) -> jax.Array:
   """Loads from a reference into an array with the specified layout.
 
@@ -4338,6 +4418,11 @@ def load(
     layout: The optional layout to use for the resulting array.
     optimized: If True, a compilation error will be raised if no optimized
       implementation for the load is available.
+    after: An array and its layout, `(value, value_layout)`: the load's
+      addresses then depend on `value` (through the bits of its first
+      element each thread holds), so the load's address arithmetic cannot be
+      scheduled before `value` is computed. Needs `layout`, and a reference
+      with no tiling or swizzling transforms. Interpreted, it has no effect.
 
   Returns:
     The loaded array.
@@ -4348,12 +4433,31 @@ def load(
   flat_src_transforms, src_transforms_treedef = tree_util.tree_flatten(
       src_transforms
   )
-  result = load_p.bind(
-      src,
-      *flat_src_transforms,
-      tree=src_transforms_treedef,
-      optimized=optimized,
-  )
+  if after is None:
+    result = load_p.bind(
+        src,
+        *flat_src_transforms,
+        tree=src_transforms_treedef,
+        optimized=optimized,
+    )
+  else:
+    value, value_layout = after
+    if layout is None:
+      raise ValueError("A load after a value needs its own `layout`.")
+    if not isinstance(value_layout, SomeLayout):
+      raise TypeError(
+          f"`after` takes (value, its layout); got a layout {value_layout!r}."
+      )
+    if not jnp.ndim(value):
+      raise ValueError("`after` takes an array in a layout, not a scalar.")
+    result = load_p.bind(
+        src,
+        *flat_src_transforms,
+        value,
+        tree=src_transforms_treedef,
+        optimized=optimized,
+        after=(value_layout, layout),
+    )
   if layout is not None:
     result = gpu_core.layout_cast(result, layout)
   return result

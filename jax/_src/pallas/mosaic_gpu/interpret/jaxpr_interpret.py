@@ -395,10 +395,12 @@ class JaxprInterpreter:
     assert eqn.primitive in (state_primitives.get_p, gpu_primitives.load_p)
     assert isinstance(eqn.outvars[0].aval, jax_core.ShapedArray)
     invals = get_invals()
+    # A load after a value (`after`) takes it last, which addresses nothing.
+    tree = eqn.params["tree"]
     ref, transforms = resolve_ref(
         eqn.invars[0].aval,
         invals[0],
-        jax.tree.unflatten(eqn.params["tree"], invals[1:]),
+        jax.tree.unflatten(tree, invals[1:1 + tree.num_leaves]),
     )
     return gpu_callbacks.call_get(
         token=token,
