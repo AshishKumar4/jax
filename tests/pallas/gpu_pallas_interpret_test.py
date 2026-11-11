@@ -136,6 +136,23 @@ class InterpretTest(jtu.JaxTestCase):
     np.testing.assert_array_equal(_kernel(x), x)
 
   @jtu.parameterized.parameters(True, False)
+  def test_fresh_axis_index_is_axis_index(self, functional):
+    def body(o_ref):
+      a, b = jax.lax.axis_index('a'), jax.lax.axis_index('b')
+      o_ref[a, b] = plgpu.fresh_axis_index('a') * 10 + plgpu.fresh_axis_index('b')
+
+    out = plgpu.kernel(
+        body,
+        out_type=jax.ShapeDtypeStruct((2, 3), jnp.int32),
+        grid=(2, 3),
+        grid_names=('a', 'b'),
+        interpret=InterpretParams(functional=functional),
+    )()
+    np.testing.assert_array_equal(
+        out, np.arange(2)[:, None] * 10 + np.arange(3)[None, :]
+    )
+
+  @jtu.parameterized.parameters(True, False)
   def test_functional_interpreter_agrees_with_simulated_memory(self, grid):
     # One thread a block: a grid of blocks, each copying its slice through
     # SMEM, scaled, with a loop and a branch.

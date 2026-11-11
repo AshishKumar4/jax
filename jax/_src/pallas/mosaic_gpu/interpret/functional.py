@@ -80,6 +80,7 @@ they are issued, each of these has nothing left to order."""
 
 _HANDLED = (
     lax.axis_index_p,
+    gpu_primitives.fresh_axis_index_p,
     primitives.program_id_p,
     state_primitives.get_p,
     gpu_primitives.load_p,
@@ -358,7 +359,7 @@ class _Interpreter:
 
   def eqn(self, eqn, invals):
     p, params = eqn.primitive, eqn.params
-    if p is lax.axis_index_p:
+    if p in (lax.axis_index_p, gpu_primitives.fresh_axis_index_p):
       if params["axis_name"] not in self.axes:
         raise ValueError(f"Unable to determine axis index for axis name {params['axis_name']}")
       return self.axes[params["axis_name"]]
