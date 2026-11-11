@@ -608,15 +608,16 @@ def thread_idx():
     # One dependent index a context, its shuffles once however many reads use it.
     return formed
   i32 = ir.IntegerType.get_signless(32)
-  thread = arith.index_cast(i32, index)
+  thread = index
   # Lane l reads lane l ^ 31's (t ^ b) and b: their XOR is lane l ^ 31's t,
   # which is t ^ 31 (a block's threads are numbered along x, a warp's 32
   # consecutive), so one more XOR with 31 gives t back exactly.
   mixed = shfl_bfly(arith.xori(thread, token), 31)
   shuffled = shfl_bfly(token, 31)
-  thread = arith.xori(arith.xori(mixed, shuffled), c(31, i32))
-  after[1] = arith.index_cast(ir.IndexType.get(), thread)
+  after[1] = arith.xori(arith.xori(mixed, shuffled), c(31, i32))
   return after[1]
+
+
 block_idx = functools.partial(_3d_to_1d_idx, gpu.block_id, gpu.grid_dim)
 
 
