@@ -270,9 +270,9 @@ class InterpretTest(jtu.JaxTestCase):
         jax.jit(_kernel)(jnp.array([1, 0], jnp.int32), x),
         np.array([[12, 13], [14, 15], [10, 10]], np.int32))
 
-  def test_functional_interpreter_copies_through_tma_before_gmem_as_the_hardware(self):
-    # A TMA window starting before its GMEM buffer reads zeros there and drops
-    # what it would store there, never wrapping round to the buffer's end.
+  def test_functional_interpreter_loads_through_tma_before_gmem_as_the_hardware(self):
+    # A TMA load whose window starts before its GMEM source reads zeros there,
+    # never the source's last rows.
     x = jnp.arange(6, dtype=jnp.int32).reshape((3, 2))
 
     @functools.partial(
@@ -286,32 +286,57 @@ class InterpretTest(jtu.JaxTestCase):
       plgpu.barrier_wait(barrier)
       smem[...] = smem[...] + 10
       plgpu.commit_smem()
-      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(start_ref[1], 4)])
+      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(0, 4)])
       plgpu.wait_smem_to_gmem(0)
 
     np.testing.assert_array_equal(
-        jax.jit(_kernel)(jnp.array([-1, -1], jnp.int32), x),
-        np.array([[10, 11], [12, 13], [14, 15]], np.int32))
+        jax.jit(_kernel)(jnp.array([-1], jnp.int32), x),
+        np.array([[10, 10], [10, 11], [12, 13]], np.int32))
+
+  def test_functional_interpreter_stores_through_tma_before_gmem_as_the_hardware(self):
+    # A TMA store whose window starts before its GMEM destination drops what
+    # lies there, never writing the destination's last rows.
+    x = jnp.arange(8, dtype=jnp.float32).reshape((4, 2))
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((6, 2), jnp.float32),
+        interpret=InterpretParams(functional=True),
+        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((4, 2), jnp.float32)),
+    )
+    def _kernel(start_ref, in_gmem, out_gmem, barrier, smem):
+      plgpu.copy_gmem_to_smem(in_gmem, smem, barrier)
+      plgpu.barrier_wait(barrier)
+      plgpu.copy_smem_to_gmem(smem, out_gmem.at[pl.ds(start_ref[0], 4)])
+      plgpu.wait_smem_to_gmem(0)
+
+    out = np.asarray(jax.jit(_kernel)(jnp.array([-1], jnp.int32), x))
+    np.testing.assert_array_equal(out[:3], np.asarray(x)[1:])
+    self.assertTrue(np.isnan(out[3:]).all())
 
   @jtu.parameterized.parameters(True, False)
   def test_functional_interpreter_copies_gmem_to_smem_only_where_its_predicate_holds(
       self, predicate):
+    # A disabled copy touches no memory, even where its window would lie past
+    # its SMEM destination.
     @functools.partial(
         plgpu.kernel,
         out_type=jax.ShapeDtypeStruct((4,), jnp.int32),
         interpret=InterpretParams(functional=True),
-        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((4,), jnp.int32)),
+        scratch_types=dict(barrier=plgpu.Barrier(), smem=plgpu.SMEM((8,), jnp.int32)),
     )
-    def _kernel(flag_ref, x_ref, o_ref, barrier, smem):
-      smem[...] = jnp.full((4,), -1, jnp.int32)
+    def _kernel(flag_ref, start_ref, x_ref, o_ref, barrier, smem):
+      smem[...] = jnp.full((8,), -1, jnp.int32)
       plgpu.commit_smem()
-      plgpu.copy_gmem_to_smem(x_ref, smem, barrier, predicate=flag_ref[0] == 1)
+      plgpu.copy_gmem_to_smem(x_ref, smem.at[pl.ds(start_ref[0], 4)], barrier,
+                              predicate=flag_ref[0] == 1)
       plgpu.barrier_wait(barrier)
-      o_ref[...] = smem[...]
+      o_ref[...] = smem[pl.ds(0, 4)]
 
     x = jnp.arange(4, dtype=jnp.int32)
     np.testing.assert_array_equal(
-        jax.jit(_kernel)(jnp.array([int(predicate)], jnp.int32), x),
+        jax.jit(_kernel)(jnp.array([int(predicate)], jnp.int32),
+                         jnp.array([0 if predicate else 6], jnp.int32), x),
         x if predicate else np.full((4,), -1, np.int32))
 
   def test_functional_interpreter_keeps_a_while_conditions_writes(self):
