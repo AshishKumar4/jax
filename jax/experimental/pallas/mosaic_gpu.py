@@ -100,6 +100,7 @@ from jax._src.pallas.mosaic_gpu.primitives import semaphore_signal_multicast as 
 from jax._src.pallas.mosaic_gpu.primitives import semaphore_signal_parallel as semaphore_signal_parallel
 from jax._src.pallas.mosaic_gpu.primitives import semaphore_wait as semaphore_wait
 from jax._src.pallas.mosaic_gpu.primitives import SemaphoreSignal as SemaphoreSignal
+from jax._src.pallas.mosaic_gpu.primitives import fresh_axis_index as fresh_axis_index
 from jax._src.pallas.mosaic_gpu.primitives import set_max_registers as set_max_registers
 from jax._src.pallas.mosaic_gpu.primitives import ShapeDtypeStruct as ShapeDtypeStruct
 from jax._src.pallas.mosaic_gpu.primitives import store as store

@@ -3632,8 +3632,22 @@ def _reduce_prod_lowering_rule_wg(
   )
 
 
-def _block_id(ctx: LoweringRuleContext, dim: gpu_dialect.Dimension) -> ir.Value:
-  result = gpu_dialect.block_id(dim)
+def _block_id(
+    ctx: LoweringRuleContext, dim: gpu_dialect.Dimension, *, fresh: bool = False
+) -> ir.Value:
+  if fresh:
+    # A side-effecting read of the coordinate where it is used: neither merged
+    # with another read nor moved, so no earlier read is held live to this use.
+    read = llvm_dialect.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [],
+        f"mov.u32 $0, %ctaid.{'xyz'[dim.value]};",
+        "=r",
+        has_side_effects=True,
+    )
+    result = arith_dialect.index_cast(ir.IndexType.get(), read)
+  else:
+    result = gpu_dialect.block_id(dim)
   cluster_size = ctx.launch_ctx.cluster_size
   if math.prod(cluster_size) == 1 or cluster_size[dim.value] == 1:
     return result
@@ -3708,6 +3722,14 @@ def block_id_to_grid_id(ctx: LoweringRuleContext,
 @register_lowering_rule(lax.axis_index_p, mgpu.LoweringSemantics.Warpgroup)
 @register_lowering_rule(lax.axis_index_p, *gpu_core.WGxWARP_SEMANTICS)
 def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
+  return axis_index(ctx, axis_name, fresh=False)
+
+
+def axis_index(
+    ctx: LoweringRuleContext, axis_name: Hashable, *, fresh: bool
+) -> ir.Value:
+  """The program's index along `axis_name`, a grid axis's read afresh where
+  `fresh` (`_block_id`)."""
   if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
     if axis_name == ctx.module_ctx.warp_axis_name:
       w_idx = mgpu.warp_idx(sync=True)
@@ -3754,11 +3776,23 @@ def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
             gpu_dialect.Dimension(axis_names.cluster.index(axis_name))
         ),
     )
-  block_ids = tuple(arith_dialect.index_cast(
-          ir.IntegerType.get_signless(32),
-          _block_id(ctx, dimension),
-  ) for dimension in gpu_dialect.Dimension)
-  return block_id_to_grid_id(ctx, block_ids, axis_name)
+  return block_id_to_grid_id(ctx, _BlockIds(ctx, fresh), axis_name)
+
+
+class _BlockIds:
+  """The block's coordinates as i32, each read when it is looked up: a fresh
+  read is side-effecting, so one never read must not be emitted."""
+
+  def __init__(self, ctx: LoweringRuleContext, fresh: bool):
+    self._ctx, self._fresh = ctx, fresh
+
+  def __getitem__(self, dimension) -> ir.Value:
+    return arith_dialect.index_cast(
+        ir.IntegerType.get_signless(32),
+        _block_id(
+            self._ctx, gpu_dialect.Dimension(dimension), fresh=self._fresh
+        ),
+    )
 
 
 @register_lowering_rule(debugging.debug_print_p, mgpu.LoweringSemantics.Lane)
