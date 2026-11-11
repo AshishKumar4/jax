@@ -430,26 +430,59 @@ class TiledLayout:
   def partitioned_lane_dims(self) -> tuple[int, ...]:
     return tuple(d for d in self.lane_dims if isinstance(d, int))
 
+  def _linear_offsets(
+      self, shape: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], list[int]]:
+    """The strides of a thread's tiled warp and lane indices into an array of
+    `shape`, and each of its registers' offsets from them, in register order:
+    together the linear index of the register's first element."""
+    contig_strides = tuple(utils.get_contiguous_strides(shape))
+    tile_strides = self.tiling.tile_strides(contig_strides)
+    register_offsets = [
+        sum(i * s for i, s in zip(tile_idx, tile_strides))
+        for tile_idx in np.ndindex(self.registers_shape(shape))
+    ]
+    return tile_strides[-self.tiled_tiling_rank:], register_offsets
+
   def thread_idxs(self, shape: tuple[int, ...]) -> Iterable[tuple[ir.Value, ...]]:
     # We first find the linear index and then divide by the shape to
     # get the index.
     i32 = ir.IntegerType.get_signless(32)
     index = ir.IndexType.get()
     contig_strides = tuple(utils.get_contiguous_strides(shape))
-    tile_strides = self.tiling.tile_strides(contig_strides)
-    dyn_tile_strides = [c(s, i32) for s in tile_strides[-self.tiled_tiling_rank:]]
+    thread_strides, register_offsets = self._linear_offsets(shape)
+    dyn_tile_strides = [c(s, i32) for s in thread_strides]
     warp_offset = utils.dyn_dot(self.warp_indices(), dyn_tile_strides)
     lane_offset = utils.dyn_dot(self.lane_indices(), dyn_tile_strides)
     dyn_offset = arith.addi(warp_offset, lane_offset)
-    register_shape = self.registers_shape(shape)
-    for tile_idx in np.ndindex(register_shape):
-      tile_lin_idx = sum(i * s for i, s in zip(tile_idx, tile_strides))
+    for tile_lin_idx in register_offsets:
       dyn_lin_idx = arith.addi(dyn_offset, c(tile_lin_idx, i32))
       idx = []
       for stride in contig_strides:
         idx.append(arith.index_castui(index, arith.divui(dyn_lin_idx, c(stride, i32))))
         dyn_lin_idx = arith.remui(dyn_lin_idx, c(stride, i32))
       yield tuple(idx)
+
+  def register_indices(
+      self, shape: tuple[int, ...], warp: int, lane: int
+  ) -> list[tuple[int, ...]]:
+    """The index of each register's first element in lane `lane` of warp
+    `warp` of the warpgroup, in register order, as `thread_idxs` computes it
+    at run time; a vector's elements follow it along the last dimension."""
+    thread_strides, register_offsets = self._linear_offsets(shape)
+    thread_offset = sum(
+        (w + l) * s
+        for w, l, s in zip(
+            self._delinearize_index(warp, self.warp_dims),
+            self._delinearize_index(lane, self.lane_dims),
+            thread_strides,
+            strict=True,
+        )
+    )
+    return [
+        tuple(int(i) for i in np.unravel_index(thread_offset + offset, shape))
+        for offset in register_offsets
+    ]
 
   @property
   def base_tile_shape(self) -> tuple[int, ...]:
@@ -507,20 +540,38 @@ class TiledLayout:
     shape[self.vector_dim] = tiled_tiling[self.vector_dim]
     return self.tiling.untile_shape(tuple(shape))
 
+  @overload
+  def _delinearize_index(
+      self, idx: int, dims: tuple[int | Replicated | Unreduced, ...]
+  ) -> tuple[int, ...]:
+    ...
+
+  @overload
   def _delinearize_index(
       self, idx: ir.Value, dims: tuple[int | Replicated | Unreduced, ...]
   ) -> tuple[ir.Value, ...]:
-    i32 = ir.IntegerType.get_signless(32)
+    ...
+
+  def _delinearize_index(self, idx, dims):
+    """`idx`, a warp's or a lane's index (an i32 value, or a Python integer
+    for the index map evaluated ahead of time), as its tiled indices."""
     tiled_shape = self.tiled_tiling_shape
     dims_shape = tuple(
         tiled_shape[d] if isinstance(d, int) else d.times for d in dims
     )
     dims_strides = utils.get_contiguous_strides(dims_shape)
-    dims_indices = tuple(
-        arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
-        for stride, size in zip(dims_strides, dims_shape)
-    )
-    full_indices = [arith.constant(i32, 0)] * len(tiled_shape)
+    if isinstance(idx, int):
+      dims_indices = tuple(
+          idx // stride % size for stride, size in zip(dims_strides, dims_shape)
+      )
+      full_indices = [0] * len(tiled_shape)
+    else:
+      i32 = ir.IntegerType.get_signless(32)
+      dims_indices = tuple(
+          arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
+          for stride, size in zip(dims_strides, dims_shape)
+      )
+      full_indices = [arith.constant(i32, 0)] * len(tiled_shape)
     for d, i in zip(dims, dims_indices):
       if isinstance(d, int):
         full_indices[d] = i
@@ -1091,6 +1142,68 @@ TMA_INDICES_4_LAYOUT = TiledLayout(
     lane_dims=(Replicated(32),),
     vector_dim=-1,
 )
+
+@dataclasses.dataclass(frozen=True)
+class _RowLanes:
+  """How a layout lays a 2D array's rows over a warp's lanes, as a row shift
+  reads them: in each warp, a register holds a group of `rows` rows, the
+  register's row in its group its `offsets` entry plus `lane // columns` (a
+  row's elements of the register in `columns` consecutive lanes, which hold
+  the same columns in each row); `peers` maps each register to the registers
+  holding the same columns of its group, by their offsets."""
+
+  columns: int
+  rows: int
+  offsets: dict[tuple[int, ...], int]
+  peers: dict[tuple[int, ...], dict[int, tuple[int, ...]]]
+
+
+@functools.cache
+def _row_lanes(layout: TiledLayout, shape: tuple[int, ...]) -> _RowLanes | None:
+  """The rows of a 2D array of `shape` over a warp's lanes (`_RowLanes`), as
+  the layout's own index map places them (`TiledLayout.register_indices`);
+  None for a layout whose warps hold no whole groups of rows so."""
+  registers = list(np.ndindex(layout.registers_shape(shape)))
+  placed = np.array([
+      [layout.register_indices(shape, warp, lane) for lane in range(WARP_SIZE)]
+      for warp in range(WARPS_IN_WARPGROUP)
+  ])  # [warps, lanes, registers, 2]
+  rows, columns = placed[..., 0], placed[..., 1]
+  lane = np.arange(WARP_SIZE)[None, :, None]
+  # A row's lanes: the fewest consecutive lanes apart whose rows differ.
+  per_row = next(
+      n for n in (1, 2, 4, 8, 16, WARP_SIZE)
+      if n == WARP_SIZE or np.any(rows[:, n] != rows[:, 0])
+  )
+  if np.any(columns != columns[:, np.arange(WARP_SIZE) % per_row]):
+    return None
+  # The largest group of rows a warp holds whole.
+  for group in (64, 32, 16, 8):
+    if group < WARP_SIZE // per_row:
+      continue
+    offsets = rows[0, 0] % group
+    base = rows - rows % group
+    if np.all(rows % group == offsets + lane // per_row) and np.all(
+        base == base[:, :1]
+    ):
+      peers = {
+          at: {
+              int(offsets[j]): other
+              for j, other in enumerate(registers)
+              if base[0, 0, j] == base[0, 0, i]
+              and columns[0, 0, j] == columns[0, 0, i]
+          }
+          for i, at in enumerate(registers)
+      }
+      # Each register's group held whole, a lane's rows apart a register.
+      whole = list(range(0, group, WARP_SIZE // per_row))
+      if all(sorted(held) == whole for held in peers.values()):
+        return _RowLanes(
+            per_row, group, {at: int(o) for at, o in zip(registers, offsets)},
+            peers,
+        )
+  return None
+
 
 def can_relayout_wgmma_4x_to_wgmma_2x(bitwidth: int) -> bool:
   return bitwidth == 4
@@ -1784,6 +1897,64 @@ class FragmentedArray:
       )
     return type(self).splat(
         self.registers.item(), self.shape, new_layout, is_signed=self.is_signed
+    )
+
+  def row_shifted(self, shift: ir.Value, period: int) -> FragmentedArray:
+    """Each row `i` of a 2D array holding row `i - shift`'s values within its
+    group of `period` rows, `shift` an i32 value uniform over the warpgroup;
+    a row whose source lies outside its group holds unspecified values.
+
+    The values move between a warp's lanes by shuffles, so the layout's warps
+    must each hold whole groups of `period` rows, a row's elements of a
+    register in consecutive lanes (`_row_lanes`), as WGMMA_LAYOUT's and
+    TCGEN05_LAYOUT's do.
+    """
+    shape = self.shape
+    if (
+        not isinstance(self.layout, TiledLayout)
+        or self.is_unreduced
+        or len(shape) != 2
+    ):
+      raise NotImplementedError(
+          f"Row shifts take a 2D array in a tiled layout, got {self.layout}"
+          f" of shape {shape}"
+      )
+    form = _row_lanes(self.layout, shape)
+    if form is None or form.rows % period:
+      raise NotImplementedError(
+          f"{self.layout}'s warps hold no whole groups of {period} rows of an"
+          f" array of shape {shape}"
+      )
+    i32 = ir.IntegerType.get_signless(32)
+    lane = arith.remui(utils.thread_idx(), c(WARP_SIZE, i32))
+    lane_row = arith.divui(lane, c(form.columns, i32))
+    lane_column = arith.remui(lane, c(form.columns, i32))
+    warp_rows = WARP_SIZE // form.columns
+    new_regs = np.empty_like(self.registers)
+    for at in np.ndindex(self.registers.shape):
+      # The row of the group this lane's element of the register reads (the
+      # group's size a power of two, so a negative difference's residue too),
+      # the lane holding it and its register's offset among the peers.
+      row = arith.addi(lane_row, c(form.offsets[at], i32))
+      source = arith.remui(arith.subi(row, shift), c(form.rows, i32))
+      within = arith.remui(source, c(warp_rows, i32))
+      source_lane = arith.addi(
+          arith.muli(within, c(form.columns, i32)), lane_column
+      )
+      source_offset = arith.subi(source, within)
+      value = None
+      for offset, peer in sorted(form.peers[at].items()):
+        moved = utils.shfl_idx(self.registers[peer], source_lane)
+        if value is None:
+          value = moved
+        else:
+          taken = arith.cmpi(
+              arith.CmpIPredicate.eq, source_offset, c(offset, i32)
+          )
+          value = arith.select(taken, moved, value)
+      new_regs[at] = value
+    return FragmentedArray(
+        _registers=new_regs, _layout=self.layout, _is_signed=self.is_signed
     )
 
   def _pointwise(
