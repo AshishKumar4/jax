@@ -4356,9 +4356,9 @@ def _load_after_wg(ctx, x_ref, *leaves, tree, optimized=True, after=None):
           optimized=optimized,
       )
 
-  _, pytree_ref_transforms = jax.tree.flatten(
-      [None, tree.unflatten(range(tree.num_leaves))]
-  )
+  # The transforms' tree over their own leaves: a placeholder that reads as a
+  # static dimension would turn a dynamic slice's start static, one leaf less.
+  _, pytree_ref_transforms = jax.tree.flatten([None, tree.unflatten(transforms)])
   ctx = dataclasses.replace(
       ctx, avals_in=(ctx.avals_in[-1], ctx.avals_in[0], *ctx.avals_in[1:-1])
   )
