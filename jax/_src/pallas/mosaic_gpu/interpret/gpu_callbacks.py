@@ -14,18 +14,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import contextlib
 import dataclasses
 import functools
 import inspect
 import itertools
+import math
 import threading
 from typing import Any
 
 import jax
 from jax import numpy as jnp
 from jax._src import callback
+from jax._src import config
 from jax._src import source_info_util
 from jax._src.pallas.mosaic.interpret import thread_map
 from jax._src.pallas.mosaic.interpret import utils as interpret_utils
@@ -624,12 +626,92 @@ def _validate_transforms(transforms):
         raise ValueError(f"Unsupported transform: {transform}")
 
 
+class _Packed:
+  """An access's arguments packed for its callback: every integer array among
+  them (a buffer's key, a location's coordinates, a dynamic index) in one
+  vector, which crosses to the host as one operand, and the rest as traced.
+
+  At run time the arguments are rebuilt from the vector's values, each packed
+  leaf a Python int or an int array, and decoded (`decode`) once for each
+  distinct vector: an access's key, location and indices are rebuilt once, not
+  at every access (each callback otherwise rebuilds every pytree it is handed).
+  """
+
+  def __init__(self, args: Any, decode: Callable[..., Any]):
+    leaves, self._tree = jax.tree.flatten(args)
+    dtype = jnp.int64 if config.enable_x64.value else jnp.int32
+    self._leaves: list[Any] = list(leaves)
+    self._slots: list[tuple[int, int, tuple[int, ...], Any]] = []
+    vectors, offset = [], 0
+    for position, leaf in enumerate(leaves):
+      if isinstance(leaf, (int, np.integer)):
+        continue  # Static: it stays a leaf of the template.
+      if not jnp.issubdtype(leaf.dtype, jnp.integer):
+        raise TypeError(f"an access's argument of dtype {leaf.dtype} is no index")
+      self._slots.append((position, offset, tuple(leaf.shape), leaf.dtype))
+      vectors.append(jnp.ravel(leaf).astype(dtype))
+      offset += math.prod(leaf.shape)
+    self.vector = (jnp.concatenate(vectors) if vectors
+                   else jnp.zeros((0,), dtype))
+    self._decode = decode
+    self._decoded: dict[tuple[int, ...], Any] = {}
+
+  def unpacked(self, vector: np.ndarray) -> Any:
+    """The decoded arguments the vector's values give."""
+    values = tuple(vector.tolist())
+    decoded = self._decoded.get(values)
+    if decoded is None:
+      leaves = list(self._leaves)
+      for position, offset, shape, dtype in self._slots:
+        if shape:
+          leaves[position] = np.array(
+              values[offset:offset + math.prod(shape)], dtype).reshape(shape)
+        else:
+          leaves[position] = values[offset]
+      decoded = self._decode(*self._tree.unflatten(leaves))
+      if len(self._decoded) >= _DECODED_HELD:
+        self._decoded.clear()
+      self._decoded[values] = decoded
+    return decoded
+
+
+# The distinct argument vectors an access keeps decoded (`_Packed`): one of a
+# kernel's loads reads at most this many places before it decodes afresh.
+_DECODED_HELD = 1 << 14
+
+
+def _decoded_access(
+    mesh_location, thread, allocation_key_as_array, transforms, *rest
+):
+  """An access's arguments as its callback takes them: its buffer's key, its
+  transforms but the layout's (`_remove_noop_transforms`) with their indices as
+  Python ints, and each index tuple as one."""
+  return (
+      mesh_location,
+      thread,
+      HostAllocationKey.from_array(allocation_key_as_array),
+      jax.tree.map(int, _remove_noop_transforms(transforms)),
+      *(None if part is None else tuple(int(x) for x in part)
+        for part in rest),
+  )
+
+
+def _unpacking(func: Callable[..., Any], access: _Packed):
+  """`func` called with `access`'s arguments, decoded from the vector its
+  callback is handed (`_Packed`)."""
+
+  def call(token, vector, *rest, **kwargs):
+    return func(token, *access.unpacked(vector), *rest, **kwargs)
+
+  return call
+
+
 @fail_on_exception
 def _get(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread | None,
-    allocation_key_as_array: jax.Array,
+    allocation_key: HostAllocationKey,
     transforms,
     block_indices=None,
     grid_loop_idx=None,
@@ -638,22 +720,15 @@ def _get(
     source_info=None,
     input_name=None,
 ) -> tuple[jax.Array, np.ndarray]:
-  """Performs a read from the buffer for `allocation_key_as_array` from the given device and thread."""
-  allocation_key = HostAllocationKey.from_array(allocation_key_as_array)
-  del allocation_key_as_array
-
-  transforms = _remove_noop_transforms(transforms)
+  """Performs a read from the buffer for `allocation_key` from the given device and thread."""
   _validate_transforms(transforms)
-  transforms = jax.tree.map(int, transforms)
 
   if input_name is not None:
     # NOTE: input_name, block_indices, and grid_loop_idx are set only if this
     # function is being called to read a block from a pallas_call input (at the
     # start of one iteration of the kernel body).
     assert block_indices is not None
-    block_indices = tuple(int(x) for x in block_indices)
     assert grid_loop_idx is not None
-    grid_loop_idx = tuple(int(x) for x in grid_loop_idx)
 
   shared_memory = _get_shared_memory()
 
@@ -710,17 +785,20 @@ def call_get(
     source_info=None,
     input_name=None,
 ) -> tuple[jax.Array, jax.Array]:
+  access = _Packed(
+      (mesh_location, thread, allocation_key_as_array, transforms,
+       block_indices, grid_loop_idx),
+      _decoded_access,
+  )
   return callback.io_callback_numpy_inputs(
-      functools.partial(_get, source_info=source_info, input_name=input_name),
+      functools.partial(
+          _unpacking(_get, access), source_info=source_info,
+          input_name=input_name,
+      ),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
-      mesh_location,
-      thread,
-      allocation_key_as_array,
-      transforms,
-      block_indices,
-      grid_loop_idx,
-      clock,
+      access.vector,
+      clock=clock,
   )
 
 @fail_on_exception
@@ -728,7 +806,7 @@ def _swap(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
+    allocation_key: HostAllocationKey,
     transforms,
     val: np.ndarray,
     mask: jax.Array | None,
@@ -738,12 +816,7 @@ def _swap(
     source_info=None,
 ) -> tuple[jax.Array, np.ndarray]:
   """Performs a swap into the buffer for `allocation_key` from the given device and thread."""
-  allocation_key = HostAllocationKey.from_array(allocation_key_as_array)
-  del allocation_key_as_array
-
-  transforms = _remove_noop_transforms(transforms)
   _validate_transforms(transforms)
-  transforms = jax.tree.map(int, transforms)
 
   if mask is not None:
     assert mask.shape == val.shape
@@ -807,14 +880,15 @@ def call_swap(
     clock=None,
     source_info=None,
 ) -> tuple[jax.Array, jax.Array]:
+  access = _Packed(
+      (mesh_location, thread, allocation_key_as_array, transforms),
+      _decoded_access,
+  )
   return callback.io_callback_numpy_inputs(
-      functools.partial(_swap, source_info=source_info),
+      functools.partial(_unpacking(_swap, access), source_info=source_info),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
-      mesh_location,
-      thread,
-      allocation_key_as_array,
-      transforms,
+      access.vector,
       val,
       mask,
       clock=clock,
