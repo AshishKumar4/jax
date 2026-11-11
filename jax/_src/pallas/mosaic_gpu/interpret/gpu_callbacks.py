@@ -1917,6 +1917,22 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
           self.b_access,
           source_info=self.source_info,
       )
+      # A block-scaled MMA reads its scales (in TMEM) as it reads its
+      # operands.
+      for key, transforms in ((self.a_scale_key, self.a_scale_transforms),
+                              (self.b_scale_key, self.b_scale_transforms)):
+        if key is None:
+          continue
+        get_races().check_read(
+            self.thread,
+            clock.async_smem_clock
+            if key.memory_space_id
+            == memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.MemorySpace.SMEM]
+            else clock.generic_clock,
+            key,
+            shared_memory.access(key, transforms or ()),
+            source_info=self.source_info,
+        )
 
     acc_range = self.acc_access
     acc_dtype = shared_memory.buffer_shape_and_dtype(self.acc_key).dtype
