@@ -3685,7 +3685,7 @@ def _is_global_scope(collective_axes: CollectiveAxesType,
   return set(collective_axes) == set(axis_names)
 
 def block_id_to_grid_id(ctx: LoweringRuleContext,
-                        block_ids: Sequence[ir.Value],
+                        block_ids: Sequence[ir.Value] | _FreshBlockIds,
                         axis_name: Hashable):
   squashed_dims = ctx.module_ctx.squashed_dims
   axis_names = ctx.module_ctx.axis_names
@@ -3776,22 +3776,26 @@ def axis_index(
             gpu_dialect.Dimension(axis_names.cluster.index(axis_name))
         ),
     )
-  return block_id_to_grid_id(ctx, _BlockIds(ctx, fresh), axis_name)
+  if fresh:
+    return block_id_to_grid_id(ctx, _FreshBlockIds(ctx), axis_name)
+  block_ids = tuple(arith_dialect.index_cast(
+          ir.IntegerType.get_signless(32),
+          _block_id(ctx, dimension),
+  ) for dimension in gpu_dialect.Dimension)
+  return block_id_to_grid_id(ctx, block_ids, axis_name)
 
 
-class _BlockIds:
-  """The block's coordinates as i32, each read when it is looked up: a fresh
-  read is side-effecting, so one never read must not be emitted."""
+class _FreshBlockIds:
+  """The block's coordinates as i32, each read afresh when it is looked up: a
+  fresh read is side-effecting, so one never looked up must not be emitted."""
 
-  def __init__(self, ctx: LoweringRuleContext, fresh: bool):
-    self._ctx, self._fresh = ctx, fresh
+  def __init__(self, ctx: LoweringRuleContext):
+    self._ctx = ctx
 
   def __getitem__(self, dimension) -> ir.Value:
     return arith_dialect.index_cast(
         ir.IntegerType.get_signless(32),
-        _block_id(
-            self._ctx, gpu_dialect.Dimension(dimension), fresh=self._fresh
-        ),
+        _block_id(self._ctx, gpu_dialect.Dimension(dimension), fresh=True),
     )
 
 
