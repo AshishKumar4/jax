@@ -245,8 +245,6 @@ class TMEMTransferTest(parameterized.TestCase):
   """A TMEM load's instructions, as it emits them: no GPU needed."""
 
   def setUp(self):
-    if not HAS_MOSAIC_GPU:
-      self.skipTest("jaxlib built without Mosaic GPU")
     super().setUp()
     self.enter_context(mlir.make_ir_context())
     mgpu_dialect.register_dialect(ir.Context.current)
