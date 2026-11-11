@@ -286,8 +286,9 @@ class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
     self.assertAllClose(api.grad(lambda x: jax.vmap(
         lambda _: staged(x, jnp.float32(2)), out_axes=None)(ignored))(x), 3.)
 
-  @parameterized.parameters("eval_jaxpr", "registered_call")
-  def test_staged_shared_output_refused_through_a_call_primitive(self, call):
+  @parameterized.parameters("eval_jaxpr", "registered_call", "cond", "scan",
+                            "while_loop")
+  def test_staged_shared_output_refused_through_a_call_primitive(self, through):
     @jax.custom_jvp
     def f(x, ignored):
       return 3 * x
@@ -297,19 +298,29 @@ class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
       return 3 * primals[0], 3 * tangents[0]
 
     body = jax.make_jaxpr(f)(jnp.float32(1), jnp.float32(2))
-    primitive = (core.eval_jaxpr_p if call == "eval_jaxpr"
-                 else eval_jaxpr.create_call_primitive("staged_shared_call"))
+    registered = eval_jaxpr.create_call_primitive("staged_shared_call")
 
     def called(x, ignored):
-      out, = primitive.bind(x, ignored, call_jaxpr=body)
-      return out
+      if through in ("eval_jaxpr", "registered_call"):
+        primitive = core.eval_jaxpr_p if through == "eval_jaxpr" else registered
+        out, = primitive.bind(x, ignored, call_jaxpr=body)
+        return out
+      if through == "cond":
+        return lax.cond(x > 0, f, lambda x, _: 3 * x, x, ignored)
+      if through == "scan":
+        _, ys = lax.scan(lambda carry, _: (carry, f(x, ignored)), x, length=1)
+        return ys[0]
+      return lax.while_loop(lambda state: state[0] < 1,
+                            lambda state: (state[0] + 1, f(x, ignored)),
+                            (0, x))[1]
 
     x, ignored = jnp.float32(1), jnp.array([2., 6.])
     self.assertAllClose(jax.vmap(called, in_axes=(None, 0))(x, ignored),
                         jnp.array([3., 3.]))
-    # The call's batching keeps its body's staged custom_jvp outputs marked, so
-    # a shared read refuses them as a direct jit's does, never summing the
-    # conservative broadcast (6. here) as though each value were mapped.
+    # The primitive's batching keeps its body's staged custom_jvp outputs
+    # marked, so a shared read refuses them as a direct jit's does, never
+    # summing the conservative broadcast (6. here) as though each value were
+    # mapped.
     for sum_match in (False, True):
       with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
         jax.vmap(called, in_axes=(None, 0), out_axes=None,

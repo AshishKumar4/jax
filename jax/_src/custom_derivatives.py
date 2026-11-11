@@ -2098,7 +2098,8 @@ def _remat_opt_vmap(
       fwd_jaxpr, axis_data, in_batched, False)
   extra_consts = batched_fwd_jaxpr.consts
   batched_fwd_jaxpr = pe.convert_constvars_jaxpr(batched_fwd_jaxpr)
-  out_dims = [0 if b else None for b in out_batched]
+  out_dims = batching.staged_dims([0 if b else None for b in out_batched],
+                                  out_batched)
 
   _, prim_batched = split_list(in_batched, [num_consts])
 
