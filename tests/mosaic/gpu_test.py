@@ -7452,10 +7452,11 @@ class FragmentedArrayTest(TestCase):
 
   def test_row_shifted_refuses_a_layout_without_whole_row_groups(self):
     def body(ctx, src, dst, scratch):
-      del ctx, scratch
+      del ctx, src, scratch
       i32 = ir.IntegerType.get_signless(32)
-      src_reg = mgpu.FragmentedArray.load_untiled(
-          src, layout=mgpu.WGMMA_TRANSPOSED_LAYOUT, optimized=False
+      # Splatted, not loaded: an fp32 array in this layout is no transfer's.
+      src_reg = mgpu.FragmentedArray.splat(
+          c(1.0, ir.F32Type.get()), (64, 64), layout=mgpu.WGMMA_TRANSPOSED_LAYOUT
       )
       src_reg.row_shifted(c(1, i32), 8).store_untiled(dst, optimized=False)
 
