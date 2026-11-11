@@ -4362,7 +4362,7 @@ def _load_after_wg(ctx, x_ref, *leaves, tree, optimized=True, after=None):
   ctx = dataclasses.replace(
       ctx, avals_in=(ctx.avals_in[-1], ctx.avals_in[0], *ctx.avals_in[1:-1])
   )
-  return _inline_mgpu_lowering_rule_wg_semantics(
+  [result] = _inline_mgpu_lowering_rule_wg_semantics(
       ctx,
       token,
       x_ref,
@@ -4374,6 +4374,7 @@ def _load_after_wg(ctx, x_ref, *leaves, tree, optimized=True, after=None):
       pytree_ref_transforms=pytree_ref_transforms,
       pytree_ret_ty=jax.tree.structure(0),
   )
+  return result
 
 
 def _load_lowering(lane: bool):
