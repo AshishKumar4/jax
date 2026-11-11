@@ -8235,6 +8235,59 @@ class FragmentedArrayTest(TestCase):
 
     _ = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), (), (), None)()
 
+  @parameterized.product(
+      layout=(mgpu.WGMMA_LAYOUT, mgpu.TCGEN05_LAYOUT),
+      dtype=(jnp.float32, jnp.bfloat16),
+      period=(8, 16),
+      shift=(0, 1, 5, -3),
+  )
+  def test_row_shifted(self, layout, dtype, period, shift):
+    def body(ctx, src, dst, scratch):
+      del ctx, scratch
+      i32 = ir.IntegerType.get_signless(32)
+      src_reg = mgpu.FragmentedArray.load_untiled(
+          src, layout=layout, optimized=False
+      )
+      dst_reg = src_reg.row_shifted(c(shift, i32), period)
+      dst_reg.store_untiled(dst, optimized=False)
+
+    shape = (128, 64)
+    kernel = mgpu.as_gpu_kernel(
+        body,
+        grid=(1, 1, 1),
+        block=(128, 1, 1),
+        in_shape=(jax.ShapeDtypeStruct(shape, dtype),),
+        out_shape=jax.ShapeDtypeStruct(shape, dtype),
+        smem_scratch_shape=[],
+    )
+    x = self.prng.uniform(-1, 1, shape).astype(dtype)
+    rows = np.arange(shape[0])
+    source = rows - shift
+    # Only rows whose source lies in their own group are specified.
+    held = source // period == rows // period
+    np.testing.assert_array_equal(np.asarray(kernel(x))[held], x[source[held]])
+
+  def test_row_shifted_refuses_a_layout_without_whole_row_groups(self):
+    def body(ctx, src, dst, scratch):
+      del ctx, src, scratch
+      i32 = ir.IntegerType.get_signless(32)
+      # Splatted, not loaded: an fp32 array in this layout is no transfer's.
+      src_reg = mgpu.FragmentedArray.splat(
+          c(1.0, ir.F32Type.get()), (64, 64), layout=mgpu.WGMMA_TRANSPOSED_LAYOUT
+      )
+      src_reg.row_shifted(c(1, i32), 8).store_untiled(dst, optimized=False)
+
+    shape = (64, 64)
+    with self.assertRaises(NotImplementedError):
+      mgpu.as_gpu_kernel(
+          body,
+          grid=(1, 1, 1),
+          block=(128, 1, 1),
+          in_shape=(jax.ShapeDtypeStruct(shape, jnp.float32),),
+          out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
+          smem_scratch_shape=[],
+      )
+
   @parameterized.parameters(
       (mgpu.WGMMA_LAYOUT, mgpu.WGMMA_TRANSPOSED_LAYOUT),
       (mgpu.TCGEN05_LAYOUT, mgpu.TCGEN05_TRANSPOSED_LAYOUT),
