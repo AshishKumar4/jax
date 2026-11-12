@@ -9617,6 +9617,48 @@ class PipelineTest(PallasTest):
         jnp.full(block_size, num_steps, dtype=dtype)
     )
 
+  @parameterized.product(num_steps=[0, 5], max_concurrent_steps=[2, 3])
+  @run_on_sm80
+  def test_emit_pipeline_dynamic_grid_over_operands_on_a_mesh(
+      self, num_steps, max_concurrent_steps
+  ):
+    # Operands on a concrete mesh give the kernel's values that mesh's
+    # sharding: a `zeros_like` of one (the dynamic grid's own count's, and
+    # the pipeline's on cp.async) binds a reshard of a literal, which lowers
+    # to the literal itself.
+    dtype = jnp.float32
+    block_size = 128
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((block_size,), dtype),
+        scratch_types=[plgpu.SMEM((block_size,), dtype)],
+    )
+    def kernel(num_steps_gmem, x_gmem, o_gmem, acc_ref):
+      acc_ref[...] = jnp.zeros_like(acc_ref)
+      steps = num_steps_gmem[...]
+
+      def body(_, x_smem):
+        acc_ref[...] += x_smem[...]
+
+      plgpu.emit_pipeline(
+          body,
+          in_specs=[pl.BlockSpec((block_size,), lambda i: (i,))],
+          grid=(lax.max(steps, jnp.zeros_like(steps)),),
+          max_concurrent_steps=max_concurrent_steps,
+      )(x_gmem)
+
+      o_gmem[...] = acc_ref[...]
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ("x",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    x = jax.device_put(
+        jnp.ones(max(num_steps, 1) * block_size, dtype=dtype), placed
+    )
+    steps = jax.device_put(jnp.int32(num_steps), placed)
+    np.testing.assert_array_equal(
+        jax.jit(kernel)(steps, x), jnp.full(block_size, num_steps, dtype=dtype)
+    )
+
   def test_pipeline_oob_mode(self):
     # This test crashes with the default OOB fill mode of ZEROS because
     # it can't copy large 1D arrays.
