@@ -1201,8 +1201,15 @@ def deserialized(module: bytes) -> ir.Module:
   what a reader of a lowered program's kernels walks."""
   context = mlir.make_ir_context()
   dialect.register_dialect(context)
-  with context, ir.Location.unknown():
-    return _run_serde_pass(ir.Module.parse(module), serialize=False)
+  # The serialized operations' dialect is the serialization's own until the
+  # pass names them again.
+  allow_unregistered_dialects = context.allow_unregistered_dialects
+  context.allow_unregistered_dialects = True
+  try:
+    with context, ir.Location.unknown():
+      return _run_serde_pass(ir.Module.parse(module), serialize=False)
+  finally:
+    context.allow_unregistered_dialects = allow_unregistered_dialects
 
 
 def _declare_runtime_functions():
