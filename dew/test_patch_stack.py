@@ -141,6 +141,47 @@ def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_cod
     assert patch_stack.plugins("0.12.0.1.post49") == ""
 
 
+def test_a_python_only_release_ships_the_plugins_of_the_stack_it_grows_from(tmp_path, monkeypatch):
+    """A plugin release's wheels were published beside its release's stack (release/X.postN), which may differ
+    from the commit the plugins were built at in a file no build reads (a carried patch's own test, its
+    message). A later release that differs from THAT stack under jax/, tests/ and docs/ alone has its native
+    code, byte for byte, and ships those plugins; one that differs from it anywhere else (a carried patch, a
+    native source) ships none until its own are built (0.12.0.1.post82: Python only on post81, whose plugin tag
+    differs from post81's stack in one patch file's test and header, was refused the post81 plugins)."""
+    origin, clone = tmp_path / "origin.git", tmp_path / "clone"
+
+    def run(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=clone, check=True,
+                       capture_output=True)
+
+    def commit(files: dict[str, str], message: str) -> None:
+        for name, text in files.items():
+            (clone / name).parent.mkdir(parents=True, exist_ok=True)
+            (clone / name).write_text(text)
+        run("add", "-A")
+        run("commit", "-qm", message)
+
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    clone.mkdir()
+    run("init", "-q")
+    run("remote", "add", "origin", str(origin))
+    commit({"jaxlib/kernel.cc": "post81", "third_party/xla/fix.patch": "the fix\n", "jax/core.py": "post81"},
+           "the commit post81's plugins were built at")
+    run("tag", "plugin-0.12.0.1.post81")
+    commit({"third_party/xla/fix.patch": "its message, reworded\nthe fix\nits own test\n"}, "post81's release")
+    run("push", "-q", "origin", "--tags", "HEAD:refs/heads/release/0.12.0.1.post81")
+    run("tag", "-d", "plugin-0.12.0.1.post81")
+    monkeypatch.chdir(clone)
+
+    commit({"jax/core.py": "post82", "tests/core_test.py": "post82"}, "post82, Python only")
+    assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
+    commit({"third_party/xla/fix.patch": "its message, reworded\nanother fix\nits own test\n"}, "a patch changed")
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+    run("reset", "-q", "--hard", "HEAD~1")
+    commit({"jaxlib/kernel.cc": "post82"}, "a native source changed")
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+
+
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
     """A fork's build (0.1.8.post1) is indexed only beside its base release's own wheel (0.1.8), listed already or
     indexed with it: an installer that finds the package on this index looks for every version here (uv's
