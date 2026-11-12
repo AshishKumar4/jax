@@ -10668,6 +10668,7 @@ ad.defjvp2(
     lambda g, ans, _, **kw: reduce_sum_p.bind(g, **_tangent_ro_kw(ans, kw)),
 )
 batching.fancy_primitive_batchers[reduce_sum_p] = _reduce_sum_batcher
+reduce_sum_p.reduces = True  # its batcher is `batching.reducer_batcher`'s
 reduce_sum_p.is_high = _reduce_op_is_high  # type: ignore
 reduce_sum_p.to_lojax = partial(_reduce_op_to_lojax, reduce_sum_p)  # type: ignore
 
