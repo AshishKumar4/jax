@@ -179,9 +179,12 @@ class InterpretThreadMapSaturationTest(jtu.JaxTestCase):
     # barrier: every thread's program is in flight at once.
     barrier = threading.Barrier(40)
 
+    def meet():
+      barrier.wait()
+
     def f(core_index, token):
       del core_index
-      jax.experimental.io_callback(barrier.wait, (), ordered=True)
+      jax.experimental.io_callback(meet, (), ordered=True)
       return token
 
     jax.block_until_ready(thread_map(f, 40, jnp.int32(0)))
