@@ -842,6 +842,7 @@ for _op in [
     mlir_math.SinOp,
     mlir_math.CosOp,
     mlir_math.LogOp,
+    mlir_math.Log1pOp,
     mlir_math.Log2Op,
     mlir_math.RsqrtOp,
     mlir_math.SqrtOp,

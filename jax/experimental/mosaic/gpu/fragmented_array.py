@@ -2542,6 +2542,13 @@ class FragmentedArray:
       return self.log2(approx=True) * ln2
     return self._pointwise(mlir_math.log)
 
+  def log1p(self) -> FragmentedArray:
+    """`log(1 + x)` as the math dialect's log1p computes it, exact for an `x`
+    whose `1 + x` rounds away (libdevice's within an ulp)."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError(self.mlir_dtype)
+    return self._pointwise(mlir_math.log1p)
+
   def log2(self, *, approx: bool = False) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError(self.mlir_dtype)

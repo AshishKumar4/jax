@@ -434,6 +434,8 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
           lax.sqrt,
           lax.tanh,
           lax.log,
+          lax.log1p,
+          jax.nn.softplus,
           jax.nn.gelu,
           lax.abs,
           lax.round,
@@ -457,6 +459,20 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     np.testing.assert_allclose(
         kernel(x), op(x), rtol=1e-5 if approx_math else 3e-7
     )
+
+  @parameterized.parameters(False, True)
+  def test_log1p_keeps_an_argument_one_plus_it_rounds_away(self, approx_math):
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = lax.log1p(x_ref[...])
+
+    # Below 2^-24, `1 + x` rounds to one, whose log is zero; log1p is x.
+    x = jnp.float32(2.0**-30) * (1 + jnp.arange(256, dtype=jnp.float32))
+    np.testing.assert_allclose(kernel(x), x, rtol=3e-7)
 
   @parameterized.product(
       op=["exp", "exp2", "logistic", "tanh"],

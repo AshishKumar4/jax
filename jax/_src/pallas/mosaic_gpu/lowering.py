@@ -3174,6 +3174,20 @@ def _log_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   return math_dialect.log(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
+@register_lowering_rule(lax.log1p_p, mgpu.LoweringSemantics.Lane)
+@register_lowering_rule(lax.log1p_p, mgpu.LoweringSemantics.Warpgroup)
+def _log1p_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
+  """`log(1 + x)`, never its two rounded steps: under approx_math too, whose
+  `log` of a rounded `1 + x` loses every bit of a small `x` (softplus's
+  `log1p(exp(-|x|))`)."""
+  if accuracy is not None:
+    raise NotImplementedError("Not implemented: accuracy")
+  [x_aval] = ctx.avals_in
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    return _ensure_fa(x, x_aval.dtype).log1p()
+  return math_dialect.log1p(_ensure_ir_value(x, x_aval.dtype))
+
+
 @register_lowering_rule(lax.log2_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.log2_p, mgpu.LoweringSemantics.Warpgroup)
 def _log2_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
