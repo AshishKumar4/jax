@@ -243,7 +243,7 @@ class LRUCacheTest(LRUCacheTestCase):
       cache.put("shared", b"value")
     finally:
       os.umask(previous)
-    mode = (self.path / f"shared{_CACHE_SUFFIX}").stat().st_mode & 0o777
+    mode = os.stat(os.path.join(self.name, f"shared{_CACHE_SUFFIX}")).st_mode & 0o777
     self.assertEqual(mode, 0o644)
 
   def test_a_key_as_long_as_its_entry_s_name_allows_is_written(self):

@@ -108,6 +108,9 @@ ACCEPTED = {
     "jax._src.config.no_default": "a sentinel",
     "jax._src.core.empty_mat": "an immutable value",
     "jax._src.mesh.empty_abstract_mesh": "an immutable value",
+    "jax.experimental.mosaic.gpu.utils.HOPPER": "an immutable value (a frozen Arch)",
+    "jax.experimental.mosaic.gpu.utils.BLACKWELL": "an immutable value (a frozen Arch)",
+    "jax.experimental.mosaic.gpu.utils.RUBIN": "an immutable value (a frozen Arch)",
     "jax._src.core.internal_mutable_array_effect": "a stateless effect: the key holds effects by class",
     "jax._src.pallas.mosaic_gpu.core._memory_effect": "a stateless effect: the key holds effects by class",
     "jax._src.pallas.mosaic_gpu.core._pdl_effect": "a stateless effect: the key holds effects by class",
@@ -134,6 +137,7 @@ _DEFINED_BY_THE_INSTALLED_CODE = (
     "a table the installed code defines at import (a process that has not changed"
     " JAX's internals has it as it is; see the cache's contract)")
 ACCEPTED.update({name: _DEFINED_BY_THE_INSTALLED_CODE for name in (
+    "jax._src.config._jaxpr_eqn_ctx_configs",
     "jax._src.core.literalable_scalar_types",
     "jax._src.core.literalable_types",
     "jax._src.core.pytype_aval_mappings",

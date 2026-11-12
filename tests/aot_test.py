@@ -78,7 +78,8 @@ class JaxAotTest(jtu.JaxTestCase):
     x = jnp.arange(8, dtype=jnp.float32)
     compiled = f.lower(x).compile()
     serialized, in_tree, out_tree = serialize(compiled)
-    loaded = deserialize_and_load(serialized, in_tree, out_tree)(x)
+    loaded = deserialize_and_load(
+        serialized, in_tree, out_tree, execution_devices=jax.devices()[:1])(x)
     fresh = compiled(x)
     for got, want in zip(loaded, fresh):
       self.assertIs(jax.typeof(got).layout, AutoLayout)

@@ -531,7 +531,7 @@ class JitTest(jtu.BufferDonationTestCase):
     devices = jax.devices()[:2]
     mesh = jax.sharding.Mesh(np.array(devices), ("x",))
     replicated = jax.sharding.NamedSharding(mesh, P())
-    one = jax.sharding.SingleDeviceSharding(devices[0])
+    one = make_single_device_sharding(devices[0])
     for source, target in ((replicated, one), (one, replicated)):
       x = jax.device_put(np.arange(8.0), source)
       y = jax.device_put(x, target, may_alias=False, donate=False)
