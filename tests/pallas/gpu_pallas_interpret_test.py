@@ -1400,7 +1400,9 @@ class InterpretTest(jtu.JaxTestCase):
     # A two-slot ring, each tile two steps (one rotation), whose tiles two
     # consumers take in turn: each waits at a slot's every other phase, naming
     # it (a ping-pong over one ring), and the producer waits for each slot's
-    # release at the phase it names.
+    # release at the phase it names. A tile's consumer starts once the tile
+    # before it has had its steps (`order`, a phase a tile, each consumer
+    # waiting at every other): no consumer names a phase two ahead.
     stages, tiles = 2, 4
     turns = tiles * stages
     x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
@@ -1412,12 +1414,13 @@ class InterpretTest(jtu.JaxTestCase):
             smem=plgpu.SMEM((stages, 128), x.dtype),
             full=plgpu.Barrier(num_barriers=stages),
             consumed=plgpu.Barrier(num_barriers=stages),
+            order=plgpu.Barrier(),
         ),
         num_threads=3,
         thread_name='t',
         interpret=InterpretParams(detect_races=True),
     )
-    def _kernel(x_ref, out_ref, smem, full, consumed):
+    def _kernel(x_ref, out_ref, smem, full, consumed, order):
       thread_id = jax.lax.axis_index('t')
 
       @pl.when(thread_id == 0)
@@ -1433,11 +1436,14 @@ class InterpretTest(jtu.JaxTestCase):
       def consumer(first):
         @pl.loop(first, tiles, step=2)
         def _(tile):
+          pl.when(tile > 0)(
+              lambda: plgpu.barrier_wait(order, phase=tile - 1))
           for step in range(stages):
             turn = tile * stages + step
             plgpu.barrier_wait(full.at[step], phase=turn // stages)
             out_ref[turn] = smem[step] + 1
             plgpu.barrier_arrive(consumed.at[step])
+          plgpu.barrier_arrive(order)
 
       pl.when(thread_id == 1)(lambda: consumer(0))
       pl.when(thread_id == 2)(lambda: consumer(1))
@@ -1447,12 +1453,14 @@ class InterpretTest(jtu.JaxTestCase):
   @jtu.parameterized.parameters(
       ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
   def test_a_wait_names_the_latest_or_the_pending_phase(
-      self, name, arrivals, phase):
-    # A wait at a phase the hardware's parity wait would take another for:
-    # two behind the barrier's latest completion, or past the one it is
-    # completing; the latest and the pending phase are waited at.
+      self, name, observed, phase):
+    # A thread observes `observed` phases, each as it completes, then waits at
+    # `phase`: two behind the latest completion, or past the one the barrier is
+    # completing, is a phase the hardware's parity wait takes another for; the
+    # latest and the pending phase are waited at. The other thread completes
+    # the pending phase.
     del name
-    refused = not arrivals - 1 <= phase <= arrivals
+    refused = not observed - 1 <= phase <= observed
 
     @functools.partial(
         plgpu.kernel,
@@ -1467,15 +1475,15 @@ class InterpretTest(jtu.JaxTestCase):
 
       @pl.when(thread_id == 0)
       def _():
-        for _ in range(arrivals):
+        for completed in range(observed):
           plgpu.barrier_arrive(barrier)
+          plgpu.barrier_wait(barrier, phase=completed)
         plgpu.barrier_wait(barrier, phase=phase)
         out_ref[...] = jnp.ones_like(out_ref)
 
       @pl.when(thread_id == 1)
       def _():
-        if phase == arrivals:
-          # The pending phase completes with this arrival.
+        if phase == observed:
           plgpu.barrier_arrive(barrier)
 
     if refused:
