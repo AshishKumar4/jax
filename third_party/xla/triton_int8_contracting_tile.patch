@@ -1,0 +1,804 @@
+diff --git a/xla/backends/gpu/autotuner/triton.cc b/xla/backends/gpu/autotuner/triton.cc
+index a63968df6b..30d37d9562 100644
+--- a/xla/backends/gpu/autotuner/triton.cc
++++ b/xla/backends/gpu/autotuner/triton.cc
+@@ -428,7 +428,11 @@ bool TritonBackend::IsSupported(const HloInstruction& instr) {
+   return true;
+ }
+ 
+-std::string TritonBackend::version() const { return TRITON_VERSION; }
++std::string TritonBackend::version() const {
++  // Invalidate cached configs that may use a 16-element contracting tile for
++  // 8-bit operands.
++  return absl::StrCat(TRITON_VERSION, "+xla-8bit-k32");
++}
+ 
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/xla/backends/gpu/autotuner/triton/dot_search_space.cc b/xla/backends/gpu/autotuner/triton/dot_search_space.cc
+index 933a2a6809..843dec929a 100644
+--- a/xla/backends/gpu/autotuner/triton/dot_search_space.cc
++++ b/xla/backends/gpu/autotuner/triton/dot_search_space.cc
+@@ -219,7 +219,12 @@ std::vector<TritonGemmConfig> TritonDotFusionSearchSpace::OptimizeConfigSet(
+                  "sufficiently match the hints. Maybe the hints set does "
+                  "not contain a good representative set of valid configs? "
+                  "Working around this by using the full hints set instead.";
+-    return std::vector<TritonGemmConfig>(hints.begin(), hints.end());
++    std::vector<TritonGemmConfig> fallback_hints(hints.begin(), hints.end());
++    for (TritonGemmConfig& hint : fallback_hints) {
++      // Keep the fallback compilable by respecting the target minimum.
++      hint.block_k = std::max(hint.block_k, min_contracting_tile_size_);
++    }
++    return fallback_hints;
+   }
+   return result_configs;
+ }
+@@ -424,6 +429,17 @@ int TritonDotFusionSearchSpace::GetMinContractingTileSize() const {
+   /// TODO: b/395572776 - Triton currently requires at least 16 elements, but we
+   // should be able to relax this and remove this limit here.
+   constexpr int kTritonLowerLimit = 16;
++  // NVIDIA 8-bit MMA instructions have K=32; the formula above yields 16 for
++  // 8-bit operands.
++  constexpr int kEightBitContractingTileSize = 32;
++
++  const bool is_cuda =
++      device_description_.gpu_compute_capability().cuda_compute_capability() !=
++      nullptr;
++  if (is_cuda && primitive_util::BitWidth(operand_type_) == 8) {
++    return kEightBitContractingTileSize;
++  }
++
+   const int min_contracting_tile_size =
+       std::max(kMmaContractingBitwidth / operand_bitwidth_, kTritonLowerLimit);
+   VLOG(5) << "Computing min_contracting_tile_size: Based on bitwidth of "
+diff --git a/xla/backends/gpu/autotuner/triton/dot_search_space_test.cc b/xla/backends/gpu/autotuner/triton/dot_search_space_test.cc
+index 2ea0690719..2620b57da8 100644
+--- a/xla/backends/gpu/autotuner/triton/dot_search_space_test.cc
++++ b/xla/backends/gpu/autotuner/triton/dot_search_space_test.cc
+@@ -132,6 +132,22 @@ ENTRY e {
+         rhs_parallel_dim));
+   }
+ 
++  absl::StatusOr<std::unique_ptr<VerifiedHloModule>> GetDotModule(
++      absl::string_view operand_type, absl::string_view result_type,
++      int lhs_parallel_dim, int rhs_parallel_dim, int contracting_dim) {
++    constexpr const char* kModuleTextFormat = R"(
++ENTRY e {
++  p0 = %s[%d,%d] parameter(0)
++  p1 = %s[%d,%d] parameter(1)
++  ROOT r = %s[%d,%d] dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++})";
++    return ParseAndReturnVerifiedModule(absl::StrFormat(
++        kModuleTextFormat, operand_type, lhs_parallel_dim, contracting_dim,
++        operand_type, contracting_dim, rhs_parallel_dim, result_type,
++        lhs_parallel_dim, rhs_parallel_dim));
++  }
++
+   HloDotInstruction* GetDot(VerifiedHloModule* module) {
+     return Cast<HloDotInstruction>(
+         module->entry_computation()->root_instruction());
+@@ -434,6 +450,59 @@ TEST_F(DotSearchSpaceTest, EnsuresContractingTileSizeFitsInstructonShape) {
+               AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(8)))));
+ }
+ 
++TEST_F(DotSearchSpaceTest, Int8DotUsesAtLeast32ElementContractingTile) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       GetDotModule(/*operand_type=*/"s8",
++                                    /*result_type=*/"s32",
++                                    /*lhs_parallel_dim=*/1024,
++                                    /*rhs_parallel_dim=*/1024,
++                                    /*contracting_dim=*/16));
++  TritonDotFusionSearchSpace search_space = MakeSearchSpace(module.get());
++
++  std::vector<TritonGemmConfig> configs = search_space.GenerateConfigs();
++  EXPECT_THAT(configs, AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(32)))));
++
++  // A hint with a small contracting tile is clamped.
++  TritonGemmConfig hint = {
++      /*block_m=*/32,   /*block_n=*/32,  /*block_k=*/16,
++      /*num_stages=*/1, /*num_warps=*/4, /*num_ctas=*/1};
++  EXPECT_THAT(search_space.OptimizeConfigSet(configs, {hint}),
++              AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(32)))));
++
++  // Force the fallback path; it must still clamp block_k.
++  TritonGemmConfig fallback_hint = {
++      /*block_m=*/32,      /*block_n=*/32,  /*block_k=*/16,
++      /*num_stages=*/9999, /*num_warps=*/4, /*num_ctas=*/1};
++  EXPECT_THAT(search_space.OptimizeConfigSet(configs, {fallback_hint}),
++              AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(32)))));
++}
++
++TEST_F(DotSearchSpaceTest, UInt8DotUsesAtLeast32ElementContractingTile) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       GetDotModule(/*operand_type=*/"u8",
++                                    /*result_type=*/"u32",
++                                    /*lhs_parallel_dim=*/1024,
++                                    /*rhs_parallel_dim=*/1024,
++                                    /*contracting_dim=*/16));
++  TritonDotFusionSearchSpace search_space = MakeSearchSpace(module.get());
++
++  EXPECT_THAT(search_space.GenerateConfigs(),
++              AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(32)))));
++}
++
++TEST_F(DotSearchSpaceTest, Fp8DotUsesAtLeast32ElementContractingTile) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       GetDotModule(/*operand_type=*/"f8e4m3fn",
++                                    /*result_type=*/"f32",
++                                    /*lhs_parallel_dim=*/1024,
++                                    /*rhs_parallel_dim=*/1024,
++                                    /*contracting_dim=*/16));
++  TritonDotFusionSearchSpace search_space = MakeSearchSpace(module.get());
++
++  EXPECT_THAT(search_space.GenerateConfigs(),
++              AllOf(Not(IsEmpty()), Each(BlockKIs(Ge(32)))));
++}
++
+ TEST_F(DotSearchSpaceTest, FindReasonablePipeliningStageCount) {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        GetDefaultDotModule());
+diff --git a/xla/backends/gpu/codegen/triton/triton_gemm_fusion_test.cc b/xla/backends/gpu/codegen/triton/triton_gemm_fusion_test.cc
+index 7ce3f10b15..71eaf413c2 100644
+--- a/xla/backends/gpu/codegen/triton/triton_gemm_fusion_test.cc
++++ b/xla/backends/gpu/codegen/triton/triton_gemm_fusion_test.cc
+@@ -2611,11 +2611,12 @@ ENTRY e {
+                   /*run_hlo_passes=*/false));
+ }
+ 
+-TEST_F(TritonGemmTest, Fp8DotWithSmallTileDoesNotCrash) {
++TEST_F(TritonGemmTest, Fp8DotWithSmallOutputTileDoesNotCrash) {
+   if (!GetCudaComputeCapability().IsAtLeastHopper()) {
+     GTEST_SKIP() << "Doesn't pass on pre-Hopper GPUs.";
+   }
+ 
++  // Small M/N tile; block_k must be at least 32 for 8-bit operands.
+   constexpr absl::string_view kHloText = R"(
+ HloModule m
+ 
+@@ -2631,7 +2632,7 @@ ENTRY e {
+   p1 = f8e4m3fn[33,33]{1,0} parameter(1)
+   ROOT _ = bf16[33,33] fusion(p0, p1), kind=kCustom, calls=triton_dot,
+     backend_config={"fusion_backend_config": {kind: "__triton_gemm",
+-    triton_gemm_config: {"block_m":16,"block_n":16,"block_k":16,
++    triton_gemm_config: {"block_m":16,"block_n":16,"block_k":32,
+                          "num_stages":2,"num_warps":2,
+                          "num_ctas":1}}}
+ })";
+@@ -2642,6 +2643,37 @@ ENTRY e {
+                   /*run_hlo_passes=*/false));
+ }
+ 
++TEST_F(TritonGemmTest, Int8DotWithK16AndBlockK32MatchesReference) {
++  if (!GetCudaComputeCapability().IsAtLeastAmpere()) {
++    GTEST_SKIP() << "Triton int8 dots require Ampere or newer.";
++  }
++
++  constexpr absl::string_view kHloText = R"(
++HloModule m
++
++triton_dot {
++  p0 = s8[16,16]{1,0} parameter(0)
++  p1 = s8[16,16]{1,0} parameter(1)
++  ROOT _ = s32[16,16]{1,0} dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY e {
++  p0 = s8[16,16]{1,0} parameter(0)
++  p1 = s8[16,16]{1,0} parameter(1)
++  ROOT _ = s32[16,16] fusion(p0, p1), kind=kCustom, calls=triton_dot,
++    backend_config={"fusion_backend_config": {kind: "__triton_gemm",
++    triton_gemm_config: {"block_m":16,"block_n":16,"block_k":32,
++                         "num_stages":1,"num_warps":2,
++                         "num_ctas":1}}}
++})";
++
++  ASSERT_OK_AND_ASSIGN(ModuleAndNestedFusionMetadata module_and_metadata,
++                       GetModuleAndNestedFusionMetadata(kHloText));
++  EXPECT_TRUE(RunAndCompareNoHloPasses(module_and_metadata.module->ToString(),
++                                       ErrorSpec{/*aabs=*/0, /*arel=*/0}));
++}
++
+ TEST_F(TritonGemmTest, MixedF8DotExecutesCorrectly) {
+   if (!GetCudaComputeCapability().IsAtLeastHopper()) {
+     GTEST_SKIP() << "Requires a Hopper+ GPU";
+diff --git a/xla/backends/gpu/tests/test_autotune_cache.textproto b/xla/backends/gpu/tests/test_autotune_cache.textproto
+index 27d89defe7..afcf4587a7 100644
+--- a/xla/backends/gpu/tests/test_autotune_cache.textproto
++++ b/xla/backends/gpu/tests/test_autotune_cache.textproto
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-version: 3
++version: 4
+ results {
+   device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB"
+   hlo: "{\n  tmp_0 = f16[1,16,17,3]{3,2,1,0} parameter(0)\n  tmp_1 = f16[16,51]{1,0} bitcast(f16[1,16,17,3]{3,2,1,0} tmp_0)\n  tmp_2 = s8[16,17,3]{2,1,0} parameter(1)\n  tmp_3 = s8[51,16]{0,1} bitcast(s8[16,17,3]{2,1,0} tmp_2)\n  tmp_4 = f16[51,16]{0,1} convert(s8[51,16]{0,1} tmp_3)\n  tmp_5 = f16[16,16]{1,0} dot(f16[16,51]{1,0} tmp_1, f16[51,16]{0,1} tmp_4), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n  ROOT tmp_6 = f16[1,16,16]{2,1,0} bitcast(f16[16,16]{1,0} tmp_5)\n}"
+diff --git a/xla/backends/gpu/transforms/convert_triton_gemm_config.cc b/xla/backends/gpu/transforms/convert_triton_gemm_config.cc
+index 9e082b3103..d7af5b536e 100644
+--- a/xla/backends/gpu/transforms/convert_triton_gemm_config.cc
++++ b/xla/backends/gpu/transforms/convert_triton_gemm_config.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -129,6 +130,11 @@ class ConvertTritonGemmConfigVisitor : public DfsHloRewriteVisitor {
+       return absl::OkStatus();
+     }
+ 
++    // Validate the config before mutating the fusion.
++    ABSL_ASSIGN_OR_RETURN(BlockLevelParameters block_level_parameters,
++                          FindBlockLevelParameters(dot, config, mlir_context_,
++                                                   device_description_));
++
+     // Annotate the dot with the contraction tile size.
+     ABSL_ASSIGN_OR_RETURN(xla::xtile::Tile tile_sizes,
+                           dot->backend_config<xla::xtile::Tile>());
+@@ -143,10 +149,6 @@ class ConvertTritonGemmConfigVisitor : public DfsHloRewriteVisitor {
+     backend_config.clear_triton_gemm_config();
+     backend_config.set_kind(kTritonNestedGemmFusionKind);
+ 
+-    ABSL_ASSIGN_OR_RETURN(BlockLevelParameters block_level_parameters,
+-                          FindBlockLevelParameters(dot, config, mlir_context_,
+-                                                   device_description_));
+-
+     *backend_config.mutable_block_level_fusion_config() =
+         block_level_parameters.ToBlockLevelFusionConfig();
+     ABSL_RETURN_IF_ERROR(fusion->set_backend_config(gpu_config));
+@@ -235,6 +237,7 @@ absl::StatusOr<BlockLevelParameters> FindBlockLevelParameters(
+   llvm::SmallVector<int64_t> parallel_tile_sizes = with_leading_ones(root_rank);
+   absl::c_sort(parallel_tile_sizes);
+ 
++  std::string last_verification_error;
+   do {
+     ABSL_ASSIGN_OR_RETURN(std::unique_ptr<TilingSpace> ts,
+                           TilingSpace::Create(fusion_adaptor, mlir_context));
+@@ -270,6 +273,7 @@ absl::StatusOr<BlockLevelParameters> FindBlockLevelParameters(
+     Decision verification_status =
+         VerifyTritonConstraints(*tiled_computation, device_description);
+     if (!verification_status) {
++      last_verification_error = verification_status.Explain();
+       VLOG(8) << "Candidate tiling violates Triton constraints: "
+               << verification_status.Explain();
+       continue;
+@@ -314,6 +318,12 @@ absl::StatusOr<BlockLevelParameters> FindBlockLevelParameters(
+     return params;
+   } while (absl::c_next_permutation(parallel_tile_sizes));
+ 
++  if (!last_verification_error.empty()) {
++    return absl::InternalError(
++        absl::StrCat("Couldn't find output tile sizes that satisfy TilingSpace "
++                     "constraints: ",
++                     last_verification_error));
++  }
+   return absl::InternalError(
+       "Couldn't find output tile sizes that satisfy TilingSpace constraints");
+ }
+diff --git a/xla/backends/gpu/transforms/convert_triton_gemm_config_test.cc b/xla/backends/gpu/transforms/convert_triton_gemm_config_test.cc
+index c906db598e..699f965189 100644
+--- a/xla/backends/gpu/transforms/convert_triton_gemm_config_test.cc
++++ b/xla/backends/gpu/transforms/convert_triton_gemm_config_test.cc
+@@ -19,6 +19,7 @@ limitations under the License.
+ #include <gtest/gtest.h>
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "absl/log/log.h"
+ #include "absl/status/status_matchers.h"
+@@ -38,6 +39,8 @@ limitations under the License.
+ #include "xla/xla.pb.h"
+ 
+ using ::absl_testing::IsOkAndHolds;
++using ::absl_testing::StatusIs;
++using ::testing::HasSubstr;
+ 
+ namespace xla::gpu {
+ namespace {
+@@ -320,5 +323,70 @@ ENTRY entry {
+ )"));
+ }
+ 
++TEST_F(ConvertTritonGemmConfigTest, Int8DotRejectsContractingTileBelow32) {
++  absl::string_view hlo = R"(
++dot {
++  lhs = s8[4,16] parameter(0)
++  rhs = s8[16,32768] parameter(1)
++  ROOT dot = s32[4,32768] dot(lhs, rhs),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry {
++  p0 = s8[4,16] parameter(0)
++  p1 = s8[16,32768] parameter(1)
++  ROOT fusion = s32[4,32768] fusion(p0, p1), kind=kCustom, calls=dot,
++    backend_config={"fusion_backend_config": {
++      "kind":"__triton_gemm", "triton_gemm_config": {
++        "block_m":"16", "block_n":"16", "block_k":"16",
++        "num_stages":"1", "num_warps":"2", "num_ctas":"1"
++      }
++    }}
++})";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo));
++  std::string module_string = module->ToString();
++  EXPECT_THAT(ConvertTritonGemmConfig(device_description_, &mlir_context_)
++                  .Run(module.get()),
++              StatusIs(absl::StatusCode::kInternal,
++                       HasSubstr("requires at least 32 contracting elements "
++                                 "for 8-bit dot operands on CUDA")));
++  // The config is validated before the fusion is mutated, so a rejected config
++  // must leave the module unchanged.
++  EXPECT_EQ(module->ToString(), module_string);
++}
++
++TEST_F(ConvertTritonGemmConfigTest, Int8DotWithK16AcceptsK32Tile) {
++  absl::string_view hlo = R"(
++dot {
++  lhs = s8[4,16] parameter(0)
++  rhs = s8[16,32768] parameter(1)
++  ROOT dot = s32[4,32768] dot(lhs, rhs),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry {
++  p0 = s8[4,16] parameter(0)
++  p1 = s8[16,32768] parameter(1)
++  ROOT fusion = s32[4,32768] fusion(p0, p1), kind=kCustom, calls=dot,
++    backend_config={"fusion_backend_config": {
++      "kind":"__triton_gemm", "triton_gemm_config": {
++        "block_m":"16", "block_n":"16", "block_k":"32",
++        "num_stages":"1", "num_warps":"2", "num_ctas":"1"
++      }
++    }}
++})";
++
++  std::unique_ptr<VerifiedHloModule> module = RunConvertTritonGemmConfig(hlo);
++  EXPECT_TRUE(*RunFileCheck(module->ToString(), R"(
++    CHECK: ROOT {{.*}} = s32[4,32768]{1,0} dot(
++    CHECK-SAME: backend_config={"sizes":["32"]}
++    CHECK: ENTRY
++    CHECK: ROOT{{.*}}fusion(
++    CHECK-SAME: "block_level_fusion_config"
++  )"));
++}
++
+ }  // namespace
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/autotuning/autotune_cache_key.h b/xla/service/gpu/autotuning/autotune_cache_key.h
+index cff2ac206c..0953d292f5 100644
+--- a/xla/service/gpu/autotuning/autotune_cache_key.h
++++ b/xla/service/gpu/autotuning/autotune_cache_key.h
+@@ -34,7 +34,7 @@ class AutotuneCacheKey {
+   // changes that may affect the autotuning results.
+   // To prevent accidental merges of concurrent increments, update the comment
+   // to explain why the version is bumped.
+-  static constexpr int kCurrentVersion = 60;  // Triton integration 1.43.
++  static constexpr int kCurrentVersion = 61;  // 8-bit Triton dots require K>=32.
+ 
+   AutotuneCacheKey(const se::DeviceDescription& device_description,
+                    const HloInstruction& instruction,
+diff --git a/xla/service/gpu/autotuning/autotuner_cache.cc b/xla/service/gpu/autotuning/autotuner_cache.cc
+index b8fdefc1b6..d4d3469493 100644
+--- a/xla/service/gpu/autotuning/autotuner_cache.cc
++++ b/xla/service/gpu/autotuning/autotuner_cache.cc
+@@ -56,9 +56,10 @@ namespace xla {
+ namespace gpu {
+ namespace {
+ 
+-// Bump this version whenever you change the structure of the results.
++// Bump this version when the result structure or valid configuration set
++// changes.
+ // LINT.IfChange(version)
+-constexpr int kVersion = 3;
++constexpr int kVersion = 4;
+ // LINT.ThenChange()
+ 
+ }  // namespace
+diff --git a/xla/service/gpu/autotuning/autotuner_cache_test.cc b/xla/service/gpu/autotuning/autotuner_cache_test.cc
+index 2e9b2c6be9..7d9f03ee68 100644
+--- a/xla/service/gpu/autotuning/autotuner_cache_test.cc
++++ b/xla/service/gpu/autotuning/autotuner_cache_test.cc
+@@ -109,7 +109,7 @@ ENTRY e {
+ })";
+ 
+   static constexpr absl::string_view kResultText = R"pb(
+-    version: 3
++    version: 4
+     results {
+       device: "CUDA: 8.0, Cores: 108, GPU clock: 1.41 GHz, Memory bandwidth: 1555 GB/s, L2 cache: 40 MB, DNN version: 1.2.3"
+       hlo: "{\n  tmp_0 = f16[1,16,17,3]{3,2,1,0} parameter(0)\n  tmp_1 = f16[16,51]{1,0} bitcast(f16[1,16,17,3]{3,2,1,0} tmp_0)\n  tmp_2 = s8[16,17,3]{2,1,0} parameter(1)\n  tmp_3 = s8[51,16]{0,1} bitcast(s8[16,17,3]{2,1,0} tmp_2)\n  tmp_4 = f16[51,16]{0,1} convert(s8[51,16]{0,1} tmp_3)\n  tmp_5 = f16[16,16]{1,0} dot(f16[16,51]{1,0} tmp_1, f16[51,16]{0,1} tmp_4), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n  ROOT tmp_6 = f16[1,16,16]{2,1,0} bitcast(f16[16,16]{1,0} tmp_5)\n}"
+diff --git a/xla/service/gpu/gpu_compiler_test.cc b/xla/service/gpu/gpu_compiler_test.cc
+index 617b653573..9e1130d742 100644
+--- a/xla/service/gpu/gpu_compiler_test.cc
++++ b/xla/service/gpu/gpu_compiler_test.cc
+@@ -733,11 +733,11 @@ TEST_P(PersistedAutotuningTest, LoadMismatchedFormatResultsFallback) {
+ 
+   if (use_new_format()) {
+     AutotuneResults legacy_results;
+-    legacy_results.set_version(3);
++    legacy_results.set_version(4);
+     auto* entry = legacy_results.add_results();
+     entry->set_device("test_device");
+     entry->set_hlo("test_hlo");
+-    entry->set_version(3);
++    entry->set_version(4);
+     entry->mutable_result()->mutable_gemm()->set_algorithm(1);
+ 
+     std::string serialized;
+diff --git a/xla/service/gpu/model/triton_emitter_constraints.cc b/xla/service/gpu/model/triton_emitter_constraints.cc
+index e3e5ee1b78..4fef99ac23 100644
+--- a/xla/service/gpu/model/triton_emitter_constraints.cc
++++ b/xla/service/gpu/model/triton_emitter_constraints.cc
+@@ -31,6 +31,7 @@ limitations under the License.
+ #include "xla/codegen/tiling/tiling_space.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_opcode.h"
++#include "xla/primitive_util.h"
+ #include "xla/service/decision.h"
+ #include "xla/shape_util.h"
+ #include "xla/stream_executor/device_description.h"
+@@ -49,6 +50,8 @@ constexpr int64_t kMaxTensorNumElements = 1048576;
+ // larger than this as that leads to a large number of registers being used.
+ // Also for MMA instruction we don't want tiles greater than 256.
+ constexpr int64_t kMaxMMADimSize = 256;
++// Triton's NVIDIA backend requires K=32 for 8-bit dot operands.
++constexpr int64_t kMinEightBitDotContractingTileSize = 32;
+ 
+ // Returns a conservative estimate (in bytes) of the memory required to stage a
+ // tile whose sizes are `tile_sizes` for an instruction whose element type
+@@ -121,26 +124,66 @@ Decision VerifyTritonConstraints(const TiledHloComputation& tiled_computation,
+   // Triton's GPU codegen constrains dot operands to avoid excessive register
+   // pressure and comply with hardware MMA layout constraints. Contracting and
+   // free dimension tile sizes are limited to kMaxMMADimSize.
+-  // TODO(b/393299275): There is also a lower bound limit for Triton on what
+-  // is accepted for dimension size (both contracting and free).
++  const bool is_cuda =
++      device_info.gpu_compute_capability().cuda_compute_capability() != nullptr;
+   for (const TiledHloInstruction* inst : all_instructions) {
+-    if (inst->hlo()->opcode() == HloOpcode::kDot ||
+-        inst->hlo()->opcode() == HloOpcode::kScaledDot) {
+-      for (const TiledHloInstruction* operand : inst->operands()) {
+-        auto op_tile_sizes_or = operand->tile().GetStaticTileSizes();
+-        if (!op_tile_sizes_or.ok()) {
+-          return Decision(op_tile_sizes_or.status());
++    if (inst->hlo()->opcode() != HloOpcode::kDot &&
++        inst->hlo()->opcode() != HloOpcode::kScaledDot) {
++      continue;
++    }
++    const DotDimensionNumbers& dim_numbers =
++        inst->hlo()->dot_dimension_numbers();
++    const bool has_contracting_dim =
++        !dim_numbers.lhs_contracting_dimensions().empty() &&
++        !dim_numbers.rhs_contracting_dimensions().empty();
++    const int64_t num_operands = inst->operands().size();
++    for (int64_t operand_index = 0; operand_index < num_operands;
++         ++operand_index) {
++      const TiledHloInstruction* operand = inst->operands()[operand_index];
++      auto op_tile_sizes_or = operand->tile().GetStaticTileSizes();
++      if (!op_tile_sizes_or.ok()) {
++        return Decision(op_tile_sizes_or.status());
++      }
++      llvm::SmallVector<int64_t> op_tile_sizes = std::move(*op_tile_sizes_or);
++
++      for (int64_t size : op_tile_sizes) {
++        if (size > kMaxMMADimSize) {
++          return Decision::Forbid(
++              absl::StrCat("Dot operand instruction ", operand->hlo()->name(),
++                           " has a tile size of ", size,
++                           ", which exceeds the maximum MMA dimension size of ",
++                           kMaxMMADimSize, "."));
+         }
+-        llvm::SmallVector<int64_t> op_tile_sizes = std::move(*op_tile_sizes_or);
+-
+-        for (int64_t size : op_tile_sizes) {
+-          if (size > kMaxMMADimSize) {
+-            return Decision::Forbid(absl::StrCat(
+-                "Dot operand instruction ", operand->hlo()->name(),
+-                " has a tile size of ", size,
+-                ", which exceeds the maximum MMA dimension size of ",
+-                kMaxMMADimSize, "."));
+-          }
++      }
++
++      // Only the matrix operands participate in the MMA. Dots without a
++      // contracting dimension only get the max-MMA check.
++      if (!is_cuda || operand_index >= 2 || !has_contracting_dim) {
++        continue;
++      }
++      const PrimitiveType element_type = operand->hlo()->shape().element_type();
++      if (primitive_util::BitWidth(element_type) != 8) {
++        continue;
++      }
++      const auto& contracting_dims =
++          operand_index == 0 ? dim_numbers.lhs_contracting_dimensions()
++                             : dim_numbers.rhs_contracting_dimensions();
++      for (int64_t contracting_dim : contracting_dims) {
++        if (contracting_dim < 0 ||
++            contracting_dim >= static_cast<int64_t>(op_tile_sizes.size())) {
++          return Decision::Forbid(
++              absl::StrCat("Dot operand instruction ", operand->hlo()->name(),
++                           " has contracting dimension ", contracting_dim,
++                           " but only ", op_tile_sizes.size(), " tile sizes."));
++        }
++        const int64_t contracting_tile_size = op_tile_sizes[contracting_dim];
++        if (contracting_tile_size < kMinEightBitDotContractingTileSize) {
++          return Decision::Forbid(absl::StrCat(
++              "Dot operand instruction ", operand->hlo()->name(),
++              " has a contracting dimension tile size of ",
++              contracting_tile_size, ", but Triton requires at least ",
++              kMinEightBitDotContractingTileSize,
++              " contracting elements for 8-bit dot operands on CUDA."));
+         }
+       }
+     }
+@@ -255,11 +298,29 @@ Decision VerifySubsetOfTritonConstraints(
+   auto dimensions = tiling_space.dimensions();
+ 
+   // Hardware MMA limits for Dot / ScaledDot instructions.
+-  // TODO(b/393299275): There is also a lower bound limit for Triton on what
+-  // is accepted for dimension size (both contracting and free).
++  const bool is_cuda =
++      device_info.gpu_compute_capability().cuda_compute_capability() != nullptr;
+   for (const auto& [idx, dim] : llvm::enumerate(dimensions)) {
+     if (dim.hlo != nullptr && (dim.hlo->opcode() == HloOpcode::kDot ||
+                                dim.hlo->opcode() == HloOpcode::kScaledDot)) {
++      if (is_cuda && dim.type == TilingSpace::DimensionSemantics::kSequential &&
++          padded_tile_sizes[idx] < kMinEightBitDotContractingTileSize) {
++        if (dim.hlo->operand_count() < 2) {
++          continue;
++        }
++        const bool has_8bit_matrix_operand =
++            primitive_util::BitWidth(
++                dim.hlo->operand(0)->shape().element_type()) == 8 ||
++            primitive_util::BitWidth(
++                dim.hlo->operand(1)->shape().element_type()) == 8;
++        if (has_8bit_matrix_operand) {
++          return Decision::Forbid(absl::StrCat(
++              "Tile size ", padded_tile_sizes[idx],
++              " for contracting dimension ", idx, " of ", dim.hlo->name(),
++              " is below the minimum of ", kMinEightBitDotContractingTileSize,
++              " contracting elements for 8-bit dot operands on CUDA."));
++        }
++      }
+       if (padded_tile_sizes[idx] > kMaxMMADimSize) {
+         return Decision::Forbid(absl::StrCat(
+             "Tile size ", padded_tile_sizes[idx], " for dimension ", idx,
+diff --git a/xla/service/gpu/model/triton_emitter_constraints_test.cc b/xla/service/gpu/model/triton_emitter_constraints_test.cc
+index 27bbd1dd6d..abfb38bc46 100644
+--- a/xla/service/gpu/model/triton_emitter_constraints_test.cc
++++ b/xla/service/gpu/model/triton_emitter_constraints_test.cc
+@@ -153,6 +153,150 @@ ENTRY entry_computation {
+               StatusIs(_, HasSubstr("exceeds the maximum MMA dimension size")));
+ }
+ 
++TEST_F(VerifyTritonConstraintsTest, Int8DotContractingTileIsAtLeast32) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"hlo(
++HloModule m
++
++fused_computation {
++  p0 = s8[4,16] parameter(0)
++  p1 = s8[16,32768] parameter(1)
++  ROOT dot = s32[4,32768] dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry_computation {
++  param_0 = s8[4,16] parameter(0)
++  param_1 = s8[16,32768] parameter(1)
++  ROOT fusion = s32[4,32768] fusion(param_0, param_1), kind=kCustom,
++    calls=fused_computation,
++    backend_config={"fusion_backend_config":{"kind":"__triton"}}
++}
++)hlo"));
++
++  // A 16-element contracting tile is rejected for 8-bit operands.
++  EXPECT_THAT(CheckTiling(module.get(), {4, 4, 16}),
++              StatusIs(absl::StatusCode::kInvalidArgument,
++                       HasSubstr("requires at least 32 contracting elements "
++                                 "for 8-bit dot operands")));
++  // A 32-element tile is valid even when the contracting dimension is smaller.
++  EXPECT_OK(CheckTiling(module.get(), {4, 4, 32}));
++}
++
++TEST_F(VerifyTritonConstraintsTest, Fp8DotContractingTileIsAtLeast32) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"hlo(
++HloModule m
++
++fused_computation {
++  p0 = f8e4m3fn[4,16] parameter(0)
++  p1 = f8e4m3fn[16,32768] parameter(1)
++  ROOT dot = f32[4,32768] dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry_computation {
++  param_0 = f8e4m3fn[4,16] parameter(0)
++  param_1 = f8e4m3fn[16,32768] parameter(1)
++  ROOT fusion = f32[4,32768] fusion(param_0, param_1), kind=kCustom,
++    calls=fused_computation,
++    backend_config={"fusion_backend_config":{"kind":"__triton"}}
++}
++)hlo"));
++
++  EXPECT_THAT(CheckTiling(module.get(), {4, 4, 16}),
++              StatusIs(absl::StatusCode::kInvalidArgument,
++                       HasSubstr("requires at least 32 contracting elements "
++                                 "for 8-bit dot operands")));
++  EXPECT_OK(CheckTiling(module.get(), {4, 4, 32}));
++}
++
++TEST_F(VerifyTritonConstraintsTest, EmptyContractionStillChecksMMAMaxSize) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"hlo(
++HloModule m
++
++fused_computation {
++  p0 = s8[4] parameter(0)
++  p1 = s8[4] parameter(1)
++  ROOT dot = s32[4,4] dot(p0, p1),
++    lhs_contracting_dims={}, rhs_contracting_dims={}
++}
++
++ENTRY entry_computation {
++  param_0 = s8[4] parameter(0)
++  param_1 = s8[4] parameter(1)
++  ROOT fusion = s32[4,4] fusion(param_0, param_1), kind=kCustom,
++    calls=fused_computation,
++    backend_config={"fusion_backend_config":{"kind":"__triton"}}
++}
++)hlo"));
++
++  // No-contraction dots still get the max-MMA check.
++  EXPECT_THAT(CheckTiling(module.get(), {512, 4}),
++              StatusIs(absl::StatusCode::kInvalidArgument,
++                       HasSubstr("exceeds the maximum MMA dimension size")));
++  EXPECT_OK(CheckTiling(module.get(), {4, 4}));
++}
++
++TEST_F(VerifyTritonConstraintsTest, Int8DotSmallContractingTileAllowedOnRocm) {
++  device_description_ = TestGpuDeviceInfo::AMDMI300DeviceInfo();
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"hlo(
++HloModule m
++
++fused_computation {
++  p0 = s8[4,16] parameter(0)
++  p1 = s8[16,32768] parameter(1)
++  ROOT dot = s32[4,32768] dot(p0, p1),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry_computation {
++  param_0 = s8[4,16] parameter(0)
++  param_1 = s8[16,32768] parameter(1)
++  ROOT fusion = s32[4,32768] fusion(param_0, param_1), kind=kCustom,
++    calls=fused_computation,
++    backend_config={"fusion_backend_config":{"kind":"__triton"}}
++}
++)hlo"));
++
++  // The K=32 requirement is NVIDIA-specific.
++  EXPECT_OK(CheckTiling(module.get(), {4, 4, 16}));
++}
++
++TEST_F(VerifyTritonConstraintsTest, ScaledDotContractingTileIsAtLeast32) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"hlo(
++HloModule m
++
++fused_computation {
++  lhs = f8e4m3fn[128,32] parameter(0)
++  rhs = f8e4m3fn[32,128] parameter(1)
++  lhs_scale = f8e8m0fnu[128,1] parameter(2)
++  rhs_scale = f8e8m0fnu[1,128] parameter(3)
++  ROOT dot = f32[128,128] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
++    lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++
++ENTRY entry_computation {
++  lhs = f8e4m3fn[128,32] parameter(0)
++  rhs = f8e4m3fn[32,128] parameter(1)
++  lhs_scale = f8e8m0fnu[128,1] parameter(2)
++  rhs_scale = f8e8m0fnu[1,128] parameter(3)
++  ROOT fusion = f32[128,128] fusion(lhs, rhs, lhs_scale, rhs_scale),
++    kind=kCustom, calls=fused_computation,
++    backend_config={"fusion_backend_config":{"kind":"__triton"}}
++}
++)hlo"));
++
++  EXPECT_THAT(CheckTiling(module.get(), {64, 64, 16}),
++              StatusIs(absl::StatusCode::kInvalidArgument,
++                       HasSubstr("requires at least 32 contracting elements "
++                                 "for 8-bit dot operands")));
++  EXPECT_OK(CheckTiling(module.get(), {64, 64, 32}));
++}
++
+ TEST_F(VerifyTritonConstraintsTest, ScaledDotOperandSizeConstraintIsEnforced) {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        ParseAndReturnVerifiedModule(R"hlo(
+@@ -406,6 +550,62 @@ TEST_F(VerifySubsetOfTritonConstraintsTest, RejectsDotTileExceedingMMALimit) {
+   EXPECT_TRUE(valid_decision.IsAllowed()) << valid_decision.Explain();
+ }
+ 
++TEST_F(VerifySubsetOfTritonConstraintsTest, RejectsInt8DotTileBelow32) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"(
++    HloModule m
++    ENTRY e {
++      p0 = s8[16,16] parameter(0)
++      p1 = s8[16,16] parameter(1)
++      ROOT dot = s32[16,16] dot(p0, p1),
++          lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    }
++  )"));
++  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(
++      module->entry_computation()->root_instruction());
++  ASSERT_OK_AND_ASSIGN(auto space,
++                       TilingSpace::Create(*fusion_adaptor, &mlir_context_));
++
++  Decision invalid_decision = VerifySubsetOfTritonConstraints(
++      {16, 16, 16}, *space, device_description_);
++  EXPECT_TRUE(invalid_decision.IsForbidden());
++  EXPECT_THAT(
++      invalid_decision.Explain(),
++      HasSubstr("below the minimum of 32 contracting elements for 8-bit "
++                "dot operands on CUDA"));
++
++  Decision valid_decision = VerifySubsetOfTritonConstraints(
++      {16, 16, 32}, *space, device_description_);
++  EXPECT_TRUE(valid_decision.IsAllowed()) << valid_decision.Explain();
++}
++
++TEST_F(VerifySubsetOfTritonConstraintsTest,
++       RejectsMixedOperandInt8ScaledDotTileBelow32) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"(
++    HloModule m
++    ENTRY e {
++      lhs = f4e2m1fn[128,32] parameter(0)
++      rhs = f8e4m3fn[32,128] parameter(1)
++      lhs_scale = f8e8m0fnu[128,1] parameter(2)
++      rhs_scale = f8e8m0fnu[1,128] parameter(3)
++      ROOT dot = f32[128,128] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
++          lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    }
++  )"));
++  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(
++      module->entry_computation()->root_instruction());
++  ASSERT_OK_AND_ASSIGN(auto space,
++                       TilingSpace::Create(*fusion_adaptor, &mlir_context_));
++
++  Decision decision = VerifySubsetOfTritonConstraints({64, 64, 16}, *space,
++                                                      device_description_);
++  EXPECT_TRUE(decision.IsForbidden());
++  EXPECT_THAT(decision.Explain(),
++              HasSubstr("below the minimum of 32 contracting elements for "
++                        "8-bit dot operands on CUDA"));
++}
++
+ TEST_F(VerifySubsetOfTritonConstraintsTest, MultiOutputFusionEvaluatedPerRoot) {
+   auto space = std::make_unique<TilingSpace>();
+   ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+diff --git a/xla/service/xla_aot_compile_test_autotune_results.txtpb b/xla/service/xla_aot_compile_test_autotune_results.txtpb
+index ac512dafa8..b39824f043 100644
+--- a/xla/service/xla_aot_compile_test_autotune_results.txtpb
++++ b/xla/service/xla_aot_compile_test_autotune_results.txtpb
+@@ -15,7 +15,7 @@
+ # proto-file: third_party/tensorflow/compiler/xla/autotune_results.proto
+ # proto-message: xla.AutotuneResults
+ 
+-version: 3
++version: 4
+ results {
+   device: "CUDA: 9.0, Cores: 132, GPU clock: 1.98 GHz, Memory bandwidth: 3352 GB/s, L2 cache: 50 MB, DNN version: 9.23.0"
+   hlo: "(f32[3,3]{1,0}, s8[72]{0}) custom-call(f32[3,3]{1,0}, f32[3,3]{1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"beta\":0,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[],\"lhs_contracting_dimensions\":[\"1\"],\"rhs_batch_dimensions\":[],\"rhs_contracting_dimensions\":[\"0\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"9\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"DEFAULT\",\"DEFAULT\"]},\"rhs_stride\":\"9\"},\"operation_queue_id\":\"0\"}"

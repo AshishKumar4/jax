@@ -53,6 +53,10 @@ archive_override(
         # too, which the compile set (a backward's force_deterministic under deterministic ops): otherwise its
         # thunk's fingerprint names no serialized graph (Dew ledger 5322).
         "//third_party:xla/cudnn_graph_cache_hit_config.patch",
+        # An 8-bit Triton dot's contracting tile is at least 32 on CUDA, the K of NVIDIA's 8-bit MMA, where a
+        # 16 (or the problem's 8) gave an int8 product 2x (4x) its value, silently (openxla/xla#51016; Dew
+        # ledger 593). Upstream's openxla/xla#52565, carried until the pin holds it.
+        "//third_party:xla/triton_int8_contracting_tile.patch",
     ],
     strip_prefix = "xla-c308dbb884239531b82276135a785c1a04683ebb",
     urls = ["https://github.com/openxla/xla/archive/c308dbb884239531b82276135a785c1a04683ebb.tar.gz"],
