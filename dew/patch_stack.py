@@ -85,10 +85,15 @@ def tests(release: str) -> list[str]:
 def plugins(version: str) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
-    commit HEAD differs from only in `PYTHON_ONLY` (jax's Python package, its tests, its docs), so its
-    plugins are built from HEAD's own native code, as a post release of Python fixes alone is (Main, 2026-11-03:
-    post46's two Mosaic GPU fixes; post63's lowering cache, whose Pallas changelog entry is a doc); "" where neither
-    is. A dev build's (X.postN.devM) is never one: the index never listed it."""
+    native code is HEAD's: HEAD differs only in `PYTHON_ONLY` (jax's Python package, its tests, its docs) from
+    the commit its plugins were built at (its tag), or from the stack they were published beside (its release
+    branch, release/X.postN, where origin has one), as a post release of Python fixes alone does (Main,
+    2026-11-03: post46's two Mosaic GPU fixes; post63's lowering cache, whose Pallas changelog entry is a doc);
+    "" where neither is. The published stack counts because a release may take, after its plugins are built, a
+    change no build reads (a carried patch's own test, its message), which its own publish pairs with those
+    plugins: a later Python-only release then has that stack's native code byte for byte, though not the tag's
+    (post82 on post81, 2026-11-12, refused post81's plugins for one patch file's test and header). A dev build's
+    (X.postN.devM) is never one: the index never listed it."""
     release, _, post = version.rpartition(".post")
     tags = git("ls-remote", "origin", "refs/tags/plugin-*").split()[1::2]
     published = {int(match.group(2)): tag for tag in tags
@@ -98,8 +103,11 @@ def plugins(version: str) -> str:
         if found == int(post):
             return tag.removeprefix("refs/tags/")
         git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
-        if not git("diff", "--name-only", tag, "HEAD", "--", ".",
-                   *(f":(exclude){path}" for path in PYTHON_ONLY)).strip():
+        stack = f"refs/remotes/origin/release/{release}.post{found}"
+        git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
+        held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
+        if any(not git("diff", "--name-only", base, "HEAD", "--", ".",
+                       *(f":(exclude){path}" for path in PYTHON_ONLY)).strip() for base in held):
             return tag.removeprefix("refs/tags/")
     return ""
 
