@@ -1109,9 +1109,17 @@ class LaunchContext:
       return gmem_transform, smem_ref
     if any(s % t for _, s, t in tiled) or any(s != t for _, s, t in tiled[1:]):
       return gmem_transform, smem_ref
-    untiled = (*logical[:-rank], logical[-rank], *tiling.tiling[1:])
     if smem_ref is not None:
-      smem_ref = utils.memref_reshape(smem_ref, untiled)
+      # The SMEM ref's own tiles, `(..., n, 1, ..., 1, t0, t1, ...)`: a copy
+      # partitioned across a cluster (`CopyPartition`) holds its share of the
+      # slice along the partitioned dimension, not the slice.
+      shape = ir.MemRefType(smem_ref.type).shape
+      leading, counts = shape[:-2 * rank], shape[-2 * rank:-rank]
+      if any(n != 1 for n in counts[1:]):
+        return gmem_transform, smem_ref
+      smem_ref = utils.memref_reshape(
+          smem_ref, (*leading, counts[0] * tiling.tiling[0], *tiling.tiling[1:])
+      )
     return (), smem_ref
 
   def _prepare_async_copy(
