@@ -29,7 +29,6 @@ TOP_LEVEL_TOKEN_VALUE = 42
 NESTED_TOKEN_VALUE = 1337
 
 
-# top-level function so that caching works properly
 # The executions a CPU client's device holds in flight at once
 # (cpu_client.h's LocalDeviceState, max_inflight_computations default): a
 # leased client runs this many threads on each of its devices.
@@ -40,9 +39,9 @@ _clients_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def _leased_client(num_threads: int):
-  """A CPU client of the interpreter's own, held by this thread map alone, with
-  a device for every `_THREADS_PER_DEVICE` of its `num_threads` threads.
+def _leased_devices(num_threads: int):
+  """The devices of a CPU client of the interpreter's own, held by this thread
+  map alone: one for every `_THREADS_PER_DEVICE` of its `num_threads` threads.
 
   A thread map runs inside a host callback of the computation that calls it,
   and runs its threads' programs from threads of its own: off the callback's
@@ -63,12 +62,13 @@ def _leased_client(num_threads: int):
   if client is None:
     client = xla_client.make_cpu_client(asynchronous=False, num_devices=devices)
   try:
-    yield client
+    yield client.local_devices()[:devices]
   finally:
     with _clients_lock:
       _free_clients.append(client)
 
 
+# top-level function so that caching works properly
 def _run(jaxpr, consts, *args):
   jax_core.eval_jaxpr(jaxpr, consts, *args)
 
@@ -94,16 +94,13 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
   threads = []
-  with _leased_client(num_threads) as client, futures.ThreadPoolExecutor(
+  with _leased_devices(num_threads) as devices, futures.ThreadPoolExecutor(
       max_workers=num_threads
   ) as executor:
-    # The constants and inputs go to each of the leased client's devices the
-    # threads run on once, and every thread there reads those arrays rather
-    # than transferring them again (about 15% of an interpreted kernel's time
-    # in one measured test).
-    devices = client.local_devices()
-    placed = [jax.device_put((consts, invals), devices[d])
-              for d in range(-(-num_threads // _THREADS_PER_DEVICE))]
+    # The constants and inputs go to each leased device once, and every thread
+    # there reads those arrays rather than transferring them again (about 15%
+    # of an interpreted kernel's time in one measured test).
+    placed = [jax.device_put((consts, invals), d) for d in devices]
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
