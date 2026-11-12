@@ -24,6 +24,7 @@ from .core import (
     ClusterBarrier as ClusterBarrier,
     CtaBarrier as CtaBarrier,
     LoweringSemantics as LoweringSemantics,
+    deserialized as deserialized,
     TMEM as TMEM,
     Union as Union,
     as_gpu_kernel as as_gpu_kernel,

@@ -1195,6 +1195,16 @@ def _run_serde_pass(
   return module
 
 
+def deserialized(module: bytes) -> ir.Module:
+  """A kernel's module as a Mosaic GPU custom call holds it (its serialized
+  bytecode, the call's ``module``), its operations in their own dialects again:
+  what a reader of a lowered program's kernels walks."""
+  context = mlir.make_ir_context()
+  dialect.register_dialect(context)
+  with context, ir.Location.unknown():
+    return _run_serde_pass(ir.Module.parse(module), serialize=False)
+
+
 def _declare_runtime_functions():
   """Declares the runtime functions that can be used by the generated code."""
   ptr_ty = llvm.PointerType.get()
