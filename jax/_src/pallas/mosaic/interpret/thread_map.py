@@ -22,6 +22,7 @@ from jax._src import callback
 from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
+import numpy as np
 
 
 TOP_LEVEL_TOKEN_VALUE = 42
@@ -86,11 +87,6 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   # the CPU device and back before that.
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
-  if num_threads > _MAX_THREADS:
-    raise ValueError(
-        f"a thread map runs at most {_MAX_THREADS} threads, the executions a"
-        f" CPU client holds in flight at once, not {num_threads}"
-    )
   threads = []
   with _leased_client() as client, futures.ThreadPoolExecutor(
       max_workers=num_threads
@@ -98,14 +94,17 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
     # The constants and inputs go to the leased client's device once, and
     # every thread reads those arrays rather than transferring them again
     # (about 15% of an interpreted kernel's time in one measured test).
-    consts, invals = jax.device_put((consts, invals), client.local_devices()[0])
+    device = client.local_devices()[0]
+    consts, invals = jax.device_put((consts, invals), device)
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
       #   - prepend the thread ID onto the `invals`; and
       #   - flatten the arguments that are to be passed through to the
       #     evaluation of `jaxpr`.
-      args = (jnp.int32(i), *invals)
+      # The thread ID is placed there too: a body with no other operand runs
+      # where its arguments are committed, which would otherwise be nowhere.
+      args = (jax.device_put(np.int32(i), device), *invals)
       flat_args, _ = jax.tree.flatten(args)
       threads.append(executor.submit(_run_jaxpr, jaxpr, consts, *flat_args))
     exceptions = []
@@ -162,6 +161,15 @@ def thread_map(
     # We're running `f` in the same JAX computation as the caller, so we thread
     # the token through.
     return f(jnp.int32(0), token, *args)
+  if num_threads > _MAX_THREADS:
+    # Refused as the kernel is traced: a refusal inside the callback would leave
+    # the interpreter's shared state mid-kernel for the kernels after it. No
+    # kernel maps more: a GPU block holds at most 8 warpgroups (1,024 threads)
+    # and a TPU device at most 16 subcores.
+    raise ValueError(
+        f"a thread map runs at most {_MAX_THREADS} threads, the executions a"
+        f" CPU client holds in flight at once, not {num_threads}"
+    )
 
   def _f(core_or_thread_index, *args):
     # We are running `f` in sparate JAX computations on different threads from

@@ -122,15 +122,18 @@ _SATURATED = textwrap.dedent("""
     import jax.numpy as jnp
     from jax._src.pallas.mosaic.interpret import thread_map
 
-    count = int(sys.argv[1])
+    count, inputs = int(sys.argv[1]), int(sys.argv[2])
     entered = threading.Barrier(count + 1)
-    body = jax.make_jaxpr(lambda thread, x: jnp.sin(x))(np.int32(0), np.float32(0))
+    if inputs:
+      body = jax.make_jaxpr(lambda thread, x: jnp.sin(x))(np.int32(0), np.float32(0))
+    else:
+      body = jax.make_jaxpr(lambda thread: jnp.sin(thread * 1.0))(np.int32(0))
 
     def callback(x):
       entered.wait()
       thread_map._thread_map_callback(
-          body.jaxpr, np.int32(42), None, np.int32(2), body.consts, (x,),
-          on_exception=lambda *args, **kwargs: None)
+          body.jaxpr, np.int32(42), None, np.int32(2), body.consts,
+          (x,) if inputs else (), on_exception=lambda *args, **kwargs: None)
       return np.float32(x + 1)
 
     launch = jax.jit(lambda x: io_callback(
@@ -153,21 +156,30 @@ class InterpretThreadMapSaturationTest(jtu.JaxTestCase):
     if not jtu.test_device_matches(['cpu']):
       self.skipTest('CPU-only test')
 
-  @parameterized.parameters(31, 32)
-  def test_thread_map_runs_inside_callbacks_holding_every_unit(self, count):
+  @parameterized.parameters((31, 1), (32, 1), (32, 0))
+  def test_thread_map_runs_inside_callbacks_holding_every_unit(
+      self, count, inputs):
     # Each callback's thread map runs its threads' programs off the callback's
     # thread. With every unit of the caller's client held by the computations
     # running those callbacks (32), a thread's program waiting for a unit there
     # would wait for ever; one fewer (31) leaves it one. A thread map runs its
-    # threads on a client of its own, so both finish.
+    # threads on a client of its own, so all finish: a body with no input
+    # besides its thread ID too.
     try:
       ran = subprocess.run(
-          [sys.executable, "-c", _SATURATED, str(count)],
+          [sys.executable, "-c", _SATURATED, str(count), str(inputs)],
           capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
       self.fail(f"{count} saturating callbacks' thread maps never returned")
     self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
     self.assertIn("done", ran.stdout)
+
+  def test_a_thread_map_of_more_threads_than_a_client_runs_is_refused_as_traced(
+      self):
+    # A map wider than a client's in-flight executions is refused as its kernel
+    # is traced, before any callback runs.
+    with self.assertRaises(ValueError):
+      thread_map(lambda thread, token: token, 33, jnp.int32(0))
 
   def test_thread_map_computes_as_its_callers_client_does(self):
     # A thread's program, run on the thread map's own client, gives what the
