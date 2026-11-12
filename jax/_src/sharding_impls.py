@@ -643,12 +643,13 @@ def _process_slices(
 
   current_pid = next(iter(tensor_sharding.addressable_devices)).process_index
   slices_per_process = len(process_to_slice[current_pid])
+  held = {p: sorted(x) for p, x in sorted(process_to_slice.items())}
 
   # Verify that all processes have the same number of slices.
   if any(len(x) != slices_per_process for x in process_to_slice.values()):
     raise NonUniformShardingError(
         f'{tensor_sharding=} is non-uniform on {dim=} as some processes have '
-        'different number of slices.'
+        f'different number of slices: each process\'s slices {held}'
     )
   # After removing duplicate processes all unique slices should
   # cover the dimension exactly once. If they don' it means that
@@ -656,7 +657,8 @@ def _process_slices(
   if sum(len(h) for h in {frozenset(x) for x in process_to_slice.values()}
          ) != len(all_slices):
     raise NonUniformShardingError(
-        f'{tensor_sharding=} is non-uniform on {dim=}'
+        f'{tensor_sharding=} is non-uniform on {dim=}: each process\'s slices '
+        f'{held}, which overlap without being the same'
     )
   return process_to_slice, current_pid
 
