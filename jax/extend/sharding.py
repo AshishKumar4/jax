@@ -16,6 +16,9 @@
 # shardings like sub-axes, strided shardings, etc.
 from jax._src.lib import xla_client
 from jax._src.sharding_impls import GSPMDSharding as GSPMDSharding
+from jax._src.sharding_impls import NonUniformShardingError as NonUniformShardingError
+from jax._src.sharding_impls import ProcessShards as ProcessShards
+from jax._src.sharding_impls import process_shards as process_shards
 
 
 def get_op_sharding_from_serialized_proto(

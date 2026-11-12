@@ -150,5 +150,92 @@ class ShardingTest(jtu.JaxTestCase):
     self.assertEqual(hlo_sharding, deserialized_hlo_sharding)
 
 
+class ProcessShardsTest(jtu.JaxTestCase):
+  """jax.extend.sharding.process_shards over a sharding whose devices four
+  processes hold (a test double: one process runs the test), a dimension
+  of eight rows each device holding one."""
+
+  class _Placed(jax.sharding.Sharding):
+    """Rows `held[d]` on device d, device d on process `owners[d]`, this
+    process `current`."""
+
+    class _Device:
+      def __init__(self, id, process_index):
+        self.id, self.process_index = id, process_index
+
+    def __init__(self, held, owners, current):
+      self._held, self._owners, self._current = tuple(held), tuple(owners), current
+      self._devices = tuple(self._Device(d, p) for d, p in enumerate(owners))
+
+    def __hash__(self):
+      return hash((self._held, self._owners, self._current))
+
+    def __eq__(self, other):
+      return isinstance(other, type(self)) and hash(self) == hash(other)
+
+    @property
+    def device_set(self):
+      return set(self._devices)
+
+    @property
+    def num_devices(self):
+      return len(self._devices)
+
+    @property
+    def addressable_devices(self):
+      return {d for d in self._devices if d.process_index == self._current}
+
+    @property
+    def is_fully_addressable(self):
+      return len(set(self._owners)) == 1
+
+    @property
+    def is_fully_replicated(self):
+      return len(set(self._held)) == 1
+
+    @property
+    def memory_kind(self):
+      return None
+
+    @property
+    def _device_assignment(self):
+      return self._devices
+
+    def devices_indices_map(self, global_shape):
+      return {d: (slice(row, row + 1),) for d, row in zip(self._devices, self._held)}
+
+    def shard_shape(self, global_shape):
+      return (1,)
+
+    def with_memory_kind(self, kind):
+      return self
+
+    def check_compatible_aval(self, aval_shape):
+      pass
+
+  def test_a_process_reads_its_group_ranked_among_the_processes_beside_it(self):
+    # Processes 0 and 2 hold rows {4, 5}, 1 and 3 rows {0, 1}: the group
+    # holding row 0 comes first however the processes are numbered, each
+    # process ranked among its group's by process index, two rows apiece.
+    held, owners = (4, 5, 0, 1, 4, 5, 0, 1), (0, 0, 1, 1, 2, 2, 3, 3)
+    found = [jex.sharding.process_shards(self._Placed(held, owners, p), 0, 1)
+             for p in range(4)]
+    self.assertEqual(found, [
+        jex.sharding.ProcessShards(index=1, count=2, readers=2, reader=0, local=2),
+        jex.sharding.ProcessShards(index=0, count=2, readers=2, reader=0, local=2),
+        jex.sharding.ProcessShards(index=1, count=2, readers=2, reader=1, local=2),
+        jex.sharding.ProcessShards(index=0, count=2, readers=2, reader=1, local=2)])
+
+  def test_a_sharding_whose_groups_overlap_unequally_is_refused(self):
+    held, owners = (0, 1, 1, 2), (0, 0, 1, 1)
+    with self.assertRaises(jex.sharding.NonUniformShardingError):
+      jex.sharding.process_shards(self._Placed(held, owners, 0), 0, 1)
+
+  def test_a_replicated_dimension_is_one_group_every_process_reads(self):
+    held, owners = (0, 0, 0, 0), (0, 1, 2, 3)
+    found = jex.sharding.process_shards(self._Placed(held, owners, 2), 0, 1)
+    self.assertEqual(found, jex.sharding.ProcessShards(0, 1, 4, 2, 1))
+
+
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

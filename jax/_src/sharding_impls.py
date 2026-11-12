@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import math
 import itertools as it
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from jax._src import core
 from jax._src import sharding as jsharding
@@ -612,6 +612,17 @@ def get_process_index_and_count(
   if (tensor_sharding.is_fully_addressable or
       tensor_sharding.is_fully_replicated):
     return (0, 1)
+  process_to_slice, current_pid = _process_slices(tensor_sharding, dim, ndims)
+  addressable_slices = frozenset(process_to_slice[current_pid])
+  unique_processes = list({frozenset(x) for x in process_to_slice.values()})
+  return (unique_processes.index(addressable_slices), len(unique_processes))
+
+
+def _process_slices(
+    tensor_sharding: jsharding.Sharding, dim: int, ndims: int
+) -> tuple[dict[int, set[tuple[int, int]]], int]:
+  """Each process's slices of dimension `dim` and the current process's index,
+  the sharding checked process uniform in `dim` (`get_process_index_and_count`)."""
   # Get device to indices map, we don't care about the concrete
   # global shape here, only to get the distribution of shards across the tensor
   # using (num_devices, num_devices, ...)  This is a universal shape that is
@@ -619,42 +630,76 @@ def get_process_index_and_count(
   device_map = tensor_sharding.devices_indices_map(
       (tensor_sharding.num_devices,) * ndims)
 
-  # Get the slices for 'dim' for all devices.
-  global_slice = {k: v[dim] for k, v in device_map.items()}
-
   # Contains mapping from process_index to a set of slices for that process.
   process_to_slice = collections.defaultdict(set)
   # Contains global set of slices across all processes.
   all_slices = set()
 
   # Compute the set of slices for each process and the global set of slices.
-  for d, v in global_slice.items():
-    key = (v.start, v.stop)
+  for d, v in device_map.items():
+    key = (v[dim].start or 0, v[dim].stop)
     process_to_slice[d.process_index].add(key)
     all_slices.add(key)
 
-  # Get the set of slices for the current process which we will use to compute
-  # the index of the current process.
   current_pid = next(iter(tensor_sharding.addressable_devices)).process_index
-  addressable_slices = frozenset(process_to_slice[current_pid])
+  slices_per_process = len(process_to_slice[current_pid])
 
   # Verify that all processes have the same number of slices.
-  slices_per_process = len(addressable_slices)
   if any(len(x) != slices_per_process for x in process_to_slice.values()):
     raise NonUniformShardingError(
         f'{tensor_sharding=} is non-uniform on {dim=} as some processes have '
         'different number of slices.'
     )
-  unique_processes = list({frozenset(x) for x in process_to_slice.values()})
-
   # After removing duplicate processes all unique slices should
   # cover the dimension exactly once. If they don' it means that
   # the sharding is not uniform.
-  if sum(len(h) for h in unique_processes) != len(all_slices):
+  if sum(len(h) for h in {frozenset(x) for x in process_to_slice.values()}
+         ) != len(all_slices):
     raise NonUniformShardingError(
         f'{tensor_sharding=} is non-uniform on {dim=}'
     )
-  return (unique_processes.index(addressable_slices), len(unique_processes))
+  return process_to_slice, current_pid
+
+
+class ProcessShards(NamedTuple):
+  """How the processes of a process-uniform sharding share a dimension
+  (`process_shards`): the groups of processes that hold the same slices of it,
+  `count` of them, ordered by the first slice each holds, this process's group
+  (`index`), how many processes are in it (`readers`) and this process's rank
+  among them by process index (`reader`), and how many distinct slices of the
+  dimension each process holds (`local`)."""
+
+  index: int
+  count: int
+  readers: int
+  reader: int
+  local: int
+
+
+@util.cache(max_size=4096, trace_context_in_key=False)
+def process_shards(
+    tensor_sharding: jsharding.Sharding, dim: int, ndims: int) -> ProcessShards:
+  """`get_process_index_and_count`'s analysis with what a loader of a
+  process's share needs beside it (`ProcessShards`): an order of the groups
+  every process derives alike, the first slice each holds, and the processes
+  that read the same share, so one share's records are read once between them.
+  A fully replicated sharding is one group of every process; a fully
+  addressable one, this process alone holding every slice.
+
+  Raises:
+    NonUniformShardingError: if the sharding is not process uniform in `dim`.
+  """
+  if tensor_sharding.is_fully_addressable:
+    slices = {(v[dim].start or 0, v[dim].stop) for v in
+              tensor_sharding.devices_indices_map(
+                  (tensor_sharding.num_devices,) * ndims).values()}
+    return ProcessShards(0, 1, 1, 0, len(slices))
+  process_to_slice, current_pid = _process_slices(tensor_sharding, dim, ndims)
+  mine = frozenset(process_to_slice[current_pid])
+  groups = sorted({frozenset(x) for x in process_to_slice.values()}, key=min)
+  readers = sorted(p for p, x in process_to_slice.items() if frozenset(x) == mine)
+  return ProcessShards(groups.index(mine), len(groups), len(readers),
+                       readers.index(current_pid), len(mine))
 
 
 def local_to_global_shape(
