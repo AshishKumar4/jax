@@ -13,20 +13,55 @@
 # limitations under the License.
 
 from concurrent import futures
+import contextlib
 import functools
+import threading
 
 import jax
 from jax._src import callback
+from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
 
-import numpy as np
 
 TOP_LEVEL_TOKEN_VALUE = 42
 NESTED_TOKEN_VALUE = 1337
 
 
 # top-level function so that caching works properly
+# The executions a CPU client's device holds in flight at once
+# (cpu_client.h's LocalDeviceState, max_inflight_computations default): a
+# leased client runs at most this many threads.
+_MAX_THREADS = 32
+
+_free_clients: list[xla_client.Client] = []
+_clients_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _leased_client():
+  """A CPU client of the interpreter's own, held by this thread map alone.
+
+  A thread map runs inside a host callback of the computation that calls it,
+  and runs its threads' programs from threads of its own: off the callback's
+  thread, each execution takes a unit of its client's in-flight semaphore,
+  which the callback's thread alone is exempt from (cpu_client.cc's
+  ThisThreadIsInsideHostCallback). On the caller's client, computations queued
+  behind the one running the callback can hold every unit, so the threads'
+  programs wait for units that free only when the callback returns: a
+  deadlock. On a client no other computation uses, the thread map's own
+  executions are all that hold its units, at most `_MAX_THREADS`."""
+  with _clients_lock:
+    client = _free_clients.pop() if _free_clients else None
+  if client is None:
+    client = xla_client.make_cpu_client(asynchronous=False)
+  try:
+    yield client
+  finally:
+    with _clients_lock:
+      _free_clients.append(client)
+
+
 def _run(jaxpr, consts, *args):
   jax_core.eval_jaxpr(jaxpr, consts, *args)
 
@@ -51,13 +86,19 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   # the CPU device and back before that.
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
+  if num_threads > _MAX_THREADS:
+    raise ValueError(
+        f"a thread map runs at most {_MAX_THREADS} threads, the executions a"
+        f" CPU client holds in flight at once, not {num_threads}"
+    )
   threads = []
-  with futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-    # The constants and inputs go to the device once, on a worker as each
-    # thread's run would put them, and every thread reads those arrays rather
-    # than transferring them again (about 15% of an interpreted kernel's time
-    # in one measured test).
-    consts, invals = executor.submit(jax.device_put, (consts, invals)).result()
+  with _leased_client() as client, futures.ThreadPoolExecutor(
+      max_workers=num_threads
+  ) as executor:
+    # The constants and inputs go to the leased client's device once, and
+    # every thread reads those arrays rather than transferring them again
+    # (about 15% of an interpreted kernel's time in one measured test).
+    consts, invals = jax.device_put((consts, invals), client.local_devices()[0])
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
