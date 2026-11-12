@@ -332,7 +332,8 @@ class PallasBaseTest(ptu.PallasTest):
 
 class TritonHalfFloatLoweringTest(jtu.JaxTestCase):
   """Pallas Triton lowers a 16-bit float division (and so logistic and a
-  negative power) and erf_inv for CUDA, on any host."""
+  negative power), erf_inv and the multiply-adds a polynomial's evaluation
+  binds for CUDA, on any host."""
 
   def setUp(self):
     super().setUp()
@@ -344,7 +345,7 @@ class TritonHalfFloatLoweringTest(jtu.JaxTestCase):
     )
 
   @parameterized.product(
-      op=["true_divide", "erf_inv", "logistic", "reciprocal"],
+      op=["true_divide", "erf_inv", "logistic", "reciprocal", "fma", "fmuladd"],
       dtype=["bfloat16", "float16"],
   )
   def test_lowers(self, op, dtype):
@@ -357,6 +358,8 @@ class TritonHalfFloatLoweringTest(jtu.JaxTestCase):
         "erf_inv": lambda x, y: lax.erf_inv(x),
         "logistic": lambda x, y: jax.nn.sigmoid(x),
         "reciprocal": lambda x, y: x ** -2,
+        "fma": lambda x, y: lax.fma(x, y, x),
+        "fmuladd": lambda x, y: lax.fmuladd(x, y, x),
     }
 
     def kernel(x_ref, y_ref, o_ref):

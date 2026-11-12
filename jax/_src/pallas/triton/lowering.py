@@ -1513,6 +1513,23 @@ register_lowering(lax.polynomial_p)(
 )
 
 
+@register_lowering(lax.fma_p)
+@register_lowering(lax.fmuladd_p)
+def _fma_lowering_rule(ctx: LoweringRuleContext, *args):
+  # Rounded once, as XLA computes both on a GPU (`stablehlo.fma`): a float16,
+  # float32 or float64 in its own dtype, a narrower float in float32 (which a
+  # polynomial's evaluation, `polynomial_lower`, reaches for every float).
+  [out_aval] = ctx.avals_out
+  a, b, c = (
+      _bcast_to(_ensure_ir_value(arg, aval), out_aval.shape)
+      for arg, aval in zip(args, ctx.avals_in)
+  )
+  if out_aval.dtype in (jnp.float16, jnp.float32, jnp.float64):
+    return math_dialect.fma(a, b, c)
+  wide = (_cast(x, out_aval.dtype, jnp.float32) for x in (a, b, c))
+  return _cast(math_dialect.fma(*wide), jnp.float32, out_aval.dtype)
+
+
 @register_lowering(lax.iota_p)
 def _iota_lowering_rule(ctx: LoweringRuleContext, *, dtype, shape, dimension,
                         sharding):
