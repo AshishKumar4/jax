@@ -66,6 +66,16 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         f"\nsealing the installation: {seal['files']} files, "
         f"{seal['bytes'] / 1e6:.0f} MB hashed in {seal['seconds']:.3f} s")
 
+  def test_a_second_lowering_in_one_process_is_read_from_what_it_holds(self):
+    # The process holds what it lowered: with the directory's entries gone, the
+    # same kernel lowered again in the process is a hit, the same entry as the
+    # miss's, and each lookup records the time its key took.
+    first, second = self.run_child(after=["forget_store"])["runs"]
+    self.assertEqual(first["events"], ["miss"])
+    self.assertEqual(second["events"], ["hit"])
+    self.assertEqual(first["normalized"], second["normalized"])
+    self.assertEqual(first["text_sha"], second["text_sha"])
+
   def test_the_flag_is_the_environment_variable(self):
     flag = {"jax_pallas_lowering_cache_dir": str(self.cache_dir)}
     first = self.lower(cache=False, config=flag)

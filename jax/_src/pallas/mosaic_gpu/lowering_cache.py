@@ -61,6 +61,13 @@ Each boundary catches what it expects of it: the store's ``OSError``, an
 entry's ``ValueError`` or ``KeyError``, MLIR's parse error, the encoder's
 ``Uncacheable``, the seal's ``Unsealed``. Anything else is an error.
 
+The cache has two tiers under one key: the process holds the latest
+``_HELD`` entries it read or wrote, so a kernel lowered again in the process (by
+another program, a candidate of another plan, a rematerialized trace) is read
+from memory, and the directory holds every entry for another process. A hit
+from either is the same entry, rebuilt the same way; the duration event
+``.../key_seconds`` is the time each lookup spent making its key.
+
 ``jax_pallas_lowering_cache_verify`` lowers every hit afresh as well and raises
 when the two differ; a process that made a lowering through the cache with it
 set and verified no hit exits with status 3. The counters are ``jax.monitoring``
@@ -73,6 +80,7 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import collections
 import hashlib
 import io
 import logging
@@ -185,6 +193,30 @@ def _count(event: str) -> None:
 # cacheable), has verified nothing, and a run of it that is green would say it
 # had: it exits with this status instead.
 _EXIT_STATUS_UNVERIFIED = 3
+
+_HELD = 4096
+"""The entries the process holds in memory, the latest read or written."""
+
+_held: collections.OrderedDict[str, store_lib.Entry] = collections.OrderedDict()
+_held_lock = threading.Lock()
+
+
+def _held_entry(key: str) -> store_lib.Entry | None:
+  """The entry the process holds under `key`, made the latest; none if it holds none."""
+  with _held_lock:
+    entry = _held.get(key)
+    if entry is not None:
+      _held.move_to_end(key)
+    return entry
+
+
+def _hold(key: str, entry: store_lib.Entry) -> None:
+  """`entry` held under `key`, the oldest let go past ``_HELD``."""
+  with _held_lock:
+    _held[key] = entry
+    _held.move_to_end(key)
+    while len(_held) > _HELD:
+      _held.popitem(last=False)
 
 
 class _Verification:
@@ -448,9 +480,13 @@ def lower_unpipelined_jaxpr_to_module(
     _eligible(params, ctx.module_context.context)
     inputs = _gather_inputs(jax_mesh)
     dispatch = registries_lib.current()
+    keyed = time.perf_counter()
     key = _key(
         ctx, gpu_mesh, jax_mesh, jaxpr, in_shapes, out_shapes, params, inputs,
         code, dispatch.digest, constants_lib.digest(),
+    )
+    monitoring.record_event_duration_secs(
+        _EVENT_PREFIX + "key_seconds", time.perf_counter() - keyed
     )
   except sealing.Unsealed as e:
     _say_once(str(e))
@@ -477,13 +513,18 @@ def lower_unpipelined_jaxpr_to_module(
       )
 
   store = store_lib.open_store(directory)  # None if the directory cannot be used.
-  entry = None if store is None else store.get(key)
+  entry = _held_entry(key)
+  if entry is None and store is not None:
+    entry = store.get(key)
   if entry is not None:
     result = _rebuild(entry, context)
     if result is None:
-      assert store is not None
-      store.discard(key)
+      with _held_lock:
+        _held.pop(key, None)
+      if store is not None:
+        store.discard(key)
     else:
+      _hold(key, entry)
       if config.jax_pallas_lowering_cache_verify.value:
         lowered = lower_neutral()
         if not registries_lib.unchanged(dispatch):
@@ -511,9 +552,11 @@ def lower_unpipelined_jaxpr_to_module(
     _count("unsealed")
     return result
   _count("miss")
+  entry = dataclasses.replace(_normalized(result), seconds=seconds)
+  _hold(key, entry)
   if store is not None:
     try:
-      store.put(key, dataclasses.replace(_normalized(result), seconds=seconds))
+      store.put(key, entry)
     except OSError as e:
       logger.warning("the Mosaic GPU lowering cache cannot be written: %s", e)
   return result

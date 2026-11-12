@@ -37,6 +37,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import pathlib
 import sys
 import traceback
@@ -309,6 +310,12 @@ def apply_tweak(spec):
     table = lowering.mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS]
     table[jax_core.Primitive("lowering_cache_test_foreign")] = wrap(
         next(iter(table.values())))
+  elif name == "forget_store":
+    # The directory's entries gone: what the process holds is all it can read.
+    directory = jax.config.jax_pallas_lowering_cache_dir
+    for entry in os.listdir(directory):
+      path = os.path.join(directory, entry)
+      shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
   elif name == "smem_alignment":
     gpu_core.SMEM_ALIGNMENT = int(arg)
   elif name == "smem_alignment_numpy":
