@@ -1396,12 +1396,13 @@ class InterpretTest(jtu.JaxTestCase):
     y = _kernel(x)
     np.testing.assert_array_equal(y, x + 2)
 
-  @jtu.parameterized.product(offset=[0, 1])
-  def test_ring_awaited_at_explicit_parities(self, offset):
-    # A two-slot ring whose waits name the turn's parity, as one bit a ring
-    # shares; an offset of one names the other parity, which no phase the
-    # waiting thread observes next has.
-    stages, turns = 2, 6
+  def test_consumers_of_alternate_tiles_of_one_ring_skip_its_phases(self):
+    # A two-slot ring, each tile two steps (one rotation), whose tiles two
+    # consumers take in turn: each waits at a slot's every other phase, naming
+    # it (a ping-pong over one ring), and the producer waits for each slot's
+    # release at the phase it names.
+    stages, tiles = 2, 4
+    turns = tiles * stages
     x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
 
     @functools.partial(
@@ -1412,7 +1413,7 @@ class InterpretTest(jtu.JaxTestCase):
             full=plgpu.Barrier(num_barriers=stages),
             consumed=plgpu.Barrier(num_barriers=stages),
         ),
-        num_threads=2,
+        num_threads=3,
         thread_name='t',
         interpret=InterpretParams(detect_races=True),
     )
@@ -1425,24 +1426,64 @@ class InterpretTest(jtu.JaxTestCase):
         def _(turn):
           slot, rotation = turn % stages, turn // stages
           pl.when(rotation > 0)(lambda: plgpu.barrier_wait(
-              consumed.at[slot], parity=(rotation - 1 + offset) % 2 == 1))
+              consumed.at[slot], phase=rotation - 1))
           smem[slot] = x_ref[turn] + 1
           plgpu.barrier_arrive(full.at[slot])
 
-      @pl.when(thread_id == 1)
-      def consumer():
-        @pl.loop(0, turns)
-        def _(turn):
-          slot, rotation = turn % stages, turn // stages
-          plgpu.barrier_wait(full.at[slot], parity=rotation % 2 == 1)
-          out_ref[turn] = smem[slot] + 1
-          plgpu.barrier_arrive(consumed.at[slot])
+      def consumer(first):
+        @pl.loop(first, tiles, step=2)
+        def _(tile):
+          for step in range(stages):
+            turn = tile * stages + step
+            plgpu.barrier_wait(full.at[step], phase=turn // stages)
+            out_ref[turn] = smem[step] + 1
+            plgpu.barrier_arrive(consumed.at[step])
 
-    if offset:
-      with self.assertRaises(jax.errors.JaxRuntimeError):
-        _kernel(x).block_until_ready()
+      pl.when(thread_id == 1)(lambda: consumer(0))
+      pl.when(thread_id == 2)(lambda: consumer(1))
+
+    np.testing.assert_array_equal(_kernel(x), x + 2)
+
+  @jtu.parameterized.parameters(
+      ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
+  def test_a_wait_names_the_latest_or_the_pending_phase(
+      self, name, arrivals, phase):
+    # A wait at a phase the hardware's parity wait would take another for:
+    # two behind the barrier's latest completion, or past the one it is
+    # completing; the latest and the pending phase are waited at.
+    del name
+    refused = not arrivals - 1 <= phase <= arrivals
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=dict(barrier=plgpu.Barrier()),
+        num_threads=2,
+        thread_name='t',
+        interpret=InterpretParams(),
+    )
+    def _kernel(out_ref, barrier):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def _():
+        for _ in range(arrivals):
+          plgpu.barrier_arrive(barrier)
+        plgpu.barrier_wait(barrier, phase=phase)
+        out_ref[...] = jnp.ones_like(out_ref)
+
+      @pl.when(thread_id == 1)
+      def _():
+        if phase == arrivals:
+          # The pending phase completes with this arrival.
+          plgpu.barrier_arrive(barrier)
+
+    if refused:
+      with self.assertRaisesRegex(
+          jax.errors.JaxRuntimeError, "the hardware's wait at that parity"):
+        _kernel().block_until_ready()
     else:
-      np.testing.assert_array_equal(_kernel(x), x + 2)
+      np.testing.assert_array_equal(_kernel(), np.ones((128,), np.float32))
 
   @jtu.parameterized.product(with_race=[True, False])
   def test_barrier_multidimensional_1d(self, with_race):

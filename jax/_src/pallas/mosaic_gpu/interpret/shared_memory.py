@@ -1389,16 +1389,16 @@ class Barrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
+      phase: int | None = None,
   ):
-    """Waits for the next phase `thread` observes; given a `parity`, the
-    phase must be of it (the hardware waits for the phase of that parity)."""
+    """Waits for the next phase `thread` observes, or for `phase` where given
+    (counted from 0, the barrier's first completion)."""
     # Fail early if the kernel has already failed. This cannot be done while
     # holding the lock on `self.cv`, so the below loop checks `self.aborted`
     # and we only call `check_failed` again once `self.cv` has been released.
     self.shared_memory.check_failed()
     try:
-      self._wait(thread, logging_info, parity)
+      self._wait(thread, logging_info, phase)
     except _BarrierAborted:
       self.shared_memory.check_failed()
       raise RuntimeError(
@@ -1409,7 +1409,7 @@ class Barrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
+      phase: int | None = None,
   ):
     with self.cv:
       last_observed_phase = self.last_observed_phase_by_thread.get(
@@ -1421,10 +1421,24 @@ class Barrier(memory.Allocation):
             thread.warpgroup(), None
         )
 
+      if phase is not None:
+        # The hardware waits at the named phase's parity: for the latest phase
+        # the barrier completed where that has its parity, else for the one it
+        # is completing. Any other phase it names is taken for one of those, a
+        # phase of the same parity: two or more behind, or one ahead or more.
+        if not self.phase - 1 <= phase <= self.phase:
+          taken = self.phase - (phase - self.phase) % 2
+          raise ValueError(
+              f"Thread {thread} is waiting at barrier {id(self)} for phase"
+              f" {phase}, but the barrier has completed {self.phase} phases:"
+              f" the hardware's wait at that parity takes phase {taken}."
+          )
+        # A waiter that names its phase may have skipped those before it.
+        last_observed_phase = phase
       # Since not all threads in a block may use the barrier, we must lazily
       # initialize the `last_observed_phase_by_thread` array the first time each
       # thread participates in the barrier.
-      if last_observed_phase is None:
+      elif last_observed_phase is None:
         if self.phase > 1:
           raise ValueError(
               f"Thread {thread} is waiting at barrier {id(self)} for"
@@ -1458,13 +1472,6 @@ class Barrier(memory.Allocation):
                 " but its constituent warps have previously observed different"
                 f" phases: {observed_phases}."
             )
-
-      if parity is not None and parity != last_observed_phase % 2:
-        raise ValueError(
-            f"Thread {thread} is waiting at barrier {id(self)} for a phase of"
-            f" parity {parity}, but the next phase it observes is phase"
-            f" {last_observed_phase}, of parity {last_observed_phase % 2}."
-        )
 
       # Suppose our last observed phase was phase `p`...
       if last_observed_phase <= self.phase - 2:
@@ -1700,7 +1707,7 @@ class ClusterBarrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
-      parity: int | None = None,
+      phase: int | None = None,
   ):
     if self.enable_logging and logging_info is not None:
       with self.lock:
@@ -1711,7 +1718,7 @@ class ClusterBarrier(memory.Allocation):
             )
         )
 
-    self.block_barrier(thread).wait(thread, logging_info, parity)
+    self.block_barrier(thread).wait(thread, logging_info, phase)
 
   def block_barrier(self, thread: Thread) -> Barrier:
     """The barrier for the block that `thread` belongs to."""

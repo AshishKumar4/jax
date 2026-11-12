@@ -1954,9 +1954,9 @@ def _barrier_wait_pp_eqn(
 ):
   barrier, *flat_transforms = eqn.invars
   pp_params = {}
-  if eqn.params.get("has_parity", False):
-    *flat_transforms, parity = flat_transforms
-    pp_params["parity"] = parity.pretty_print(context)
+  if eqn.params.get("has_phase", False):
+    *flat_transforms, phase = flat_transforms
+    pp_params["phase"] = phase.pretty_print(context)
   transforms_treedef = eqn.params["transforms_treedef"]
   transforms = transforms_treedef.unflatten(flat_transforms)
   return pp.concat([
@@ -1981,11 +1981,18 @@ def _barrier_wait_lowering(
     barrier,
     *flat_transforms,
     transforms_treedef,
-    has_parity: bool = False,
+    has_phase: bool = False,
 ):
-  if has_parity:
-    *flat_transforms, parity = flat_transforms
-    parity = lowering._ensure_ir_value(parity, jnp.bool)  # pylint: disable=protected-access
+  if has_phase:
+    *flat_transforms, phase = flat_transforms
+    phase = lowering._ensure_ir_value(phase, jnp.int32)  # pylint: disable=protected-access
+    i32 = ir.IntegerType.get_signless(32)
+    # The hardware waits at a phase's parity, its low bit.
+    parity = arith_dialect.cmpi(
+        arith_dialect.CmpIPredicate.ne,
+        arith_dialect.andi(phase, mgpu_utils.c(1, i32)),
+        mgpu_utils.c(0, i32),
+    )
   else:
     parity = None
   barrier_aval = ctx.avals_in[0]
@@ -2007,16 +2014,19 @@ def _barrier_wait_lowering(
 def barrier_wait(
     barrier: state.AbstractRef,
     *,
-    parity: bool | jax.Array | None = None,
+    phase: int | jax.Array | None = None,
 ) -> None:
   """Waits on the given barrier.
 
-  Without a ``parity``, the wait takes the barrier's next phase, which the
-  kernel tracks for each barrier of an array. With one, it waits for the phase
-  of that parity to complete and tracks nothing: a ring whose barriers all
-  complete a phase each turn shares one parity bit between them (the turn's),
-  where tracking spends a bit test and a flip on every wait. A barrier is
-  awaited one way throughout a kernel.
+  Without a ``phase``, the wait takes the barrier's next phase, which the
+  kernel tracks for each barrier of an array. With one, it waits for that
+  phase, counted from 0 (the barrier's first completion), and tracks nothing:
+  a ring whose barriers all complete a phase each turn names the turn's
+  rotation, where tracking spends a bit test and a flip on every wait. The
+  hardware waits at the phase's parity, so a waiter may skip phases (consumers
+  taking alternate tiles of one ring) as long as the phase it names is the
+  barrier's latest completed or the one it is completing; the interpreter
+  checks that. A barrier is awaited one way throughout a kernel.
   """
   barrier, transforms = state_primitives.get_ref_and_transforms(
       barrier, None, "barrier_wait"
@@ -2025,9 +2035,9 @@ def barrier_wait(
   barrier_wait_p.bind(
       barrier,
       *flat_transforms,
-      *() if parity is None else (parity,),
+      *() if phase is None else (phase,),
       transforms_treedef=transforms_treedef,
-      has_parity=parity is not None,
+      has_phase=phase is not None,
   )
 
 

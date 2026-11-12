@@ -2334,9 +2334,9 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     np.testing.assert_array_equal(kernel(), np.array([0, 0, 1, 0, 1]))
 
-  def test_barrier_wait_at_explicit_parities(self):
+  def test_barrier_wait_at_explicit_phases(self):
     # Two arrivals complete phases 0 and 1 of the barrier; a wait at each
-    # parity returns, and the barrier's tracked phases are left alone.
+    # returns, and the barrier's tracked phases are left alone.
     @functools.partial(
         self.kernel,
         out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
@@ -2344,9 +2344,9 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     )
     def kernel(o_ref, barrier):
       plgpu.barrier_arrive(barrier)
-      plgpu.barrier_wait(barrier, parity=False)
+      plgpu.barrier_wait(barrier, phase=0)
       plgpu.barrier_arrive(barrier)
-      plgpu.barrier_wait(barrier, parity=jnp.bool_(True))
+      plgpu.barrier_wait(barrier, phase=jnp.int32(1))
       o_ref[...] = jnp.ones_like(o_ref)
 
     np.testing.assert_array_equal(kernel(), np.ones((128,), np.float32))
