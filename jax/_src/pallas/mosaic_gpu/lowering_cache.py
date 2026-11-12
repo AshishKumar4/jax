@@ -448,9 +448,13 @@ def lower_unpipelined_jaxpr_to_module(
     _eligible(params, ctx.module_context.context)
     inputs = _gather_inputs(jax_mesh)
     dispatch = registries_lib.current()
+    keyed = time.perf_counter()
     key = _key(
         ctx, gpu_mesh, jax_mesh, jaxpr, in_shapes, out_shapes, params, inputs,
         code, dispatch.digest, constants_lib.digest(),
+    )
+    monitoring.record_event_duration_secs(
+        _EVENT_PREFIX + "key_seconds", time.perf_counter() - keyed
     )
   except sealing.Unsealed as e:
     _say_once(str(e))
