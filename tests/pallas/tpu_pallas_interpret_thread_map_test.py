@@ -174,12 +174,18 @@ class InterpretThreadMapSaturationTest(jtu.JaxTestCase):
     self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
     self.assertIn("done", ran.stdout)
 
-  def test_a_thread_map_of_more_threads_than_a_client_runs_is_refused_as_traced(
-      self):
-    # A map wider than a client's in-flight executions is refused as its kernel
-    # is traced, before any callback runs.
-    with self.assertRaises(ValueError):
-      thread_map(lambda thread, token: token, 33, jnp.int32(0))
+  def test_a_thread_map_wider_than_a_devices_executions_runs_all_at_once(self):
+    # 40 threads, more than one device holds in flight (32), all meet at one
+    # barrier: every thread's program is in flight at once.
+    barrier = threading.Barrier(40)
+
+    def f(core_index, token):
+      del core_index
+      jax.experimental.io_callback(barrier.wait, (), ordered=True)
+      return token
+
+    jax.block_until_ready(thread_map(f, 40, jnp.int32(0)))
+    self.assertEqual(barrier.n_waiting, 0)
 
   def test_thread_map_computes_as_its_callers_client_does(self):
     # A thread's program, run on the thread map's own client, gives what the
