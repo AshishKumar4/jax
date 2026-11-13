@@ -201,6 +201,28 @@ def _has_communication(module, **_):
 KNOWN_KERNELS: dict[bytes, bytes] = {}
 
 
+def kernel_hash(module: ir.Module) -> bytes:
+  """The digest naming `module`'s kernel, which compiles once a process.
+
+  It reads the module's operations, not its locations: one kernel traced in two
+  contexts (alone, and within a program's gradient) names its operations by two
+  name stacks, and is one kernel.
+  """
+  kernel_text = module.operation.get_asm(
+      binary=True, enable_debug_info=False, assume_verified=True
+  )
+  kernel_id = hashlib.sha256(kernel_text).digest()
+  # Note that this is technically only a half measure. Someone might load a
+  # compiled module with a hash collision from disk. But that's so unlikely with
+  # SHA256 that it shouldn't be a problem.
+  if (known := KNOWN_KERNELS.get(kernel_id, None)) is not None:
+    if known != kernel_text:
+      raise RuntimeError("Kernel hash collision!")
+  else:
+    KNOWN_KERNELS[kernel_id] = kernel_text
+  return kernel_id
+
+
 # Frontend attributes understood by the XLA:GPU compiler. They let a custom
 # call request a specific memory space for its operands and results. See
 # xla/service/gpu/gpu_memory_space_assignment.h for the definitions.
@@ -312,15 +334,7 @@ def _mosaic_gpu_lowering_rule(
   bytecode_buffer = io.BytesIO()
   module.operation.write_bytecode(bytecode_buffer, desired_version=0)
   module_asm = bytecode_buffer.getvalue()
-  kernel_id = hashlib.sha256(module_asm).digest()
-  # Note that this is technically only a half measure. Someone might load a
-  # compiled module with a hash collision from disk. But that's so unlikely with
-  # SHA256 that it shouldn't be a problem.
-  if (kernel_text := KNOWN_KERNELS.get(kernel_id, None)) is not None:
-    if kernel_text != module_asm:
-      raise RuntimeError("Kernel hash collision!")
-  else:
-    KNOWN_KERNELS[kernel_id] = module_asm
+  kernel_id = kernel_hash(module)
 
   if dump_basename_attr is not None:
     module.operation.attributes[dump_basename_attr_name] = dump_basename_attr
