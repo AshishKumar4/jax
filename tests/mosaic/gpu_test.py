@@ -294,6 +294,23 @@ class TMEMTransferTest(parameterized.TestCase):
                       (128, 128), jnp.float32, max_registers=2)
 
 
+class KernelHashTest(parameterized.TestCase):
+  """The hash naming a kernel, which compiles once a process: no GPU needed."""
+
+  def test_one_kernel_at_two_locations_is_one_kernel(self):
+    def kernel(value, location):
+      with mlir.make_ir_context():
+        return core.kernel_hash(ir.Module.parse(
+            "func.func @kernel() -> i32 {\n"
+            f"  %0 = arith.constant {value} : i32 loc({location})\n"
+            "  return %0 : i32\n"
+            "}\n"))
+
+    alone = kernel(1, '"add:"("kernels.py":3:5)')
+    self.assertEqual(alone, kernel(1, '"transpose(jvp(step))/add"'))
+    self.assertNotEqual(alone, kernel(2, '"add:"("kernels.py":3:5)'))
+
+
 class Sm90ATestCase(TestCase, jtu.CudaArchSpecificTest):
 
   def setUp(self):
