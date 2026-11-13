@@ -264,6 +264,83 @@ class InterpretTest(jtu.JaxTestCase):
           interpret=InterpretParams(),
       )(jnp.zeros((16, 128), jnp.float32))
 
+  def _ragged_block_pipeline(self, x, start, rows):
+    # A block of `rows` rows from row `start` of `x`, which may reach past
+    # its last row, through a pipeline that reads past its operand as zeros
+    # (`plgpu.BlockSpec`'s default `OOBFillMode.ZEROS`), copied out whole.
+    def kernel(x_ref, o_ref):
+      def step(indices, x_smem):
+        del indices
+        o_ref[...] = x_smem[...]
+
+      plgpu.emit_pipeline(
+          step,
+          grid=(1,),
+          in_specs=[plgpu.BlockSpec(
+              # The start traced, as a tile's rows are: a static one past
+              # the operand is refused at indexing.
+              (pl.Element(rows), x.shape[1]), lambda i: (i + start, 0)
+          )],
+          max_concurrent_steps=1,
+      )(x_ref)
+
+    return functools.partial(
+        plgpu.kernel,
+        kernel,
+        out_type=jax.ShapeDtypeStruct((rows, x.shape[1]), x.dtype),
+    )
+
+  def test_pipeline_reads_a_ragged_last_block_past_its_operand_as_zeros(self):
+    # Rows 200 to 263 of a 256-row operand: the 56 inside it, then zeros.
+    x = jnp.arange(256 * 128, dtype=jnp.float32).reshape(256, 128) + 1
+    out = self._ragged_block_pipeline(x, 200, 64)(
+        interpret=InterpretParams()
+    )(x)
+    np.testing.assert_array_equal(out[:56], x[200:])
+    np.testing.assert_array_equal(out[56:], np.zeros((8, 128), np.float32))
+
+  def test_pipeline_reads_a_dynamically_sliced_views_block_past_its_operand_as_zeros(self):
+    # A view sliced at a dynamic start (rows 200 to 263 of a 256-row operand),
+    # its one block inside the view: not provably inside the operand, so it
+    # reads past it as zeros rather than promising it in bounds.
+    x = jnp.arange(256 * 128, dtype=jnp.float32).reshape(256, 128) + 1
+
+    def kernel(x_ref, start_ref, o_ref):
+      def step(indices, x_smem):
+        del indices
+        o_ref[...] = x_smem[...]
+
+      plgpu.emit_pipeline(
+          step,
+          grid=(1,),
+          in_specs=[plgpu.BlockSpec((64, 128), lambda i: (i, 0))],
+          max_concurrent_steps=1,
+      )(x_ref.at[pl.ds(start_ref[0], 64)])
+
+    out = plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((64, 128), jnp.float32),
+        interpret=InterpretParams(),
+    )(x, jnp.asarray([200], jnp.int32))
+    np.testing.assert_array_equal(out[:56], x[200:])
+    np.testing.assert_array_equal(out[56:], np.zeros((8, 128), np.float32))
+
+  def test_a_ragged_pipeline_block_lowers_for_an_a100s_cp_async(self):
+    # The same block lowered for an A100 (cp.async, a compile-only device):
+    # each transfer's source size its bytes inside the operand.
+    x = jax.ShapeDtypeStruct((256, 128), jnp.float32)
+    device = jax.sharding.AbstractDevice(
+        device_kind='NVIDIA A100-SXM4-80GB',
+        platform='cuda',
+        num_cores=None,
+        compute_capability='8.0',
+    )
+    with jax.sharding.use_abstract_mesh(
+        jax.sharding.AbstractMesh((), (), abstract_device=device)
+    ):
+      call = self._ragged_block_pipeline(x, 200, 64)()
+      jax.jit(call).trace(x).lower(lowering_platforms=('cuda',))
+
   def test_layout_cast(self):
     # the layout_cast is a no-op in interpret mode
     @functools.partial(
