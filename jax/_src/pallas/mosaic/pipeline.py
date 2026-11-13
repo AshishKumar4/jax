@@ -1859,6 +1859,7 @@ def _emit_pipeline(
     output_wait_read_only: bool = False,
     num_cores: int | None = None,
     core_id: jax.Array | int | None = None,
+    init_carry: Any | None = None,
     _explicit_indices: bool = False,
 ):
   """Creates a function to emit a manual pallas pipeline.
@@ -1884,6 +1885,10 @@ def _emit_pipeline(
       is for SparseCore push streams, whose write wait fences all streams.
     num_cores: If set, the number of cores to partition the grid over.
     core_id: If set, the core ID of the current core for partitioning the grid.
+    init_carry: Optional initial carry. If provided, ``body`` receives the
+      carry from the previous step as its last argument and returns the next
+      one, and the pipeline returns the last (``init_carry`` itself where the
+      grid has no steps), as the Mosaic GPU pipeline's ``init_carry`` does.
     _explicit_indices: If True, the body will receive the iteration indices as
       its first argument. This parameter is meant for internal use only.
   """
@@ -1983,8 +1988,14 @@ def _emit_pipeline(
           _explicit_indices=_explicit_indices,
       )
 
+    def run_body(*args, body_carry):
+      if init_carry is None:
+        body(*args)
+        return None
+      return body(*args, body_carry)
+
     def loop_body(step, carry):
-      unaliased_brefs, indices = carry
+      unaliased_brefs, indices, body_carry = carry
       indices = _filter_indices(indices, grid)
       scheduler = make_scheduler(step, indices)
       with scheduler.grid_env():
@@ -2002,9 +2013,11 @@ def _emit_pipeline(
                 tuple(jnp.asarray(i, jnp.int32) for i in scheduler.indices),
                 scheduler.step,
             )
-            body(pipeline_step, *current_refs, *scratches)
+            body_carry = run_body(
+                pipeline_step, *current_refs, *scratches, body_carry=body_carry)
           else:
-            body(*current_refs, *scratches)
+            body_carry = run_body(
+                *current_refs, *scratches, body_carry=body_carry)
 
         # loop output handling phase
         brefs = map_brefs(scheduler.copy_out, brefs, refs)
@@ -2015,7 +2028,7 @@ def _emit_pipeline(
         # we will be returning TransformedRefs which are not valid
         # JAX types.
         brefs = map_brefs(scheduler.unalias_local_refs, brefs)
-      return brefs, _next_index(indices, grid)
+      return brefs, _next_index(indices, grid), body_carry
 
     if no_pipelining:
       # Debugging mode where all copies are synchronous.
@@ -2023,7 +2036,7 @@ def _emit_pipeline(
       brefs = map_brefs(lambda bref: bref.initialize_slots(), allocations)
 
       def _loop_body(step, carry):
-        brefs, indices = carry
+        brefs, indices, body_carry = carry
         indices = _filter_indices(indices, grid)
         scheduler = make_scheduler(step, indices)
         with scheduler.grid_env():
@@ -2040,25 +2053,28 @@ def _emit_pipeline(
                   tuple(jnp.asarray(i, jnp.int32) for i in scheduler.indices),
                   jnp.asarray(scheduler.step, jnp.int32),
               )
-              body(pipeline_step, *current_refs, *scratches)
+              body_carry = run_body(
+                  pipeline_step, *current_refs, *scratches,
+                  body_carry=body_carry)
             else:
-              body(*current_refs, *scratches)
+              body_carry = run_body(
+                  *current_refs, *scratches, body_carry=body_carry)
           # loop output handling phase
           copy_out = lambda bref, ref: sync_copy(bref, ref, indices)
           map_outputs(copy_out, brefs, refs)
         brefs = map_brefs(scheduler.unalias_local_refs, brefs)
-        return brefs, _next_index(indices, grid)
+        return brefs, _next_index(indices, grid), body_carry
 
       with config.mutable_array_checks(False):
-        _fori_loop(
+        _, _, body_carry = _fori_loop(
             0,
             num_steps,
             _loop_body,
-            (brefs, initial_indices),
+            (brefs, initial_indices, init_carry),
         )
+      return body_carry
     else:
-      @when(num_steps > 0)
-      def _():
+      def pipelined():
         # pipeline prologue
         initial_indices = (jnp.int32(0),) * len(grid)
         scheduler = make_scheduler(0, initial_indices)
@@ -2083,11 +2099,11 @@ def _emit_pipeline(
 
         # pipeline loop
         with config.mutable_array_checks(False):
-          brefs, next_indices = _fori_loop(
+          brefs, next_indices, body_carry = _fori_loop(
               0,
               num_steps,
               loop_body,
-              (brefs, initial_indices),
+              (brefs, initial_indices, init_carry),
           )
 
         # pipeline epilogue
@@ -2108,6 +2124,13 @@ def _emit_pipeline(
         if output_wait_read_only:  # Only the source reads were awaited so far.
           fence = lambda bref, ref: bref.wait_out_write(ref, final_indices)
           map_outputs(fence, brefs, refs)
+        return body_carry
+
+      if init_carry is None:
+        when(num_steps > 0)(pipelined)
+        return None
+      # A grid of no steps runs none and returns the carry it was given.
+      return lax.cond(num_steps > 0, pipelined, lambda: init_carry)
 
   return pipeline
 
@@ -2189,6 +2212,7 @@ def emit_pipeline(
     trace_scopes: bool = True,
     no_pipelining: bool = False,
     output_wait_read_only: bool = False,
+    init_carry: Any | None = None,
     _explicit_indices: bool = False,
 ):
   in_specs = _normalize_specs(in_specs)
@@ -2248,10 +2272,16 @@ def emit_pipeline(
           trace_scopes=trace_scopes,
           no_pipelining=no_pipelining,
           output_wait_read_only=output_wait_read_only,
+          init_carry=init_carry,
           _explicit_indices=_explicit_indices,
           num_cores=num_cores,
           core_id=core_id,
       )(*in_refs, *out_refs, allocations=allocations, **kwargs)
+    if init_carry is not None:
+      raise NotImplementedError(
+          "emit_pipeline's init_carry is not supported by the emit_pipeline"
+          " primitive (jax_use_emit_pipeline_primitive)"
+      )
 
     in_specs_flat, _ = tree_util.tree_flatten(in_specs_)
     out_specs_flat, _ = tree_util.tree_flatten(out_specs_)
