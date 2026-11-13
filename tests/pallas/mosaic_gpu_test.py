@@ -204,7 +204,7 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
       found.append(pipeline.get_allocations(*refs))
 
     with jax.sharding.use_abstract_mesh(mesh):
-      jax.make_jaxpr(stated)(jnp.int32(4))
+      jax.make_jaxpr(stated)(jax.ShapeDtypeStruct((), jnp.int32))
     [allocations] = found
     self.assertEqual(
         [(ref.shape, ref.dtype) for ref in allocations["in_smem_refs"]],
