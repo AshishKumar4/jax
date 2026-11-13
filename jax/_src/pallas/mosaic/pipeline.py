@@ -2153,7 +2153,7 @@ def _cond_slots(predicate, update, brefs):
   leaves, tree = jax.tree.flatten(brefs)
   held = [
       isinstance(leaf, state.TransformedRef)
-      or isinstance(jax_core.get_aval(leaf), state.AbstractRef)
+      or isinstance(jax_core.typeof(leaf), state.AbstractRef)
       for leaf in leaves
   ]
 
