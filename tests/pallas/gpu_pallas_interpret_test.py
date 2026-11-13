@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import threading
 import math
 from typing import Any
 from absl.testing import absltest
@@ -1454,6 +1455,109 @@ class InterpretTest(jtu.JaxTestCase):
       pl.when(thread_id == 2)(lambda: consumer(1))
 
     np.testing.assert_array_equal(_kernel(x), x + 2)
+
+  def test_consumer_warps_of_alternate_tiles_of_one_ring_skip_its_phases(self):
+    # The ping-pong over one ring with its consumers the four warps of one
+    # warpgroup, each the tiles of its index modulo four in turn (a turn
+    # barrier a warp, its predecessor arriving once its tile is done: one
+    # order barrier would have a warp name a phase two ahead before its
+    # first tile): three tiles pass a warp by between its own, so a slot's
+    # phases pass the warpgroup its warps' observations give it as well as
+    # each warp.
+    stages, tiles, warps = 2, 8, 4
+    turns = tiles * stages
+    x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=x,
+        scratch_types=dict(
+            smem=plgpu.SMEM((stages, 128), x.dtype),
+            full=plgpu.Barrier(num_barriers=stages),
+            consumed=plgpu.Barrier(num_barriers=stages),
+            ordered=plgpu.Barrier(num_barriers=warps),
+        ),
+        num_threads=2,
+        thread_name='t',
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(x_ref, out_ref, smem, full, consumed, ordered):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def producer():
+        @pl.loop(0, turns)
+        def _(turn):
+          slot, rotation = turn % stages, turn // stages
+          pl.when(rotation > 0)(lambda: plgpu.barrier_wait(
+              consumed.at[slot], phase=rotation - 1))
+          smem[slot] = x_ref[turn] + 1
+          plgpu.barrier_arrive(full.at[slot])
+
+      @pl.when(thread_id == 1)
+      def consumers():
+        @plgpu.warp_map
+        def _(warp_id):
+          @pl.loop(warp_id, tiles, step=warps)
+          def _(tile):
+            # Warp 0's j-th tile waits its predecessor's (j - 1)-th arrival,
+            # every other warp's its j-th.
+            pl.when(tile > 0)(lambda: plgpu.barrier_wait(
+                ordered.at[warp_id],
+                phase=tile // warps - (warp_id == 0).astype(jnp.int32)))
+            for step in range(stages):
+              turn = tile * stages + step
+              plgpu.barrier_wait(full.at[step], phase=turn // stages)
+              out_ref[turn] = smem[step] + 1
+              plgpu.barrier_arrive(consumed.at[step])
+            plgpu.barrier_arrive(ordered.at[(warp_id + 1) % warps])
+
+    np.testing.assert_array_equal(_kernel(x), x + 2)
+
+  def test_a_named_wait_woken_past_its_phase_is_refused(self):
+    # A waiter blocked at the phase the barrier is completing, which completes
+    # it and two more before the waiter runs again (they arrive while the
+    # barrier's lock is held, the waiter inside its wait): the hardware's poll
+    # at its phase's parity would see none of them, so its wait is refused.
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
+
+    memory = shared_memory.GPUSharedMemory(
+        num_devices=1, out_of_bounds_reads="raise", dma_execution_mode="eager",
+        uninitialized_memory="nan", detect_races=False,
+        barrier=threading.Barrier(1), clean_up_barrier=threading.Barrier(1),
+        num_threads_per_block=2, num_blocks_per_cluster=1,
+        num_tma_threads_per_device=1)
+    barrier = shared_memory.Barrier(
+        memory, num_pallas_threads_per_block=2, ref_count=1, num_arrivals=1,
+        orders_tensor_core=False)
+    waiter = shared_memory.Warpgroup(0, 0, 0, 0)
+    barrier.arrive(None)
+    barrier.wait(waiter, phase=0)
+
+    entered, refused = threading.Event(), []
+    blocked = barrier.cv.wait
+
+    def waiting(*args, **kwargs):
+      entered.set()
+      return blocked(*args, **kwargs)
+
+    barrier.cv.wait = waiting
+
+    def wait():
+      try:
+        barrier.wait(waiter, phase=1)
+      except ValueError as error:
+        refused.append(error)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    entered.wait()
+    with barrier.cv:
+      for _ in range(3):
+        barrier.arrive(None)
+    thread.join()
+    self.assertLen(refused, 1)
+    self.assertIn("the hardware's wait at that parity", str(refused[0]))
 
   @jtu.parameterized.parameters(
       ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
