@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import threading
 import math
 from typing import Any
 from absl.testing import absltest
@@ -1514,37 +1515,49 @@ class InterpretTest(jtu.JaxTestCase):
     np.testing.assert_array_equal(_kernel(x), x + 2)
 
   def test_a_named_wait_woken_past_its_phase_is_refused(self):
-    # A thread waits at the phase the barrier is completing, which the other
-    # completes and then completes twice more: woken past it, or arriving at
-    # its wait after, the waiter names a phase the hardware's wait at its
-    # parity would take another for.
+    # A waiter blocked at the phase the barrier is completing, which completes
+    # it and two more before the waiter runs again (they arrive while the
+    # barrier's lock is held, the waiter inside its wait): the hardware's poll
+    # at its phase's parity would see none of them, so its wait is refused.
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
 
-    @functools.partial(
-        plgpu.kernel,
-        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
-        scratch_types=dict(barrier=plgpu.Barrier(), go=plgpu.Barrier()),
-        num_threads=2,
-        thread_name='t',
-        interpret=InterpretParams(),
-    )
-    def _kernel(out_ref, barrier, go):
-      thread_id = jax.lax.axis_index('t')
+    memory = shared_memory.GPUSharedMemory(
+        num_devices=1, out_of_bounds_reads="raise", dma_execution_mode="eager",
+        uninitialized_memory="nan", detect_races=False,
+        barrier=threading.Barrier(1), clean_up_barrier=threading.Barrier(1),
+        num_threads_per_block=2, num_blocks_per_cluster=1,
+        num_tma_threads_per_device=1)
+    barrier = shared_memory.Barrier(
+        memory, num_pallas_threads_per_block=2, ref_count=1, num_arrivals=1,
+        orders_tensor_core=False)
+    waiter = shared_memory.Warpgroup(0, 0, 0, 0)
+    barrier.arrive(None)
+    barrier.wait(waiter, phase=0)
 
-      @pl.when(thread_id == 0)
-      def _():
-        plgpu.barrier_arrive(go)
-        plgpu.barrier_wait(barrier, phase=0)
-        out_ref[...] = jnp.ones_like(out_ref)
+    entered, refused = threading.Event(), []
+    blocked = barrier.cv.wait
 
-      @pl.when(thread_id == 1)
-      def _():
-        plgpu.barrier_wait(go)
-        for _ in range(3):
-          plgpu.barrier_arrive(barrier)
+    def waiting(*args, **kwargs):
+      entered.set()
+      return blocked(*args, **kwargs)
 
-    with self.assertRaisesRegex(
-        jax.errors.JaxRuntimeError, "the hardware's wait at that parity"):
-      _kernel().block_until_ready()
+    barrier.cv.wait = waiting
+
+    def wait():
+      try:
+        barrier.wait(waiter, phase=1)
+      except ValueError as error:
+        refused.append(error)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    entered.wait()
+    with barrier.cv:
+      for _ in range(3):
+        barrier.arrive(None)
+    thread.join()
+    self.assertLen(refused, 1)
+    self.assertIn("the hardware's wait at that parity", str(refused[0]))
 
   @jtu.parameterized.parameters(
       ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
