@@ -758,6 +758,55 @@ _MOST_KNOWN_MULTIPLE = 1 << 20
 offset needs a coarser alignment."""
 
 
+def _cp_async_bounds(
+    shape: Sequence[int],
+    starts: Sequence[ir.Value],
+    lengths: Sequence[int],
+) -> list[tuple[int, ir.Value] | None] | None:
+  """A cp.async copy's bounds where it reads past its GMEM reference as zeros
+  (``OOBFillMode.ZEROS``): for each of the reference's dimensions, its extent and
+  the slice's start along it, or None where the slice lies statically inside it;
+  None where every dimension's does (the copy then emits as a promised one)."""
+  bounds = []
+  for extent, start, length in zip(shape, starts, lengths, strict=True):
+    known = _constant(start)
+    bounds.append(
+        None if known is not None and known + length <= extent
+        else (extent, start)
+    )
+  return None if all(bound is None for bound in bounds) else bounds
+
+
+def _cp_async_source_size(
+    bounds: Sequence[tuple[int, ir.Value] | None],
+    coordinates: Sequence[ir.Value],
+    bytes_per_transfer: int,
+    element_bitwidth: int,
+) -> ir.Value:
+  """A cp.async transfer's source size (``cp.async``'s ``src-size``, an i32 of
+  bytes) at ``coordinates`` (index values, one a dimension of ``bounds``, its
+  first element's within the slice; its elements lie along the last): its bytes
+  inside the reference, which cp.async reads, filling the rest with zeros, and
+  none where a coordinate of an outer dimension is past the reference."""
+  index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+  size = c(bytes_per_transfer, i32)
+  *outer, (inner, last) = zip(bounds, coordinates, strict=True)
+  if inner is not None:
+    extent, start = inner
+    left = arith.index_cast(i32, arith.subi(c(extent, index), arith.addi(start, last)))
+    left = arith.divsi(arith.muli(left, c(element_bitwidth, i32)), c(8, i32))
+    size = arith.maxsi(c(0, i32), arith.minsi(size, left))
+  for bound, coordinate in outer:
+    if bound is None:
+      continue
+    extent, start = bound
+    inside = arith.cmpi(
+        arith.CmpIPredicate.ult, arith.addi(start, coordinate), c(extent, index)
+    )
+    size = arith.select(inside, size, c(0, i32))
+  return size
+
+
 def _known_multiple(value) -> int:
   """The largest power of two, up to `_MOST_KNOWN_MULTIPLE`, an index `value` is
   known to be a multiple of, as Mosaic GPU's one divisibility analysis proves it
@@ -1235,6 +1284,7 @@ class LaunchContext:
                         *(t.batch(len(squeezed_dims)) for t in gmem_transform))
 
     untransformed_slice_shape = tuple(slice_shape)
+    untransformed_base_indices = dyn_base_indices
     if implementation == AsyncCopyImplementation.CP_ASYNC and squeezed_dims:
       # CP_ASYNC offsets the slice's base by the untransformed indices and
       # strides, then squeezes, so the transforms apply to the slice with its
@@ -1249,6 +1299,7 @@ class LaunchContext:
           [1] * len(squeezed_dims) + list(logical_shape),
           untransformed_slice_shape,
           dyn_base_indices,
+          untransformed_base_indices,
           squeezed_dims,
           gather_indices,
           gmem_transform,
@@ -1262,6 +1313,7 @@ class LaunchContext:
         list(slice_shape),
         untransformed_slice_shape,
         dyn_base_indices,
+        untransformed_base_indices,
         squeezed_dims,
         gather_indices,
         gmem_transform,
@@ -1546,6 +1598,7 @@ class LaunchContext:
         slice_shape,
         untransformed_slice_shape,
         dyn_base_indices,
+        untransformed_base_indices,
         squeezed_dims,
         gather_indices,
         gmem_transform,
@@ -1597,6 +1650,33 @@ class LaunchContext:
         gep_type = element_type
 
       gmem_strides, _ = gmem_ref_ty.get_strides_and_offset()
+      # A copy that reads past its GMEM reference as zeros gives each transfer
+      # the bytes of it inside the reference as its source size, so cp.async
+      # reads nothing past the reference and fills the rest with zeros, as TMA
+      # does; a promised copy, or one statically inside, emits none.
+      bounds = (
+          _cp_async_bounds(
+              gmem_ref_ty.shape,
+              untransformed_base_indices,
+              untransformed_slice_shape,
+          )
+          if oob_mode == OOBFillMode.ZEROS
+          else None
+      )
+      rank = gmem_ref_ty.rank
+      sliced = [i for i in range(rank) if i not in squeezed_dims]
+
+      def source_size(sliced_coordinates):
+        # A squeezed dimension's coordinate is its index alone.
+        if bounds is None:
+          return None
+        coordinates = [c(0, index)] * rank
+        for i, coordinate in zip(sliced, sliced_coordinates, strict=True):
+          coordinates[i] = coordinate
+        return _cp_async_source_size(
+            bounds, coordinates, bytes_per_transfer, element_bitwidth
+        )
+
       transformed_strides = gmem_strides
       # A squeezing copy's base indices are untransformed (_prepare_async_copy).
       if not squeezed_dims:
@@ -1715,9 +1795,18 @@ class LaunchContext:
                 strict=True,
             )
         )
+        if bounds is not None and shape[-1] % layout.vec_size:
+          raise NotImplementedError(
+              "A CP_ASYNC copy reading past its reference as zeros needs each"
+              " transfer within one row of its slice"
+          )
         for linear_idx in layout.linear_thread_idxs():
           idx = arith.index_castui(i32, linear_idx)
           gmem_idx = idx
+          coordinates, remaining = [], linear_idx
+          for size in reversed(shape) if bounds is not None else ():
+            coordinates.insert(0, arith.remui(remaining, c(size, index)))
+            remaining = arith.divui(remaining, c(size, index))
           if strided:
             gmem_idx, remaining = c(0, i64), arith.index_castui(i64, linear_idx)
             for size, stride in reversed(
@@ -1734,7 +1823,8 @@ class LaunchContext:
           smem_ptr = utils.getelementptr(smem_base_ptr, [idx], gep_type)
           gmem_ptr = utils.getelementptr(gmem_base_ptr, [gmem_idx], gep_type)
           nvvm.cp_async_shared_global(
-              smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
+              smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier,
+              cp_size=source_size(coordinates),
           )
       else:
         assert swizzle is not None
@@ -1752,6 +1842,15 @@ class LaunchContext:
         lane_offset = utils.dyn_dot(layout.lane_indices(), dst_tiled_strides)
         warp_offset = utils.dyn_dot(layout.warp_indices(), dst_tiled_strides)
         dyn_offset = arith.addi(lane_offset, warp_offset)
+        if bounds is not None:
+          # The thread's row and column in the slice (its columns within a
+          # row's stride, a swizzle's at most).
+          thread_row = arith.index_castui(
+              index, arith.divui(dyn_offset, c(gmem_strides[0], i32))
+          )
+          thread_column = arith.index_castui(
+              index, arith.remui(dyn_offset, c(gmem_strides[0], i32))
+          )
         dyn_offset = arith.divui(dyn_offset, c(offset_scale, i32))
         dyn_offset = arith.extui(i64, dyn_offset)
         dyn_offset = arith.addi(dyn_offset, gmem_offset)
@@ -1777,9 +1876,16 @@ class LaunchContext:
             else nvvm.LoadCacheModifierKind.CA
         )
         for _get, _update, get_base_idx, smem_ptr in transfers:
-          constant_offset = sum(i * s for i, s in zip(get_base_idx(), gmem_strides, strict=True))
+          row, column = get_base_idx()
+          constant_offset = sum(i * s for i, s in zip((row, column), gmem_strides, strict=True))
           gmem_ptr = utils.getelementptr(gmem_base_ptr, [constant_offset // offset_scale], gep_type)
-          nvvm.cp_async_shared_global(smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier)
+          size = None if bounds is None else source_size((
+              arith.addi(thread_row, c(row, index)),
+              arith.addi(thread_column, c(column, index)),
+          ))
+          nvvm.cp_async_shared_global(
+              smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier, cp_size=size
+          )
       if barrier is None:
         nvvm.cp_async_commit_group()
       else:
@@ -2509,6 +2615,7 @@ class LaunchContext:
         slice_shape,
         _,
         dyn_base_indices,
+        _,
         squeezed_dims,
         gather_indices,
         gmem_transform,
