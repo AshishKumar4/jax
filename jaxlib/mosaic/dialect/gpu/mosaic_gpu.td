@@ -351,7 +351,7 @@ def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
     commit groups and has to be awaited with `nvvm.cp_async_wait_group` rather
     than the barrier. When the `barrier` is omitted, `collective` and
     `leader_tracked` must not be set, and `oob_fill_mode` must be
-    `promise_in_bounds`.
+    `promise_in_bounds` or `zeros`.
 
     The `indices` and `slice_lengths` inputs define what slice of the GMEM
     `source` corresponds to the SMEM `destination`. Both `indices` and
@@ -385,8 +385,9 @@ def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
     (Hopper and newer).
 
     The `oob_fill_mode` attribute controls the behavior of out-of-bounds
-    accesses. `zeros` and `undefined` are only supported with TMA (Hopper and
-    newer); the `cp.async` implementation only supports `promise_in_bounds`.
+    accesses. `undefined` is only supported with TMA (Hopper and newer); the
+    `cp.async` implementation supports `promise_in_bounds` and `zeros`, each
+    transfer's source size its bytes inside the GMEM reference.
 
     The `predicate` allows scheduling the transfer conditionally. The async copy
     is always scheduled by at most a single lane in the warpgroup.

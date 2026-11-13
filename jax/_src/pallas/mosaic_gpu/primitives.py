@@ -1084,6 +1084,8 @@ def _copy_gmem_to_smem_lowering(
           f"cluster size {row_major_cluster_size}."
       )
 
+  if oob_mode is None:
+    oob_mode = OOBFillMode.ZEROS
   # TMA is only available on Hopper and newer. On older architectures we fall
   # back to the cp.async implementation.
   if is_cp_async := mgpu.utils.get_arch().major < 9:
@@ -1103,21 +1105,19 @@ def _copy_gmem_to_smem_lowering(
       raise ValueError(
           "Only the TMA implementation supports leader_tracked copies"
       )
-    # cp.async does not predicate out-of-bounds accesses, so the caller has to
-    # guarantee that the copy stays in bounds.
-    if oob_mode != OOBFillMode.PROMISE_IN_BOUNDS:
+    # cp.async fills the bytes past the GMEM reference with zeros by each
+    # transfer's source size (``OOBFillMode.ZEROS``), or trusts the caller's
+    # promise that the copy stays in bounds.
+    if oob_mode not in (OOBFillMode.PROMISE_IN_BOUNDS, OOBFillMode.ZEROS):
       raise ValueError(
           "The cp.async implementation only supports "
-          "oob_mode=OOBFillMode.PROMISE_IN_BOUNDS"
+          "oob_mode=OOBFillMode.PROMISE_IN_BOUNDS or OOBFillMode.ZEROS"
       )
     if has_user_predicate:
       raise NotImplementedError(
           "The cp.async implementation does not support user-defined predicates"
       )
   else:
-    if oob_mode is None:
-      oob_mode = OOBFillMode.ZEROS
-
     if barrier is None:
       raise ValueError(
           "copy_gmem_to_smem without a barrier is only supported on pre-Hopper"
@@ -1376,8 +1376,9 @@ def copy_gmem_to_smem(
       and newer).
     oob_mode: The optional out-of-bounds fill mode. Can be
       ``OOBFillMode.UNDEFINED``, ``OOBFillMode.PROMISE_IN_BOUNDS`` or
-      ``OOBFillMode.ZEROS`` for the TMA implementation, and only
-      ``OOBFillMode.PROMISE_IN_BOUNDS`` for the ``cp.async`` one.
+      ``OOBFillMode.ZEROS`` for the TMA implementation, and
+      ``OOBFillMode.PROMISE_IN_BOUNDS`` or ``OOBFillMode.ZEROS`` for the
+      ``cp.async`` one (each transfer's source size the bytes in bounds).
     predicate: A boolean indicating whether the copy should be performed. If
       ``None``, the copy is always performed. If ``False``, neither the copy nor
       the barrier arrival is performed.
