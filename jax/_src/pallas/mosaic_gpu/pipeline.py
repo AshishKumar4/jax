@@ -417,11 +417,14 @@ def emit_pipeline[T](
           for spec, ref in zip(in_specs, in_gmem_refs)
       )
       for spec in effective_in_specs:
-        if spec.oob_fill_mode is not OOBFillMode.PROMISE_IN_BOUNDS:
+        if spec.oob_fill_mode not in (
+            OOBFillMode.PROMISE_IN_BOUNDS, OOBFillMode.ZEROS
+        ):
           raise NotImplementedError(
-              "emit_pipeline on pre-Hopper GPUs requires input accesses to be"
-              " provably in bounds, or oob_fill_mode="
-              "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
+              "emit_pipeline on pre-Hopper GPUs reads a block past its operand"
+              " as zeros (OOBFillMode.ZEROS) or promised in bounds"
+              " (OOBFillMode.PROMISE_IN_BOUNDS), not "
+              f"{spec.oob_fill_mode}"
           )
     threads = (
         1 if thread_axis is None
