@@ -1249,6 +1249,11 @@ class Barrier(memory.Allocation):
     self.last_observed_phase_by_thread: dict[Thread, int] = (
         {}
     )  # Protected by `self.cv`'s lock.
+    # The threads whose waits on the barrier name their phase (`wait`'s
+    # `phase`): each wait is checked against the barrier as it waits, so such a
+    # thread may let phases pass it between its waits (consumers of alternate
+    # tiles of one ring).
+    self.naming_threads: set[Thread] = set()  # Protected by `self.cv`'s lock.
 
     # Invariant: We allow the lock on `self.cv` to be acquired and held in a
     # scope where `self.shared_memory.lock` is already held, but *not* the other
@@ -1369,6 +1374,8 @@ class Barrier(memory.Allocation):
             i,
             last_observed_phase,
         ) in self.last_observed_phase_by_thread.items():
+          if i in self.naming_threads:
+            continue
           if last_observed_phase < self.phase - 2:
             raise ValueError(
                 f"Thread {i} only observed barrier up to phase"
@@ -1433,8 +1440,16 @@ class Barrier(memory.Allocation):
               f" {phase}, but the barrier has completed {self.phase} phases:"
               f" the hardware's wait at that parity takes phase {taken}."
           )
-        # A waiter that names its phase may have skipped those before it.
+        # A waiter that names its phase may have skipped those before it, and
+        # may skip more before its next wait (`arrive`'s check passes it by):
+        # it and, a warpgroup's, its warps.
         last_observed_phase = phase
+        self.naming_threads.add(thread)
+        if isinstance(thread, Warpgroup):
+          self.naming_threads.update(
+              thread.warp(i)
+              for i in range(mosaic_gpu_core.WarpMesh._NUM_WARPS_PER_WARPGROUP)
+          )
       # Since not all threads in a block may use the barrier, we must lazily
       # initialize the `last_observed_phase_by_thread` array the first time each
       # thread participates in the barrier.
