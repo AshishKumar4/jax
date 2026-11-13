@@ -190,14 +190,22 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
         jax.ShapeDtypeStruct((256, 32), jnp.float16),
         jax.ShapeDtypeStruct((128,), jnp.float32),
     ]
-    with jax.sharding.use_abstract_mesh(mesh):
+    found = []
+
+    def stated(dynamic):
+      # Within a trace, as a kernel states it: the grid a traced extent
+      # where it is dynamic.
       pipeline = plgpu.emit_pipeline(
           lambda *_: None,
-          grid=(steps if steps is not None else jnp.int32(4),),
+          grid=(dynamic if steps is None else steps,),
           in_specs=specs,
           max_concurrent_steps=3,
       )
-      allocations = pipeline.get_allocations(*refs)
+      found.append(pipeline.get_allocations(*refs))
+
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.make_jaxpr(stated)(jnp.int32(4))
+    [allocations] = found
     self.assertEqual(
         [(ref.shape, ref.dtype) for ref in allocations["in_smem_refs"]],
         [((slots, 64, 32), jnp.float16), ((slots, 32), jnp.float32)],
