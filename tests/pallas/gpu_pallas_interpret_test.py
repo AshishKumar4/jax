@@ -1396,15 +1396,20 @@ class InterpretTest(jtu.JaxTestCase):
     y = _kernel(x)
     np.testing.assert_array_equal(y, x + 2)
 
-  def test_consumers_of_alternate_tiles_of_one_ring_skip_its_phases(self):
-    # A two-slot ring, each tile two steps (one rotation), whose tiles two
-    # consumers take in turn: each waits at a slot's every other phase, naming
-    # it (a ping-pong over one ring), and the producer waits for each slot's
-    # release at the phase it names. A tile's consumer starts once the tile
-    # before it has had its steps (`order`, a phase a tile, each consumer
-    # waiting at every other): no consumer names a phase two ahead.
+  @jtu.parameterized.parameters(1, 2)
+  def test_consumers_of_alternate_tiles_of_one_ring_skip_its_phases(
+      self, rotations):
+    # A two-slot ring, each tile `rotations` rotations of its steps, whose tiles
+    # two consumers take in turn: each waits at a slot's phases of its own
+    # tiles, naming each (a ping-pong over one ring), and lets its partner's
+    # pass, two or more a slot where a tile takes two rotations; the producer
+    # waits for each slot's release at the phase it names. A tile's consumer
+    # starts once the tile before it has had its steps (`order`, a phase a
+    # tile, each consumer waiting at every other): no consumer names a phase
+    # two ahead.
     stages, tiles = 2, 4
-    turns = tiles * stages
+    steps = stages * rotations
+    turns = tiles * steps
     x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
 
     @functools.partial(
@@ -1438,11 +1443,11 @@ class InterpretTest(jtu.JaxTestCase):
         def _(tile):
           pl.when(tile > 0)(
               lambda: plgpu.barrier_wait(order, phase=tile - 1))
-          for step in range(stages):
-            turn = tile * stages + step
-            plgpu.barrier_wait(full.at[step], phase=turn // stages)
-            out_ref[turn] = smem[step] + 1
-            plgpu.barrier_arrive(consumed.at[step])
+          for step in range(steps):
+            turn, slot = tile * steps + step, step % stages
+            plgpu.barrier_wait(full.at[slot], phase=turn // stages)
+            out_ref[turn] = smem[slot] + 1
+            plgpu.barrier_arrive(consumed.at[slot])
           plgpu.barrier_arrive(order)
 
       pl.when(thread_id == 1)(lambda: consumer(0))
