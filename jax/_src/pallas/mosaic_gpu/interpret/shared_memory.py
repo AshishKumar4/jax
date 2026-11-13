@@ -1412,6 +1412,18 @@ class Barrier(memory.Allocation):
           f"Barrier {id(self)} was aborted, but no failure was recorded."
       ) from None
 
+  def _check_named(self, thread: Thread, phase: int):
+    """Refuses a wait at `phase` the hardware's wait at its parity would take
+    another phase for: the barrier's latest completed phase or the one it is
+    completing are the two it can wait at (`self.cv`'s lock held)."""
+    if not self.phase - 1 <= phase <= self.phase:
+      taken = self.phase - (phase - self.phase) % 2
+      raise ValueError(
+          f"Thread {thread} is waiting at barrier {id(self)} for phase"
+          f" {phase}, but the barrier has completed {self.phase} phases:"
+          f" the hardware's wait at that parity takes phase {taken}."
+      )
+
   def _wait(
       self,
       thread: Thread,
@@ -1433,23 +1445,17 @@ class Barrier(memory.Allocation):
         # the barrier completed where that has its parity, else for the one it
         # is completing. Any other phase it names is taken for one of those, a
         # phase of the same parity: two or more behind, or one ahead or more.
-        if not self.phase - 1 <= phase <= self.phase:
-          taken = self.phase - (phase - self.phase) % 2
-          raise ValueError(
-              f"Thread {thread} is waiting at barrier {id(self)} for phase"
-              f" {phase}, but the barrier has completed {self.phase} phases:"
-              f" the hardware's wait at that parity takes phase {taken}."
-          )
+        self._check_named(thread, phase)
         # A waiter that names its phase may have skipped those before it, and
         # may skip more before its next wait (`arrive`'s check passes it by):
-        # it and, a warpgroup's, its warps.
+        # it, a warpgroup's warps and a warp's warpgroup (whose observation its
+        # warps' give it).
         last_observed_phase = phase
-        self.naming_threads.add(thread)
-        if isinstance(thread, Warpgroup):
-          self.naming_threads.update(
-              thread.warp(i)
-              for i in range(mosaic_gpu_core.WarpMesh._NUM_WARPS_PER_WARPGROUP)
-          )
+        warpgroup = thread.warpgroup()
+        self.naming_threads |= {thread, warpgroup, *(
+            warpgroup.warp(i)
+            for i in range(mosaic_gpu_core.WarpMesh._NUM_WARPS_PER_WARPGROUP)
+        )}
       # Since not all threads in a block may use the barrier, we must lazily
       # initialize the `last_observed_phase_by_thread` array the first time each
       # thread participates in the barrier.
@@ -1520,6 +1526,10 @@ class Barrier(memory.Allocation):
             )
           self.cv.wait()
 
+        if phase is not None:
+          # Woken past the phase it named, the hardware's poll at its parity
+          # would not have seen it complete.
+          self._check_named(thread, phase)
         if self.enable_logging and logging_info is not None:
           self._log(
               logging_info.format(
