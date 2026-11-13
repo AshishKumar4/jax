@@ -167,6 +167,45 @@ def run_on_sm80(method):
   return method
 
 
+class PipelineAllocationsTest(jtu.JaxTestCase):
+  """A pipeline's scoped buffers stated before it runs (`get_allocations`)."""
+
+  @parameterized.parameters(("8.0", None, 3), ("9.0", None, 3), ("9.0", 2, 2))
+  def test_emit_pipeline_states_its_scoped_allocations(
+      self, capability, steps, slots
+  ):
+    # Three steps' slots of each block, as many as a static grid's steps where
+    # it has fewer, and TMA's barriers alone from Hopper on (cp.async before it
+    # waits on its groups).
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", num_cores=None, platform="cuda",
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=device)
+    specs = [
+        plgpu.BlockSpec((64, 32), lambda i: (i, 0)),
+        plgpu.BlockSpec((32,), lambda i: (i,)),
+    ]
+    refs = [
+        jax.ShapeDtypeStruct((256, 32), jnp.float16),
+        jax.ShapeDtypeStruct((128,), jnp.float32),
+    ]
+    with jax.sharding.use_abstract_mesh(mesh):
+      pipeline = plgpu.emit_pipeline(
+          lambda *_: None,
+          grid=(steps if steps is not None else jnp.int32(4),),
+          in_specs=specs,
+          max_concurrent_steps=3,
+      )
+      allocations = pipeline.get_allocations(*refs)
+    self.assertEqual(
+        [(ref.shape, ref.dtype) for ref in allocations["in_smem_refs"]],
+        [((slots, 64, 32), jnp.float16), ((slots, 32), jnp.float32)],
+    )
+    self.assertEqual(allocations["out_smem_refs"], [])
+    self.assertEqual(allocations["barrier_ref"] is None, capability == "8.0")
+
+
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
   LOWERING_SEMANTICS: ClassVar[plgpu.LoweringSemantics]
 
