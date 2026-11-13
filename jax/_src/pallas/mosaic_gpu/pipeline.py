@@ -296,6 +296,7 @@ def emit_pipeline[T](
     max_concurrent_steps: int = 1,
     init_carry: T | None = None,
     thread_axis: str | None = None,
+    prefetch: Callable[..., Any] | None = None,
 ):
   r"""Creates a function to emit a manual pipeline within a Pallas kernel.
 
@@ -331,6 +332,21 @@ def emit_pipeline[T](
       barrier. Either way the threads meet again after ``body``, before the
       slot is refilled, so no thread overwrites a slot another still reads.
       Only input pipelines take a thread axis.
+    prefetch: Optional. ``prefetch(indices, *input_refs)`` reads a step's first
+      values from its input slots into registers (a matrix product's first
+      fragments). With it, ``body`` takes two more arguments after the carry
+      (if any): ``prefetched``, the values ``prefetch`` read of this step's
+      slots, and ``boundary``, a callable taking no arguments that ``body``
+      calls exactly once, before its last reads of this step's slots end
+      (its last products, their operands already in registers). ``boundary``
+      waits for the next step's slots (as the next step would at its start)
+      and returns ``prefetch`` of them, so the next step's first values load
+      under this step's last products, CUTLASS's multistage order across a
+      step; ``body`` returns them beside its carry
+      (``(next_carry, next_prefetched)``, or ``next_prefetched`` alone
+      without ``init_carry``), and the next step does not wait again. On the
+      last step ``boundary`` waits for nothing more and its values are not
+      read. Input-only pipelines whose specs take no ``delay_release``.
 
   Returns:
     A function that, when called with GMEM input and output refs, executes the
@@ -370,6 +386,12 @@ def emit_pipeline[T](
   # reduce the size of the refs allocated in SMEM.
   if not has_dynamic_grid and max_concurrent_steps > num_steps:
     max_concurrent_steps = int(num_steps)
+  if prefetch is not None and max_concurrent_steps == 1 and (
+      has_dynamic_grid or num_steps > 1
+  ):
+    # One slot is refilled after its step's body, so no step's boundary finds
+    # the next step's slots in flight.
+    raise ValueError("emit_pipeline's prefetch needs two slots or more")
 
   if is_cp_async := mgpu_utils._infer_arch() < (9, 0):
     if out_specs:
@@ -379,6 +401,11 @@ def emit_pipeline[T](
   if thread_axis is not None and out_specs:
     raise NotImplementedError(
         "emit_pipeline with a thread_axis only supports input-only pipelines"
+    )
+  if prefetch is not None and (out_specs or delay_release_levels != [0]):
+    raise NotImplementedError(
+        "emit_pipeline's prefetch takes an input-only pipeline whose specs"
+        " take no delay_release"
     )
 
   def pipeline(*gmem_refs: state.AbstractRef):
@@ -565,10 +592,7 @@ def emit_pipeline[T](
             lambda: None,
         )
 
-    def loop_body(step, carry, *, wait_count=0):
-      (indices, fetch_index_levels, last_store_indices, prev_body_carry,
-       slot, fetch_slots) = carry
-
+    def await_slot(slot, wait_count):
       if barrier_ref is not None:
         # Wait for the current GMEM->SMEM copy to complete, if any.
         gpu_primitives.barrier_wait(barrier_ref.at[slot])
@@ -579,6 +603,20 @@ def emit_pipeline[T](
         # past it, every share of the slot has landed.
         gpu_primitives.wait_gmem_to_smem(wait_count)
         meet()
+
+    def prefetched_at(indices, slot):
+      return prefetch(
+          indices, *(bref.get_ref_for_slot(slot) for bref in in_brefs)
+      )
+
+    def loop_body(step, carry, *, wait_count=0, next_wait_count=0):
+      (indices, fetch_index_levels, last_store_indices, prev_body_carry,
+       slot, fetch_slots, prefetched) = carry
+
+      if prefetch is None:
+        await_slot(slot, wait_count)
+      # Else the step before awaited this step's slot (its ``boundary``), or
+      # the pipeline did before its first step.
       if lead:
         fetch(step, fetch_index_levels, fetch_slots)
       # Wait for the previous output SMEM->GMEM copy to complete.
@@ -587,6 +625,27 @@ def emit_pipeline[T](
             max_concurrent_steps - 1, wait_read_only=True
         )
 
+      extra = ()
+      called = []
+      if prefetch is not None:
+        def boundary():
+          if called:
+            raise ValueError("a pipeline body calls its boundary once")
+          called.append(True)
+          following = next_slot(slot)
+          if barrier_ref is not None:
+            # No copy fills a slot past the last step's: its barrier is not
+            # awaited.
+            lax.cond(
+                step + 1 < num_steps,
+                lambda: gpu_primitives.barrier_wait(barrier_ref.at[following]),
+                lambda: None,
+            )
+          else:
+            await_slot(following, next_wait_count)
+          return prefetched_at(_inc_grid_by_1(indices, grid), following)
+        extra = (prefetched, boundary)
+
       next_body_carry = body(
           indices,
           *(
@@ -594,7 +653,20 @@ def emit_pipeline[T](
               for bref in it.chain(in_brefs, out_brefs)
           ),
           *(prev_body_carry,) if init_carry is not None else (),
+          *extra,
       )
+      next_prefetched = None
+      if prefetch is not None:
+        if not called:
+          raise ValueError(
+              "a pipeline body with prefetch calls its boundary on every path,"
+              " before its last reads of its step's slots: the next step does"
+              " not wait for its slots"
+          )
+        if init_carry is not None:
+          next_body_carry, next_prefetched = next_body_carry
+        else:
+          next_body_carry, next_prefetched = None, next_body_carry
 
       if copies_out_in_loop:
         gpu_primitives.commit_smem()
@@ -647,6 +719,7 @@ def emit_pipeline[T](
           next_body_carry if init_carry is not None else None,
           next_slot(slot),
           tuple(next_slot(fetch_slot) for fetch_slot in fetch_slots),
+          next_prefetched,
       )
 
     fetch_index_levels = []
@@ -664,6 +737,24 @@ def emit_pipeline[T](
         else (jnp.array(-1),) * len(bref.spec.block_shape)
         for bref in out_brefs
     ]
+    first_prefetched = None
+    if prefetch is not None:
+      # The first step's slots, awaited before the loop as each later step's
+      # are by the step before it (``boundary``): on cp.async, past the
+      # groups the prologue issued after the first step's (a dynamic grid's
+      # count is not known, so all of them).
+      if is_cp_async:
+        first_wait = 0 if has_dynamic_grid else (
+            (prologue_steps - 1) * copies_per_step
+        )
+        await_slot(jnp.asarray(0, dtype=jnp.int32), first_wait)
+      elif barrier_ref is not None:
+        lax.cond(
+            num_steps > 0,
+            lambda: gpu_primitives.barrier_wait(barrier_ref.at[0]),
+            lambda: None,
+        )
+      first_prefetched = prefetched_at(indices, jnp.asarray(0, dtype=jnp.int32))
     init_loop_carry = (
         indices,
         fetch_index_levels,
@@ -678,6 +769,7 @@ def emit_pipeline[T](
             )
             for delay_release in delay_release_levels
         ),
+        first_prefetched,
     )
     if is_cp_async and copies_per_step > 0:
       if has_dynamic_grid:
@@ -690,12 +782,21 @@ def emit_pipeline[T](
         )
       else:
         steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
+      steady_wait = (max_concurrent_steps - 1 - lead) * copies_per_step
+      if prefetch is not None:
+        # A steady step's ``boundary`` awaits the next step's slots at the
+        # steady count, as the next step itself would, but the last steady
+        # step's next one is the drain's first, which waits for one group
+        # fewer (no step past the grid fetched): it drains with exact counts.
+        steady_steps = (
+            jnp.maximum(steady_steps - 1, 0) if has_dynamic_grid
+            else max(0, steady_steps - 1)
+        )
       loop_carry = lax.fori_loop(
           0,
           steady_steps,
           functools.partial(
-              loop_body,
-              wait_count=(max_concurrent_steps - 1 - lead) * copies_per_step,
+              loop_body, wait_count=steady_wait, next_wait_count=steady_wait,
           ),
           init_loop_carry,
       )
@@ -708,7 +809,7 @@ def emit_pipeline[T](
         loop_carry = lax.fori_loop(
             steady_steps,
             num_steps,
-            functools.partial(loop_body, wait_count=0),
+            functools.partial(loop_body, wait_count=0, next_wait_count=0),
             loop_carry,
         )
       else:
@@ -719,10 +820,11 @@ def emit_pipeline[T](
               jnp.asarray(step),
               loop_carry,
               wait_count=(num_steps - 1 - step) * copies_per_step,
+              next_wait_count=max(0, num_steps - 2 - step) * copies_per_step,
           )
-      last_indices, _, _, final_carry, _, _ = loop_carry
+      last_indices, _, _, final_carry, _, _, _ = loop_carry
     else:
-      last_indices, _, _, final_carry, _, _ = lax.fori_loop(
+      last_indices, _, _, final_carry, _, _, _ = lax.fori_loop(
           0, num_steps, loop_body, init_loop_carry,
       )
 
