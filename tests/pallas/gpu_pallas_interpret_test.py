@@ -1474,13 +1474,13 @@ class InterpretTest(jtu.JaxTestCase):
             smem=plgpu.SMEM((stages, 128), x.dtype),
             full=plgpu.Barrier(num_barriers=stages),
             consumed=plgpu.Barrier(num_barriers=stages),
-            turns=plgpu.Barrier(num_barriers=warps),
+            ordered=plgpu.Barrier(num_barriers=warps),
         ),
         num_threads=2,
         thread_name='t',
         interpret=InterpretParams(detect_races=True),
     )
-    def _kernel(x_ref, out_ref, smem, full, consumed, turns):
+    def _kernel(x_ref, out_ref, smem, full, consumed, ordered):
       thread_id = jax.lax.axis_index('t')
 
       @pl.when(thread_id == 0)
@@ -1502,14 +1502,14 @@ class InterpretTest(jtu.JaxTestCase):
             # Warp 0's j-th tile waits its predecessor's (j - 1)-th arrival,
             # every other warp's its j-th.
             pl.when(tile > 0)(lambda: plgpu.barrier_wait(
-                turns.at[warp_id],
+                ordered.at[warp_id],
                 phase=tile // warps - (warp_id == 0).astype(jnp.int32)))
             for step in range(stages):
               turn = tile * stages + step
               plgpu.barrier_wait(full.at[step], phase=turn // stages)
               out_ref[turn] = smem[step] + 1
               plgpu.barrier_arrive(consumed.at[step])
-            plgpu.barrier_arrive(turns.at[(warp_id + 1) % warps])
+            plgpu.barrier_arrive(ordered.at[(warp_id + 1) % warps])
 
     np.testing.assert_array_equal(_kernel(x), x + 2)
 
