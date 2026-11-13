@@ -1457,9 +1457,12 @@ class InterpretTest(jtu.JaxTestCase):
 
   def test_consumer_warps_of_alternate_tiles_of_one_ring_skip_its_phases(self):
     # The ping-pong over one ring with its consumers the four warps of one
-    # warpgroup, each the tiles of its index modulo four: three tiles pass a
-    # warp by between its own, so a slot's phases pass the warpgroup its warps'
-    # observations give it as well as each warp.
+    # warpgroup, each the tiles of its index modulo four in turn (a turn
+    # barrier a warp, its predecessor arriving once its tile is done: one
+    # order barrier would have a warp name a phase two ahead before its
+    # first tile): three tiles pass a warp by between its own, so a slot's
+    # phases pass the warpgroup its warps' observations give it as well as
+    # each warp.
     stages, tiles, warps = 2, 8, 4
     turns = tiles * stages
     x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
@@ -1471,13 +1474,13 @@ class InterpretTest(jtu.JaxTestCase):
             smem=plgpu.SMEM((stages, 128), x.dtype),
             full=plgpu.Barrier(num_barriers=stages),
             consumed=plgpu.Barrier(num_barriers=stages),
-            order=plgpu.Barrier(),
+            turns=plgpu.Barrier(num_barriers=warps),
         ),
         num_threads=2,
         thread_name='t',
         interpret=InterpretParams(detect_races=True),
     )
-    def _kernel(x_ref, out_ref, smem, full, consumed, order):
+    def _kernel(x_ref, out_ref, smem, full, consumed, turns):
       thread_id = jax.lax.axis_index('t')
 
       @pl.when(thread_id == 0)
@@ -1496,14 +1499,17 @@ class InterpretTest(jtu.JaxTestCase):
         def _(warp_id):
           @pl.loop(warp_id, tiles, step=warps)
           def _(tile):
-            pl.when(tile > 0)(
-                lambda: plgpu.barrier_wait(order, phase=tile - 1))
+            # Warp 0's j-th tile waits its predecessor's (j - 1)-th arrival,
+            # every other warp's its j-th.
+            pl.when(tile > 0)(lambda: plgpu.barrier_wait(
+                turns.at[warp_id],
+                phase=tile // warps - (warp_id == 0).astype(jnp.int32)))
             for step in range(stages):
               turn = tile * stages + step
               plgpu.barrier_wait(full.at[step], phase=turn // stages)
               out_ref[turn] = smem[step] + 1
               plgpu.barrier_arrive(consumed.at[step])
-            plgpu.barrier_arrive(order)
+            plgpu.barrier_arrive(turns.at[(warp_id + 1) % warps])
 
     np.testing.assert_array_equal(_kernel(x), x + 2)
 
