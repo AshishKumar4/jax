@@ -1796,7 +1796,7 @@ class InterpretTest(jtu.JaxTestCase):
       @pl.kernel(
           out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
           mesh=pltpu.TensorCoreMesh(axis_name='core', num_cores=1),
-          scratch_shapes=[pltpu.SMEM((1,), jnp.int32)],
+          scratch_types=[pltpu.SMEM((1,), jnp.int32)],
           interpret=pltpu.InterpretParams(),
       )
       def kernel(x_hbm_ref, o_hbm_ref, count_ref):
