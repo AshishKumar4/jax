@@ -1783,6 +1783,46 @@ class InterpretTest(jtu.JaxTestCase):
         out = kernel(x)
         np.testing.assert_array_equal(out, x + 1)
 
+  @parameterized.parameters(4, 0)
+  def test_emit_pipeline_carries_its_bodys_value_across_steps(self, steps):
+    # Each step's block added onto the carry the step before returned, the
+    # last carry the pipeline's result: the sum of the blocks, or the carry
+    # given where the grid (traced) has no steps.
+    abstract_mesh = jax.sharding.AbstractMesh(
+        (), (),
+        abstract_device=jax.sharding.AbstractDevice('TPU v6e', 1, 'tpu'),
+    )
+    with jax.sharding.use_abstract_mesh(abstract_mesh):
+      @pl.kernel(
+          out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+          mesh=pltpu.TensorCoreMesh(axis_name='core', num_cores=1),
+          scratch_shapes=[pltpu.SMEM((1,), jnp.int32)],
+          interpret=pltpu.InterpretParams(),
+      )
+      def kernel(x_hbm_ref, o_hbm_ref, count_ref):
+        count_ref[0] = steps
+
+        def body(x_ref, total):
+          return total + x_ref[...]
+
+        total = pltpu.emit_pipeline(
+            body,
+            grid=(count_ref[0],),
+            in_specs=pl.BlockSpec((8, 128), lambda i: (i, 0)),
+            init_carry=jnp.full((8, 128), 1.0, jnp.float32),
+        )(x_hbm_ref)
+
+        def store(held):
+          held[...] = total
+          pltpu.sync_copy(held, o_hbm_ref)
+
+        pl.run_scoped(store, pltpu.VMEM((8, 128), jnp.float32))
+
+      x = jnp.arange(4 * 8 * 128, dtype=jnp.float32).reshape(4, 8, 128)
+      out = kernel(x.reshape(4 * 8, 128))
+      expected = 1.0 + (x.sum(0) if steps else 0.0)
+      np.testing.assert_array_equal(out, expected)
+
   @parameterized.named_parameters(
       ('interpret_params', pltpu.InterpretParams()),
       ('interpret_true', True),
