@@ -2074,11 +2074,10 @@ def _emit_pipeline(
         )
       return body_carry
     else:
-      def pipelined():
-        # pipeline prologue
-        initial_indices = (jnp.int32(0),) * len(grid)
+      initial_indices = (jnp.int32(0),) * len(grid)
+
+      def prologue(brefs):
         scheduler = make_scheduler(0, initial_indices)
-        brefs = map_brefs(lambda bref: bref.initialize_slots(), allocations)
         def _sync_copy_in(bref, ref):
           if (
               bref.is_trivial_windowing
@@ -2096,17 +2095,9 @@ def _emit_pipeline(
             brefs = map_brefs(functools.partial(
                 scheduler.initialize_step, step=step),
                 brefs, refs)
+        return brefs
 
-        # pipeline loop
-        with config.mutable_array_checks(False):
-          brefs, next_indices, body_carry = _fori_loop(
-              0,
-              num_steps,
-              loop_body,
-              (brefs, initial_indices, init_carry),
-          )
-
-        # pipeline epilogue
+      def epilogue(brefs, next_indices):
         final_indices = _prev_index(next_indices, grid)
         scheduler = make_scheduler(num_steps - 1, final_indices)
         with scheduler.grid_env():
@@ -2124,13 +2115,33 @@ def _emit_pipeline(
         if output_wait_read_only:  # Only the source reads were awaited so far.
           fence = lambda bref, ref: bref.wait_out_write(ref, final_indices)
           map_outputs(fence, brefs, refs)
-        return body_carry
+        return brefs
 
+      def loop(brefs, body_carry):
+        with config.mutable_array_checks(False):
+          return _fori_loop(
+              0,
+              num_steps,
+              loop_body,
+              (brefs, initial_indices, body_carry),
+          )
+
+      initialized = lambda: map_brefs(
+          lambda bref: bref.initialize_slots(), allocations)
       if init_carry is None:
-        when(num_steps > 0)(pipelined)
+        @when(num_steps > 0)
+        def _():
+          brefs, next_indices, _ = loop(prologue(initialized()), None)
+          epilogue(brefs, next_indices)
         return None
-      # A grid of no steps runs none and returns the carry it was given.
-      return lax.cond(num_steps > 0, pipelined, lambda: init_carry)
+      # A grid of no steps copies nothing and returns the carry it was given:
+      # only the prologue's and epilogue's copies are guarded, so the carry
+      # stays the loop's alone (one buffer, not a conditional's result too).
+      nonempty = num_steps > 0
+      brefs = lax.cond(nonempty, prologue, lambda brefs: brefs, initialized())
+      brefs, next_indices, body_carry = loop(brefs, init_carry)
+      lax.cond(nonempty, epilogue, lambda brefs, _: brefs, brefs, next_indices)
+      return body_carry
 
   return pipeline
 
