@@ -1,0 +1,108 @@
+From 8732029b5cf411e4767b53d8f5c5c0c38cf9d9f1 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 13 Nov 2026 17:57:47 -0600
+Subject: [PATCH] [XLA] A reducer rooted in a copy of its reduction reduces by
+ the copied operation
+
+Shardy's export holds a sharding on a reducer region's root as a copy of its add. AllReducePromotion rebuilt the
+promoted reducer as a binary of the root's opcode and aborted on the copy ('Invalid binary instruction opcode
+copy'), and MatchReductionComputation read such a reducer as no reduction.
+---
+ .../collectives/all_reduce_promotion.cc       |  9 +++--
+ .../collectives/all_reduce_promotion_test.cc  | 34 +++++++++++++++++++
+ xla/service/collective_ops_utils.cc           |  5 +++
+ 3 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/xla/hlo/transforms/collectives/all_reduce_promotion.cc b/xla/hlo/transforms/collectives/all_reduce_promotion.cc
+index 510136341c..f788a8919a 100644
+--- a/xla/hlo/transforms/collectives/all_reduce_promotion.cc
++++ b/xla/hlo/transforms/collectives/all_reduce_promotion.cc
+@@ -60,9 +60,14 @@ std::unique_ptr<HloInstruction> CloneAllReduce(
+         /*parameter_number=*/0, ShapeUtil::MakeShape(type, {}), "x"));
+     auto y = promoted.AddInstruction(HloInstruction::CreateParameter(
+         /*parameter_number=*/1, ShapeUtil::MakeShape(type, {}), "y"));
++    // A reducer whose root copies its reduction (a sharding exported onto a
++    // region's root is a copy that holds it) reduces by the copied operation.
++    const HloInstruction* reduction = to_apply->root_instruction();
++    while (reduction->opcode() == HloOpcode::kCopy) {
++      reduction = reduction->operand(0);
++    }
+     promoted.AddInstruction(HloInstruction::CreateBinary(
+-        ShapeUtil::MakeShape(type, {}), to_apply->root_instruction()->opcode(),
+-        x, y));
++        ShapeUtil::MakeShape(type, {}), reduction->opcode(), x, y));
+     return inst->GetModule()->AddEmbeddedComputation(promoted.Build());
+   }();
+   new_inst->set_to_apply(to_apply_promoted);
+diff --git a/xla/hlo/transforms/collectives/all_reduce_promotion_test.cc b/xla/hlo/transforms/collectives/all_reduce_promotion_test.cc
+index 140165e762..225e266098 100644
+--- a/xla/hlo/transforms/collectives/all_reduce_promotion_test.cc
++++ b/xla/hlo/transforms/collectives/all_reduce_promotion_test.cc
+@@ -21,7 +21,9 @@ limitations under the License.
+ #include <memory>
+ 
+ #include "absl/strings/string_view.h"
++#include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+ #include "xla/hlo/testlib/pattern_matcher_gmock.h"
+ #include "xla/service/pattern_matcher.h"
+@@ -38,6 +40,38 @@ class AllReducePromotionTest : public HloHardwareIndependentTestBase {
+                                            /*promote_all_reduce_only=*/true};
+ };
+ 
++TEST_F(AllReducePromotionTest, PromotionOfAReducerRootedInACopy) {
++  // Shardy's export holds a sharding on a reducer's root as a copy of its add.
++  absl::string_view hlo_text = R"(
++  HloModule test
++
++  sum {
++    a = u16[] parameter(0)
++    b = u16[] parameter(1)
++    add.1 = u16[] add(a, b)
++    ROOT add.2 = u16[] copy(add.1)
++  }
++
++  ENTRY test_computation {
++    id32 = u32[] replica-id()
++    id = u16[] convert(id32)
++    id2 = u16[2] broadcast(id), dimensions={}
++    a0 = u16[2] constant({10, 15})
++    a1 = u16[2] add(id2, a0)
++    ROOT cp = u16[2] all-reduce(a1), replica_groups={}, to_apply=sum
++  }
++  )";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_text));
++  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&pass_, module.get()));
++  EXPECT_TRUE(changed);
++  const HloInstruction* all_reduce =
++      module->entry_computation()->root_instruction()->operand(0);
++  EXPECT_EQ(all_reduce->to_apply()->root_instruction()->opcode(),
++            HloOpcode::kAdd);
++  EXPECT_EQ(all_reduce->shape().element_type(), U32);
++}
++
+ TEST_F(AllReducePromotionTest, SimplePromotionAllReduce) {
+   absl::string_view hlo_text = R"(
+   HloModule test
+diff --git a/xla/service/collective_ops_utils.cc b/xla/service/collective_ops_utils.cc
+index d2c39d0143..4fed36aa35 100644
+--- a/xla/service/collective_ops_utils.cc
++++ b/xla/service/collective_ops_utils.cc
+@@ -100,6 +100,11 @@ std::optional<ReductionKind> MatchReductionComputation(
+     const HloComputation* computation) {
+   namespace m = match;
+   const HloInstruction* root = computation->root_instruction();
++  // A root that copies the reduction (a sharding exported onto a region's root
++  // is a copy that holds it) is that reduction.
++  while (root->opcode() == HloOpcode::kCopy) {
++    root = root->operand(0);
++  }
+   auto kind = MatchReductionInstruction(root);
+   if (kind && !Match(root, m::Op()
+                                .WithBinaryOperandsAnyOrder(m::Parameter(0),
+-- 
+2.53.0
+

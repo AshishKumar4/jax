@@ -68,6 +68,10 @@ archive_override(
         # client's DebugOptions state of its mode: GEMM fusions compile with no device, and with one take their
         # first compilable config as before (rows 5389 and the GPU tier's "No supported config found").
         "//third_party:xla/deterministic_ops_keep_triton.patch",
+        # A reducer rooted in a copy of its reduction (Shardy's export holds a region root's sharding so)
+        # reduces by the copied operation: AllReducePromotion aborted a CPU bf16 psum's compile on it, and
+        # MatchReductionComputation read it as no reduction (Dew row 5900).
+        "//third_party:xla/reducer_copy_root.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
