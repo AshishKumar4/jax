@@ -2138,12 +2138,37 @@ def _emit_pipeline(
       # only the prologue's and epilogue's copies are guarded, so the carry
       # stays the loop's alone (one buffer, not a conditional's result too).
       nonempty = num_steps > 0
-      brefs = lax.cond(nonempty, prologue, lambda brefs: brefs, initialized())
+      brefs = _cond_slots(nonempty, prologue, initialized())
       brefs, next_indices, body_carry = loop(brefs, init_carry)
-      lax.cond(nonempty, epilogue, lambda brefs, _: brefs, brefs, next_indices)
+      _cond_slots(nonempty, lambda brefs: epilogue(brefs, next_indices), brefs)
       return body_carry
 
   return pipeline
+
+
+def _cond_slots(predicate, update, brefs):
+  """``update(brefs)`` where ``predicate`` holds, ``brefs`` otherwise: a
+  conditional over the buffered refs' slot values alone, their refs (which a
+  conditional cannot return) the same on both sides."""
+  leaves, tree = jax.tree.flatten(brefs)
+  held = [
+      isinstance(leaf, state.TransformedRef)
+      or isinstance(jax_core.get_aval(leaf), state.AbstractRef)
+      for leaf in leaves
+  ]
+
+  def rebuilt(values):
+    values = iter(values)
+    return tree.unflatten(
+        [leaf if ref else next(values) for leaf, ref in zip(leaves, held)])
+
+  def updated(values):
+    new_leaves, new_tree = jax.tree.flatten(update(rebuilt(values)))
+    assert new_tree == tree
+    return [leaf for leaf, ref in zip(new_leaves, held) if not ref]
+
+  values = [leaf for leaf, ref in zip(leaves, held) if not ref]
+  return rebuilt(lax.cond(predicate, updated, lambda values: values, values))
 
 
 def emit_pipeline_with_allocations(
