@@ -158,7 +158,7 @@ def kernel(
     scratch_types: pl_core.ScratchShapeTree = (),
     compiler_params: pl_core.CompilerParams | None = None,
     interpret: Any = False,
-    cost_estimate: pl_core.CostEstimate | None = None,
+    cost_estimate: pl_core.CostEstimate | Callable[..., Any] | None = None,
     debug: bool = False,
     name: str | None = None,
     metadata: dict[str, str] | None = None,
@@ -209,7 +209,11 @@ def kernel(
     compiler_params: The compiler parameters to pass to the backend.
     interpret: Whether to run the function in interpret mode.
     debug: Whether or not to output helpful debugging information.
-    cost_estimate: The cost estimate of the function.
+    cost_estimate: The cost estimate of the function, or a callable of the
+      traced kernel returning one: called with the primitive and the
+      parameters it is bound with (the kernel's jaxprs among them), once the
+      kernel is traced, so a cost read from the kernel's body takes no trace
+      of its own.
     name: The (optional) name of the kernel.
     metadata: Optional dictionary of information about the kernel that will be
       serialized as JSON in the HLO. Can be used for debugging and analysis.

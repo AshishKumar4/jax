@@ -330,7 +330,7 @@ def kernel(
     out_type: object = (),
     scratch_types: ScratchShapeTree = (),
     compiler_params: pallas_core.CompilerParams | None = None,
-    cost_estimate: pallas_core.CostEstimate | None = None,
+    cost_estimate: pallas_core.CostEstimate | Callable[..., Any] | None = None,
     # Mesh kwargs
     grid: tuple[int, ...] = (),
     grid_names: tuple[str, ...] = (),
@@ -356,7 +356,11 @@ def kernel(
       PyTree of ``jax.ShapeDtypeStruct`` or JAX types.
     compiler_params: Additional compiler options. See the `CompilerParams`
       dataclass for more details.
-    cost_estimate: The cost estimate of the function.
+    cost_estimate: The cost estimate of the function, or a callable of the
+      traced kernel returning one: called with the primitive and the
+      parameters it is bound with (the kernel's jaxprs among them), once the
+      kernel is traced, so a cost read from the kernel's body takes no trace
+      of its own.
     grid: A tuple of integers specifying the size of the kernel grid.
     grid_names: The axis names of the grid. Must be the same length as `grid`.
     cluster: A tuple of integers specifying the size of the kernel cluster.
@@ -473,7 +477,10 @@ def kernel(
     add_batch_dim = lambda x: x.update(shape=(axis_size, *x.shape))
     mesh_kwargs_ = dict(mesh_kwargs)
     batched_cost_estimate = None
-    if cost_estimate is not None and jax_core.is_constant_dim(axis_size):
+    if callable(cost_estimate):
+      # Read from the batched kernel's own trace.
+      batched_cost_estimate = cost_estimate
+    elif cost_estimate is not None and jax_core.is_constant_dim(axis_size):
       batched_cost_estimate = dataclasses.replace(
           cost_estimate,
           flops=cost_estimate.flops * axis_size,

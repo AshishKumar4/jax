@@ -155,6 +155,39 @@ class PallasCostEstimateTest(jtu.JaxTestCase):
     self.assertEqual(cost.transcendentals, 0)
     self.assertEqual(cost.bytes_accessed, 4 * (m * k + k * n + m * n))
 
+  def test_a_callable_cost_estimate_reads_the_kernel_as_traced(self):
+    # The callable gets the primitive and the jaxpr it binds, once traced;
+    # what it returns is the kernel's estimate.
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def kernel(x_ref, o_ref):
+      o_ref[...] = jnp.exp(x_ref[...])
+
+    def counted(primitive, params):
+      jaxprs = params["jaxprs"] if "jaxprs" in params else (params["jaxpr"],)
+      eqns = sum(len(jaxpr.eqns) for jaxpr in jaxprs)
+      return pl.CostEstimate(flops=eqns, transcendentals=len(jaxprs),
+                             bytes_accessed=len(primitive.name))
+
+    x = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    calls = {
+        "pallas_call": pl.pallas_call(
+            kernel, out_shape=x, cost_estimate=counted),
+        "mpmd_map": plgpu.kernel(kernel, out_type=x, cost_estimate=counted),
+    }
+    for name, call in calls.items():
+      (eqn,) = jax.make_jaxpr(call)(x).eqns
+      self.assertEqual(eqn.primitive.name, name)
+      bodies = (eqn.params["jaxprs"] if name == "mpmd_map"
+                else (eqn.params["jaxpr"],))
+      self.assertEqual(
+          eqn.params["cost_estimate"],
+          pl.CostEstimate(
+              flops=sum(len(body.eqns) for body in bodies),
+              transcendentals=len(bodies),
+              bytes_accessed=len(name)))
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

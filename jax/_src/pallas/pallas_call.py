@@ -1120,7 +1120,7 @@ def pallas_call(
     interpret: Any = False,
     name: str | None = None,
     compiler_params: pallas_core.CompilerParams | None = None,
-    cost_estimate: CostEstimate | None = None,
+    cost_estimate: CostEstimate | Callable[..., Any] | None = None,
     metadata: dict[str, str] | None = None,
 ) -> Callable[..., Any]:
   """Entry point for creating a Pallas kernel.
@@ -1172,6 +1172,10 @@ def pallas_call(
       (:class:`jax.experimental.pallas.tpu.CompilerParams`,
       :class:`jax.experimental.pallas.triton.CompilerParams`,
       :class:`jax.experimental.pallas.mosaic_gpu.CompilerParams`).
+    cost_estimate: The cost estimate of the kernel, or a callable of the traced
+      kernel returning one: called with the primitive and the parameters it is
+      bound with (the kernel's jaxpr among them), once the kernel is traced, so
+      a cost read from the kernel's body takes no trace of its own.
     metadata: Optional dictionary of information about the kernel that will be
       serialized as JSON in the HLO. Can be used for debugging and analysis.
 
@@ -1227,7 +1231,7 @@ def _pallas_call(
     interpret: Any = False,
     name: str | None = None,
     compiler_params: CompilerParams | None = None,
-    cost_estimate: CostEstimate | None = None,
+    cost_estimate: CostEstimate | Callable[..., Any] | None = None,
     metadata: dict[str, str] | None = None,
 ):
   interpret = (
@@ -1324,6 +1328,15 @@ def _pallas_call(
             f"a different abstract value {out_aval}.")
 
     index_args, rest_args = split_list(flat_args, [grid_mapping.num_index_operands])
+    estimate = (
+        cost_estimate(
+            pallas_call_p,
+            dict(jaxpr=jaxpr, grid_mapping=grid_mapping, mesh=mesh,
+                 out_avals=flat_out_avals),
+        )
+        if callable(cost_estimate)
+        else cost_estimate
+    )
     ctx = (
         api.named_scope(name) if name is not None else contextlib.nullcontext()
     )
@@ -1341,7 +1354,7 @@ def _pallas_call(
           mesh=mesh,
           input_output_aliases=tuple(input_output_aliases.items()),
           compiler_params=compiler_params,
-          cost_estimate=cost_estimate,
+          cost_estimate=estimate,
           metadata=FrozenDict(metadata) if metadata is not None else None,
           name=name,
           # If we're running under GPU Interpret Mode, save the kernel arg

@@ -890,7 +890,7 @@ def mpmd_map(
     compiler_params: Any | None = None,
     interpret: bool | Any = False,
     debug: bool = False,
-    cost_estimate: pallas_core.CostEstimate | None = None,
+    cost_estimate: pallas_core.CostEstimate | Callable[..., Any] | None = None,
     name: str | None = None,
     metadata: dict[str, str] | None = None,
 ) -> Callable[..., Any]:
@@ -1057,7 +1057,7 @@ def _mpmd_map(
     compiler_params: Any | None = None,
     interpret: bool | Any = False,
     debug: bool = False,
-    cost_estimate: pallas_core.CostEstimate | None = None,
+    cost_estimate: pallas_core.CostEstimate | Callable[..., Any] | None = None,
     name: str | None = None,
     metadata: dict[str, str] | None = None,
 ) -> Callable[..., Any]:
@@ -1210,6 +1210,15 @@ def _mpmd_map(
         print(f"jaxpr for {mesh.core_type}")
         print(jaxpr)
 
+    estimate = (
+        cost_estimate(
+            mpmd_map_p,
+            dict(meshes=tuple(meshes), jaxprs=tuple(jaxprs),
+                 out_avals=flat_out_avals),
+        )
+        if callable(cost_estimate)
+        else cost_estimate
+    )
     # TODO(slebedev): The named scope should not be necessary here.
     ctx = (
         api.named_scope(name) if name is not None else contextlib.nullcontext()
@@ -1226,7 +1235,7 @@ def _mpmd_map(
           compiler_params=compiler_params,
           interpret=interpret,
           debug=debug,
-          cost_estimate=cost_estimate,
+          cost_estimate=estimate,
           metadata=FrozenDict(metadata) if metadata is not None else None,
           name=name,
       )
