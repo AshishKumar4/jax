@@ -1,0 +1,99 @@
+From 211d33d0429f65a8907013c2d1eee5b35445006a Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 13 Nov 2026 20:03:04 -0600
+Subject: [PATCH] [XLA] cuDNN frontend 1.32.3
+
+The packed (ragged) d256 attention backward's plan under 1.26.0 holds 9.68 GB of engine workspace at a
+12,288-token call; 1.32.3 over the same cuDNN backend picks the same engine at 577 MiB (Dew row 5916). The
+header patch is refreshed for 1.32.3's includes.
+---
+ third_party/cudnn_frontend/workspace.bzl    |  6 +++---
+ third_party/cudnn_frontend_header_fix.patch | 24 ++++++++++-----------
+ 2 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/third_party/cudnn_frontend/workspace.bzl b/third_party/cudnn_frontend/workspace.bzl
+index 99829b00b8..bafb6be6aa 100644
+--- a/third_party/cudnn_frontend/workspace.bzl
++++ b/third_party/cudnn_frontend/workspace.bzl
+@@ -22,7 +22,7 @@ def repo():
+         name = "cudnn_frontend_archive",
+         build_file = "//third_party:cudnn_frontend.BUILD",
+         patch_file = ["//third_party:cudnn_frontend_header_fix.patch"],
+-        sha256 = "abe33b7c1892655377cc1e82ada80504e76e81f868f55b95ed2efd35c2df587c",
+-        strip_prefix = "cudnn-frontend-1.26.0",
+-        urls = tf_mirror_urls("https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.26.0.zip"),
++        sha256 = "0d98a4958594574ec1795753d0dbe848c34d13e2222412c5638d8ca5f8a4e9bf",
++        strip_prefix = "cudnn-frontend-1.32.3",
++        urls = tf_mirror_urls("https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.32.3.zip"),
+     )
+diff --git a/third_party/cudnn_frontend_header_fix.patch b/third_party/cudnn_frontend_header_fix.patch
+index cf729d06c4..521dec4268 100644
+--- a/third_party/cudnn_frontend_header_fix.patch
++++ b/third_party/cudnn_frontend_header_fix.patch
+@@ -13,10 +13,10 @@
+ # limitations under the License.
+ # ==============================================================================
+ diff --git a/include/cudnn_frontend.h b/include/cudnn_frontend.h
+-index e3f1ec8..373e52d 100644
++index ea6cf09..7ba8355 100644
+ --- a/include/cudnn_frontend.h
+ +++ b/include/cudnn_frontend.h
+-@@ -97,7 +97,7 @@
++@@ -86,7 +86,7 @@
+   *      - Simpler samples on how to use the new API.
+   */
+  
+@@ -26,40 +26,40 @@ index e3f1ec8..373e52d 100644
+  #include "cudnn_frontend_ConvDesc.h"
+  #include "cudnn_frontend_Heuristics.h"
+ diff --git a/include/cudnn_frontend/backend/backend_descriptor.h b/include/cudnn_frontend/backend/backend_descriptor.h
+-index 47387a1..3864c1d 100644
++index 2b67edf..6be2251 100644
+ --- a/include/cudnn_frontend/backend/backend_descriptor.h
+ +++ b/include/cudnn_frontend/backend/backend_descriptor.h
+-@@ -3,7 +3,7 @@
++@@ -8,7 +8,7 @@
+  #include <memory>
+  
+  #include "../graph_helpers.h"
+--#include "cudnn.h"
++-#include <cudnn.h>
+ +#include "third_party/gpus/cudnn/cudnn.h"
+  
+  namespace cudnn_frontend::detail {
+  
+ diff --git a/include/cudnn_frontend/backend/execution_helpers.h b/include/cudnn_frontend/backend/execution_helpers.h
+-index 334ffde..d2ca694 100644
++index 6d16eb3..44559b4 100644
+ --- a/include/cudnn_frontend/backend/execution_helpers.h
+ +++ b/include/cudnn_frontend/backend/execution_helpers.h
+-@@ -2,7 +2,7 @@
++@@ -7,7 +7,7 @@
+  
+  #include <vector>
+  
+--#include "cudnn.h"
++-#include <cudnn.h>
+ +#include "third_party/gpus/cudnn/cudnn.h"
+  
+  #include "backend_descriptor.h"
+  
+ diff --git a/include/cudnn_frontend/backend/plan_helpers.h b/include/cudnn_frontend/backend/plan_helpers.h
+-index 1fa458d..8c37d10 100644
++index 1b7c5e1..9362e1a 100644
+ --- a/include/cudnn_frontend/backend/plan_helpers.h
+ +++ b/include/cudnn_frontend/backend/plan_helpers.h
+-@@ -2,7 +2,7 @@
+- 
++@@ -8,7 +8,7 @@
++ #include <sstream>
+  #include <vector>
+  
+--#include "cudnn.h"
++-#include <cudnn.h>
+ +#include "third_party/gpus/cudnn/cudnn.h"
+  
+  #include "backend_descriptor.h"
+-- 
+2.53.0
+
