@@ -514,6 +514,8 @@ struct CompiledKernel {
   std::string kernel_name;
   int32_t smem_bytes = 0;
   int32_t cluster_size = 1;
+  // What ptxas noted of a loss of performance as it assembled the kernel.
+  std::vector<mosaic::gpu::PtxasNote> assembler_notes;
   // The following fields are used for de/serialization of CompiledKernel.
   std::string object_file;
   std::string host_func_name;
@@ -911,6 +913,15 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
   std::string kernel_name = kernel_name_attr.getValue().str();
   int32_t smem_bytes = smem_bytes_attr.getInt();
   int32_t cluster_size = cluster_size_attr.getInt();
+  std::vector<mosaic::gpu::PtxasNote> assembler_notes;
+  if (auto notes = (*module)->getAttrOfType<mlir::ArrayAttr>(
+          mosaic::gpu::kAssemblerNotesAttr)) {
+    for (auto note : notes.getAsRange<mlir::DictionaryAttr>()) {
+      assembler_notes.push_back(
+          {note.getAs<mlir::StringAttr>("code").getValue().str(),
+           note.getAs<mlir::StringAttr>("message").getValue().str()});
+    }
+  }
 
   ASSIGN_OR_RETURN(
       auto object_file,
@@ -925,9 +936,13 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
 
   ASSIGN_OR_RETURN(auto host_func_name, GetHostFuncName(*module));
 
-  return CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
-                          use_nvshmem, multimem_used, std::move(gpu_binary),
-                          std::move(kernel_name), smem_bytes, cluster_size);
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<CompiledKernel> kernel,
+      CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
+                       use_nvshmem, multimem_used, std::move(gpu_binary),
+                       std::move(kernel_name), smem_bytes, cluster_size));
+  kernel->assembler_notes = std::move(assembler_notes);
+  return kernel;
 }
 
 struct KernelCache {
@@ -1151,6 +1166,11 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
   kernel_proto.set_smem_bytes(kernel->smem_bytes);
   kernel_proto.set_cluster_size(kernel->cluster_size);
   kernel_proto.set_caller_metadata(resources.metadata);
+  for (const PtxasNote& note : kernel->assembler_notes) {
+    mosaic::gpu::AssemblerNote* stated = kernel_proto.add_assembler_notes();
+    stated->set_code(note.code);
+    stated->set_message(note.message);
+  }
   return kernel_proto.SerializeAsString();
 }
 
@@ -1187,12 +1207,18 @@ CustomCallResources::Deserialize(absl::string_view data) {
       GetOrCreateKernel(
           resources->hash,
           [&]() -> absl::StatusOr<std::unique_ptr<CompiledKernel>> {
-            return CreateAndInitJIT(
-                llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
-                                                 "kernel"),
-                std::move(host_func_name), kernel_proto.is_nvshmem_used(),
-                kernel_proto.is_multimem_used(), std::move(gpu_binary),
-                std::move(kernel_name), smem_bytes, cluster_size);
+            ASSIGN_OR_RETURN(
+                std::unique_ptr<CompiledKernel> kernel,
+                CreateAndInitJIT(
+                    llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
+                                                     "kernel"),
+                    std::move(host_func_name), kernel_proto.is_nvshmem_used(),
+                    kernel_proto.is_multimem_used(), std::move(gpu_binary),
+                    std::move(kernel_name), smem_bytes, cluster_size));
+            for (const auto& note : kernel_proto.assembler_notes()) {
+              kernel->assembler_notes.push_back({note.code(), note.message()});
+            }
+            return kernel;
           }));
   return resources;
 }
