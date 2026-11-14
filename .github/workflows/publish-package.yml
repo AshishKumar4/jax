@@ -11,6 +11,10 @@
 # resolves it from here alone, so Dew's lock, which resolves it from PyPI until a pin head maps it here
 # explicitly, would find only what this index holds (ledger 3116: the CUDA plugins' first publish broke every
 # lane's lock gate).
+#
+# The package's build backend, its tests and their dependencies run in `assemble`, a job that holds no storage key and
+# no write token and keeps no Git credential; `index` runs nothing it fetched, holds the index's keys, and takes what
+# `assemble` made as files (Dew ledger 6204: built code never shares a job with publishing credentials).
 name: publish package
 
 on:
@@ -51,14 +55,11 @@ defaults:
     shell: bash
 
 jobs:
-  publish:
+  assemble:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
-      BUCKET: ${{ secrets.R2_BUCKET }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       REPOSITORY: ${{ inputs.repository }}
       REF: ${{ inputs.ref }}
       TESTS: ${{ inputs.tests }}
@@ -66,18 +67,17 @@ jobs:
       UPSTREAM: ${{ inputs.upstream }}
       RELEASE: ${{ inputs.release }}
       PACKAGE_WANTED: ${{ inputs.package }}
-      NEW_PROJECT: ${{ inputs.new_project }}
-      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: The inputs are of their forms
+        run: |
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "::error::repository"; exit 1; }
+          [[ -z "$PACKAGE_WANTED" || "$PACKAGE_WANTED" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::package"; exit 1; }
+          [ -z "$RELEASE" ] || [ -z "$REF" ] || { echo "::error::release and ref name two artifacts: give one"; exit 1; }
       - uses: actions/checkout@v4
         with:
           path: dew
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
-      - name: The index's storage is configured
-        run: |
-          for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
-            [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
-          done
       - name: Fetch PyPI's own wheels
         if: inputs.upstream != ''
         # Every wheel of each release, whatever its Python or platform, checked against PyPI's digest: an installer
@@ -86,6 +86,7 @@ jobs:
           mkdir -p dist
           read -ra releases <<< "$UPSTREAM"
           for release in "${releases[@]}"; do
+            [[ "$release" =~ ^[A-Za-z0-9._-]+==[A-Za-z0-9.+_-]+$ ]] || { echo "::error::upstream: $release"; exit 1; }
             curl -fsS "https://pypi.org/pypi/${release%%==*}/${release##*==}/json" > release.json
             python3 - <<'EOF'
           import hashlib, json, urllib.request
@@ -101,8 +102,9 @@ jobs:
           ls dist
       - name: Fetch the release's wheels
         if: inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          [ -z "$REF" ] || { echo "::error::release and ref name two artifacts: give one"; exit 1; }
           # A wheel's file name holds its project's name with - as _ (PEP 427).
           gh release download "$RELEASE" --repo "$REPOSITORY" --dir dist \
             --pattern "${PACKAGE_WANTED:+${PACKAGE_WANTED//-/_}-}*.whl"
@@ -113,7 +115,7 @@ jobs:
           git clone -q "https://github.com/$REPOSITORY.git" source
           git -C source checkout -q "$REF"
           uv build -q --wheel --out-dir source-dist source
-          cp source-dist/*.whl dist/ 2>/dev/null || { mkdir -p dist && cp source-dist/*.whl dist/; }
+          mkdir -p dist && cp source-dist/*.whl dist/
           ls dist
       - name: Test the wheel
         if: inputs.ref != ''
@@ -124,8 +126,45 @@ jobs:
           read -ra tests <<< "$TESTS"
           # Against the installed wheel, out of the source tree (dew/test_wheel.sh).
           bash dew/dew/test_wheel.sh tested/bin/python source-dist/*.whl source "${tests[@]}"
+      - name: What it made
+        run: mkdir -p dist && ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+          if-no-files-found: ignore
+
+  index:
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      NEW_PROJECT: ${{ inputs.new_project }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+          persist-credentials: false
+      - name: The index's storage is configured
+        run: |
+          for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
+          done
+          [[ -z "$NEW_PROJECT" || "$NEW_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::new_project"; exit 1; }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: wheels
+          path: dist
       - name: Index it
         run: |
+          # Files alone: nothing assemble made is run here; dew/index.sh reads each wheel's name and metadata.
           shopt -s nullglob
           wheels=(dist/*.whl)
           bash dew/dew/index.sh site "${wheels[@]}"

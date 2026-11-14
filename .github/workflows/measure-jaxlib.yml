@@ -3,16 +3,20 @@
 # nowhere: one Python's build cold (as Dew's remote cache stands), then again from a fresh output base (what that cache
 # then serves). Each build's seconds and exit in the run's summary and its builds.tsv artifact (Main, 2026-11-14:
 # whether macOS arm64 and Windows jaxlib builds are cheap enough to keep those platforms).
+#
+# The cache's token reaches Bazel only through a credential helper reading a file (dew/bazel_credentials.py), on no
+# option or line Bazel can echo, and no raw log leaves the runner (Dew ledger 6204: an option once printed it). Inputs
+# reach a shell as environment variables, each checked against its form.
 name: measure jaxlib
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "the fork's commit or branch to build, e.g. release/0.12.0.1.post91"
+        description: "the fork's release branch to build, e.g. release/0.12.0.1.post91"
         required: true
       runner:
-        description: "the hosted runner: macos-14 or windows-latest"
+        description: "the hosted runner: macos-15 or windows-latest"
         required: true
       python:
         required: true
@@ -32,10 +36,27 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      REF: ${{ inputs.ref }}
+      RUNNER: ${{ inputs.runner }}
+      PYTHON: ${{ inputs.python }}
+      ATTEMPT: ${{ matrix.attempt }}
     steps:
+      - name: The inputs are of their forms
+        run: |
+          [[ "$REF" =~ ^release/[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::ref: a release branch"; exit 1; }
+          [[ "$RUNNER" =~ ^(macos-1[4-9]|windows-latest|windows-202[2-9])$ ]] || { echo "::error::runner"; exit 1; }
+          [[ "$PYTHON" =~ ^3\.1[0-9]$ ]] || { echo "::error::python"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: dew
+          path: dew-tools
+          sparse-checkout: dew
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python }}
@@ -51,39 +72,35 @@ jobs:
                      base="C:/b" ;;
             *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
           esac
-          # Dew's remote cache, its token handed by a credential helper that reads it from a file at each request:
-          # no option, command line or Bazel message ever holds it (a header option once split at its space and
-          # Bazel printed the token as a target).
-          printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token"
-          helper="$RUNNER_TEMP/credentials.py"
-          printf 'import json, pathlib, sys\nsys.stdin.read()\nprint(json.dumps({"headers": {"Authorization": ["Bearer " + pathlib.Path(%s).read_text().strip()]}}))\n' \
-            "'$(cygpath -m "$RUNNER_TEMP/bazel.token" 2>/dev/null || echo "$RUNNER_TEMP/bazel.token")'" > "$helper"
+          # The token in a file of the runner's own, out of the build's sources; the variable gone before Bazel runs.
+          token="$RUNNER_TEMP/bazel.token"
+          (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$token")
+          unset DEW_BAZEL_TOKEN
+          helper="$GITHUB_WORKSPACE/dew-tools/dew/bazel_credentials.py"
           case "$RUNNER_OS" in
             Windows) launcher="$RUNNER_TEMP/credentials.bat"
-                     printf '@"%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v python)")" "$(cygpath -w "$helper")" > "$launcher"
+                     printf '@"%s" "%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v python)")" "$(cygpath -w "$helper")" \
+                       "$(cygpath -w "$token")" > "$launcher"
                      launcher=$(cygpath -m "$launcher") ;;
             *) launcher="$RUNNER_TEMP/credentials"
-               printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v python)" "$helper" > "$launcher"
+               printf '#!/bin/sh\nexec %q %q %q "$@"\n' "$(command -v python)" "$helper" "$token" > "$launcher"
                chmod 700 "$launcher" ;;
           esac
           printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --credential_helper=dew-bazel.ashishkmr472.workers.dev=%s\ncommon --remote_upload_local_results=true\n' \
             "$launcher" > .bazelrc.user
           started=$(date +%s) code=0
-          python build/build.py build --wheels=jaxlib --python_version="${{ inputs.python }}" "${config[@]}" \
+          python build/build.py build --wheels=jaxlib --python_version="$PYTHON" "${config[@]}" \
             --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_startup_options=--output_base="$base" \
             --output_path="$RUNNER_TEMP/dist" > "$RUNNER_TEMP/build.log" 2>&1 || code=$?
           seconds=$(( $(date +%s) - started ))
-          rm -f .bazelrc.user "$RUNNER_TEMP/bazel.token"
-          printf '%s\t%s\t%s\t%s\t%s\n' "${{ inputs.runner }}" "${{ inputs.python }}" "${{ matrix.attempt }}" \
-            "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
-          echo "| ${{ inputs.runner }} | cp${{ inputs.python }} | ${{ matrix.attempt }} | ${seconds} s | exit ${code} |" \
-            >> "$GITHUB_STEP_SUMMARY"
+          rm -f .bazelrc.user "$token"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$RUNNER" "$PYTHON" "$ATTEMPT" "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
+          echo "| $RUNNER | cp$PYTHON | $ATTEMPT | ${seconds} s | exit ${code} |" >> "$GITHUB_STEP_SUMMARY"
           # Bazel's last summary lines alone, never its option or target echoes.
           grep -E '^(INFO: (Elapsed|Build completed|[0-9]+ processes)|ERROR: Build did NOT)' "$RUNNER_TEMP/build.log" || true
-          ls -l "$RUNNER_TEMP/dist" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
-          # Its seconds and exit alone: no raw build log leaves the runner (2026-11-14: one carried a token).
+          # Its seconds and exit alone: no raw build log leaves the runner.
           path: ${{ runner.temp }}/builds.tsv

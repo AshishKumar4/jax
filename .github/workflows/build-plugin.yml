@@ -2,13 +2,17 @@
 # and attached to the release `release`: an aarch64 build on the free arm64 runner, where no Dew node is one. Bazel
 # reads and writes Dew's remote cache (DEW_BAZEL_TOKEN), so a build cut off at the job's limit leaves what it built
 # there, and the next run of the same inputs carries on from it.
+#
+# The build runs the fork's code and Bazel's, so its job holds no write token and keeps no Git credential: what it
+# made goes to `attach`, a job that runs nothing built and alone may write the release (Dew ledger 6204). Inputs reach
+# a shell as environment variables, each checked against its form, never as shell source.
 name: build plugin
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "the fork's commit or branch to build, e.g. release/0.12.0.1.post42"
+        description: "the fork's release branch to build, e.g. release/0.12.0.1.post42"
         required: true
       version:
         description: "every wheel's version, e.g. 0.12.0.1.post42"
@@ -28,31 +32,73 @@ on:
         default: "12 13"
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 355
+    permissions:
+      contents: read
+    env:
+      REF: ${{ inputs.ref }}
+      VERSION: ${{ inputs.version }}
+      PYTHONS: ${{ inputs.pythons }}
+      CUDAS: ${{ inputs.cudas }}
     steps:
+      - name: The inputs are of their forms
+        run: |
+          [[ "$REF" =~ ^release/[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::ref: a release branch"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::version"; exit 1; }
+          [[ "$PYTHONS" =~ ^(3\.1[0-9])( 3\.1[0-9])*$ ]] || { echo "::error::pythons"; exit 1; }
+          [[ "$CUDAS" =~ ^(1[2-9])( 1[2-9])*$ ]] || { echo "::error::cudas"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: dew
           sparse-checkout: dew
+          persist-credentials: false
       - name: Build
         env:
           DEW_BAZEL_TOKEN: ${{ secrets.DEW_BAZEL_TOKEN }}
         run: |
-          printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token"
-          DEW_BAZEL_TOKEN_FILE="$RUNNER_TEMP/bazel.token" bash dew/build_plugin.sh "${{ inputs.ref }}" \
-            "${{ inputs.version }}" "$RUNNER_TEMP/out" "${{ inputs.pythons }}" "${{ inputs.cudas }}"
-      - name: Attach
-        env:
-          GH_TOKEN: ${{ github.token }}
+          (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token")
+          unset DEW_BAZEL_TOKEN
+          code=0
+          DEW_BAZEL_TOKEN_FILE="$RUNNER_TEMP/bazel.token" bash dew/build_plugin.sh "$REF" "$VERSION" \
+            "$RUNNER_TEMP/out" "$PYTHONS" "$CUDAS" || code=$?
+          rm -f "$RUNNER_TEMP/bazel.token"
+          exit $code
+      - name: What it made
         run: |
           cd "$RUNNER_TEMP/out"
           # One checksum file a machine and set of Pythons: a later build for other Pythons (cp313 after cp312 and
           # cp314) adds its own beside the first's, never over it.
-          sums="wheels-$(uname -m)-py$(echo ${{ inputs.pythons }} | tr ' ' '-').sha256"
-          cp wheels.sha256 "$sums"
-          gh release upload "${{ inputs.release }}" dist/*.whl "$sums" debug-*.tar.gz -R "$GITHUB_REPOSITORY"
+          cp wheels.sha256 "wheels-$(uname -m)-py$(echo "$PYTHONS" | tr ' ' '-').sha256"
+          mkdir -p "$RUNNER_TEMP/made" && cp dist/*.whl wheels-*.sha256 debug-*.tar.gz "$RUNNER_TEMP/made/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: made
+          path: ${{ runner.temp }}/made/
+          if-no-files-found: error
+
+  attach:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE: ${{ inputs.release }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: The release is of its form
+        run: '[[ "$RELEASE" =~ ^plugin-[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::release"; exit 1; }'
+      - uses: actions/download-artifact@v4
+        with:
+          name: made
+          path: made
+      - name: Attach
+        run: gh release upload "$RELEASE" made/*.whl made/wheels-*.sha256 made/debug-*.tar.gz -R "$GITHUB_REPOSITORY"

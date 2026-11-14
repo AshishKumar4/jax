@@ -46,14 +46,11 @@ base=$(sed -n 's/^_version = "\(.*\)"$/\1/p' jax/version.py)
 case "$version" in "$base"?*) suffix=${version#"$base"} ;; *) echo "$version is not $base with a suffix"; exit 1 ;; esac
 sed -i "s/^_release_version: str | None = .*/_release_version: str | None = None/" jax/version.py
 grep -q "^_release_version: str | None = None$" jax/version.py
-# Bazel's credential helper protocol: the request on stdin, its headers as JSON on stdout. The helper reads the
-# token file when Bazel calls it.
+# Bazel's credential helper (dew/bazel_credentials.py): the request on stdin, its headers as JSON on stdout, the
+# token read from its file when Bazel calls it and on no line Bazel can echo (Dew ledger 6204). The launcher passes
+# the helper and the file as quoted arguments.
 helper="$tree/credentials"
-cat > "$helper" <<EOF
-#!/bin/sh
-cat > /dev/null
-printf '{"headers": {"Authorization": ["Bearer %s"]}}' "\$(tr -d '\n' < '$(realpath "$token_file")')"
-EOF
+printf '#!/bin/sh\nexec python3 %q %q "$@"\n' "$here/bazel_credentials.py" "$(realpath "$token_file")" > "$helper"
 chmod 700 "$helper"
 host=${cache#https://}
 host=${host%%/*}
