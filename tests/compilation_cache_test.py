@@ -210,6 +210,26 @@ class CompilationCacheTest(CompilationCacheTestCase):
     self.assertIsNotNone(cc._cache)
     self.assertTrue(cc._cache_initialized)
 
+  def test_a_compile_for_compile_only_gpus_caches_only_where_it_states_its_tuning(self):
+    # A client over GPUs' topology runs nothing and autotunes nothing.
+    deviceless = mock.Mock(runtime_type="compile_only_runtime", platform="cuda")
+    attached = mock.Mock(runtime_type="stream_executor", platform="cuda")
+
+    def options(**overrides):
+      built = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      built.env_option_overrides = list(overrides.items())
+      return built
+
+    self.assertFalse(compiler._states_its_tuning(options(), deviceless))
+    self.assertTrue(compiler._states_its_tuning(
+        options(xla_gpu_autotune_level=0), deviceless))
+    self.assertTrue(compiler._states_its_tuning(
+        options(xla_gpu_require_complete_aot_autotune_results=True),
+        deviceless))
+    self.assertTrue(compiler._states_its_tuning(options(), attached))
+    with mock.patch.dict(os.environ, {"XLA_FLAGS": "--xla_gpu_autotune_level=0"}):
+      self.assertTrue(compiler._states_its_tuning(options(), deviceless))
+
   def test_get_no_executable(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
     devices = np.array([[jax.local_devices()[0]]])
