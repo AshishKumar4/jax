@@ -397,8 +397,6 @@ xla_flags_to_exclude_from_cache_key = [
     "--xla_dump_hlo_as_long_text",
     "--xla_dump_hlo_as_html",
     "--xla_dump_hlo_as_dot",
-    "--xla_dump_hlo_unoptimized_snapshots",
-    "--xla_enable_dumping",
     "--xla_dump_to",
     "--xla_force_host_platform_device_count",
     "--xla_dump_disable_metadata",
