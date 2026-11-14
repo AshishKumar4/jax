@@ -2078,7 +2078,7 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
   @parameterized.product(
       lhs_transpose=(False, True),
       rhs_transpose=(False, True),
-      in_jax_dtype=(jnp.float16, jnp.bfloat16, jnp.float8_e5m2, jnp.float8_e4m3fn),  # TODO(apaszke): f32
+      in_jax_dtype=(jnp.float16, jnp.bfloat16, jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float32),
       out_jax_dtype=(jnp.float16, jnp.float32,),
       m=(64, 128,),  # TODO(apaszke): 64, 192, 256
       n=(64, 128, 192, 224, 256, 512),
@@ -2246,6 +2246,11 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     x = self.prng.uniform(-1, 1, x_shape).astype(in_jax_dtype)
     y_shape = (n, k) if rhs_transpose else (k, n)
     y = self.prng.uniform(-1, 1, y_shape).astype(in_jax_dtype)
+    if in_jax_dtype == jnp.float32:
+      # f32 operands are read as TF32: inputs TF32 holds exactly (10 mantissa
+      # bits), so the product differs from float64's by f32 accumulation alone.
+      x, y = ((v.view(np.uint32) & np.uint32(0xFFFFE000)).view(np.float32)
+              for v in (x, y))
     out_shape = jax.ShapeDtypeStruct((m, n), out_jax_dtype)
     if y_shape[0] % rhs_tiling[0] != 0 or y_shape[1] % rhs_tiling[1] != 0:
       self.skipTest("rhs tiling must divide y_shape")
@@ -2271,12 +2276,8 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     z = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), (x, y), out_shape, scratch_shape
     )(x, y)
-    x32, y32 = x.astype(np.float32), y.astype(np.float32)
-    ref = jnp.matmul(
-        x32.T if lhs_transpose else x32,
-        y32.T if rhs_transpose else y32,
-        precision="high",
-    )
+    x64, y64 = x.astype(np.float64), y.astype(np.float64)
+    ref = np.matmul(x64.T if lhs_transpose else x64, y64.T if rhs_transpose else y64)
     atol = 2e-2 if out_jax_dtype == jnp.float16 else 2e-5
     rtol = 8e-4 if out_jax_dtype == jnp.float16 else 1e-7
     np.testing.assert_allclose(z, ref, atol=atol, rtol=rtol)
