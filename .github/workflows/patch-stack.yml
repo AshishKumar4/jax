@@ -204,6 +204,7 @@ jobs:
       NEW: ${{ needs.carry.outputs.new }}
       RESULT: ${{ needs.carry.outputs.result }}
       TESTED: ${{ needs.carry.outputs.tested }}
+      PUSHED: ${{ needs.candidate.result }}
     steps:
       - name: Open an issue
         run: |
@@ -211,7 +212,9 @@ jobs:
             conflict) why="a fix does not apply" ;;
             upstreamed) why="the release holds every fix: Dew can return to it" ;;
             rebased)
-              if [ "$TESTED" = success ]; then
+              if [ "$PUSHED" != success ]; then
+                why="the stack rebased, but candidate/v$NEW was not pushed ($PUSHED)"
+              elif [ "$TESTED" = success ]; then
                 why="candidate/v$NEW is rebased and green, for its whole-stack review before publish"
               else
                 why="candidate/v$NEW is rebased, its tests red"
@@ -319,7 +322,7 @@ jobs:
 
   index:
     needs: [carry, assemble]
-    if: always() && (needs.assemble.result == 'success' || (inputs.yank != '' && needs.carry.outputs.release == ''))
+    if: always() && (needs.assemble.result == 'success' || (inputs.yank != '' && needs.carry.result == 'success' && needs.carry.outputs.release == ''))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -342,21 +345,22 @@ jobs:
           for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
             [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
           done
+      # What assemble made, into a directory of its own: no file of it lands on this job's own scripts.
       - uses: actions/download-artifact@v4
         if: needs.assemble.result == 'success'
         with:
           name: artifacts
-          path: .
+          path: incoming
       - name: Index them
         run: |
           # jax (its wheels, or only the files `yank` names), then each native project, every one through
           # dew/index.sh, which reads each wheel's name and metadata and runs nothing of it.
           shopt -s nullglob
-          PACKAGE=jax bash dew/dew/index.sh site dist/*.whl
+          PACKAGE=jax bash dew/dew/index.sh site incoming/dist/*.whl
           export YANK=
           for cuda in $CUDAS; do
             for project in pjrt plugin; do
-              wheels=(native/jax_cuda"$cuda"_"$project"-*.whl)
+              wheels=(incoming/native/jax_cuda"$cuda"_"$project"-*.whl)
               [ ${#wheels[@]} -eq 0 ] || bash dew/dew/index.sh site "${wheels[@]}"
             done
           done

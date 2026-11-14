@@ -132,7 +132,7 @@ jobs:
         with:
           name: wheels
           path: dist/
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   index:
     needs: assemble
@@ -157,14 +157,14 @@ jobs:
             [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
           done
           [[ -z "$NEW_PROJECT" || "$NEW_PROJECT" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::new_project"; exit 1; }
+      # What assemble made, into a directory of its own: no file of it lands on this job's own scripts.
       - uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: wheels
-          path: dist
+          path: incoming
       - name: Index it
         run: |
           # Files alone: nothing assemble made is run here; dew/index.sh reads each wheel's name and metadata.
           shopt -s nullglob
-          wheels=(dist/*.whl)
+          wheels=(incoming/*.whl)
           bash dew/dew/index.sh site "${wheels[@]}"

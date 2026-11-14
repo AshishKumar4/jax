@@ -4,7 +4,7 @@ beside this script; aarch64's are built by the fork's build-plugin workflow on G
 
     python3 dew/plugin_jobs.py VERSION SHA > dew/plugin-jobs.json
     node launch dew-a10-build-<ts> lambda:gpu_1x_a10 --role build
-    node put dew-a10-build-<ts> dew/bazel.token dew/debug_split.py dew/build_plugin.sh
+    node put dew-a10-build-<ts> dew/bazel.token dew/debug_split.py dew/bazel_credentials.py dew/build_plugin.sh
     node push dew-a10-build-<ts> dew/plugin-jobs.json
 
 A plugin build needs no GPU: Bazel's CUDA toolchain is hermetic and Dew's remote cache serves its objects. It never
