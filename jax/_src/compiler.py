@@ -631,6 +631,34 @@ def _resolve_compilation_strategy(
     # enabled. This is also the AutoPGLE-disabled path.
     return cache_key, first_pass_compile_options
 
+def _states_its_tuning(options: xc.CompileOptions, backend: xc.Client) -> bool:
+  """Whether a compile's program is the one its key names a device's to be.
+
+  A compile for compile-only GPUs (a client over their topology, no device to
+  run them) cannot autotune: unless its options say how it is tuned, XLA
+  compiles its default configs, a program a device's tuned compile under the
+  same key never is (a GEMM fusion read 7 to 80 times slower from such an
+  entry). Its options say so where it autotunes nothing
+  (`xla_gpu_autotune_level` 0, part of the key) or takes every autotuned
+  config from the stored results a device's compile wrote
+  (`xla_gpu_require_complete_aot_autotune_results`, which fails where one is
+  missing). Every other compile states its own.
+  """
+  if (backend.runtime_type != "compile_only_runtime"
+      or backend.platform not in ("cuda", "rocm")):
+    return True
+  # The compile's own options, else the process's XLA_FLAGS (the last of a
+  # flag's occurrences, a bare flag true), as the plugin applies them.
+  stated = {}
+  for token in os.getenv("XLA_FLAGS", "").split():
+    name, equals, value = token.removeprefix("--").partition("=")
+    stated[name] = value if equals else "true"
+  stated.update(dict(options.env_option_overrides))
+  level = stated.get("xla_gpu_autotune_level")
+  complete = stated.get("xla_gpu_require_complete_aot_autotune_results")
+  return str(level) == "0" or str(complete).lower() == "true"
+
+
 def _get_cache_key(
     options: xc.CompileOptions,
     backend: xc.Client,
@@ -638,6 +666,11 @@ def _get_cache_key(
     devices: np.ndarray,
     override_fdo_profile: bytes | None = None) -> str | None:
   if not compilation_cache.is_cache_used(backend):
+    return None
+  if not _states_its_tuning(options, backend):
+    # Neither read nor written: an untuned program under its device's key.
+    logger.debug("compile_or_get_cached: a compile for compile-only GPUs "
+                 "that states no tuning skips the persistent cache")
     return None
   if override_fdo_profile is not None:
     options = copy.deepcopy(options)
