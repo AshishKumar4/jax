@@ -48,6 +48,7 @@ import numpy as np
 from jax import monitoring
 from jax._src import core as jax_core
 from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
+from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
 from jax._src.pallas.mosaic_gpu import lowering_cache
@@ -178,7 +179,9 @@ def load_kernels(case):
 def make_kernel(case):
   params = case.get("compiler_params")
   if params is not None:
-    params = plgpu.CompilerParams(**params)
+    params = plgpu.CompilerParams(**{
+        name: value.encode() if name == "metadata" else value
+        for name, value in params.items()})
   factory = getattr(load_kernels(case), case.get("kernel", "plain"))
   return factory(case["size"], case["power"], params, case["scale"],
                  **case.get("kernel_args", {}))
@@ -201,7 +204,7 @@ def lower(case, kernel, x):
   if kind is None:
     mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
     with jax.sharding.use_abstract_mesh(mesh):
-      return jax.jit(kernel).trace(x).lower(lowering_platforms=("cuda",)).as_text()
+      return jax.jit(kernel).trace(x).lower(lowering_platforms=("cuda",))
   # A kernel run by each of two devices, of a mesh that is a compile-only
   # target's (an abstract one) or the process's own (its two CPUs), lowered for
   # the GPU.
@@ -212,14 +215,30 @@ def lower(case, kernel, x):
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("x",))
   p = jax.sharding.PartitionSpec
   body = jax.shard_map(kernel, mesh=mesh, in_specs=p(), out_specs=p(), check_vma=False)
-  return jax.jit(body).trace(x).lower(lowering_platforms=("cuda",)).as_text()
+  return jax.jit(body).trace(x).lower(lowering_platforms=("cuda",))
+
+
+def caller_metadata(lowered) -> str | None:
+  """What the lowered program's Mosaic GPU call carries of its caller
+  (`CompilerParams.metadata`), read from the call's backend config."""
+  found = []
+
+  def visit(operation):
+    if (operation.name == "stablehlo.custom_call"
+        and "metadata" in (config := ir.DictAttr(operation.attributes["backend_config"]))):
+      found.append(ir.StringAttr(config["metadata"]).value)
+    return ir.WalkResult.ADVANCE
+
+  lowered.compiler_ir("stablehlo").operation.walk(visit)
+  return found[0] if found else None
 
 
 def one(case, rec, kernel, x):
   """One lowering: what the cache counted, and what it produced or raised."""
   rec.reset()
   try:
-    text = lower(case, kernel, x)
+    lowered = lower(case, kernel, x)
+    text = lowered.as_text()
   except Exception as e:  # pylint: disable=broad-exception-caught
     return {"events": list(rec.events), "error": type(e).__name__,
             "message": str(e)[:600]}
@@ -230,6 +249,7 @@ def one(case, rec, kernel, x):
       "seconds_saved": list(rec.saved),
       "normalized": normalize(result),
       "text_sha": hashlib.sha256(text.encode()).hexdigest(),
+      "caller_metadata": caller_metadata(lowered),
       "has_file_locations": '.py"' in asm,
       "reads_in_snapshot": sorted({n for n, inside in rec.reads if inside}),
       "reads_outside": sorted({n for n, inside in rec.reads if not inside}),

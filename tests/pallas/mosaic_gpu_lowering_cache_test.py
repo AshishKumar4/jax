@@ -147,6 +147,18 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
 
   # -- what makes a miss
 
+  def test_the_callers_metadata_is_no_input_of_the_key_and_a_hit_carries_its_own(self):
+    # A caller's statement of its launch (`CompilerParams.metadata`) rides the
+    # call, not the module: kernels differing in it alone share one lowering,
+    # each call carrying its own caller's.
+    first = self.lower(compiler_params={"metadata": b"launch-a"})
+    self.assertEqual(first["events"], ["miss"])
+    second = self.lower(compiler_params={"metadata": b"launch-b"})
+    self.assertEqual(second["events"], ["hit"], second)
+    self.assertEqual((first["caller_metadata"], second["caller_metadata"]),
+                     ("launch-a", "launch-b"))
+    self.assertLen(self.entries(), 1)
+
   def test_each_input_of_the_key_is_one(self):
     base = self.lower()
     self.assertEqual(base["events"], ["miss"])
