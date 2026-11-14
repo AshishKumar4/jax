@@ -29,8 +29,8 @@ token_file=${DEW_BAZEL_TOKEN_FILE:-$here/bazel.token}
 cache=${DEW_BAZEL_CACHE:-https://dew-bazel.ashishkmr472.workers.dev/bazel}
 tree=$(mktemp -d /tmp/dew-plugin-XXXX)
 trap 'rm -rf "$tree"' EXIT
-# On armada (a `build` job, dew/plugin_jobs.py) the token is the secret DEW_BAZEL_TOKEN in the environment, kept in
-# a file of the build's own for the credential helper; a file named explicitly wins.
+# Where the token is the secret DEW_BAZEL_TOKEN in the environment, it is kept in a file of the build's own for the
+# credential helper; a file named explicitly wins.
 if [ -z "${DEW_BAZEL_TOKEN_FILE:-}" ] && [ -n "${DEW_BAZEL_TOKEN:-}" ]; then
   token_file="$tree/token"
   (umask 077 && printf %s "$DEW_BAZEL_TOKEN" > "$token_file")
