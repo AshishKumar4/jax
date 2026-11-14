@@ -35,10 +35,14 @@ import dataclasses
 from dataclasses import dataclass
 import enum
 import itertools as it
+import os
+import shutil
+import tempfile
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from jax._src import config
 from jax._src import core
+from jax._src import peak_live
 from jax._src import sharding as sharding_lib
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -673,13 +677,35 @@ class Lowered(Stage):
 
   def compile(
       self, compiler_options: CompilerOptions | None = None, *,
-      device_assignment: tuple[xc.Device, ...] | None = None) -> Compiled:
-    """Compile, returning a corresponding ``Compiled`` instance."""
+      device_assignment: tuple[xc.Device, ...] | None = None,
+      peak_live_in: str | os.PathLike | None = None) -> Compiled:
+    """Compile, returning a corresponding ``Compiled`` instance.
+
+    With ``peak_live_in``, a directory, XLA dumps the compile's buffer
+    assignment into a directory of its own there, which is read into the
+    buffers live at its temporary allocation's peak (``Compiled.peak_live``)
+    and then removed.
+    """
+    dumped = (None if peak_live_in is None
+              else tempfile.mkdtemp(prefix="peak-live-", dir=peak_live_in))
+    if dumped is not None:
+      # The private dump's options over the caller's: what it reads must be
+      # written as it reads it.
+      compiler_options = {**(compiler_options or {}),
+                          **peak_live.dump_options(dumped)}
     kw: dict[str, Any] = {"compiler_options": compiler_options,
                           "device_assignment": device_assignment}
-    return Compiled(self._lowering.compile(**kw), self._lowering.const_args,
-                    self.args_info, self.out_tree, self._no_kwargs,
-                    self._in_types, self._out_types)
+    try:
+      compiled = Compiled(self._lowering.compile(**kw),
+                          self._lowering.const_args, self.args_info,
+                          self.out_tree, self._no_kwargs, self._in_types,
+                          self._out_types)
+      if dumped is not None:
+        compiled._peak_live = peak_live.read(dumped)
+    finally:
+      if dumped is not None:
+        shutil.rmtree(dumped, ignore_errors=True)
+    return compiled
 
   def as_text(self, dialect: str | None = None, *,
               debug_info: bool = False) -> str:
@@ -744,7 +770,8 @@ class Compiled(Stage):
   common API for querying properties of compiled computations across
   JAX's various compilation paths and backends.
   """
-  __slots__ = ["args_info", "out_tree", "_executable", "_no_kwargs", "_params"]
+  __slots__ = ["args_info", "out_tree", "_executable", "_no_kwargs", "_params",
+               "_peak_live"]
 
   # PyTree of ArgInfo, including dead args, but not const_args
   args_info: Any
@@ -763,6 +790,7 @@ class Compiled(Stage):
         self._executable, self._no_kwargs, self.in_tree, self.out_tree,
         const_args, in_types, out_types)
     self._call = None
+    self._peak_live = None
 
   def as_text(self) -> str | None:
     """A human-readable text representation of this executable.
@@ -813,6 +841,15 @@ class Compiled(Stage):
       return self._executable.memory_analysis()
     except NotImplementedError:
       return None
+
+  def peak_live(self) -> tuple[peak_live.LiveBuffer, ...] | None:
+    """The buffers live at the peak of the compile's temporary allocation.
+
+    Read where the compile was asked for them (``Lowered.compile``'s
+    ``peak_live_in``) from XLA's own buffer assignment; ``None`` otherwise, or
+    where the compile ran no compiler (the persistent cache answered it).
+    """
+    return self._peak_live
 
   @property
   def in_avals(self):
