@@ -1,0 +1,75 @@
+# How long the fork's jaxlib takes to build on one of GitHub's hosted runners, by jax's own CI configuration of that
+# machine (.bazelrc ci_darwin_arm64 without its push to Google's cache; ci_windows_amd64), measured and published
+# nowhere: one Python's build cold (as Dew's remote cache stands), then again from a fresh output base (what that cache
+# then serves). Each build's seconds and exit in the run's summary and its builds.tsv artifact (Main, 2026-11-14:
+# whether macOS arm64 and Windows jaxlib builds are cheap enough to keep those platforms).
+name: measure jaxlib
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "the fork's commit or branch to build, e.g. release/0.12.0.1.post91"
+        required: true
+      runner:
+        description: "the hosted runner: macos-14 or windows-latest"
+        required: true
+      python:
+        required: true
+        default: "3.12"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      max-parallel: 1
+      matrix:
+        attempt: [cold, cached]
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - name: Build
+        env:
+          DEW_BAZEL_TOKEN: ${{ secrets.DEW_BAZEL_TOKEN }}
+        run: |
+          case "$RUNNER_OS" in
+            macOS) config=(--bazel_options=--config=clang_local --bazel_options=--macos_minimum_os=11.0)
+                   base="$RUNNER_TEMP/base" ;;
+            Windows) config=(--bazel_options=--config=ci_windows_amd64
+                             "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
+                     base="C:/b" ;;
+            *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
+          esac
+          # Dew's remote cache, its token in a file Bazel reads and no command line shows.
+          printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --remote_header=Authorization=Bearer %s\ncommon --remote_upload_local_results=true\n' \
+            "$DEW_BAZEL_TOKEN" > .bazelrc.user
+          started=$(date +%s) code=0
+          python build/build.py build --wheels=jaxlib --python_version="${{ inputs.python }}" "${config[@]}" \
+            --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_startup_options=--output_base="$base" \
+            --output_path="$RUNNER_TEMP/dist" > "$RUNNER_TEMP/build.log" 2>&1 || code=$?
+          seconds=$(( $(date +%s) - started ))
+          rm -f .bazelrc.user
+          printf '%s\t%s\t%s\t%s\t%s\n' "${{ inputs.runner }}" "${{ inputs.python }}" "${{ matrix.attempt }}" \
+            "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
+          echo "| ${{ inputs.runner }} | cp${{ inputs.python }} | ${{ matrix.attempt }} | ${seconds} s | exit ${code} |" \
+            >> "$GITHUB_STEP_SUMMARY"
+          tail -40 "$RUNNER_TEMP/build.log"
+          ls -l "$RUNNER_TEMP/dist" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
+          path: |
+            ${{ runner.temp }}/builds.tsv
+            ${{ runner.temp }}/build.log
