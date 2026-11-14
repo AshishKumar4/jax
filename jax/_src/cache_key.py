@@ -408,6 +408,7 @@ xla_flags_to_exclude_from_cache_key = [
     "--xla_gpu_cuda_data_dir",
     "--xla_gpu_experimental_autotune_cache_mode",
     "--xla_gpu_per_fusion_autotune_cache_dir",
+    "--xla_gpu_require_complete_aot_autotune_results",
     "--xla_tpu_compiler_variant",
 ]
 
@@ -447,6 +448,12 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   debug_options.xla_dump_disable_metadata = False
   debug_options.xla_dump_hlo_pipeline_re = ""
   debug_options.xla_gpu_experimental_autotune_cache_mode = 0
+  # A compile without a device that requires each autotuned instruction's
+  # config from the autotune cache fails where one is missing and otherwise
+  # applies the config the device compile stored there: the requirement
+  # changes no compile that succeeds, so a host compiling ahead writes the
+  # entries its device's run reads.
+  debug_options.xla_gpu_require_complete_aot_autotune_results = False
 
   # Optional way to specify the cuda install path to be used by the compiler.
   # This could possibly affect the cuda version compiled with, but this should

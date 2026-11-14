@@ -75,6 +75,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     debug_options.xla_dump_disable_metadata = True
     debug_options.xla_dump_hlo_pipeline_re = "xyzzy"
     debug_options.xla_gpu_experimental_autotune_cache_mode = 2
+    debug_options.xla_gpu_require_complete_aot_autotune_results = True
     hash2 = self.get_hashed_value(
         cache_key._hash_serialized_compile_options, compile_options
     )
