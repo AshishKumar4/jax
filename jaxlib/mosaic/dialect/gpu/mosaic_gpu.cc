@@ -354,13 +354,10 @@ llvm::LogicalResult AsyncLoadOp::verify() {
     if (getLeaderTracked()) {
       return emitOpError("`leader_tracked` requires a `barrier`.");
     }
-    // Without a barrier the copy is cp.async's, which reads past its source as
-    // zeros by each transfer's source size, or trusts a promise.
-    if (getOobFillMode() != OOBFillMode::kPromiseInBounds &&
-        getOobFillMode() != OOBFillMode::kZeros) {
+    if (getOobFillMode() != OOBFillMode::kPromiseInBounds) {
       return emitOpError(
-          "Only the `promise_in_bounds` and `zeros` out-of-bounds fill modes "
-          "are supported without a `barrier`.");
+          "Only the `promise_in_bounds` out-of-bounds fill mode is supported "
+          "without a `barrier`.");
     }
   }
 
