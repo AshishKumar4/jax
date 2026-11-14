@@ -55,4 +55,4 @@ jobs:
           # cp314) adds its own beside the first's, never over it.
           sums="wheels-$(uname -m)-py$(echo ${{ inputs.pythons }} | tr ' ' '-').sha256"
           cp wheels.sha256 "$sums"
-          gh release upload "${{ inputs.release }}" dist/*.whl "$sums" -R "$GITHUB_REPOSITORY"
+          gh release upload "${{ inputs.release }}" dist/*.whl "$sums" debug-*.tar.gz -R "$GITHUB_REPOSITORY"

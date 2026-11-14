@@ -20,7 +20,8 @@
 # cache's bazel-scope token (else DEW_BAZEL_TOKEN, else bazel.token beside this script), which Bazel reads through
 # a credential helper when it calls the cache, so no rc file or command line holds it (JAX's .bazelrc announces every
 # rc line it reads); DEW_BAZEL_CACHE is the cache's URL. OUT receives the wheels (dist/), their sha256 list
-# (wheels.sha256), each build's log and seconds (builds.tsv) and the commit built (commit.txt).
+# (wheels.sha256), their objects' debug files by build-id (debug/, debug-<machine>.tar.gz), each build's log and
+# seconds (builds.tsv) and the commit built (commit.txt).
 set -euo pipefail
 ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -69,6 +70,7 @@ for python in $pythons; do
     python3 build/build.py build --wheels="$wheels" --cuda_major_version="$cuda" --python_version="$python" \
       --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
+      --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
     [ "$code" = 0 ] || { tail -40 "$out/plugin-cp${python/./}-cuda$cuda.log"; exit "$code"; }
@@ -82,5 +84,11 @@ for wheel in "$out"/dist/*.whl; do
     *) echo "build_plugin: $(basename "$wheel") is not $version's; OUT holds another build's wheels" >&2; exit 1 ;;
   esac
 done
+# Built with line tables (-g1) and unstripped: each wheel's objects stripped again in place, their debug information
+# moved to files named by build-id under OUT/debug (dew/debug_split.py) and packed as debug-<machine>.tar.gz, which
+# the release carries beside the wheels, so a stack captured on a host running them reads their frames (row 6013).
+# DEW_DEBUG_SPLIT names the splitter where this script is staged apart from it (a fleet job's extra/).
+python3 "${DEW_DEBUG_SPLIT:-$here/debug_split.py}" "$out/dist" "$out/debug" | tee "$out/debug.txt"
+tar -C "$out/debug" -czf "$out/debug-$(uname -m).tar.gz" .build-id
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
 column -t -s $'\t' "$out/builds.tsv"

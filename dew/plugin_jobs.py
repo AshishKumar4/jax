@@ -31,10 +31,10 @@ def jobs(version: str, sha: str) -> dict:
     if not re.fullmatch(r"\d+(\.\d+)+(\.(post|dev)\d+)?", version) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise SystemExit(f"plugin_jobs: {version!r} is no release version or {sha!r} no full commit sha")
     tag = version.rsplit(".", 1)[-1].upper()
-    build = (f"DEW_BAZEL_TOKEN_FILE=$SESSION/extra/bazel.token taskset -c 0-{CORES - 1} "
-             f"bash $SESSION/extra/build_plugin.sh {sha} {version} \"$OUT\"")
+    build = (f"DEW_BAZEL_TOKEN_FILE=$SESSION/extra/bazel.token DEW_DEBUG_SPLIT=$SESSION/extra/debug_split.py "
+             f"taskset -c 0-{CORES - 1} bash $SESSION/extra/build_plugin.sh {sha} {version} \"$OUT\"")
     common = {"ref": "main", "keep": [], "priority": 3, "prepare": f"git ls-remote {FORK} {sha} && {build}",
-              "prepare_minutes": 120, "minutes": 5, "run": "ls -l \"$OUT\"/dist/*.whl",
+              "prepare_minutes": 240, "minutes": 5, "run": "ls -l \"$OUT\"/dist/*.whl \"$OUT\"/debug-*.tar.gz",
               "measures": f"{version}'s CUDA and PJRT plugins, every Python and CUDA, for its machine"}
     return {"note": f"{version}'s plugin builds (dew/plugin_jobs.py): no GPU held", "jobs": [
         {"name": f"PLUGIN-{tag}-{machine}", "kind": "correctness", "gpu": gpu, "cpus": CORES, **common}
