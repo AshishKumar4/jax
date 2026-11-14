@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import collections
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -19,6 +22,7 @@ from jax import numpy as jnp
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import hijax
+from jax._src import pjit
 from jax._src import test_util as jtu
 from jax._src.pallas import cost_estimate
 from jax._src.state import discharge
@@ -155,6 +159,37 @@ class PallasCostEstimateTest(jtu.JaxTestCase):
     self.assertEqual(cost.transcendentals, 0)
     self.assertEqual(cost.bytes_accessed, 4 * (m * k + k * n + m * n))
 
+
+  def test_a_count_in_its_callers_units_through_a_loop_and_a_call(self):
+    """A count under its caller's rules sums each primitive's in the caller's
+    own units, a loop's body by its trips, a call's body through `count`."""
+    def products(ctx, **_):
+      return collections.Counter(dots=1)
+
+    def loop(ctx, *, jaxpr, length, **_):
+      return collections.Counter(
+          {key: value * length
+           for key, value in ctx.count(jaxpr.jaxpr).items()})
+
+    def call(ctx, *, jaxpr, **_):
+      return ctx.count(jaxpr.jaxpr)
+
+    rules = {lax.dot_general_p: products, lax.scan_p: loop, pjit.jit_p: call}
+
+    def step(x, _):
+      return x @ x, None
+
+    def body(x):
+      return jax.jit(lambda x: lax.scan(step, x, length=3)[0] @ x)(x)
+
+    jaxpr = jax.make_jaxpr(body)(jnp.ones((4, 4))).jaxpr
+    counted = cost_estimate.count_jaxpr(
+        jaxpr, rules, collections.Counter(), priced=False)
+    self.assertEqual(counted, collections.Counter(dots=4))
+    with self.assertRaisesRegex(cost_estimate.Unpriced, "no rule prices"):
+      cost_estimate.count_jaxpr(
+          jax.make_jaxpr(lambda x: jnp.sin(x) @ x)(jnp.ones((4, 4))).jaxpr,
+          rules, collections.Counter(), priced=True)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Helper tool for automatic cost estimation."""
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import functools
 import math
@@ -56,20 +56,54 @@ def register_cost_rule(primitive: jax_core.Primitive, rule):
 class Context:
   avals_in: Sequence[Any]
   avals_out: Sequence[Any]
+  # The count of a jaxpr under the same rules (`count_jaxpr`), for a rule of a
+  # primitive that holds jaxprs (a loop's body, a call's); None under
+  # `cost_estimate_jaxpr`'s own rules, which recurse through it themselves.
+  count: Callable[[jax_core.Jaxpr], Any] | None = None
+
+
+class Unpriced(ValueError):
+  """A primitive no rule prices, where the caller asked for every one."""
+
+
+def count_jaxpr(
+    jaxpr: jax_core.Jaxpr,
+    rules: Mapping[jax_core.Primitive, Callable[..., Any]],
+    zero: Any,
+    *,
+    priced: bool = False,
+) -> Any:
+  """The sum of `jaxpr`'s equations' counts, each its primitive's rule's.
+
+  A rule takes a `Context` (its equation's avals, and `count`, this count
+  under the same rules, for the jaxprs its primitive holds) and the equation's
+  params, and returns a value that adds to `zero` and to the others: the
+  caller's own units. An equation no rule holds counts nothing, or, with
+  `priced`, raises `Unpriced` naming its primitive.
+  """
+  def count(inner: jax_core.Jaxpr) -> Any:
+    return count_jaxpr(inner, rules, zero, priced=priced)
+
+  total = zero
+  for eqn in jaxpr.eqns:
+    rule = rules.get(eqn.primitive)
+    if rule is None:
+      if priced:
+        raise Unpriced(f"no rule prices {eqn.primitive}")
+      continue
+    context = Context(avals_in=[v.aval for v in eqn.invars],
+                      avals_out=[v.aval for v in eqn.outvars], count=count)
+    total = total + rule(context, **eqn.params)
+  return total
+
 
 def cost_estimate_jaxpr(
     jaxpr: jax_core.Jaxpr,
 ) -> pallas_core.CostEstimate:
   """Returns the cost estimate for the given Jaxpr."""
-  total_cost = CostEstimate(flops=0, transcendentals=0, bytes_accessed=0)
-
-  for eqn in jaxpr.eqns:
-    rule = _cost_rules.get(eqn.primitive, None)
-    if rule is not None:
-      context = Context(avals_in=[v.aval for v in eqn.invars],
-                        avals_out=[v.aval for v in eqn.outvars])
-      op_cost = rule(context, **eqn.params)
-      total_cost = total_cost + op_cost
+  total_cost = count_jaxpr(
+      jaxpr, _cost_rules,
+      CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
   return pallas_core.CostEstimate(
       flops=total_cost.flops,
       transcendentals=total_cost.transcendentals,
