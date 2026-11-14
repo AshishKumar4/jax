@@ -197,8 +197,9 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEqual(self.lower(env=missing)["events"], ["unsealed"])
 
   def test_what_no_lowering_reads_is_no_input_of_the_key(self):
-    # A process's own settings: its compilation cache and its client's
-    # allocations. Processes differing in them alone share their lowerings.
+    # A process's own settings: its compilation cache, its client's
+    # allocations, XLA's dumps and a profiler's injection. Processes differing
+    # in them alone share their lowerings.
     base = self.lower()
     self.assertEqual(base["events"], ["miss"])
     flags = os.environ.get("XLA_FLAGS", "")  # the children's own, kept
@@ -212,6 +213,12 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
             "jax_persistent_cache_min_compile_time_secs": 7.0}),
         "XLA's autotuning cache": dict(env={"XLA_FLAGS": (
             f"{flags} --xla_gpu_per_fusion_autotune_cache_dir=/tmp/picks")}),
+        "XLA's dumps": dict(env={"XLA_FLAGS": (
+            f"{flags} --xla_dump_to=/tmp/dumps --xla_dump_hlo_as_text"
+            " --xla_dump_hlo_module_re=.*step.*")}),
+        "a profiler's injection": dict(env={
+            "CUDA_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so",
+            "NVTX_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so"}),
     }
     for name, change in unread.items():
       with self.subTest(name):
