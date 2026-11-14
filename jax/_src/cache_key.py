@@ -408,6 +408,13 @@ xla_flags_to_exclude_from_cache_key = [
     "--xla_gpu_cuda_data_dir",
     "--xla_gpu_experimental_autotune_cache_mode",
     "--xla_gpu_per_fusion_autotune_cache_dir",
+    # A compile without a device that requires each autotuned instruction's
+    # config from the autotune cache fails where one is missing and otherwise
+    # applies the config the device compile stored there: the requirement
+    # changes no compile that succeeds, so a host compiling ahead (the option
+    # its program's, `compiler_options`) writes the entries its device's run
+    # reads.
+    "--xla_gpu_require_complete_aot_autotune_results",
     "--xla_tpu_compiler_variant",
 ]
 
