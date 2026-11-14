@@ -635,18 +635,20 @@ def _resolve_compilation_strategy(
 def _states_its_tuning(options: xc.CompileOptions, backend: xc.Client) -> bool:
   """Whether a compile's program is the one its key names a device's to be.
 
-  A compile for compile-only GPUs (a client over their topology, no device to
-  run them) cannot autotune: unless its options say how it is tuned, XLA
-  compiles its default configs, a program a device's tuned compile under the
-  same key never is (a GEMM fusion read 7 to 80 times slower from such an
-  entry). Its options say so where it autotunes nothing
-  (`xla_gpu_autotune_level` 0, part of the key) or takes every autotuned
-  config from the stored results a device's compile wrote
-  (`xla_gpu_require_complete_aot_autotune_results`, which fails where one is
-  missing). Every other compile states its own.
+  A compile for compile-only GPUs (a `CompileOnlyPyClient` over their
+  topology) on a host with no GPU of theirs to compile through
+  (`_get_cross_compile_backend`, which autotunes on the host's own GPUs)
+  cannot autotune: unless its options say how it is tuned, XLA compiles its
+  default configs, a program a device's tuned compile under the same key never
+  is (a GEMM fusion read 7 to 80 times slower from such an entry). Its options
+  say so where it autotunes nothing (`xla_gpu_autotune_level` 0, part of the
+  key) or takes every autotuned config from the stored results a device's
+  compile wrote (`xla_gpu_require_complete_aot_autotune_results`, which fails
+  where one is missing). Every other compile states its own.
   """
-  if (backend.runtime_type != "compile_only_runtime"
-      or backend.platform not in ("cuda", "rocm")):
+  if (not isinstance(backend, _jax.CompileOnlyPyClient)
+      or backend.platform != "gpu"
+      or _get_cross_compile_backend(backend) is not None):
     return True
   # The compile's own options, else the process's XLA_FLAGS (the last of a
   # flag's occurrences, a bare flag true), as the plugin applies them.
