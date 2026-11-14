@@ -45,6 +45,7 @@ from jax._src import test_util as jtu
 from jax._src import test_warning_util
 from jax._src import xla_bridge
 from jax._src.compilation_cache_interface import CacheInterface
+from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 from jax.sharding import PartitionSpec as P
 import numpy as np
@@ -211,9 +212,11 @@ class CompilationCacheTest(CompilationCacheTestCase):
     self.assertTrue(cc._cache_initialized)
 
   def test_a_compile_for_compile_only_gpus_caches_only_where_it_states_its_tuning(self):
-    # A client over GPUs' topology runs nothing and autotunes nothing.
-    deviceless = mock.Mock(runtime_type="compile_only_runtime", platform="cuda")
-    attached = mock.Mock(runtime_type="stream_executor", platform="cuda")
+    # A client over GPUs' topology, as jax builds one: it runs nothing and,
+    # with no GPU of the host's to compile through, autotunes nothing.
+    deviceless = mock.create_autospec(
+        _jax.CompileOnlyPyClient, instance=True, platform="gpu")
+    attached = mock.create_autospec(xc.Client, instance=True, platform="gpu")
 
     def options(**overrides):
       built = compiler.get_compile_options(num_replicas=1, num_partitions=1)
@@ -228,6 +231,10 @@ class CompilationCacheTest(CompilationCacheTestCase):
         deviceless))
     self.assertTrue(compiler._states_its_tuning(options(), attached))
     with mock.patch.dict(os.environ, {"XLA_FLAGS": "--xla_gpu_autotune_level=0"}):
+      self.assertTrue(compiler._states_its_tuning(options(), deviceless))
+    # Where the host's own GPUs compile it, they autotune it.
+    with mock.patch.object(compiler, "_get_cross_compile_backend",
+                           return_value=attached):
       self.assertTrue(compiler._states_its_tuning(options(), deviceless))
 
   def test_get_no_executable(self):
