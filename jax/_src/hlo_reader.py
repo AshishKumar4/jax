@@ -43,29 +43,18 @@ class Instruction(NamedTuple):
 
 
 @functools.cache
-def pool() -> Any:
-  """XLA's protos (`xla_protos`) in a descriptor pool of their own: another library's copy of these
-  files (xla/xla_data.proto) in the default pool does not meet it."""
+def _module_class() -> Any:
   from google.protobuf import descriptor_pb2
   from google.protobuf import descriptor_pool
+  from google.protobuf import message_factory
   from jax._src import xla_protos
 
-  held = descriptor_pool.DescriptorPool()
+  # A pool of its own: another library's copy of these files (xla/xla_data.proto) in the default pool
+  # does not meet it.
+  pool = descriptor_pool.DescriptorPool()
   for file in descriptor_pb2.FileDescriptorSet.FromString(xla_protos.FILE_DESCRIPTOR_SET).file:
-    held.Add(file)
-  return held
-
-
-@functools.cache
-def message_class(name: str) -> Any:
-  """The message class of XLA's message `name` (`xla.HloProto`), from `pool`."""
-  from google.protobuf import message_factory
-
-  return message_factory.GetMessageClass(pool().FindMessageTypeByName(name))
-
-
-def _module_class() -> Any:
-  return message_class("xla.HloModuleProto")
+    pool.Add(file)
+  return message_factory.GetMessageClass(pool.FindMessageTypeByName("xla.HloModuleProto"))
 
 
 def module_from_text(text: str) -> Any:
