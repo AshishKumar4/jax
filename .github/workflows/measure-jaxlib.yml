@@ -51,15 +51,29 @@ jobs:
                      base="C:/b" ;;
             *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
           esac
-          # Dew's remote cache, its token in a file Bazel reads and no command line shows.
-          printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --remote_header=Authorization=Bearer %s\ncommon --remote_upload_local_results=true\n' \
-            "$DEW_BAZEL_TOKEN" > .bazelrc.user
+          # Dew's remote cache, its token handed by a credential helper that reads it from a file at each request:
+          # no option, command line or Bazel message ever holds it (a header option once split at its space and
+          # Bazel printed the token as a target).
+          printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token"
+          helper="$RUNNER_TEMP/credentials.py"
+          printf 'import json, pathlib, sys\nsys.stdin.read()\nprint(json.dumps({"headers": {"Authorization": ["Bearer " + pathlib.Path(%s).read_text().strip()]}}))\n' \
+            "'$(cygpath -m "$RUNNER_TEMP/bazel.token" 2>/dev/null || echo "$RUNNER_TEMP/bazel.token")'" > "$helper"
+          case "$RUNNER_OS" in
+            Windows) launcher="$RUNNER_TEMP/credentials.bat"
+                     printf '@"%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v python)")" "$(cygpath -w "$helper")" > "$launcher"
+                     launcher=$(cygpath -m "$launcher") ;;
+            *) launcher="$RUNNER_TEMP/credentials"
+               printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v python)" "$helper" > "$launcher"
+               chmod 700 "$launcher" ;;
+          esac
+          printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --credential_helper=dew-bazel.ashishkmr472.workers.dev=%s\ncommon --remote_upload_local_results=true\n' \
+            "$launcher" > .bazelrc.user
           started=$(date +%s) code=0
           python build/build.py build --wheels=jaxlib --python_version="${{ inputs.python }}" "${config[@]}" \
             --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_startup_options=--output_base="$base" \
             --output_path="$RUNNER_TEMP/dist" > "$RUNNER_TEMP/build.log" 2>&1 || code=$?
           seconds=$(( $(date +%s) - started ))
-          rm -f .bazelrc.user
+          rm -f .bazelrc.user "$RUNNER_TEMP/bazel.token"
           printf '%s\t%s\t%s\t%s\t%s\n' "${{ inputs.runner }}" "${{ inputs.python }}" "${{ matrix.attempt }}" \
             "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
           echo "| ${{ inputs.runner }} | cp${{ inputs.python }} | ${{ matrix.attempt }} | ${seconds} s | exit ${code} |" \
