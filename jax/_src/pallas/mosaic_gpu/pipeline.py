@@ -30,7 +30,6 @@ from jax import lax
 from jax._src import core
 from jax._src import flattree as ft
 from jax._src import state
-from jax._src.state import indexing as state_indexing
 from jax._src import util
 from jax._src.interpreters import partial_eval as pe
 from jax._src.pallas import core as pallas_core
@@ -97,31 +96,13 @@ def _is_fully_in_bounds(
   return True
 
 
-def _view_inside(ref: Any) -> bool:
-  """Whether ``ref`` lies provably inside the reference it views: a plain
-  reference, or one sliced at static starts alone (a static slice past its
-  reference is refused at indexing). A slice at a dynamic start may reach past
-  its reference, so a block inside the view is not provably inside it."""
-  if not isinstance(ref, state.TransformedRef):
-    return True
-  return not any(
-      isinstance(index, pl.Slice) and index.is_dynamic_start
-      for transform in ref.transforms
-      if isinstance(transform, state_indexing.NDIndexer)
-      for index in transform.indices
-  )
-
-
 def _maybe_promise_in_bounds(
-    spec: gpu_core.BlockSpec, ref: Any
+    spec: gpu_core.BlockSpec, operand_shape: tuple[int, ...]
 ) -> gpu_core.BlockSpec:
-  """Upgrades to ``OOBFillMode.PROMISE_IN_BOUNDS`` if provably in bounds: the
-  blocks inside ``ref`` (``_is_fully_in_bounds``) and ``ref`` inside the
-  reference it views (``_view_inside``)."""
+  """Upgrades to ``OOBFillMode.PROMISE_IN_BOUNDS`` if provably in bounds."""
   if (
       spec.oob_fill_mode is not OOBFillMode.PROMISE_IN_BOUNDS
-      and _is_fully_in_bounds(spec, ref.shape)
-      and _view_inside(ref)
+      and _is_fully_in_bounds(spec, operand_shape)
   ):
     return dataclasses.replace(
         spec, oob_fill_mode=OOBFillMode.PROMISE_IN_BOUNDS
@@ -432,18 +413,15 @@ def emit_pipeline[T](
     effective_in_specs = in_specs
     if is_cp_async:
       effective_in_specs = tuple(
-          _maybe_promise_in_bounds(spec, ref)
+          _maybe_promise_in_bounds(spec, ref.shape)
           for spec, ref in zip(in_specs, in_gmem_refs)
       )
       for spec in effective_in_specs:
-        if spec.oob_fill_mode not in (
-            OOBFillMode.PROMISE_IN_BOUNDS, OOBFillMode.ZEROS
-        ):
+        if spec.oob_fill_mode is not OOBFillMode.PROMISE_IN_BOUNDS:
           raise NotImplementedError(
-              "emit_pipeline on pre-Hopper GPUs reads a block past its operand"
-              " as zeros (OOBFillMode.ZEROS) or promised in bounds"
-              " (OOBFillMode.PROMISE_IN_BOUNDS), not "
-              f"{spec.oob_fill_mode}"
+              "emit_pipeline on pre-Hopper GPUs requires input accesses to be"
+              " provably in bounds, or oob_fill_mode="
+              "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
           )
     threads = (
         1 if thread_axis is None
