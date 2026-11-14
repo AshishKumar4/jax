@@ -78,12 +78,12 @@ jobs:
             "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
           echo "| ${{ inputs.runner }} | cp${{ inputs.python }} | ${{ matrix.attempt }} | ${seconds} s | exit ${code} |" \
             >> "$GITHUB_STEP_SUMMARY"
-          tail -40 "$RUNNER_TEMP/build.log"
+          # Bazel's last summary lines alone, never its option or target echoes.
+          grep -E '^(INFO: (Elapsed|Build completed|[0-9]+ processes)|ERROR: Build did NOT)' "$RUNNER_TEMP/build.log" || true
           ls -l "$RUNNER_TEMP/dist" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
-          path: |
-            ${{ runner.temp }}/builds.tsv
-            ${{ runner.temp }}/build.log
+          # Its seconds and exit alone: no raw build log leaves the runner (2026-11-14: one carried a token).
+          path: ${{ runner.temp }}/builds.tsv
