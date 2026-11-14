@@ -82,6 +82,9 @@ def create_instr_descriptor(
     elif ty == ir.BF16Type.get():
       assert acc_dtype == f32
       return 1
+    elif ty == ir.FloatTF32Type.get():
+      assert acc_dtype == f32
+      return 2  # .kind::tf32's TF32
     elif ty == ir.Float8E4M3FNType.get():
       assert acc_dtype in {f16, f32}
       return 0
@@ -756,6 +759,10 @@ def _do_mma(
   else:
     if isinstance(a_element_type, (ir.F16Type, ir.BF16Type)):
       kind = "f16"
+    elif isinstance(a_element_type, ir.FloatTF32Type):
+      # f32 operands read as TF32: K is 8 an instruction (32 bytes, as 16-bit
+      # types' 16), the instruction descriptor's A/B type TF32.
+      kind = "tf32"
     elif isinstance(a_element_type, (ir.Float8E5M2Type, ir.Float8E4M3FNType)):
       kind = "f8f6f4"
     elif (
