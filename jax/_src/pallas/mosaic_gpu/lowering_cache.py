@@ -141,14 +141,19 @@ _UNREAD_FLAGS = frozenset({
     "jax_explain_cache_misses",
 })
 _UNREAD_VARIABLES = re.compile(
-    r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_)")
+    r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_"
+    # A profiler's injection libraries (Nsight Systems', CUPTI's), which observe
+    # a run and change no lowering: a profiled process shares its lowerings.
+    r"|CUDA_INJECTION64_PATH$|NVTX_INJECTION64_PATH$)")
 # What a lowering dumps and where: none changes the lowering, and one that
 # dumps as it runs is not cached (`_eligible`).
 _DUMP_VARIABLES = re.compile(r"^MOSAIC_GPU_DUMP")
-# XLA_FLAGS' cache directories, each its job's own; every other flag a
+# XLA_FLAGS' cache directories, each its job's own, and its dumps (where and
+# what XLA writes of a compile, which it compiles alike); every other flag a
 # lowering may read (NVSHMEM's, `is_nvshmem_available`) stays keyed.
 _UNREAD_XLA_FLAGS = re.compile(
-    r"--xla_gpu_per_fusion_autotune_cache_dir=\S*|--xla_gpu_kernel_cache_file=\S*")
+    r"--xla_gpu_per_fusion_autotune_cache_dir=\S*|--xla_gpu_kernel_cache_file=\S*"
+    r"|--xla_dump_\S*")
 
 
 def _keyed_environment() -> dict[str, str]:
