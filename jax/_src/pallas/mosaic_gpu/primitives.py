@@ -1741,7 +1741,14 @@ def _barrier_arrive_lowering(
   else:
     scope = mgpu_utils.ThreadSubset.WARPGROUP
 
-  if isinstance(barrier, mgpu.CollectiveBarrierRef):
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    # A named barrier counts its arriving warpgroups' threads (`bar.arrive`).
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise NotImplementedError(
+          "Arriving on a CTA barrier is not supported in a warp context"
+      )
+    barrier.arrive(predicate=predicate)
+  elif isinstance(barrier, mgpu.CollectiveBarrierRef):
     if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
       raise NotImplementedError(
           "Arriving on a collective barrier is not supported in a warp context"
@@ -1834,6 +1841,15 @@ def _barrier_arrive_and_wait_lowering(
     *flat_transforms,
     transforms_treedef,
 ):
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    # A named barrier arrives and waits in one instruction (`bar.sync`).
+    base_index = _get_barrier_base_index(
+        ctx.avals_in[0], transforms_treedef.unflatten(flat_transforms)
+    )
+    if base_index is not None:
+      barrier = barrier[base_index]
+    barrier.arrive_and_wait()
+    return ()
   _barrier_arrive_lowering(
       ctx, barrier, *flat_transforms, transforms_treedef=transforms_treedef
   )
@@ -1997,6 +2013,11 @@ def _barrier_wait_lowering(
     parity = None
   barrier_aval = ctx.avals_in[0]
   assert isinstance(barrier_aval, state_types.AbstractRef)
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    raise NotImplementedError(
+        "A CTA barrier has no wait apart from its arrival: use"
+        " barrier_arrive_and_wait"
+    )
   transforms = transforms_treedef.unflatten(flat_transforms)
   orders_tensor_core = getattr(
       barrier_aval.inner_aval.dtype, "orders_tensor_core", False  # pyrefly: ignore[missing-attribute]

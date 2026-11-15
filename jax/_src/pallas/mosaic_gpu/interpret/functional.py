@@ -455,7 +455,14 @@ class _Interpreter:
       inner = aval.inner_aval
       if transforms:
         inner = state_types.TransformedRef(inner, transforms).type
-      if isinstance(inner.dtype, (mosaic_gpu_core.BarrierType, mosaic_gpu_core.ClusterBarrierType)):
+      if isinstance(
+          inner.dtype,
+          (
+              mosaic_gpu_core.BarrierType,
+              mosaic_gpu_core.ClusterBarrierType,
+              mosaic_gpu_core.CtaBarrierType,
+          ),
+      ):
         allocs.append(_Barrier())
         continue
       allocs.append(_Ref((self.allocate(
