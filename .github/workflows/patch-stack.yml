@@ -384,8 +384,18 @@ jobs:
           # dashes as underscores): a yank reaches jaxlib and the CUDA plugins as it does jax (2026-11-15: a jaxlib
           # that crashed CPU processes could not be yanked, `yank` reached jax alone).
           asked=$YANK
-          own() { local prefix=${1//-/_}- name; for name in $asked; do [[ $name == "$prefix"[0-9]* ]] && printf '%s ' "$name"; done; }
-          YANK=$(own jax) PACKAGE=jax bash dew/dew/index.sh site incoming/dist/*.whl
+          own() {
+            local prefix=${1//-/_}- name
+            for name in $asked; do
+              if [[ $name == "$prefix"[0-9]* ]]; then printf '%s ' "$name"; fi
+            done
+          }
+          # jax where it has wheels or files to yank: a run that yanks only native files indexes no jax.
+          jax=(incoming/dist/*.whl)
+          yanked=$(own jax)
+          if [ ${#jax[@]} -gt 0 ] || [ -n "$yanked" ]; then
+            YANK=$yanked PACKAGE=jax bash dew/dew/index.sh site "${jax[@]}"
+          fi
           for project in jaxlib $(for cuda in $CUDAS; do printf 'jax-cuda%s-pjrt jax-cuda%s-plugin ' "$cuda" "$cuda"; done); do
             wheels=(incoming/native/"${project//-/_}"-*.whl)
             yanked=$(own "$project")
