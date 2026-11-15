@@ -24,6 +24,7 @@ from jax._src.pallas.mosaic_gpu.core import SMEM_ALIGNMENT as SMEM_ALIGNMENT
 from jax._src.pallas.mosaic_gpu.core import BlockSpec as BlockSpec
 from jax._src.pallas.mosaic_gpu.core import cluster_ref as cluster_ref
 from jax._src.pallas.mosaic_gpu.core import ClusterBarrier as ClusterBarrier
+from jax._src.pallas.mosaic_gpu.core import CtaBarrier as CtaBarrier
 from jax._src.pallas.mosaic_gpu.core import CompilerParams as CompilerParams
 from jax._src.pallas.mosaic_gpu.core import im2col_ref as im2col_ref
 from jax._src.pallas.mosaic_gpu.core import kernel as kernel
