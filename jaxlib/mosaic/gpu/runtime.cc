@@ -15,8 +15,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <utility>
 
@@ -180,6 +182,30 @@ CommonTmaParams prepare_tma_params(const CUtensorMap* tma_desc,
 
   return params;
 }
+
+// The tensor maps this thread's host code has encoded since its last launch
+// spec (`mosaic_gpu_build_kernel_spec`), each by its encoding's arguments.
+thread_local absl::InlinedVector<mosaic::gpu::TensorMapEncoding, 4> encoded;
+
+// `encoding`'s arguments shared by both encodings: those `params` holds.
+mosaic::gpu::TensorMapEncoding Encoding(const CUtensorMap* tma_desc,
+                                        const CommonTmaParams& params,
+                                        int64_t rank, void* base_addr) {
+  mosaic::gpu::TensorMapEncoding encoding;
+  std::memcpy(encoding.encoded, tma_desc, sizeof(encoding.encoded));
+  encoding.data_type = params.data_type;
+  encoding.rank = static_cast<uint32_t>(rank);
+  encoding.global_address = reinterpret_cast<uint64_t>(base_addr);
+  for (int64_t i = 0; i < rank; ++i) {
+    encoding.dims[i] = params.sizes[i];
+    if (i + 1 < rank) encoding.strides[i] = params.strides[i];
+  }
+  encoding.interleave = CU_TENSOR_MAP_INTERLEAVE_NONE;
+  encoding.swizzle = params.swizzle;
+  encoding.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_NONE;
+  encoding.oob_fill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+  return encoding;
+}
 }  // namespace
 
 extern "C" {
@@ -223,6 +249,13 @@ void mosaic_gpu_init_tma_desc(CUtensorMap* tma_desc, void* base_addr,
                              params.swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
       "cuTensorMapEncodeTiled failed: %s\n");
+  mosaic::gpu::TensorMapEncoding encoding =
+      Encoding(tma_desc, params, rank, base_addr);
+  for (int64_t i = 0; i < rank; ++i) {
+    encoding.box[i] = tma_window_shape[i];
+    encoding.element_strides[i] = element_strides[i];
+  }
+  encoded.push_back(encoding);
 }
 
 void mosaic_gpu_init_tma_im2col_desc(
@@ -306,6 +339,19 @@ void mosaic_gpu_init_tma_im2col_desc(
           CU_TENSOR_MAP_INTERLEAVE_NONE, params.swizzle,
           CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
       "cuTensorMapEncodeIm2col failed: %s\n");
+  mosaic::gpu::TensorMapEncoding encoding =
+      Encoding(tma_desc, params, rank, base_addr);
+  encoding.im2col = true;
+  for (int64_t i = 0; i < rank; ++i) {
+    encoding.element_strides[i] = element_strides[i];
+  }
+  for (int i = 0; i < spatial_rank; ++i) {
+    encoding.lower[i] = tma_lower_corner[i];
+    encoding.upper[i] = tma_upper_corner[i];
+  }
+  encoding.channels_per_pixel = static_cast<uint32_t>(channels_per_pixel);
+  encoding.pixels_per_column = static_cast<uint32_t>(pixels_per_column);
+  encoded.push_back(encoding);
 }
 
 // Fills `cfg` with the kernel spec.
@@ -341,5 +387,28 @@ void mosaic_gpu_build_kernel_spec(mosaic::gpu::MosaicKernelSpec* cfg,
       cfg->AddDeviceArg(*reinterpret_cast<void**>(arg_ptrs[i]));
     }
   }
+  // Each tensor map encoded since the last spec, placed at the first 64-byte
+  // aligned slot of a host argument holding its encoding that no other map
+  // took (two maps of one tensor encode alike).
+  for (mosaic::gpu::TensorMapEncoding& encoding : encoded) {
+    constexpr int32_t kSize = sizeof(encoding.encoded);
+    for (int32_t i = 0; i < num_args && encoding.arg < 0; ++i) {
+      auto* payload = static_cast<const std::byte*>(arg_ptrs[i]);
+      for (int32_t offset = 0;
+           offset + kSize <= arg_bytes[i] && encoding.arg < 0; offset += 64) {
+        bool taken = false;
+        for (const mosaic::gpu::TensorMapEncoding& other : cfg->tensor_maps) {
+          taken |= other.arg == i && other.offset == offset;
+        }
+        if (!taken &&
+            std::memcmp(payload + offset, encoding.encoded, kSize) == 0) {
+          encoding.arg = i;
+          encoding.offset = offset;
+        }
+      }
+    }
+    cfg->tensor_maps.push_back(encoding);
+  }
+  encoded.clear();
 }
 }

@@ -33,6 +33,36 @@ struct Dim3 {
   uint32_t z = 1;
 };
 
+// A tensor map the host code encoded for a launch: the arguments it passed to
+// cuTensorMapEncodeTiled (or cuTensorMapEncodeIm2col), in the driver's order
+// and enums, and where its 128-byte encoding sits among the launch's arguments
+// (the host argument `arg`, at `offset`, found by its bytes: the launch's
+// arguments are copies). A launch capture (capture.h) states each map by these
+// arguments, as a simulator takes it, not by its opaque encoding.
+struct TensorMapEncoding {
+  std::byte encoded[128] = {};
+  int32_t arg = -1;  // -1: in no host argument of the launch.
+
+  int32_t offset = 0;
+  uint32_t data_type = 0;
+  uint32_t rank = 0;
+  uint64_t global_address = 0;
+  uint64_t dims[5] = {1, 1, 1, 1, 1};
+  uint64_t strides[4] = {0, 0, 0, 0};  // In bytes, one fewer than `rank`.
+  uint32_t box[5] = {1, 1, 1, 1, 1};
+  uint32_t element_strides[5] = {1, 1, 1, 1, 1};
+  uint32_t interleave = 0;
+  uint32_t swizzle = 0;
+  uint32_t l2_promotion = 0;
+  uint32_t oob_fill = 0;
+  // cuTensorMapEncodeIm2col's own, `box` unused.
+  bool im2col = false;
+  int32_t lower[3] = {0, 0, 0};
+  int32_t upper[3] = {0, 0, 0};
+  uint32_t channels_per_pixel = 0;
+  uint32_t pixels_per_column = 0;
+};
+
 // Describes a kernel launch.
 struct MosaicKernelSpec {
   struct DeviceArg {
@@ -58,6 +88,9 @@ struct MosaicKernelSpec {
   // Owns copied host-argument bytes (e.g. TMA descriptor bundles).
   // `HostArg::offset` above indexes into this vector.
   absl::InlinedVector<std::byte, 256> host_bytes;
+  // The tensor maps encoded into the host arguments, each by its encoding's
+  // arguments.
+  absl::InlinedVector<TensorMapEncoding, 4> tensor_maps;
 
   bool IsHostArg(int32_t arg_index) const {
     return std::holds_alternative<HostArg>(args[arg_index]);
@@ -80,6 +113,7 @@ struct MosaicKernelSpec {
   void Clear() {
     args.clear();
     host_bytes.clear();
+    tensor_maps.clear();
   }
 
   // Pre-allocates space for arguments. Not mandatory to call this method.
