@@ -898,8 +898,20 @@ class GPUSharedMemory(
           )
         self.mem.pop(key)
 
-  def assert_no_barriers_allocated(self):
-    for key, alloc in self.mem.items():
+  def assert_no_barriers_allocated(self, device: Device):
+    """Asserts that `device`'s kernel left none of its barriers allocated.
+
+    Only `device`'s: the devices of a mesh interpret their kernels at once, so
+    another device's barriers may still be allocated when this device's kernel
+    ends.
+    """
+    with self.lock:
+      held = [
+          (key, alloc)
+          for key, alloc in self.mem.items()
+          if key.device_id == device.device_id
+      ]
+    for key, alloc in held:
       assert not isinstance(
           alloc, Barrier
       ), f"Barrier remains allocated at key `{key}`."
