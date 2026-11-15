@@ -18,10 +18,12 @@ import json
 import math
 from typing import Callable, Tuple, TypedDict
 
+from jax._src import config
 from jax._src import core
 from jax._src import custom_derivatives
 from jax._src import dispatch
 from jax._src import dtypes
+from jax._src import mesh as mesh_lib
 from jax._src import numpy as jnp
 from jax._src import xla_bridge
 from jax._src.api import make_jaxpr, vjp
@@ -411,21 +413,42 @@ def check_cudnn_version():
     raise RuntimeError("cuDNN is not detected.")
   return cuda_versions.cudnn_get_version()
 
+def _target_capability() -> tuple[int, int] | None:
+  """The CUDA compute capability of the GPU the computation being traced runs
+  on: a device of the concrete mesh it is traced under (`jax.set_mesh`), else
+  the default device (`jax.default_device`), where either is a GPU, else the
+  first GPU of this process's default backend, as before. None where none is a
+  CUDA GPU.
+
+  A program compiled ahead for GPUs the process does not hold (compile-only
+  devices of a topology, `jax.experimental.topologies`) is traced in a process
+  whose default backend is the CPU, so the default backend alone reads no GPU
+  and refuses what the target GPU runs."""
+  mesh = mesh_lib.get_concrete_mesh()
+  default = config.default_device.value
+  placed = [*([] if mesh is None or mesh.empty else [mesh.devices.flat[0]]),
+            *([] if default is None or isinstance(default, str) else [default])]
+  device = next((device for device in placed if device.platform == "gpu"), None)
+  if device is None:
+    if 'cuda' not in xla_bridge.get_backend().platform_version:
+      return None
+    device, *_ = xla_bridge.local_devices(backend="gpu")
+  # A ROCm GPU states its architecture ('gfx942'), not a CUDA capability.
+  major, dot, minor = str(getattr(device, "compute_capability", "")).partition(".")
+  if not (dot and major.isdigit() and minor.isdigit()):
+    return None
+  return int(major), int(minor)
+
+
 def check_compute_capability(capability):
-  if not 'cuda' in xla_bridge.get_backend().platform_version:
-    return False
-  d, *_ = xla_bridge.local_devices(backend="gpu")
+  current = _target_capability()
   target = tuple(int(x) for x in capability.split("."))
-  current = tuple(int(x) for x in d.compute_capability.split("."))
-  return current >= target
+  return current is not None and current >= target
 
 def is_cuda_compute_capability_equal(capability):
-  if not 'cuda' in xla_bridge.get_backend().platform_version:
-    return False
-  d, *_ = xla_bridge.local_devices(backend="gpu")
+  current = _target_capability()
   target = tuple(int(x) for x in capability.split("."))
-  current = tuple(int(x) for x in d.compute_capability.split("."))
-  return current == target
+  return current is not None and current == target
 
 def _dot_product_attention_fwd(
     query, key, value, bias, q_seqlen, kv_seqlen, q_offsets, kv_offsets,
