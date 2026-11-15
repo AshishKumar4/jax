@@ -162,6 +162,108 @@ class InterpretTest(jtu.JaxTestCase):
 
     np.testing.assert_equal(jax.jit(_kernel)(), np.arange(num_threads))
 
+  @jtu.parameterized.product(steps=(1, 2, 5), stages=(2, 3), carried=(False, True))
+  def test_pipeline_prefetch_reads_each_steps_first_values_at_the_step_before(
+      self, steps, stages, carried
+  ):
+    # Each step's first row read by `prefetch` at the step before it (the
+    # first step's before the loop), the step's body reading it beside the
+    # whole block; the body calls `boundary` before its last read.
+    rows, width = 8, 128
+
+    def body(o_ref, scratch):
+      def step(indices, x_smem, *rest):
+        if carried:
+          total, prefetched, boundary = rest
+        else:
+          prefetched, boundary = rest
+        (i,) = indices
+        o_ref[i, 0] = prefetched
+        following = boundary()
+        o_ref[i, 1] = x_smem[0]
+        if carried:
+          return total + x_smem[rows - 1], following
+        return following
+
+      def prefetch(indices, x_smem):
+        del indices
+        return x_smem[0]
+
+      out = plgpu.emit_pipeline(
+          step,
+          grid=(steps,),
+          in_specs=[plgpu.BlockSpec((rows, width), lambda i: (i, 0))],
+          max_concurrent_steps=stages,
+          prefetch=prefetch,
+          init_carry=jnp.zeros((width,), jnp.float32) if carried else None,
+      )(scratch)
+      if carried:
+        o_ref[steps, 0] = out
+
+    def kernel(x_ref, o_ref):
+      body(o_ref, x_ref)
+
+    x = jnp.arange(steps * rows * width, dtype=jnp.float32).reshape(
+        steps * rows, width
+    )
+    out = plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((steps + 1, 2, width), jnp.float32),
+        interpret=InterpretParams(),
+    )(x)
+    firsts = x[::rows]
+    np.testing.assert_array_equal(out[:steps, 0], firsts)
+    np.testing.assert_array_equal(out[:steps, 1], firsts)
+    if carried:
+      np.testing.assert_array_equal(out[steps, 0], x[rows - 1::rows].sum(0))
+
+  @jtu.parameterized.parameters("cond", "loop")
+  def test_pipeline_prefetch_boundary_under_control_flow_is_refused(self, flow):
+    # A boundary under a cond waits on one path alone, and under a loop as many
+    # times as it runs: either leaves the next step's wait unmatched.
+    def step(indices, x_smem, prefetched, boundary):
+      del indices, x_smem
+      if flow == "cond":
+        jax.lax.cond(prefetched[0] > 0, lambda: boundary(), lambda: prefetched)
+      else:
+        jax.lax.fori_loop(0, 1, lambda i, c: boundary(), prefetched)
+      return prefetched
+
+    def kernel(x_ref, o_ref):
+      del o_ref
+      plgpu.emit_pipeline(
+          step,
+          grid=(2,),
+          in_specs=[plgpu.BlockSpec((8, 128), lambda i: (i, 0))],
+          max_concurrent_steps=2,
+          prefetch=lambda indices, x_smem: x_smem[0],
+      )(x_ref)
+
+    with self.assertRaisesRegex(ValueError, "never under a cond or a loop"):
+      plgpu.kernel(
+          kernel,
+          out_type=jax.ShapeDtypeStruct((8,), jnp.float32),
+          interpret=InterpretParams(),
+      )(jnp.zeros((16, 128), jnp.float32))
+
+  def test_pipeline_prefetch_body_without_boundary_is_refused(self):
+    def kernel(x_ref, o_ref):
+      del o_ref
+      plgpu.emit_pipeline(
+          lambda indices, x_smem, prefetched, boundary: prefetched,
+          grid=(2,),
+          in_specs=[plgpu.BlockSpec((8, 128), lambda i: (i, 0))],
+          max_concurrent_steps=2,
+          prefetch=lambda indices, x_smem: x_smem[0],
+      )(x_ref)
+
+    with self.assertRaisesRegex(ValueError, "calls its boundary"):
+      plgpu.kernel(
+          kernel,
+          out_type=jax.ShapeDtypeStruct((8,), jnp.float32),
+          interpret=InterpretParams(),
+      )(jnp.zeros((16, 128), jnp.float32))
+
   def test_layout_cast(self):
     # the layout_cast is a no-op in interpret mode
     @functools.partial(
