@@ -5037,5 +5037,12 @@ def _delay_lowering(ctx: LoweringRuleContext, nanos):
 @register_lowering_rule(pjit.reshard_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(pjit.reshard_p, mgpu.LoweringSemantics.Warpgroup)
 def _reshard_lowering_rule(ctx, x, dst_sharding, concrete_mesh):
-  del ctx, dst_sharding, concrete_mesh
+  del dst_sharding, concrete_mesh
+  # A kernel's values have no sharding, so a reshard is the identity. It still
+  # returns what the semantics represent a value as: a reshard of a literal (a
+  # `zeros_like` of a value carrying a concrete mesh's sharding binds one) is
+  # handed a Python scalar, which warpgroup semantics hold as an ir.Value.
+  if (ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup
+      and not isinstance(x, ir.Value)):
+    return _ensure_ir_value(x, ctx.avals_out[0].dtype)
   return x
