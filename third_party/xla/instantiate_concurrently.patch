@@ -1,4 +1,4 @@
-From f7167ce4ea38a7a12f11556d29b5bf0f8d0cee20 Mon Sep 17 00:00:00 2001
+From a27135d9a4409582db40e7207858370e12dbc77b Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 02:12:49 -0600
 Subject: [PATCH] [XLA:GPU] FFI handlers that instantiate concurrently are
@@ -22,11 +22,12 @@ execution_state, CustomCallThunk::Instantiated the one instantiate). An instanti
  xla/ffi/api/api.h                             |   6 +
  xla/ffi/api/c_api.h                           |   5 +
  xla/ffi/ffi_registry.h                        |   6 +
- xla/service/gpu/BUILD                         |   3 +
- xla/service/gpu/gpu_compiler_test.cc          |  91 +++++++++++
+ xla/service/gpu/BUILD                         |  27 ++++
+ .../gpu/instantiate_concurrently_test.cc      | 133 ++++++++++++++++
  xla/service/gpu/thunk_emitter.cc              | 149 ++++++++++++++----
  xla/service/gpu/thunk_emitter.h               |  29 ++++
- 13 files changed, 365 insertions(+), 47 deletions(-)
+ 13 files changed, 431 insertions(+), 47 deletions(-)
+ create mode 100644 xla/service/gpu/instantiate_concurrently_test.cc
 
 diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
 index 0580f1faff..3694b0cb84 100644
@@ -319,7 +320,7 @@ index 517f6fd9c9..15fd9da67f 100644
  }
  
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 54be8fda6a..a38f9920ed 100644
+index 9127d9e185..e83c68dc44 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -561,6 +561,8 @@ cc_library(
@@ -331,39 +332,87 @@ index 54be8fda6a..a38f9920ed 100644
          "//xla/hlo/ir:hlo",
          "//xla/hlo/ir:hlo_instruction_utils",
          "//xla/mlir/utils:error_util",
-@@ -2245,6 +2247,7 @@ xla_test(
-         "@com_google_absl//absl/status:statusor",
-         "@com_google_absl//absl/strings",
-         "@com_google_absl//absl/strings:string_view",
+@@ -2185,6 +2187,31 @@ xla_test(
+     ],
+ )
+ 
++xla_test(
++    name = "instantiate_concurrently_test",
++    srcs = ["instantiate_concurrently_test.cc"],
++    backends = ["gpu"],
++    deps = [
++        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
++        "//xla/ffi",
++        "//xla/ffi:ffi_api",
++        "//xla/ffi/api:c_api",
++        "//xla/hlo/ir:hlo",
++        "//xla/service:compiler",
++        "//xla/service:executable",
++        "//xla/service:gpu_topology",
++        "//xla/service:hlo_module_config",
++        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings:string_view",
 +        "@com_google_absl//absl/time",
-         "@com_google_absl//absl/types:span",
-         "@com_google_googletest//:gtest_main",
-         "@com_google_protobuf//:protobuf",
-diff --git a/xla/service/gpu/gpu_compiler_test.cc b/xla/service/gpu/gpu_compiler_test.cc
-index ba4bd75582..f26e451a8d 100644
---- a/xla/service/gpu/gpu_compiler_test.cc
-+++ b/xla/service/gpu/gpu_compiler_test.cc
-@@ -15,6 +15,7 @@ limitations under the License.
- 
- #include "xla/service/gpu/gpu_compiler.h"
- 
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "gpu_compiler_test",
+     srcs = ["gpu_compiler_test.cc"],
+diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
+new file mode 100644
+index 0000000000..bcbda9047d
+--- /dev/null
++++ b/xla/service/gpu/instantiate_concurrently_test.cc
+@@ -0,0 +1,133 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
 +#include <atomic>
- #include <gmock/gmock.h>
- #include <gtest/gtest.h>
- 
-@@ -44,6 +45,8 @@ limitations under the License.
- #include "absl/strings/str_replace.h"
- #include "absl/strings/string_view.h"
- #include "absl/strings/substitute.h"
++#include <memory>
++
++#include <gmock/gmock.h>
++#include <gtest/gtest.h>
++#include "absl/status/status.h"
++#include "absl/status/status_matchers.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
 +#include "absl/time/clock.h"
 +#include "absl/time/time.h"
- #include "absl/types/span.h"
- #include "google/protobuf/text_format.h"
- #include "tsl/platform/regexp.h"
-@@ -2697,6 +2700,94 @@ TEST_F(GpuCompilerTest, GlobalLLVMLockGetsReleasedForCustomCallThunkCreation) {
-   EXPECT_EQ(result.GetLinear<int32_t>(0), 42);
- }
- 
++#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
++#include "xla/ffi/api/c_api.h"
++#include "xla/ffi/ffi.h"
++#include "xla/ffi/ffi_api.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/service/compiler.h"
++#include "xla/service/executable.h"
++#include "xla/service/gpu_topology.h"
++#include "xla/service/hlo_module_config.h"
++#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/statusor.h"
++
++namespace xla::gpu {
++namespace {
++
++using ::testing::HasSubstr;
++
 +// Calls arrived at the instantiate stage of `xla.gpu.instantiate_together`.
 +static std::atomic<int> instantiate_together_arrived = 0;
 +
@@ -389,10 +438,10 @@ index ba4bd75582..f26e451a8d 100644
 +XLA_FFI_DEFINE_HANDLER(kInstantiateTogetherExecute,
 +                       []() { return absl::OkStatus(); }, ffi::Ffi::Bind());
 +
-+class GpuCompilerInstantiateTogetherTest : public GpuCompilerTest {
++class InstantiateConcurrentlyTest : public HloPjRtGpuTestBase {
 + protected:
 +  void SetUp() override {
-+    GpuCompilerTest::SetUp();
++    HloPjRtGpuTestBase::SetUp();
 +    XLA_FFI_Handler_Bundle bundle = {
 +        /*instantiate=*/kInstantiateTogether,
 +        /*prepare=*/nullptr,
@@ -413,8 +462,8 @@ index ba4bd75582..f26e451a8d 100644
 +    // Two compile threads.
 +    config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
 +        2);
-+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
-+                          ParseAndReturnVerifiedModule(hlo_text, config));
++    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
++                        ParseAndReturnVerifiedModule(hlo_text, config));
 +    Compiler::CompileOptions compile_options;
 +    compile_options.gpu_topology = GetSingleDeviceGpuTopology(
 +        /*platform_version=*/"", gpu_target_config());
@@ -423,9 +472,9 @@ index ba4bd75582..f26e451a8d 100644
 +  }
 +};
 +
-+TEST_F(GpuCompilerInstantiateTogetherTest,
++TEST_F(InstantiateConcurrentlyTest,
 +       HandlersInstantiatingConcurrentlyAreInstantiatedTogether) {
-+  ASSERT_OK(Compiled(R"(
++  TF_ASSERT_OK(Compiled(R"(
 +    HloModule m
 +    ENTRY main {
 +      p0 = f32[8] parameter(0)
@@ -439,7 +488,7 @@ index ba4bd75582..f26e451a8d 100644
 +  EXPECT_EQ(instantiate_together_arrived.load(), 2);
 +}
 +
-+TEST_F(GpuCompilerInstantiateTogetherTest,
++TEST_F(InstantiateConcurrentlyTest,
 +       AConcurrentInstantiationsErrorIsTheCompiles) {
 +  EXPECT_THAT(Compiled(R"(
 +    HloModule m
@@ -452,9 +501,8 @@ index ba4bd75582..f26e451a8d 100644
 +                                     HasSubstr("instantiation refused")));
 +}
 +
- // Reproducer for b/509990632.
- TEST_F(GpuCompilerTest, WhileLoopUnrollingFlagScalarConstantSinkerNoCrash) {
-   const char* const kHloString = R"(
++}  // namespace
++}  // namespace xla::gpu
 diff --git a/xla/service/gpu/thunk_emitter.cc b/xla/service/gpu/thunk_emitter.cc
 index 5d1be01679..d848540cab 100644
 --- a/xla/service/gpu/thunk_emitter.cc
