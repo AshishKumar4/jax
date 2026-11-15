@@ -80,6 +80,17 @@ class CacheKeyTest(jtu.JaxTestCase):
     )
     self.assertEqual(hash1, hash2)
 
+  def test_a_compile_requiring_its_autotune_results_keys_as_one_without(self):
+    plain = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    required = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    required.env_option_overrides = [
+        ("xla_gpu_require_complete_aot_autotune_results", True)]
+    self.assertEqual(
+        self.get_hashed_value(cache_key._hash_serialized_compile_options, plain),
+        self.get_hashed_value(
+            cache_key._hash_serialized_compile_options, required),
+    )
+
   @jtu.skip_on_devices("cpu")
   def test_hash_accelerator_devices(self):
     devices = np.array([[jax.local_devices()[0]]])
