@@ -480,15 +480,23 @@ def flatten_fun_output(f, store, *args):
 
 
 def _reduce_any_error(error: Error):
+  """`error` with each effect's error one: a shard_map's, one a shard along
+  the leading dimensions its errors leave it with (one a shard_map, so nested
+  ones leave several), reduced to a failing shard's where any failed. A scalar
+  error stays as it is."""
   out_error = init_error
   for error_effect in error._pred.keys():
     errs, codes, payloads = (error._pred[error_effect],
                              error._code[error_effect],
                              error._payload[error_effect])
-    reduced_idx = jnp.argsort(errs)[-1]
-    pred, code, payload = tree_map(lambda x, idx=reduced_idx: x[idx],
-                                   (errs, codes, payloads))
-    out_error = out_error._update(error_effect, pred, code, {}, payload)
+    if leading := np.ndim(errs):
+      errs, codes, payloads = tree_map(
+          lambda x: jnp.reshape(x, (-1, *np.shape(x)[leading:])),
+          (errs, codes, payloads))
+      reduced_idx = jnp.argsort(errs)[-1]
+      errs, codes, payloads = tree_map(lambda x, idx=reduced_idx: x[idx],
+                                       (errs, codes, payloads))
+    out_error = out_error._update(error_effect, errs, codes, {}, payloads)
 
   out_error = out_error._replace(_metadata=error._metadata)
   return out_error
@@ -794,7 +802,7 @@ class ErrorEffects:
 @weakref_lru_cache
 def _jaxpr_to_checkify_jaxpr_cached(
     jaxpr: core.Jaxpr, enabled_errors, err_tree: PyTreeDef,
-    start_code: int,
+    start_code: int, carried: bool,
     *flat_err_and_in_vals
 ) -> tuple[core.Jaxpr, PyTreeDef, set[ErrorEffect], int]:
   sub_ctx = CheckifyContext(start_code)
@@ -802,6 +810,8 @@ def _jaxpr_to_checkify_jaxpr_cached(
   def fun_wrapped(*invals):
     error, out = checkify_jaxpr_flat(
         sub_ctx, jaxpr, jaxpr.consts, enabled_errors, err_tree, *invals)
+    if carried:
+      error = _reduce_any_error(error)
     error_effects = ErrorEffects(set(error._pred.keys()))
     return (error, out), error_effects
 
@@ -815,11 +825,16 @@ def _jaxpr_to_checkify_jaxpr_cached(
 
 def jaxpr_to_checkify_jaxpr(
     ctx: CheckifyContext, jaxpr: core.Jaxpr, enabled_errors,
-    err_tree: PyTreeDef, *flat_err_and_in_vals
+    err_tree: PyTreeDef, *flat_err_and_in_vals, carried: bool = False
 ) -> tuple[core.Jaxpr, PyTreeDef, set[ErrorEffect]]:
+  """`jaxpr` checkified, its errors first among its inputs and outputs;
+  `carried`, its errors out reduced to one (`_reduce_any_error`), as a loop's
+  body or a cond's branch carries the scalar error it was given: a shard_map
+  in it leaves its errors one a shard."""
   start_code = ctx.current_code
   result = _jaxpr_to_checkify_jaxpr_cached(
-      jaxpr, enabled_errors, err_tree, start_code, *flat_err_and_in_vals
+      jaxpr, enabled_errors, err_tree, start_code, carried,
+      *flat_err_and_in_vals
   )
   checked_jaxpr, out_tree, error_effects, num_codes = result
   ctx.advance(num_codes)
@@ -827,13 +842,17 @@ def jaxpr_to_checkify_jaxpr(
 
 def cond_error_check(ctx: CheckifyContext, error: Error, enabled_errors,
                      index, *ops, branches, **params):
+  # Its branches' errors are of one type, the scalar error each is given: a
+  # shard_map's errors (one a shard) reduced on the way in and out.
+  error = _reduce_any_error(error)
   # Get the error-effects out of all branches so the cond can be called with
   # a merged error with all these effects.
   err_vals, err_tree = jtu.tree_flatten(error)
   in_avals = map(core.typeof, [*err_vals, *ops])
   def get_error_effects_from_jaxpr(jxpr):
     _, _, effects = jaxpr_to_checkify_jaxpr(
-        CheckifyContext(), jxpr, enabled_errors, err_tree, *in_avals
+        CheckifyContext(), jxpr, enabled_errors, err_tree, *in_avals,
+        carried=True
     )
     return effects
   effects = [get_error_effects_from_jaxpr(jxpr) for jxpr in branches]
@@ -844,7 +863,8 @@ def cond_error_check(ctx: CheckifyContext, error: Error, enabled_errors,
   in_avals = map(core.typeof, [*err_vals, *ops])
   new_branches, out_trees, _ = unzip3(
       jaxpr_to_checkify_jaxpr(
-          ctx, jxpr, enabled_errors, err_tree, *in_avals) for jxpr in branches)
+          ctx, jxpr, enabled_errors, err_tree, *in_avals, carried=True)
+      for jxpr in branches)
 
   err_and_outs = lax.cond_p.bind(
       index, *err_vals, *ops,
@@ -864,12 +884,16 @@ def scan_error_check(ctx: CheckifyContext, error, enabled_errors, *in_flat,
 
   consts, carry, xs = map(list, ft_in.update(in_flat).unpack())
   xs_mapped = [core.mapped_aval(length, 0, core.typeof(val)) for val in xs]
+  # The carried error is scalar: a shard_map's errors (one a shard) reduced on
+  # the way in and at each step's end.
+  error = _reduce_any_error(error)
   # Query body effects to create a merged error containing all effects (such
   # that in and out carried error are of the same type).
   err_vals, err_tree = jtu.tree_flatten(error)
   new_in_aval = map(core.typeof, [*err_vals, *consts, *carry]) + xs_mapped
   _, _, effects = jaxpr_to_checkify_jaxpr(
-      CheckifyContext(), jaxpr, enabled_errors, err_tree, *new_in_aval
+      CheckifyContext(), jaxpr, enabled_errors, err_tree, *new_in_aval,
+      carried=True
   )
 
   merged_error = error._add_placeholder_effects(effects)
@@ -878,7 +902,8 @@ def scan_error_check(ctx: CheckifyContext, error, enabled_errors, *in_flat,
   # Create checked-jaxpr, with the needed pre-processing on the inputs.
   new_in_aval = map(core.typeof, [*err_vals, *consts, *carry]) + xs_mapped
   checked_jaxpr_, out_tree, _ = jaxpr_to_checkify_jaxpr(ctx, jaxpr, enabled_errors,
-                                                        err_tree, *new_in_aval)
+                                                        err_tree, *new_in_aval,
+                                                        carried=True)
 
   tomove = ([False] * len(err_vals) + [True] * len(consts)
             + [False] * (len(carry) + len(xs)))
@@ -919,7 +944,8 @@ def checkify_while_body_jaxpr(
   err_vals = map(core.typeof, err_vals)
   flat_err_and_in_vals = [*err_vals, *c_consts_avals, *body_jaxpr.in_avals]
   jaxpr, out_tree, error_effects = jaxpr_to_checkify_jaxpr(
-      ctx, jaxpr, enabled_errors, err_tree, *flat_err_and_in_vals)
+      ctx, jaxpr, enabled_errors, err_tree, *flat_err_and_in_vals,
+      carried=True)
   return jaxpr, out_tree, error_effects
 
 
@@ -939,8 +965,11 @@ def while_loop_error_check(ctx: CheckifyContext, error, enabled_errors,
                      'vmap-of-checkify-of-while.')
 
   c_consts, b_consts, carry = split_list(in_flat, [cond_nconsts, body_nconsts])
-  # Check if the first cond application will error.
+  # Check if the first cond application will error. The carried error is
+  # scalar: a shard_map's errors (one a shard) reduced on the way in and at
+  # each step's end (`checkify_while_body_jaxpr`).
   error, _ = checkify_jaxpr(ctx, cond_jaxpr, enabled_errors, error, *c_consts, *carry)
+  error = _reduce_any_error(error)
 
   _, _, error_effects = checkify_while_body_jaxpr(
       CheckifyContext(), cond_jaxpr, body_jaxpr, enabled_errors, error,
