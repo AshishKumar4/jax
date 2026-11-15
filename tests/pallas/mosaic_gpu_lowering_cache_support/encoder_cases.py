@@ -172,3 +172,35 @@ def run():
     except cache_encoding.Uncacheable:
       outcomes[name] = "uncacheable"
   return {"outcomes": outcomes, "expected": expected}
+
+
+def jaxpr_once():
+  """A kernel's jaxpr met twice (`lowering_cache._jaxpr_encoded`): how often its
+  equations were walked each time, and whether its encoding, a later part's
+  encoding and the primitives read are alike either way."""
+  import jax  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache  # pylint: disable=g-import-not-at-top
+
+  jaxpr = jax.make_jaxpr(lambda x: jnp.sin(x) * 2 + 1)(
+      jnp.ones((8,), jnp.float32)).jaxpr
+  walked = []
+  walk = cache_encoding.Encoder._jaxpr
+
+  def counted(self, *args, **kwargs):
+    walked.append(len(args))
+    return walk(self, *args, **kwargs)
+
+  cache_encoding.Encoder._jaxpr = counted
+  try:
+    first_encoder, first = lowering_cache._jaxpr_encoded(jaxpr)
+    met = len(walked)
+    second_encoder, second = lowering_cache._jaxpr_encoded(jaxpr)
+  finally:
+    cache_encoding.Encoder._jaxpr = walk
+  later = (jax.typeof(jnp.ones((8,), jnp.float32)),)
+  return {
+      "walked first": met, "walked again": len(walked) - met,
+      "same encoding": first == second,
+      "same later part": first_encoder.encode(later) == second_encoder.encode(later),
+      "same primitives": first_encoder.primitives == second_encoder.primitives,
+  }
