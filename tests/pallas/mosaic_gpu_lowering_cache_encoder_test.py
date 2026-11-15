@@ -39,6 +39,20 @@ class EncoderTest(harness.LoweringCacheTestCase):
         self.assertEqual(result["outcomes"][name], expected)
 
 
+class JaxprEncodedOnceTest(harness.LoweringCacheTestCase):
+
+  def test_a_jaxpr_met_before_is_read_and_keys_on_alike(self):
+    # A kernel's jaxpr met again (a held trace a caller lowers in each program
+    # calling it) takes its encoding without walking its equations, and the
+    # key's later parts encode on from the same state either way.
+    result = self.run_child(mode="jaxpr once")["jaxpr once"]
+    self.assertGreater(result["walked first"], 0)
+    self.assertEqual(result["walked again"], 0)
+    self.assertTrue(result["same encoding"])
+    self.assertTrue(result["same later part"])
+    self.assertTrue(result["same primitives"])
+
+
 class ConstantNamesTest(absltest.TestCase):
   """Which names of a module's source are constants (an analysis of the source)."""
 
