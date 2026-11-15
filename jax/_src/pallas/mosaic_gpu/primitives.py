@@ -1978,12 +1978,16 @@ def _barrier_wait_pp_eqn(
     context: jax_core.JaxprPpContext,
     settings: jax_core.JaxprPpSettings,
 ):
-  del settings
   barrier, *flat_transforms = eqn.invars
+  pp_params = {}
+  if eqn.params.get("has_phase", False):
+    *flat_transforms, phase = flat_transforms
+    pp_params["phase"] = phase.pretty_print(context)
   transforms_treedef = eqn.params["transforms_treedef"]
   transforms = transforms_treedef.unflatten(flat_transforms)
   return pp.concat([
       pp.text("barrier_wait"),
+      jax_core.pp_kv_pairs(pp_params.items(), context, settings),
       pp.text(" "),
       state_primitives.pp_ref_transforms(context, barrier, transforms),
   ])
@@ -2003,7 +2007,20 @@ def _barrier_wait_lowering(
     barrier,
     *flat_transforms,
     transforms_treedef,
+    has_phase: bool = False,
 ):
+  if has_phase:
+    *flat_transforms, phase = flat_transforms
+    phase = lowering._ensure_ir_value(phase, jnp.int32)  # pylint: disable=protected-access
+    i32 = ir.IntegerType.get_signless(32)
+    # The hardware waits at a phase's parity, its low bit.
+    parity = arith_dialect.cmpi(
+        arith_dialect.CmpIPredicate.ne,
+        arith_dialect.andi(phase, mgpu_utils.c(1, i32)),
+        mgpu_utils.c(0, i32),
+    )
+  else:
+    parity = None
   barrier_aval = ctx.avals_in[0]
   assert isinstance(barrier_aval, state_types.AbstractRef)
   transforms = transforms_treedef.unflatten(flat_transforms)
@@ -2013,18 +2030,40 @@ def _barrier_wait_lowering(
   base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
-  barrier.wait(orders_tensor_core=orders_tensor_core)
+  if parity is None:
+    barrier.wait(orders_tensor_core=orders_tensor_core)
+  else:
+    barrier.wait_parity(parity, orders_tensor_core=orders_tensor_core)
   return ()
 
 
-def barrier_wait(barrier: state.AbstractRef) -> None:
-  """Waits on the given barrier."""
+def barrier_wait(
+    barrier: state.AbstractRef,
+    *,
+    phase: int | jax.Array | None = None,
+) -> None:
+  """Waits on the given barrier.
+
+  Without a ``phase``, the wait takes the barrier's next phase, which the
+  kernel tracks for each barrier of an array. With one, it waits for that
+  phase, counted from 0 (the barrier's first completion), and tracks nothing:
+  a ring whose barriers all complete a phase each turn names the turn's
+  rotation, where tracking spends a bit test and a flip on every wait. The
+  hardware waits at the phase's parity, so a waiter may skip phases (consumers
+  taking alternate tiles of one ring) as long as the phase it names is the
+  barrier's latest completed or the one it is completing; the interpreter
+  checks that. A barrier is awaited one way throughout a kernel.
+  """
   barrier, transforms = state_primitives.get_ref_and_transforms(
       barrier, None, "barrier_wait"
   )
   flat_transforms, transforms_treedef = tree_util.tree_flatten(transforms)
   barrier_wait_p.bind(
-      barrier, *flat_transforms, transforms_treedef=transforms_treedef,
+      barrier,
+      *flat_transforms,
+      *() if phase is None else (phase,),
+      transforms_treedef=transforms_treedef,
+      has_phase=phase is not None,
   )
 
 
