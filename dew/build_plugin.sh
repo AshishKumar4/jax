@@ -68,19 +68,23 @@ printf 'common --disk_cache=%s\n' "${DEW_BAZEL_DISK_CACHE:-$HOME/.cache/dew-baze
 [ "${DEW_BAZEL_CACHE:-}" = off ] || \
   printf 'common --remote_cache=%s\ncommon --credential_helper=%s=%s\ncommon --remote_upload_local_results=true\n' \
     "$cache" "$host" "$helper" >> .bazelrc.user
-# DEW_PLUGIN_TESTS: Bazel test targets run in the same tree before the builds (a red one fails the job before hours
-# of builds), with the first CUDA's config, each `target` or `target=FILTER` (its cases alone, --test_filter); each
-# target's log and Bazel's exit in OUT/tests.tsv (0 passed, 3 a test failed), a red the job's failure.
+# DEW_PLUGIN_TESTS: Bazel test targets run in the same tree before the builds, with the first CUDA's config, each
+# `target` or `target=FILTER` (its cases alone, --test_filter), every one with --keep_going so one pass reports every
+# compile error it reaches; each target's log and Bazel's exit in OUT/tests.tsv (0 passed, 3 a test failed, 1 a
+# build failure). The builds run whatever the tests found, so a red test leaves the wheels built; a red test or build
+# is the job's failure at its end, every red one's log tail said (Main, 2026-11-15: post98's first compile error
+# cost a whole cold build to find).
+red=0
 if [ -n "${DEW_PLUGIN_TESTS:-}" ]; then
   printf 'target\tseconds\texit\n' > "$out/tests.tsv"
   for test in $DEW_PLUGIN_TESTS; do
     target=${test%%=*} filter=${test#*=} started=$(date +%s) code=0
     log="$out/test-$(echo "$target" | tr '/:@' '___').log"
     "${DEW_BAZEL:-bazel}" test --config=ci_linux_"$(uname -m)"_cuda"${cudas%% *}" \
-      --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --test_output=all \
+      --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --test_output=all --keep_going \
       ${filter:+$([ "$filter" != "$test" ] && echo "--test_filter=$filter")} > "$log" 2>&1 || code=$?
     printf '%s\t%s\t%s\n' "$test" "$(( $(date +%s) - started ))" "$code" >> "$out/tests.tsv"
-    [ "$code" = 0 ] || { tail -60 "$log"; exit "$code"; }
+    [ "$code" = 0 ] || { grep -E "error:|FAILED|NO STATUS" "$log" | head -60; red=$code; }
   done
 fi
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
@@ -96,9 +100,10 @@ for python in $pythons; do
       --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
-      --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
+      --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
-    [ "$code" = 0 ] || { tail -40 "$out/plugin-cp${python/./}-cuda$cuda.log"; exit "$code"; }
+    [ "$code" = 0 ] || { grep -E "error:|ERROR:" "$out/plugin-cp${python/./}-cuda$cuda.log" | head -60
+                         echo "build_plugin: a build of $python, CUDA $cuda failed ($code)" >&2; exit "$code"; }
   done
 done
 # Every wheel carries VERSION, or none is published: an OUT reused with an older build's wheels fails here,
@@ -117,3 +122,6 @@ python3 "${DEW_DEBUG_SPLIT:-$here/debug_split.py}" "$out/dist" "$out/debug" | te
 tar -C "$out/debug" -czf "$out/debug-$(uname -m).tar.gz" .build-id
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
 column -t -s $'\t' "$out/builds.tsv"
+# A red test leaves the wheels built and fails the job.
+[ "$red" = 0 ] || { echo "build_plugin: the wheels are built; a test target was red ($red): OUT/tests.tsv" >&2
+                    exit "$red"; }
