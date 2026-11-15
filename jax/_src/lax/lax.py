@@ -7293,6 +7293,13 @@ def _ragged_dot_general_batch_rule(
     group_offset,
     out_sharding,
 ):
+  # Each operand's mapped dimension moved to its front, an unmapped one (a
+  # shared right operand, group sizes closed over) broadcast there, so the rule
+  # for operands batched along their leading dimension applies.
+  batched_args = tuple(
+      batching.bdim_at_front(x, d, axis_data.size, axis_data.explicit_mesh_axis)
+      for x, d in zip(batched_args, batch_dims))
+  batch_dims = (0,) * len(batched_args)
   invoke = partial(_ragged_dot_general_invoke_prim, batched_args[2])
   batched_out, result_batch_dim = _dot_batch_rule(
       _ragged_dot_batch_unpack_args,
