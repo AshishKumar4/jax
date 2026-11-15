@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
       - name: The project and the index's storage
         run: |
-          [[ "$PROJECT" =~ ^[a-z0-9-]+$ ]] || { echo "::error::project"; exit 1; }
+          [[ "$PROJECT" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "::error::project"; exit 1; }
           for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
             [ -n "${!name}" ] || { echo "::error::the R2 secrets are not set"; exit 1; }
           done

@@ -8,13 +8,15 @@
 #   unlist.sh SITE PROJECT     R2, BUCKET and the AWS_* variables name the storage
 set -euo pipefail
 site=$1 package=$2
+# A project's normalized name (PEP 503), never one an option or a pattern could be read as.
+[[ "$package" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "unlist: $package is no project's name" >&2; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 . "$here/index_lib.sh"
 projects=$(published_projects) || exit 1
-grep -qx "$package" <<< "$projects" || echo "unlist: the root does not list $package; its pages are deleted anyway"
-python3 "$here/patch_stack.py" root "$site" --projects $(grep -vx "$package" <<< "$projects" || true)
+grep -Fqx -- "$package" <<< "$projects" || echo "unlist: the root does not list $package; its pages are deleted anyway"
+python3 "$here/patch_stack.py" root "$site" --projects $(grep -Fvx -- "$package" <<< "$projects" || true)
 put_page simple/
 for key in "simple/$package/" "simple/$package/index.html" "packages/$package/manifest.json"; do
   aws s3api delete-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$key" > /dev/null

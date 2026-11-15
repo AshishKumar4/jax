@@ -132,3 +132,15 @@ def test_an_unlisted_project_leaves_the_root_first_then_its_pages_and_manifest_a
     (tmp_path / "r2.puts").unlink()
     again = published(tmp_path, wheel(tmp_path / "wheels", "jaxlib", "0.12.0.1"))
     assert again.returncode != 0 and not (tmp_path / "r2.puts").exists(), again.stdout + again.stderr
+
+
+def test_an_unlist_of_no_projects_name_writes_nothing(tmp_path):
+    """A name an option or a pattern could be read as (`-e`, `.*`) is refused before anything is written: read as
+    grep's option, it emptied the root of every project."""
+    (tmp_path / "wheels").mkdir()
+    first = published(tmp_path, wheel(tmp_path / "wheels", "qwix", "0.1.8"), new_project="qwix")
+    assert first.returncode == 0, first.stdout + first.stderr
+    (tmp_path / "r2.puts").unlink()
+    for name in ("-e", ".*"):
+        assert ran(tmp_path, "unlist.sh", name).returncode != 0
+    assert not (tmp_path / "r2.puts").exists() and 'href="qwix/"' in root(tmp_path)
