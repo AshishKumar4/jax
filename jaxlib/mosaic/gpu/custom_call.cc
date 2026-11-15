@@ -1135,6 +1135,9 @@ struct CustomCallResources {
   bool uses_xla_collective_metadata = false;
   bool skip_device_barrier = false;
   std::optional<int64_t> collective_id;
+  // The custom call's `metadata` attribute: its caller's statement of the
+  // launch, one per call (calls of one kernel share `kernel`, not this).
+  std::string metadata;
 
   static absl::StatusOr<std::string> Serialize(
       const CustomCallResources& resources);
@@ -1171,6 +1174,7 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
   if (resources.collective_id.has_value()) {
     kernel_proto.set_collective_id(*resources.collective_id);
   }
+  kernel_proto.set_caller_metadata(resources.metadata);
   return kernel_proto.SerializeAsString();
 }
 
@@ -1189,6 +1193,7 @@ CustomCallResources::Deserialize(absl::string_view data) {
   }
   std::memcpy(resources->hash.data(), kernel_proto.kernel_hash().data(),
               sizeof(KernelHash));
+  resources->metadata = kernel_proto.caller_metadata();
 
   if (kernel_proto.version() != 5) {
     return absl::InternalError(absl::StrCat(
@@ -1336,6 +1341,8 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
   bool skip_device_barrier =
       attrs.get<bool>("skip_device_barrier").value_or(false);
   absl::StatusOr<int64_t> collective_id = attrs.get<int64_t>("collective_id");
+  const std::string_view metadata =
+      attrs.get<std::string_view>("metadata").value_or("");
   std::vector<int64_t> xla_replica_ids;
   std::vector<bool> symmetric_memory_parameters;
   if (uses_xla_collective_metadata) {
@@ -1355,6 +1362,7 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
       // barrier semaphores.
       .collective_id = collective_id.ok() ? std::make_optional(*collective_id)
                                           : std::nullopt,
+      .metadata = std::string(metadata),
   });
 }
 
@@ -2067,6 +2075,8 @@ XLA_FFI_DEFINE_HANDLER(kMosaicGpuPrepare, MosaicGpuPrepare,
 // - xla_replica_ids (required if uses_xla_collective_metadata is true)
 // - symmetric_memory_parameters (optional)
 // - collective_id (optional, enables barrier semaphores)
+// - metadata (optional): the caller's statement of the launch, kept in the
+//   serialized call (MosaicGpuKernelProto.caller_metadata).
 XLA_FFI_DEFINE_HANDLER(kMosaicGPUInstantiate, InstantiateResources,
                        ffi::Ffi::BindInstantiate()
                            .Ctx<ffi::TargetGpuComputeCapability>()
@@ -2118,6 +2128,56 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                              /*record=*/kMosaicGpuRecord,
                          });
 
+// Compiles `module` for `major`.`minor` with no device and writes its launch's
+// spec over `operands`, host buffers holding their contents before the launch
+// (`mosaic::gpu::CaptureDeviceless`): the kernel's own host function fills the
+// spec, its tensor maps recorded by their arguments alone (the runtime's
+// `mosaic_gpu_record_tensor_maps_only`), so the spec is the launch's as Mosaic
+// emits it. A kernel synchronizing with other devices is refused.
+absl::StatusOr<std::string> CaptureDevicelessModule(
+    llvm::StringRef module, int major, int minor,
+    const std::vector<mosaic::gpu::CapturedBuffer>& operands,
+    std::string_view root) {
+  mosaic::gpu::EnsureLLVMNVPTXTargetIsRegistered();
+  ASSIGN_OR_RETURN(std::string sm, mosaic::gpu::GetSmVersion(major, minor));
+  using FeatureExtension = se::CudaComputeCapability::FeatureExtension;
+  se::CudaComputeCapability cc(major, minor,
+                               absl::EndsWith(sm, "a")
+                                   ? FeatureExtension::kAcceleratedFeatures
+                                   : FeatureExtension::kNone);
+  ASSIGN_OR_RETURN(std::unique_ptr<CompiledKernel> kernel,
+                   Compile(module, cc, xla::cpu::TargetMachineOptions::Native()));
+  if (kernel->is_nvshmem_used || kernel->is_multimem_used) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "A deviceless capture runs one device's launch alone: Mosaic GPU "
+        "kernel '",
+        kernel->kernel_name, "' synchronizes with other devices"));
+  }
+  auto recording = kernel->lljit->lookup("mosaic_gpu_record_tensor_maps_only");
+  if (!recording) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "A deviceless capture records tensor maps by their arguments, which "
+        "this Mosaic GPU runtime does not (no "
+        "mosaic_gpu_record_tensor_maps_only): ",
+        llvm::toString(recording.takeError())));
+  }
+  auto* record_only = recording->toPtr<void (*)(int32_t)>();
+  std::vector<void*> buffers;
+  buffers.reserve(operands.size());
+  for (const mosaic::gpu::CapturedBuffer& operand : operands) {
+    buffers.push_back(operand.data);
+  }
+  mosaic::gpu::MosaicKernelSpec spec;
+  record_only(1);
+  {
+    absl::Cleanup encoding = [&] { record_only(0); };
+    kernel->host_func(&spec, buffers.data());
+  }
+  return mosaic::gpu::CaptureDeviceless(kernel->kernel_name,
+                                        kernel->gpu_binary, sm, spec, operands,
+                                        root);
+}
+
 }  // namespace
 
 extern "C" {
@@ -2159,6 +2219,32 @@ __attribute__((visibility("default"))) void** MosaicGpuCompile(
   tuple_ptr[1] = reinterpret_cast<void*>(&MosaicGpuLaunch);
   tuple_ptr[2] = (*kernel).release();
   return tuple_ptr;
+}
+
+// `CaptureDevicelessModule` for C callers (jax.experimental.mosaic.gpu's
+// `capture_deviceless`): `module` of `num_module_bytes`, compute capability
+// `major`.`minor`, and `num_operands` operands, each `data[i]` of `bytes[i]`
+// bytes named `names[i]` (in<i>, out<i>), of XLA's element type `dtypes[i]`
+// and `ranks[i]` dimensions, which `dims` holds one operand after another.
+// Writes the spec's directory into `out` (of `out_size` bytes) and returns 0,
+// or writes the error and returns 1.
+__attribute__((visibility("default"))) int MosaicGpuCaptureDeviceless(
+    const char* module, int num_module_bytes, int major, int minor,
+    int num_operands, void** data, const uint64_t* bytes,
+    const char* const* names, const char* const* dtypes, const int* ranks,
+    const int64_t* dims, const char* root, char* out, int out_size) {
+  std::vector<mosaic::gpu::CapturedBuffer> operands;
+  operands.reserve(num_operands);
+  for (int i = 0, at = 0; i < num_operands; at += ranks[i], ++i) {
+    operands.push_back({names[i], data[i], bytes[i], dtypes[i],
+                        std::vector<int64_t>(dims + at, dims + at + ranks[i])});
+  }
+  absl::StatusOr<std::string> captured = CaptureDevicelessModule(
+      llvm::StringRef(module, num_module_bytes), major, minor, operands, root);
+  const std::string written =
+      captured.ok() ? *captured : captured.status().ToString();
+  std::snprintf(out, out_size, "%s", written.c_str());
+  return captured.ok() ? 0 : 1;
 }
 
 __attribute__((visibility("default"))) void MosaicGpuUnload(void** tuple_ptr) {

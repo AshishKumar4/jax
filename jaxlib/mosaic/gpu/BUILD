@@ -322,6 +322,7 @@ cc_library(
     linkopts = if_oss(
         [],  # We use a version script to ensure symbol visibility in the OSS build.
         [
+            "-Wl,--export-dynamic-symbol='MosaicGpuCaptureDeviceless'",
             "-Wl,--export-dynamic-symbol='MosaicGpuCompile'",
             "-Wl,--export-dynamic-symbol='MosaicGpuUnload'",
         ],
