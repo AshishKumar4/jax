@@ -90,6 +90,10 @@ if [ -n "${DEW_PLUGIN_TESTS:-}" ]; then
     [ "$code" = 0 ] || { grep -m 60 -E "error:|FAILED|NO STATUS" "$log" || true; red=$code; }
   done
 fi
+# DEW_PLUGIN_TESTS_ONLY=1: the tests alone, no wheel built (a gtest's fix rerun on the tree that built the wheels).
+if [ "${DEW_PLUGIN_TESTS_ONLY:-}" = 1 ]; then
+  exit "$red"
+fi
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
