@@ -25,7 +25,20 @@ message MosaicGpuKernelProto {
   // decision), opaque to Mosaic: the custom call's `metadata` attribute, kept
   // with the compiled call so a reader of a serialized executable finds it.
   bytes caller_metadata = 17;
+  // What ptxas noted of a loss of performance in the kernel's assembly, in its
+  // order: a warpgroup MMA serialized (C7510 to C7515), a register move it
+  // ignores (C7507). Read once from ptxas's report as it assembled the kernel,
+  // so a reader of a compiled call finds them as data.
+  repeated AssemblerNote assembler_notes = 18;
 
   reserved 6;
   reserved "init_func_name";
+}
+
+// A note ptxas made of a loss of performance in a kernel's assembly.
+message AssemblerNote {
+  // Its code, as ptxas states it: `C7515`.
+  string code = 1;
+  // Its message, as ptxas states it after the code.
+  string message = 2;
 }
