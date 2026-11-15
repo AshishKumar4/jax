@@ -72,6 +72,9 @@ archive_override(
         # reduces by the copied operation: AllReducePromotion aborted a CPU bf16 psum's compile on it, and
         # MatchReductionComputation read it as no reduction (Dew row 5900).
         "//third_party:xla/reducer_copy_root.patch",
+        # cuDNN frontend 1.32.3: the packed d256 attention backward's plan holds 577 MiB of engine workspace
+        # where 1.26.0's held 9.68 GB at a 12,288-token call (Dew row 5916).
+        "//third_party:xla/cudnn_frontend_1_32_3.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
