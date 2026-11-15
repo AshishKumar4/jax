@@ -949,6 +949,9 @@ struct KernelCache {
   absl::Mutex mutex;
   absl::flat_hash_map<KernelHash, std::unique_ptr<CompiledKernel>> kernels
       ABSL_GUARDED_BY(mutex);
+  // The kernels a thread is compiling: another thread asking one waits for
+  // it rather than compiling it again.
+  absl::flat_hash_set<KernelHash> compiling ABSL_GUARDED_BY(mutex);
 };
 
 static KernelCache& GetKernelCache() {
@@ -963,17 +966,30 @@ absl::StatusOr<CompiledKernel*> GetOrCreateKernel(
   auto& cache = GetKernelCache();
   {
     absl::MutexLock lock(cache.mutex);
+    // A kernel another thread is compiling is waited for, compiled once: XLA
+    // instantiates a program's calls together, and a program calls one kernel
+    // from many places (each layer of a model).
+    std::pair<KernelCache*, const KernelHash*> asked(&cache, &kernel_hash);
+    cache.mutex.Await(absl::Condition(
+        +[](std::pair<KernelCache*, const KernelHash*>* asked)
+            ABSL_EXCLUSIVE_LOCKS_REQUIRED(asked->first->mutex) {
+              return !asked->first->compiling.contains(*asked->second);
+            },
+        &asked));
     auto it = cache.kernels.find(kernel_hash);
     if (it != cache.kernels.end()) {
       return it->second.get();
     }
+    cache.compiling.insert(kernel_hash);
   }
-  // Release the lock while compiling the kernel. It is possible that multiple
-  // threads compile the same kernel concurrently. In that case, we will discard
-  // all but the first result.
-  ASSIGN_OR_RETURN(auto kernel, factory());
+  // The lock released while compiling, so other kernels compile beside it.
+  absl::StatusOr<std::unique_ptr<CompiledKernel>> kernel = factory();
   absl::MutexLock lock(cache.mutex);
-  auto [iter, _] = cache.kernels.try_emplace(kernel_hash, std::move(kernel));
+  cache.compiling.erase(kernel_hash);
+  if (!kernel.ok()) {
+    return kernel.status();
+  }
+  auto [iter, _] = cache.kernels.try_emplace(kernel_hash, *std::move(kernel));
   return iter->second.get();
 }
 
