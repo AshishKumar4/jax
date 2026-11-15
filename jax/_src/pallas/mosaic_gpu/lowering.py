@@ -3001,21 +3001,71 @@ def _sqrt_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
 @register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.tanh_p, mgpu.LoweringSemantics.Warpgroup)
 def _tanh_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
+  """tanh in the form `accuracy` asks: none, or `AccuracyMode.DEFAULT`, the
+  kernel's `approx_math`; `AccuracyMode.HIGHEST` libdevice's, the most
+  accurate there is; a `lax.Tolerance` tanh.approx where its bound meets it,
+  else libdevice's where that one's does, else an error."""
   [x_aval] = ctx.avals_in
+  approx = ctx.module_ctx.approx_math
+  if accuracy is not None and accuracy != lax.AccuracyMode.DEFAULT:
+    if x_aval.dtype != jnp.float32:
+      raise NotImplementedError(f"accuracy for tanh of {x_aval.dtype}")
+    if accuracy == lax.AccuracyMode.HIGHEST:
+      approx = False
+    # tanh.approx's relative bound holds below the normal floats too.
+    elif _meets(accuracy, fa.APPROX_TANH_BOUND, 0.0):
+      approx = True
+    elif _meets(accuracy, fa.LIBDEVICE_TANH_BOUND, fa.LIBDEVICE_EXP_ATOL):
+      approx = False
+    else:
+      raise ValueError(
+          "No f32 tanh meets the tolerance"
+          f" (atol={accuracy.atol}, rtol={accuracy.rtol},"
+          f" ulps={accuracy.ulps}): libdevice's is within 2.5 ulps"
+      )
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    return _ensure_fa(x, x_aval.dtype).tanh(approx=ctx.module_ctx.approx_math)
-  fastmath = (
-      arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
-  )
+    return _ensure_fa(x, x_aval.dtype).tanh(approx=approx)
+  fastmath = arith_dialect.FastMathFlags.afn if approx else None
   return math_dialect.tanh(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
 
 
 def _logistic(x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
-  return 1.0 / (1 + lax.exp(-x))
+  """`1 / (1 + e^-x)`, its exponential the cheapest form that meets
+  `accuracy`.
+
+  The sum and the quotient each round once (half an ulp, a relative 2^-24
+  each), and the exponential's relative error reaches the result at most
+  whole, so the logistic's relative bound is its exponential's plus 2^-23,
+  and its ulps that times 2^24 (an ulp is at least 2^-24 of a float); a
+  result under 2^-126 (x past -87.3, where e^-x overflows) is within its own
+  size, so a tolerance asks an `atol` of 2^-126 of every form.
+  """
+  if accuracy is not None and accuracy != lax.AccuracyMode.DEFAULT:
+    if x.dtype != jnp.float32:
+      raise NotImplementedError(f"accuracy for logistic of {x.dtype}")
+    if accuracy != lax.AccuracyMode.HIGHEST:
+      flushed = fa.APPROX_FLUSHED_ATOL
+      composed = lambda bound: (
+          (bound[1] + 2.0**-23) * 2.0**24, bound[1] + 2.0**-23
+      )
+      for bound, asked in (
+          (fa.APPROX_EXP_BOUND, lax.Tolerance(
+              atol=flushed, ulps=math.ceil(fa.APPROX_EXP_BOUND[0]))),
+          (fa.LIBDEVICE_EXP_BOUND, lax.Tolerance(
+              ulps=math.ceil(fa.LIBDEVICE_EXP_BOUND[0]))),
+          (fa.EXACT_EXP_BOUND, lax.AccuracyMode.HIGHEST),
+      ):
+        if _meets(accuracy, composed(bound), flushed):
+          accuracy = asked
+          break
+      else:
+        raise ValueError(
+            "No f32 logistic meets the tolerance"
+            f" (atol={accuracy.atol}, rtol={accuracy.rtol},"
+            f" ulps={accuracy.ulps}): the exact exponential's is within 4"
+            " ulps and 2^-126"
+        )
+  return 1.0 / (1 + lax.exp(-x, accuracy=accuracy))
 
 
 mosaic_lowering_rules[gpu_core.LANExWG_SEMANTICS][lax.logistic_p] = _lower_fun(
@@ -3026,32 +3076,91 @@ mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS][lax.logistic_p] = _lower_fun(
 )
 
 
+ACCURACY_HONOURED = frozenset({
+    lax.exp_p, lax.exp2_p, lax.logistic_p, lax.tanh_p
+})
+"""The primitives whose lowering here takes the form their `accuracy` asks
+(`_exp_form`, `_logistic`, `_tanh_lowering_rule`); every other one with an
+`accuracy` parameter refuses a stated one."""
+
+
+def _meets(
+    accuracy: lax.Tolerance, bound: tuple[float, float], atol: float
+) -> bool:
+  """Whether a form within `bound` (ulps, relative) of every normal result,
+  and within `atol` of every result below the normal floats, meets
+  `accuracy`: each error within the largest of its `atol`, its `rtol` of the
+  result and its `ulps` of the result's ulp."""
+  ulps, rtol = bound
+  normal = accuracy.ulps >= ulps or accuracy.rtol >= rtol
+  # Below the normal floats an error is within the result's own size.
+  subnormal = (
+      accuracy.atol >= atol
+      or accuracy.rtol >= 1.0
+      or accuracy.ulps * 2.0**-149 >= atol
+  )
+  return normal and subnormal
+
+
+def _exp_form(accuracy, approx_math: bool, approx_bound) -> str:
+  """The form an f32 exponential takes: "approx" (the hardware's), "default"
+  (libdevice's) or "exact" (`FragmentedArray.exp`'s and `exp2`'s).
+
+  `accuracy` is lax's: none, or `AccuracyMode.DEFAULT`, takes the kernel's
+  `approx_math` (the hardware's form, else libdevice's, as before any stated
+  accuracy); `AccuracyMode.HIGHEST` the exact form; a `lax.Tolerance` the
+  cheapest form whose bound meets it (`approx_bound`'s, libdevice's, the
+  exact one's), else an error, as lax's contract asks of a tolerance no form
+  meets.
+  """
+  if accuracy is None or accuracy == lax.AccuracyMode.DEFAULT:
+    return "approx" if approx_math else "default"
+  if accuracy == lax.AccuracyMode.HIGHEST:
+    return "exact"
+  for form, bound, atol in (
+      ("approx", approx_bound, fa.APPROX_FLUSHED_ATOL),
+      ("default", fa.LIBDEVICE_EXP_BOUND, fa.LIBDEVICE_EXP_ATOL),
+      ("exact", fa.EXACT_EXP_BOUND, fa.EXACT_EXP_ATOL),
+  ):
+    if _meets(accuracy, bound, atol):
+      return form
+  raise ValueError(
+      "No f32 exponential meets the tolerance"
+      f" (atol={accuracy.atol}, rtol={accuracy.rtol}, ulps={accuracy.ulps}):"
+      " the exact form is within an ulp"
+  )
+
+
+def _exp_like(ctx: LoweringRuleContext, x, accuracy, name: str, bound):
+  [x_aval] = ctx.avals_in
+  if accuracy is not None and x_aval.dtype != jnp.float32:
+    raise NotImplementedError(f"accuracy for {name} of {x_aval.dtype}")
+  form = _exp_form(accuracy, ctx.module_ctx.approx_math, bound)
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    return getattr(_ensure_fa(x, x_aval.dtype), name)(
+        approx=form == "approx", exact=form == "exact"
+    )
+  fastmath = arith_dialect.FastMathFlags.afn if form == "approx" else None
+  result = getattr(math_dialect, name)(
+      _ensure_ir_value(x, x_aval.dtype), fastmath=fastmath
+  )
+  if form == "exact":
+    result.owner.attributes[mgpu.dialect_lowering.EXACT_ATTR] = (
+        ir.UnitAttr.get()
+    )
+  return result
+
+
 @register_lowering_rule(lax.exp_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.exp_p, mgpu.LoweringSemantics.Warpgroup)
 def _exp_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
-  [x_aval] = ctx.avals_in
-  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    return _ensure_fa(x, x_aval.dtype).exp(approx=ctx.module_ctx.approx_math)
-  fastmath = (
-      arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
-  )
-  return math_dialect.exp(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
+  return _exp_like(ctx, x, accuracy, "exp", fa.APPROX_EXP_BOUND)
 
 
 @register_lowering_rule(lax.exp2_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.exp2_p, mgpu.LoweringSemantics.Warpgroup)
 def _exp2_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
-  if accuracy is not None:
-    raise NotImplementedError("Not implemented: accuracy")
-  [x_aval] = ctx.avals_in
-  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    return _ensure_fa(x, x_aval.dtype).exp2(approx=ctx.module_ctx.approx_math)
-  fastmath = (
-      arith_dialect.FastMathFlags.afn if ctx.module_ctx.approx_math else None
-  )
-  return math_dialect.exp2(_ensure_ir_value(x, x_aval.dtype), fastmath=fastmath)
+  return _exp_like(ctx, x, accuracy, "exp2", fa.APPROX_EXP2_BOUND)
 
 @register_lowering_rule(lax.sin_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.sin_p, mgpu.LoweringSemantics.Warpgroup)
