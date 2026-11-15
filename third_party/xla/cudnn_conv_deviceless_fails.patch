@@ -1,0 +1,47 @@
+diff --git a/xla/backends/gpu/autotuner/cudnn.cc b/xla/backends/gpu/autotuner/cudnn.cc
+index abb46c31a3..26f5a07a45 100644
+--- a/xla/backends/gpu/autotuner/cudnn.cc
++++ b/xla/backends/gpu/autotuner/cudnn.cc
+@@ -391,6 +391,15 @@ bool CudnnBackend::IsSupported(const HloInstruction& instr) {
+ absl::StatusOr<std::unique_ptr<BackendConfig>> CudnnBackend::GetDefaultConfig(
+     const HloInstruction& instr) {
+   if (IsCustomCallToDnnConvolution(instr)) {
++    // Without a device no algorithm is chosen, and the default's -1 is no
++    // engine cuDNN runs: the executable would fail at its first run with
++    // CUDNN_STATUS_BAD_PARAM. Fail the compile instead.
++    if (stream_executor() == nullptr) {
++      return absl::FailedPreconditionError(
++          "Cannot get default cuDNN convolution config without a device: "
++          "compile with a StreamExecutor, or with autotune results that hold "
++          "this convolution");
++    }
+     // If the instruction is a custom call to a DnnConvolution, we can return
+     // the default config.
+     auto config = std::make_unique<BackendConfig>();
+diff --git a/xla/backends/gpu/autotuner/cudnn_test.cc b/xla/backends/gpu/autotuner/cudnn_test.cc
+index 5ec2f7280b..26d5d6b28d 100644
+--- a/xla/backends/gpu/autotuner/cudnn_test.cc
++++ b/xla/backends/gpu/autotuner/cudnn_test.cc
+@@ -393,6 +393,22 @@ TEST_F(CudnnBackendTest, CudnnDevicelessCompilationDisabledFails) {
+               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+ }
+ 
++TEST_F(CudnnBackendTest, GetDefaultConfigFromCudnnCustomCallFailsWithoutDevice) {
++  ASSERT_OK_AND_ASSIGN(stream_executor::GpuTargetConfigProto proto,
++                       GetGpuTargetConfig(GpuModel::H100_SXM));
++  ASSERT_OK_AND_ASSIGN(Compiler::GpuTargetConfig target_config,
++                       Compiler::GpuTargetConfig::FromProto(proto));
++  CudnnBackend backend_without_stream_executor(
++      /*stream_executor=*/nullptr, &debug_options_, &compiler_, &target_config);
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
++                       ParseAndReturnVerifiedModule(kCudnnCustomCallHlo));
++
++  EXPECT_THAT(
++      backend_without_stream_executor.GetDefaultConfig(
++          (*hlo_module->entry_computation()->root_instruction()->operand(0))),
++      absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
++}
++
+ TEST_F(CudnnBackendTest, ApplyConfigToCudnnFusion) {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                        ParseAndReturnVerifiedModule(kCudnnFusionHlo));
