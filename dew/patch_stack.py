@@ -82,6 +82,13 @@ def tests(release: str) -> list[str]:
     return git("diff", "--name-only", "--diff-filter=d", f"jax-v{release}", "HEAD", "--", "tests/*_test.py").split()
 
 
+def native(base: str) -> list[str]:
+    """The paths HEAD changes over `base` that a build reads: every one outside `PYTHON_ONLY` (a native source, a
+    patch Bazel applies to XLA under third_party/, MODULE.bazel), which reach a user only through Dew's own native
+    wheels (post98's XLA patches, beside jaxlib/ and jax_plugins/ alone before)."""
+    return git("diff", "--name-only", base, "HEAD", "--", ".", *(f":(exclude){path}" for path in PYTHON_ONLY)).split()
+
+
 def plugins(version: str) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
@@ -106,8 +113,7 @@ def plugins(version: str) -> str:
         stack = f"refs/remotes/origin/release/{release}.post{found}"
         git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
         held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
-        if any(not git("diff", "--name-only", base, "HEAD", "--", ".",
-                       *(f":(exclude){path}" for path in PYTHON_ONLY)).strip() for base in held):
+        if any(not native(base) for base in held):
             return tag.removeprefix("refs/tags/")
     return ""
 
@@ -297,6 +303,7 @@ def main() -> int:
     rebasing.add_argument("new")
     commands.add_parser("tests").add_argument("release")
     commands.add_parser("plugins").add_argument("version")
+    commands.add_parser("native").add_argument("release")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
     indexing.add_argument("site", type=Path)
@@ -314,6 +321,9 @@ def main() -> int:
         return 0
     if args.command == "plugins":
         print(plugins(args.version))
+        return 0
+    if args.command == "native":
+        print("\n".join(native(f"jax-v{args.release}")))
         return 0
     if args.command == "index":
         index(args.manifest, args.site, args.files, args.yank, args.reason, args.package, args.projects)

@@ -141,6 +141,35 @@ def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_cod
     assert patch_stack.plugins("0.12.0.1.post49") == ""
 
 
+def test_a_stacks_native_change_is_any_a_build_reads_an_xla_patch_among_them(tmp_path, monkeypatch):
+    """`native` lists what a stack changes over its release that a build reads: none for jax's Python, tests and
+    docs alone; an XLA patch under third_party/ and MODULE.bazel, which reach a user through Dew's own jaxlib and
+    plugins (post98: the publish read jaxlib/ and jax_plugins/ alone and would have shipped XLA's patches as jax
+    alone)."""
+    clone = tmp_path / "clone"
+    clone.mkdir()
+
+    def run(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=clone, check=True,
+                       capture_output=True)
+
+    def commit(files: dict[str, str]) -> None:
+        for name, text in files.items():
+            (clone / name).parent.mkdir(parents=True, exist_ok=True)
+            (clone / name).write_text(text)
+        run("add", "-A")
+        run("commit", "-qm", "a change")
+
+    run("init", "-q")
+    commit({"jax/core.py": "release", "MODULE.bazel": "release"})
+    run("tag", "jax-v0.12.0.1")
+    monkeypatch.chdir(clone)
+    commit({"jax/core.py": "a fix", "tests/core_test.py": "its test", "docs/notes.md": "its note"})
+    assert patch_stack.native("jax-v0.12.0.1") == []
+    commit({"third_party/xla/early_exit.patch": "the patch", "MODULE.bazel": "lists it"})
+    assert sorted(patch_stack.native("jax-v0.12.0.1")) == ["MODULE.bazel", "third_party/xla/early_exit.patch"]
+
+
 def test_a_python_only_release_ships_the_plugins_of_the_stack_it_grows_from(tmp_path, monkeypatch):
     """A plugin release's wheels were published beside its release's stack (release/X.postN), which may differ
     from the commit the plugins were built at in a file no build reads (a carried patch's own test, its

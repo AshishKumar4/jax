@@ -266,15 +266,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A stack that patches native code (jaxlib/, jax_plugins/) reaches a kernel only through its own CUDA and
-          # PJRT plugins (post42 shipped the plugin's patch alone, and kernels compiled through stock PJRT): the
-          # set publishes whole or not at all, from the plugin release whose native code the stack holds
+          # A stack that patches native code (`patch_stack.py native`: jaxlib/, jax_plugins/, XLA's patches under
+          # third_party/) reaches a kernel only through its own CUDA and PJRT plugins (post42 shipped the plugin's
+          # patch alone, and kernels compiled through stock PJRT), and jax's own lowering only through its own
+          # jaxlib, where its plugin release carries one (post98): the set publishes whole or not at all, from the plugin release whose native code the stack holds
           # (`patch_stack.py plugins`): the stack's own version's, or, for a post release of Python fixes alone,
           # the earlier one's, whose files the index lists already are kept as they are, so a machine an earlier
           # publish left out (`machines`) is added by the next (2026-11-08: post67's aarch64 plugins, built after
           # its x86_64 publish, reached the index with post68's).
           mkdir -p native
-          if git -C jax diff --quiet "jax-v$RELEASE" HEAD -- jaxlib jax_plugins; then
+          if [ -z "$(cd jax && python3 ../dew/dew/patch_stack.py native "$RELEASE")" ]; then
             echo "no native patch: jax alone"
             exit 0
           fi
@@ -288,6 +289,15 @@ jobs:
           version=${plugins#plugin-}
           gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "*.whl"
           missing=()
+          # Its jaxlib, where the release carries one, for every Python and machine; none, the release's stock one.
+          if ls native/jaxlib-*.whl > /dev/null 2>&1; then
+            for machine in $MACHINES; do
+              for python in $PYTHONS; do
+                ls native/jaxlib-"$version"-"$python"-"$python"-manylinux_*_"$machine".whl > /dev/null 2>&1 \
+                  || missing+=("jaxlib $python $machine")
+              done
+            done
+          fi
           for cuda in $CUDAS; do
             for machine in $MACHINES; do
               ls native/jax_cuda"$cuda"_pjrt-"$version"-py3-none-manylinux_*_"$machine".whl > /dev/null 2>&1 \
@@ -305,11 +315,13 @@ jobs:
           ls native
       - name: Test the stack's wheel
         run: |
-          # The stack's tests against the wheel installed beside its release's jaxlib, out of the tree it was
-          # built from (dew/test_wheel.sh), which a source-tree run imports first.
+          # The stack's tests against the wheel installed beside the jaxlib it ships (its own, where its native set
+          # carries one; else its release's stock one), out of the tree it was built from (dew/test_wheel.sh),
+          # which a source-tree run imports first.
           uv venv -q --python 3.12 tested
           wheel=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl)
-          uv pip install -q --python tested/bin/python "$wheel" "jaxlib==$RELEASE" $TEST_DEPENDENCIES
+          jaxlib=$(ls native/jaxlib-*-cp312-cp312-manylinux_*_x86_64.whl 2> /dev/null || echo "jaxlib==$RELEASE")
+          uv pip install -q --python tested/bin/python "$wheel" "$jaxlib" $TEST_DEPENDENCIES
           tests="$TESTS $(cd jax && python3 ../dew/dew/patch_stack.py tests "$RELEASE")"
           PYTEST_ARGS="-n auto" bash dew/dew/test_wheel.sh tested/bin/python "$wheel" jax $tests
       - uses: actions/upload-artifact@v4
@@ -358,6 +370,8 @@ jobs:
           shopt -s nullglob
           PACKAGE=jax bash dew/dew/index.sh site incoming/dist/*.whl
           export YANK=
+          wheels=(incoming/native/jaxlib-*.whl)
+          [ ${#wheels[@]} -eq 0 ] || bash dew/dew/index.sh site "${wheels[@]}"
           for cuda in $CUDAS; do
             for project in pjrt plugin; do
               wheels=(incoming/native/jax_cuda"$cuda"_"$project"-*.whl)
