@@ -1847,6 +1847,16 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "peak_live_test",
+    srcs = ["peak_live_test.py"],
+    deps = [
+        "//jax/_src:peak_live",
+        "//jax/_src:stages",
+        "//jax/experimental:topologies",
+    ] + py_deps("absl/testing"),
+)
+
+jax_multiplatform_test(
     name = "ode_test",
     srcs = ["ode_test.py"],
     shard_count = 2,

@@ -39,6 +39,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from jax._src import config
 from jax._src import core
+from jax._src import peak_live
 from jax._src import sharding as sharding_lib
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -813,6 +814,22 @@ class Compiled(Stage):
       return self._executable.memory_analysis()
     except NotImplementedError:
       return None
+
+  def peak_live(self) -> tuple[peak_live.LiveBuffer, ...] | None:
+    """The buffers live at the peak of each of the compile's allocations.
+
+    Read from XLA's own buffer assignment, which the compile states in its
+    memory analysis, whether it ran whole or stopped after buffer assignment
+    (``xla_gpu_experimental_early_exit``'s
+    ``EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT``); ``None`` where the backend
+    states no assignment (a plugin serving no executable metadata).
+    """
+    analysis = self.memory_analysis()
+    if analysis is None or not analysis.serialized_buffer_assignment_proto:
+      return None
+    module, = self.runtime_executable().hlo_modules()
+    return peak_live.live(analysis.serialized_buffer_assignment_proto,
+                          module.as_serialized_hlo_module_proto())
 
   @property
   def in_avals(self):
