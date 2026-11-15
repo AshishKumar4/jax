@@ -55,9 +55,26 @@ printf '#!/bin/sh\nexec python3 %q %q "$@"\n' "$here/bazel_credentials.py" "$(re
 chmod 700 "$helper"
 host=${cache#https://}
 host=${host%%/*}
-# Read by JAX's .bazelrc (try-import .bazelrc.user), after its own configs.
-printf 'common --remote_cache=%s\ncommon --credential_helper=%s=%s\ncommon --remote_upload_local_results=true\n' \
-  "$cache" "$host" "$helper" > .bazelrc.user
+# Read by JAX's .bazelrc (try-import .bazelrc.user), after its own configs. DEW_BAZEL_CACHE=off builds cold, neither
+# reading nor writing the remote cache (row 6204's containment, until its token is rotated).
+[ "${DEW_BAZEL_CACHE:-}" = off ] || \
+  printf 'common --remote_cache=%s\ncommon --credential_helper=%s=%s\ncommon --remote_upload_local_results=true\n' \
+    "$cache" "$host" "$helper" > .bazelrc.user
+# DEW_PLUGIN_TESTS: Bazel test targets run in the same tree before the builds (a red one fails the job before hours
+# of builds), with the first CUDA's config, each `target` or `target=FILTER` (its cases alone, --test_filter); each
+# target's log and Bazel's exit in OUT/tests.tsv (0 passed, 3 a test failed), a red the job's failure.
+if [ -n "${DEW_PLUGIN_TESTS:-}" ]; then
+  printf 'target\tseconds\texit\n' > "$out/tests.tsv"
+  for test in $DEW_PLUGIN_TESTS; do
+    target=${test%%=*} filter=${test#*=} started=$(date +%s) code=0
+    log="$out/test-$(echo "$target" | tr '/:@' '___').log"
+    "${DEW_BAZEL:-bazel}" test --config=ci_linux_"$(uname -m)"_cuda"${cudas%% *}" \
+      --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --test_output=all \
+      ${filter:+$([ "$filter" != "$test" ] && echo "--test_filter=$filter")} > "$log" 2>&1 || code=$?
+    printf '%s\t%s\t%s\n' "$test" "$(( $(date +%s) - started ))" "$code" >> "$out/tests.tsv"
+    [ "$code" = 0 ] || { tail -60 "$log"; exit "$code"; }
+  done
+fi
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
