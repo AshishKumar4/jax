@@ -73,6 +73,7 @@ from jax._src.util import foreach
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.experimental.mosaic.gpu import fragmented_array as fa
+from jax.experimental.mosaic.gpu import lowering_inputs as mgpu_lowering_inputs
 from jax.experimental.mosaic.gpu import profiler as mgpu_profiler
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
@@ -1028,16 +1029,15 @@ def lower_jaxpr_to_module(
       auto_barriers=not params.unsafe_no_auto_barriers,
   )
 
-  dump_options = mgpu.dialect.get_or_set_dump_options(module)
-  if dump_options.resources:
-    if prof_spec is not None:
-      smem_scratch_bytes = rs.smem_scratch_bytes + prof_spec.smem_bytes(block)
-      rs = dataclasses.replace(rs, smem_scratch_bytes=smem_scratch_bytes)
-    # Dumped with the kernel's hash once the module is lowered to its custom
-    # call (`mosaic_gpu.core`), which names the estimate's kernel.
-    module.operation.attributes[mgpu_core.RESOURCES_ATTR] = ir.StringAttr.get(
-        str(rs)
-    )
+  if prof_spec is not None:
+    smem_scratch_bytes = rs.smem_scratch_bytes + prof_spec.smem_bytes(block)
+    rs = dataclasses.replace(rs, smem_scratch_bytes=smem_scratch_bytes)
+  # Carried by every module, a cached lowering's as a fresh one's, and dumped
+  # with the kernel's hash once the module is lowered to its custom call
+  # (`mosaic_gpu.core`) where MOSAIC_GPU_DUMP_RESOURCES asks.
+  module.operation.attributes[mgpu_core.RESOURCES_ATTR] = ir.StringAttr.get(
+      str(rs)
+  )
 
   return LoweringResult(
       module, cuda_grid, block, new_out_shapes, prof_spec,
@@ -1136,14 +1136,19 @@ def lower_jaxpr_to_mosaic_gpu(
   named_regions = []
   for i, eqn in enumerate(jaxpr.eqns):
     invals = map(read_env, eqn.invars)
-    eqn_name_stack = module_ctx.name_stack + eqn.source_info.name_stack
-    with config.include_full_tracebacks_in_locations(False):
-      loc = mlir.source_info_to_location(
-          module_ctx,
-          eqn.primitive,
-          eqn_name_stack,
-          eqn.source_info.traceback or module_ctx.outer_traceback,
-      )
+    if mgpu_lowering_inputs.current() is not None:
+      # A lowering a cache keys has no source locations: they are no part of
+      # its key, so a hit and a miss both carry none.
+      loc = ir.Location.unknown()
+    else:
+      eqn_name_stack = module_ctx.name_stack + eqn.source_info.name_stack
+      with config.include_full_tracebacks_in_locations(False):
+        loc = mlir.source_info_to_location(
+            module_ctx,
+            eqn.primitive,
+            eqn_name_stack,
+            eqn.source_info.traceback or module_ctx.outer_traceback,
+        )
     with source_info_util.user_context(eqn.source_info.traceback), loc:
       rules = mosaic_lowering_rules[
           (module_ctx.lowering_semantics, module_ctx.primitive_semantics)]
