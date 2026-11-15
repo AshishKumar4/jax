@@ -2830,13 +2830,14 @@ def dot(lhs: ArrayLike, rhs: ArrayLike, *,
       dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
   return _dot_general_bound(lhs, rhs, dimension_numbers, precision=precision,
                             preferred_element_type=preferred_element_type,
-                            out_sharding=out_sharding)
+                            out_sharding=out_sharding,
+                            reduction_order=reduction_order)
 
 
 def _dot_general_bound(lhs, rhs, dimension_numbers: DotDimensionNumbers, *,
                        precision: PrecisionLike = None,
                        preferred_element_type: DTypeLike | None = None,
-                       out_sharding=None) -> Array:
+                       out_sharding=None, reduction_order: Any = None) -> Array:
   """`dot_general_p` bound with `preferred_element_type` as given: `dot`'s, a
   user's request canonicalized; and a transformation rule's (batching,
   transposition), its jaxpr's param bound as recorded, as canonicalizing it
