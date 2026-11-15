@@ -1,0 +1,544 @@
+From 77be12132b9cf3794f19de047f1197190fa1c099 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 01:49:25 -0600
+Subject: [PATCH] [XLA:GPU] A compile can stop after buffer assignment and
+ state its memory
+
+EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT (xla_gpu_experimental_early_exit) maps to the AOT
+kAfterBufferAssignment, which no compiler implemented: the GPU compiler runs the HLO passes, cuDNN's compiler
+passes (their workspaces are buffers), scheduling and the post-scheduling pipelines (ScheduleForBackend, shared
+with CompileToBackendResult), then buffer assignment, and returns an EarlyExitCompilationResult holding the
+assignment, whose GetCompiledMemoryStats states the compile's memory (CompiledMemoryStats::FromBufferAssignment,
+the one owner GpuAotCompilationResult reads too), no code emitted. A planner reads an executable's memory at the
+cost of its HLO passes alone.
+---
+ xla/debug_options_flags.cc                    |  3 +-
+ xla/pjrt/BUILD                                |  3 +
+ xla/pjrt/compiled_memory_stats.cc             | 30 +++++++
+ xla/pjrt/compiled_memory_stats.h              |  8 ++
+ xla/pjrt/gpu/se_gpu_pjrt_compiler.cc          |  4 +
+ xla/service/gpu/BUILD                         |  3 +-
+ xla/service/gpu/compile_module_to_llvm_ir.h   |  6 ++
+ .../gpu/early_exit_compilation_result.cc      | 10 ++-
+ .../gpu/early_exit_compilation_result.h       |  9 ++
+ xla/service/gpu/gpu_aot_compilation_result.cc | 34 +-------
+ xla/service/gpu/gpu_compiler.cc               | 85 +++++++++++++++----
+ xla/service/gpu/gpu_compiler.h                | 13 +++
+ xla/service/gpu/gpu_compiler_test.cc          | 50 +++++++++++
+ xla/xla.proto                                 |  2 +
+ 14 files changed, 206 insertions(+), 54 deletions(-)
+
+diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
+index 81bc1bbf2a..f2d6329c44 100644
+--- a/xla/debug_options_flags.cc
++++ b/xla/debug_options_flags.cc
+@@ -3961,7 +3961,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+       DebugOptions::EarlyExitPoint_Name(
+           debug_options->xla_gpu_experimental_early_exit()),
+       "Exits compilation early at the specified point. Available options: "
+-      "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT."));
++      "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
++      "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
+   flag_list->push_back(tsl::Flag(
+       "xla_gpu_print_compilation_stats",
+       bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
+diff --git a/xla/pjrt/BUILD b/xla/pjrt/BUILD
+index 2c8cb2366e..024481fe28 100644
+--- a/xla/pjrt/BUILD
++++ b/xla/pjrt/BUILD
+@@ -1501,8 +1501,11 @@ cc_library(
+         "//xla:shape_util",
+         "//xla/pjrt/proto:executable_metadata_proto_cc",
+         "//xla/service:buffer_assignment",
++        "//xla/service:hlo_proto_cc",
+         "//xla/service:hlo_value",
+         "@com_google_absl//absl/log:check",
++        "@com_google_absl//absl/status:status_macros",
++        "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/types:span",
+     ],
+ )
+diff --git a/xla/pjrt/compiled_memory_stats.cc b/xla/pjrt/compiled_memory_stats.cc
+index 23e9e13234..27fc192e0c 100644
+--- a/xla/pjrt/compiled_memory_stats.cc
++++ b/xla/pjrt/compiled_memory_stats.cc
+@@ -16,8 +16,11 @@ limitations under the License.
+ #include "xla/pjrt/compiled_memory_stats.h"
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ #include "absl/log/check.h"
++#include "absl/status/status_macros.h"
++#include "absl/status/statusor.h"
+ #include "absl/types/span.h"
+ #include "xla/layout.h"
+ #include "xla/service/buffer_assignment.h"
+@@ -25,6 +28,33 @@ limitations under the License.
+ 
+ namespace xla {
+ 
++absl::StatusOr<CompiledMemoryStats> CompiledMemoryStats::FromBufferAssignment(
++    const BufferAssignmentProto& assignment, const HloModuleProto& module) {
++  CompiledMemoryStats stats;
++  stats.serialized_buffer_assignment = assignment.SerializeAsString();
++  std::vector<BufferAllocation> allocations;
++  allocations.reserve(assignment.buffer_allocations_size());
++  for (const BufferAllocationProto& allocation :
++       assignment.buffer_allocations()) {
++    allocations.push_back(BufferAllocation::FromProto(allocation));
++  }
++  std::vector<const BufferAllocation*> pointers;
++  pointers.reserve(allocations.size());
++  for (const BufferAllocation& allocation : allocations) {
++    pointers.push_back(&allocation);
++  }
++  stats.PopulateBufferStatsFromAllocations(pointers);
++  ABSL_ASSIGN_OR_RETURN(PeakMemorySizes peak,
++                        ComputePeakMemorySizes(assignment, module));
++  stats.peak_memory_in_bytes = peak.padded;
++  stats.peak_unpadded_heap_bytes = peak.unpadded;
++  stats.total_allocation_bytes =
++      ComputeTotalAllocationBytes(assignment, /*memory_color=*/0);
++  stats.indefinite_allocations =
++      ComputeIndefiniteAllocationsInBytes(assignment, /*memory_color=*/0);
++  return stats;
++}
++
+ // Recomputes the memory stats from allocations. Why recompute?
+ // Firstly, there are cases in which gpu::Executable inherits its allocations
+ // from elsewhere, and no buffer assignment is available.
+diff --git a/xla/pjrt/compiled_memory_stats.h b/xla/pjrt/compiled_memory_stats.h
+index 9b4c149cbc..1b715c0567 100644
+--- a/xla/pjrt/compiled_memory_stats.h
++++ b/xla/pjrt/compiled_memory_stats.h
+@@ -19,9 +19,11 @@ limitations under the License.
+ #include <cstdint>
+ #include <string>
+ 
++#include "absl/status/statusor.h"
+ #include "absl/types/span.h"
+ #include "xla/pjrt/proto/executable_metadata.pb.h"
+ #include "xla/service/buffer_assignment.h"
++#include "xla/service/hlo.pb.h"
+ 
+ namespace xla {
+ 
+@@ -61,6 +63,12 @@ struct CompiledMemoryStats {
+ 
+   void PopulateBufferStatsFromAllocations(
+       absl::Span<const BufferAllocation* const> allocs);
++
++  // The stats of `module` compiled under `assignment`, its serialized form
++  // among them: an executable's, or a compile's that stopped after buffer
++  // assignment.
++  static absl::StatusOr<CompiledMemoryStats> FromBufferAssignment(
++      const BufferAssignmentProto& assignment, const HloModuleProto& module);
+ };
+ 
+ }  // namespace xla
+diff --git a/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc b/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
+index 25576bb3a2..693c2f214a 100644
+--- a/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
++++ b/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
+@@ -362,6 +362,10 @@ StreamExecutorGpuCompiler::Compile(
+                DebugOptions::EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT) {
+       aot_options.set_early_exit_point(
+           AotCompilationOptions::EarlyExitPoint::kAfterConfigAssignment);
++    } else if (early_exit ==
++               DebugOptions::EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT) {
++      aot_options.set_early_exit_point(
++          AotCompilationOptions::EarlyExitPoint::kAfterBufferAssignment);
+     }
+   }
+   const int num_replicas = hlo_module->config().replica_count();
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index 8785c0c2d4..54be8fda6a 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -2209,6 +2209,7 @@ xla_test(
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:pattern_matcher_gmock",
+         "//xla/hlo/testlib:verified_hlo_module",
++        "//xla/pjrt:compiled_memory_stats",
+         "//xla/service:compiled_module",
+         "//xla/service:compiler",
+         "//xla/service:device_assignment",
+@@ -2313,6 +2314,7 @@ cc_library(
+         "//xla/pjrt:compiled_memory_stats",
+         "//xla/service:compiled_module",
+         "//xla/service:executable",
++        "//xla/service:hlo_proto_cc",
+         "//xla/stream_executor:device_description",
+         "//xla/stream_executor:platform",
+         "@com_google_absl//absl/status",
+@@ -2331,7 +2333,6 @@ cc_library(
+         "//xla:xla_proto_cc",
+         "//xla/hlo/ir:hlo",
+         "//xla/pjrt:compiled_memory_stats",
+-        "//xla/service:buffer_assignment",
+         "//xla/service:compiled_module",
+         "//xla/service:executable",
+         "//xla/stream_executor:device_description",
+diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compile_module_to_llvm_ir.h
+index 2c6c78da23..f024b7cdc9 100644
+--- a/xla/service/gpu/compile_module_to_llvm_ir.h
++++ b/xla/service/gpu/compile_module_to_llvm_ir.h
+@@ -63,6 +63,12 @@ struct CompileModuleResults {
+ absl::Status LoadCache(IrEmitterContext& ir_emitter_context,
+                        absl::string_view cache_file_path);
+ 
++// The buffer assignment of scheduled `module`, as its code emission assigns
++// it.
++absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
++    const HloModule* module, const GpuAliasInfo* alias_info,
++    BufferValue::SizeFunction buffer_size_bytes_function);
++
+ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+     const HloModule* hlo_module, llvm::LLVMContext* llvm_context,
+     const std::string& target_triple, const std::string& data_layout,
+diff --git a/xla/service/gpu/early_exit_compilation_result.cc b/xla/service/gpu/early_exit_compilation_result.cc
+index 7ece24b05d..c7cc8e1a74 100644
+--- a/xla/service/gpu/early_exit_compilation_result.cc
++++ b/xla/service/gpu/early_exit_compilation_result.cc
+@@ -47,9 +47,13 @@ EarlyExitCompilationResult::LoadExecutable(
+ 
+ absl::StatusOr<CompiledMemoryStats>
+ EarlyExitCompilationResult::GetCompiledMemoryStats() const {
+-  return absl::UnavailableError(
+-      "GetCompiledMemoryStats() is not supported by "
+-      "EarlyExitCompilationResult.");
++  if (!buffer_assignment_.has_value()) {
++    return absl::UnavailableError(
++        "GetCompiledMemoryStats() needs a compile that stopped after buffer "
++        "assignment.");
++  }
++  return CompiledMemoryStats::FromBufferAssignment(*buffer_assignment_,
++                                                   module_->ToProto());
+ }
+ 
+ }  // namespace gpu
+diff --git a/xla/service/gpu/early_exit_compilation_result.h b/xla/service/gpu/early_exit_compilation_result.h
+index bea538c253..224c3c88c6 100644
+--- a/xla/service/gpu/early_exit_compilation_result.h
++++ b/xla/service/gpu/early_exit_compilation_result.h
+@@ -17,6 +17,7 @@ limitations under the License.
+ #define XLA_SERVICE_GPU_EARLY_EXIT_COMPILATION_RESULT_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <utility>
+ 
+@@ -26,6 +27,7 @@ limitations under the License.
+ #include "xla/pjrt/compiled_memory_stats.h"
+ #include "xla/service/compiled_module.h"
+ #include "xla/service/executable.h"
++#include "xla/service/hlo.pb.h"
+ #include "xla/stream_executor/device_description.h"
+ #include "xla/stream_executor/platform.h"
+ #include "xla/xla.pb.h"
+@@ -37,6 +39,12 @@ class EarlyExitCompilationResult : public CompiledModule {
+  public:
+   explicit EarlyExitCompilationResult(std::unique_ptr<HloModule> module)
+       : module_(std::move(module)) {}
++  // A compile that stopped after buffer assignment: its module and the
++  // assignment, whose memory stats it states (`GetCompiledMemoryStats`).
++  EarlyExitCompilationResult(std::unique_ptr<HloModule> module,
++                             BufferAssignmentProto buffer_assignment)
++      : module_(std::move(module)),
++        buffer_assignment_(std::move(buffer_assignment)) {}
+ 
+   absl::StatusOr<std::string> SerializeAsString() const override;
+ 
+@@ -60,6 +68,7 @@ class EarlyExitCompilationResult : public CompiledModule {
+ 
+  private:
+   std::shared_ptr<HloModule> module_;
++  std::optional<BufferAssignmentProto> buffer_assignment_;
+ };
+ 
+ }  // namespace gpu
+diff --git a/xla/service/gpu/gpu_aot_compilation_result.cc b/xla/service/gpu/gpu_aot_compilation_result.cc
+index 880c9cfbea..9462e41347 100644
+--- a/xla/service/gpu/gpu_aot_compilation_result.cc
++++ b/xla/service/gpu/gpu_aot_compilation_result.cc
+@@ -19,7 +19,6 @@ limitations under the License.
+ #include <string>
+ #include <utility>
+ #include <variant>
+-#include <vector>
+ 
+ #include "absl/functional/overload.h"
+ #include "absl/memory/memory.h"
+@@ -34,7 +33,6 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_print_options.h"
+ #include "xla/pjrt/compiled_memory_stats.h"
+ #include "xla/printer.h"
+-#include "xla/service/buffer_assignment.h"
+ #include "xla/service/executable.h"
+ #include "xla/service/gpu/gpu_executable.h"
+ #include "xla/service/gpu/gpu_executable.pb.h"
+@@ -145,35 +143,9 @@ const GpuExecutableProto& GpuAotCompilationResult::GetExecutableProto() const {
+ 
+ absl::StatusOr<CompiledMemoryStats>
+ GpuAotCompilationResult::GetCompiledMemoryStats() const {
+-  CompiledMemoryStats memory_stats;
+-  memory_stats.serialized_buffer_assignment =
+-      GetExecutableProto().buffer_assignment().SerializeAsString();
+-
+-  std::vector<BufferAllocation> allocations;
+-  allocations.reserve(
+-      GetExecutableProto().buffer_assignment().buffer_allocations_size());
+-  for (const BufferAllocationProto& allocation :
+-       GetExecutableProto().buffer_assignment().buffer_allocations()) {
+-    allocations.push_back(BufferAllocation::FromProto(allocation));
+-  }
+-  std::vector<const BufferAllocation*> alloc_ptrs;
+-  alloc_ptrs.reserve(allocations.size());
+-  for (const BufferAllocation& alloc : allocations) {
+-    alloc_ptrs.push_back(&alloc);
+-  }
+-  memory_stats.PopulateBufferStatsFromAllocations(alloc_ptrs);
+-  ABSL_ASSIGN_OR_RETURN(
+-      auto peak_memories,
+-      ComputePeakMemorySizes(
+-          GetExecutableProto().buffer_assignment(),
+-          GetExecutableProto().hlo_module_with_config().hlo_module()));
+-  memory_stats.peak_memory_in_bytes = peak_memories.padded;
+-  memory_stats.peak_unpadded_heap_bytes = peak_memories.unpadded;
+-  memory_stats.total_allocation_bytes = ComputeTotalAllocationBytes(
+-      GetExecutableProto().buffer_assignment(), /*memory_color=*/0);
+-  memory_stats.indefinite_allocations = ComputeIndefiniteAllocationsInBytes(
+-      GetExecutableProto().buffer_assignment(), /*memory_color=*/0);
+-  return memory_stats;
++  return CompiledMemoryStats::FromBufferAssignment(
++      GetExecutableProto().buffer_assignment(),
++      GetExecutableProto().hlo_module_with_config().hlo_module());
+ }
+ 
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
+index d438020ba2..9025596b36 100644
+--- a/xla/service/gpu/gpu_compiler.cc
++++ b/xla/service/gpu/gpu_compiler.cc
+@@ -2747,6 +2747,61 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
+ }
+ }  // namespace
+ 
++absl::StatusOr<std::unique_ptr<GpuAliasInfo>> GpuCompiler::ScheduleForBackend(
++    HloModule* module, const GpuTopology& gpu_topology,
++    mlir::MLIRContext* mlir_context, tsl::thread::ThreadPool* thread_pool) {
++  const se::DeviceDescription& device_description =
++      gpu_topology.gpu_target_config().device_description;
++  std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(device_description);
++  ABSL_RETURN_IF_ERROR(RunPreSchedulingPasses(module, device_description,
++                                              alias_info.get(), mlir_context));
++  ABSL_ASSIGN_OR_RETURN(
++      ScheduleMetadata schedule_metadata,
++      ScheduleGpuModule(module, pointer_size_, device_description,
++                        mlir_context, alias_info.get()));
++  HloPassPipeline pipeline("scheduled-gpu-module");
++  AddHloVerifier(&pipeline);
++  ABSL_RETURN_IF_ERROR(pipeline.Run(module).status());
++  ABSL_RETURN_IF_ERROR(RunPostSchedulingPipelines(
++      module, schedule_metadata.scheduler_mem_limit, gpu_topology,
++      alias_info.get(), mlir_context, thread_pool));
++  return alias_info;
++}
++
++absl::StatusOr<std::unique_ptr<CompiledModule>>
++GpuCompiler::CompileToBufferAssignment(std::unique_ptr<HloModule> module,
++                                       se::StreamExecutor* stream_exec,
++                                       const CompileOptions& options) {
++  tsl::profiler::TraceMe traceme("CompileToBufferAssignment");
++  ABSL_ASSIGN_OR_RETURN(
++      GpuTopology gpu_topology,
++      InferGpuTopology(module->config(), stream_exec, options,
++                       module->config().debug_options(), platform_id_));
++  // cuDNN's compiled graphs state their workspaces, buffers of the assignment.
++  BinaryMap dnn_compiled_graphs;
++  ABSL_RETURN_IF_ERROR(RunCudnnCompilerPasses(module.get(), stream_exec,
++                                              gpu_topology.gpu_target_config(),
++                                              &dnn_compiled_graphs));
++  ABSL_ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
++                        mlir_context_pool_.GetOrCreate());
++  MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
++      /*parallelism=*/module->config()
++          .debug_options()
++          .xla_gpu_force_compilation_parallelism(),
++      /*default_thread_pool=*/options.thread_pool,
++      /*default_parallelism=*/tsl::port::MaxParallelism());
++  ABSL_ASSIGN_OR_RETURN(
++      std::unique_ptr<GpuAliasInfo> alias_info,
++      ScheduleForBackend(module.get(), gpu_topology, borrowed_context->get(),
++                         thread_pool.get_mutable()));
++  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> assignment,
++                        RunBufferAssignment(module.get(), alias_info.get(),
++                                            BufferSizeBytesFunction()));
++  BufferAssignmentProto assignment_proto = assignment->ToProto();
++  return std::make_unique<EarlyExitCompilationResult>(
++      std::move(module), std::move(assignment_proto));
++}
++
+ absl::StatusOr<GpuCompiler::CompileResultWithMetadata>
+ GpuCompiler::CompileToBackendResult(
+     HloModule* module, llvm::LLVMContext* llvm_context,
+@@ -2759,30 +2814,15 @@ GpuCompiler::CompileToBackendResult(
+       module->config().debug_options().xla_gpu_kernel_cache_file();
+   const bool use_cache = !cache_path.empty();
+ 
+-  std::unique_ptr<GpuAliasInfo> alias_info =
+-      GetAliasInfo(gpu_topology.gpu_target_config().device_description);
+-  ABSL_RETURN_IF_ERROR(RunPreSchedulingPasses(
+-      module, gpu_topology.gpu_target_config().device_description,
+-      alias_info.get(), mlir_context));
+-  ABSL_ASSIGN_OR_RETURN(
+-      ScheduleMetadata schedule_metadata,
+-      ScheduleGpuModule(module, pointer_size_,
+-                        gpu_topology.gpu_target_config().device_description,
+-                        mlir_context, alias_info.get()));
+-  HloPassPipeline pipeline("scheduled-gpu-module");
+-  AddHloVerifier(&pipeline);
+-  ABSL_RETURN_IF_ERROR(pipeline.Run(module).status());
+-
+   MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
+       /*parallelism=*/module->config()
+           .debug_options()
+           .xla_gpu_force_compilation_parallelism(),
+       /*default_thread_pool=*/options.thread_pool,
+       /*default_parallelism=*/tsl::port::MaxParallelism());
+-
+-  ABSL_RETURN_IF_ERROR(RunPostSchedulingPipelines(
+-      module, schedule_metadata.scheduler_mem_limit, gpu_topology,
+-      alias_info.get(), mlir_context, thread_pool.get_mutable()));
++  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<GpuAliasInfo> alias_info,
++                        ScheduleForBackend(module, gpu_topology, mlir_context,
++                                           thread_pool.get_mutable()));
+ 
+   absl::Mutex module_stats_m_;
+   ModuleStats module_stats;
+@@ -3061,6 +3101,15 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
+       RunHloPassesIfNeeded(std::move(hlo_module), options.executor(),
+                            compile_options));
+ 
++  if (options.early_exit_point() ==
++      AotCompilationOptions::EarlyExitPoint::kAfterBufferAssignment) {
++    std::vector<std::unique_ptr<CompiledModule>> results;
++    ABSL_ASSIGN_OR_RETURN(
++        results.emplace_back(),
++        CompileToBufferAssignment(std::move(optimized_hlo_module),
++                                  options.executor(), compile_options));
++    return results;
++  }
+   if (options.early_exit_point() !=
+       AotCompilationOptions::EarlyExitPoint::kNone) {
+     std::vector<std::unique_ptr<CompiledModule>> results;
+diff --git a/xla/service/gpu/gpu_compiler.h b/xla/service/gpu/gpu_compiler.h
+index fae1025645..a3cfac8746 100644
+--- a/xla/service/gpu/gpu_compiler.h
++++ b/xla/service/gpu/gpu_compiler.h
+@@ -215,6 +215,19 @@ class GpuCompiler : public LLVMCompiler {
+     CompileModuleResults compile_module_results;
+   };
+ 
++  // Schedules `module` for `gpu_topology`'s device and runs its
++  // post-scheduling pipelines: the module buffer assignment and code emission
++  // read, under the alias info returned.
++  absl::StatusOr<std::unique_ptr<GpuAliasInfo>> ScheduleForBackend(
++      HloModule* module, const GpuTopology& gpu_topology,
++      mlir::MLIRContext* mlir_context, tsl::thread::ThreadPool* thread_pool);
++
++  // `module`, optimized, compiled as far as its buffer assignment: its memory
++  // stats, no code emitted (`kAfterBufferAssignment`).
++  absl::StatusOr<std::unique_ptr<CompiledModule>> CompileToBufferAssignment(
++      std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
++      const CompileOptions& options);
++
+   // Schedule and compile the module.
+   absl::StatusOr<CompileResultWithMetadata> CompileToBackendResult(
+       HloModule* module, llvm::LLVMContext* llvm_context,
+diff --git a/xla/service/gpu/gpu_compiler_test.cc b/xla/service/gpu/gpu_compiler_test.cc
+index 09c46a5c89..ba4bd75582 100644
+--- a/xla/service/gpu/gpu_compiler_test.cc
++++ b/xla/service/gpu/gpu_compiler_test.cc
+@@ -74,6 +74,7 @@ limitations under the License.
+ #include "xla/literal.h"
+ #include "xla/literal_util.h"
+ #include "xla/primitive_util.h"
++#include "xla/pjrt/compiled_memory_stats.h"
+ #include "xla/service/compiled_module.h"
+ #include "xla/service/compiler.h"
+ #include "xla/service/device_assignment.h"
+@@ -3643,6 +3644,55 @@ TEST_F(GpuCompilerTest, EarlyExitAfterConfigAssignment) {
+                                     "config-assigner"}));
+ }
+ 
++TEST_F(GpuCompilerTest, EarlyExitAfterBufferAssignmentStatesTheCompilesMemory) {
++  absl::string_view hlo_text = R"hlo(
++    HloModule gemm_tanh
++
++    ENTRY main {
++      p0 = f32[256,256]{1,0} parameter(0)
++      p1 = f32[256,256]{1,0} parameter(1)
++      dot = f32[256,256] dot(p0, p1),
++        lhs_contracting_dims={1}, rhs_contracting_dims={0}
++      tanh = f32[256,256] tanh(dot)
++      ROOT out = f32[256,256] dot(tanh, p1),
++        lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    }
++)hlo";
++
++  auto compiled = [&](AotCompilationOptions::EarlyExitPoint point)
++      -> absl::StatusOr<CompiledMemoryStats> {
++    AotCompilationOptions aot_options(compiler()->PlatformId());
++    aot_options.set_gpu_topology(GetSingleDeviceGpuTopology(
++        /*platform_version=*/"", gpu_target_config()));
++    aot_options.set_early_exit_point(point);
++    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(hlo_text));
++    ABSL_ASSIGN_OR_RETURN(
++        std::vector<std::unique_ptr<CompiledModule>> results,
++        compiler()->CompileAheadOfTime(std::move(module), aot_options));
++    if (results.size() != 1) {
++      return absl::InternalError("expected one compiled module");
++    }
++    return results[0]->GetCompiledMemoryStats();
++  };
++
++  ASSERT_OK_AND_ASSIGN(
++      CompiledMemoryStats early,
++      compiled(AotCompilationOptions::EarlyExitPoint::kAfterBufferAssignment));
++  ASSERT_OK_AND_ASSIGN(CompiledMemoryStats full,
++                       compiled(AotCompilationOptions::EarlyExitPoint::kNone));
++
++  // The stop after buffer assignment states what the whole compile does.
++  EXPECT_GT(early.temp_size_in_bytes, 0);
++  EXPECT_EQ(early.temp_size_in_bytes, full.temp_size_in_bytes);
++  EXPECT_EQ(early.argument_size_in_bytes, full.argument_size_in_bytes);
++  EXPECT_EQ(early.output_size_in_bytes, full.output_size_in_bytes);
++  EXPECT_EQ(early.alias_size_in_bytes, full.alias_size_in_bytes);
++  EXPECT_EQ(early.peak_memory_in_bytes, full.peak_memory_in_bytes);
++  EXPECT_EQ(early.serialized_buffer_assignment,
++            full.serialized_buffer_assignment);
++}
++
+ TEST_F(GpuCompilerTest, DevicelessCollectiveFusionWithTopologyFlag) {
+   if (device_description().gpu_compute_capability().IsRocm()) {
+     GTEST_SKIP() << "Test requires CUDA backend.";
+diff --git a/xla/xla.proto b/xla/xla.proto
+index b0e6702981..ccdd1b9304 100644
+--- a/xla/xla.proto
++++ b/xla/xla.proto
+@@ -538,6 +538,8 @@ message DebugOptions {
+   enum EarlyExitPoint {
+     EARLY_EXIT_POINT_UNSET = 0;
+     EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT = 1;
++    // After buffer assignment: the compile's memory stats, no code emitted.
++    EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT = 2;
+   }
+ 
+   enum DeterministicOpsTritonMode {
+-- 
+2.53.0
+
