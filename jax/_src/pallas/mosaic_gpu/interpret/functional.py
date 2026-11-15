@@ -52,7 +52,6 @@ from jax._src.pallas.mosaic.interpret import utils as interpret_utils
 from jax._src.pallas.mosaic_gpu import core as mosaic_gpu_core
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 from jax._src.pallas.mosaic_gpu.interpret import jaxpr_interpret
-from jax._src.pallas.mosaic_gpu.interpret import shared_memory as memory
 from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
 from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
@@ -186,11 +185,24 @@ def _fill(shape, dtype, params: InterpretGPUParams, space=None):
   return interpret_utils.get_uninitialized_array(shape, dtype, how)
 
 
+# How a ref is laid out rather than what it contains: applied to a ref's
+# physical aval they give its logical one, and as every buffer is stored at that
+# logical shape they are identities at every use.
+_LAYOUT_TRANSFORMS = (
+    mosaic_gpu_core.PlainRef,
+    mosaic_gpu_core.UnswizzleRef,
+    mosaic_gpu_core.UntilingTransform,
+    # A TMEM ref of rank > 2 is stored as `(m, prod(batch) * n)` and carries
+    # this transform back to `(*batch, m, n)`.
+    mosaic_gpu_core.ExpandLeadingBatchDimensionsTransform,
+)
+
+
 def _layout_dropped(transforms) -> tuple[Any, ...]:
   # As the GPU interpreter stores a buffer at its logical shape, it drops the
   # untiling and unswizzling transforms its uses lead with.
   transforms = tuple(transforms)
-  while transforms and isinstance(transforms[0], memory.LAYOUT_TRANSFORMS):
+  while transforms and isinstance(transforms[0], _LAYOUT_TRANSFORMS):
     transforms = transforms[1:]
   return transforms
 
