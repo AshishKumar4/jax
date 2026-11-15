@@ -1,4 +1,4 @@
-From aa77cc23ec2a5c6eb457f3311f444276a6d93d8e Mon Sep 17 00:00:00 2001
+From d97e9c56bbadf4d734a5dea1d86336d5b7f9fdcb Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 08:18:38 -0600
 Subject: [PATCH] [XLA:GPU] A compile over a device memory limit stops after
@@ -13,12 +13,12 @@ stopped after buffer assignment followed by a whole one.
  xla/debug_options_flags.cc                    |   9 ++
  xla/service/gpu/BUILD                         |  27 ++++
  xla/service/gpu/compile_module_to_llvm_ir.cc  |  15 ++
- .../gpu/gpu_compiler_memory_limit_test.cc     | 148 ++++++++++++++++++
+ .../gpu/gpu_compiler_memory_limit_test.cc     | 151 ++++++++++++++++++
  xla/service/gpu/gpu_executable.cc             |  40 ++++-
  xla/service/gpu/gpu_executable.h              |  13 ++
  xla/service/gpu/gpu_executable.proto          |   5 +
  xla/xla.proto                                 |  10 +-
- 8 files changed, 265 insertions(+), 2 deletions(-)
+ 8 files changed, 268 insertions(+), 2 deletions(-)
  create mode 100644 xla/service/gpu/gpu_compiler_memory_limit_test.cc
 
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
@@ -121,10 +121,10 @@ index 36df696e0d..fa1250ec34 100644
  
 diff --git a/xla/service/gpu/gpu_compiler_memory_limit_test.cc b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
 new file mode 100644
-index 0000000000..0f55266fa4
+index 0000000000..d24850101e
 --- /dev/null
 +++ b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,151 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -263,11 +263,14 @@ index 0000000000..0f55266fa4
 +
 +  Literal x = LiteralUtil::CreateFullWithDescendingLayout<float>({256, 256},
 +                                                                 0.5f);
-+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> limited, Limited(limit));
-+  TF_ASSERT_OK_AND_ASSIGN(Literal ran, Execute(std::move(limited), {&x, &x}));
-+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> unlimited, Limited(0));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> limited_module,
++                          Limited(limit));
++  TF_ASSERT_OK_AND_ASSIGN(Literal ran,
++                          Execute(std::move(limited_module), {&x, &x}));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> unlimited_module,
++                          Limited(0));
 +  TF_ASSERT_OK_AND_ASSIGN(Literal reference,
-+                          Execute(std::move(unlimited), {&x, &x}));
++                          Execute(std::move(unlimited_module), {&x, &x}));
 +  EXPECT_TRUE(LiteralTestUtil::Equal(reference, ran));
 +}
 +
