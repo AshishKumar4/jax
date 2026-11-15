@@ -1120,31 +1120,34 @@ def _int_pow(x: ir.Value, n: int) -> ir.Value:
 _NON_DECREASING_DISTRIBUTES_OVER = ("max", "min")
 
 
-# 2^f for f in [-1/2, 1/2]: the Taylor series of exp(f ln 2) to degree 7,
-# whose truncation is under 2^-27 of 2^f there (about 0.06 ulp), highest
-# degree first (Horner's form).
-_EXP2_TERMS = tuple(math.log(2.0) ** k / math.factorial(k) for k in range(7, -1, -1))
+# e^r for r in [-ln2/2, ln2/2], and so 2^f for f in [-1/2, 1/2] at r = f ln 2:
+# the Taylor series to degree 7, whose truncation is under 2^-27 of the result
+# there (about 0.06 ulp), highest degree first (Horner's form).
+_EXP_TERMS = tuple(1.0 / math.factorial(k) for k in range(7, -1, -1))
+# ln 2 split for Cody and Waite's reduction: its leading bits, whose product
+# with an integer under 2^8 is exact, and the rest.
+_LN2_HI = 0.693145751953125
+_LN2_LO = 1.428606765330187e-06
 
 
-def _exact_exp2_f32(x: ir.Value) -> ir.Value:
-  """`2 ** x` for an f32 scalar or vector `x`, within about one ulp.
+def _exp_series(r: ir.Value) -> ir.Value:
+  """e^r for an f32 `r` within ln 2 / 2 of zero (`_EXP_TERMS`)."""
+  ty = r.type
+  poly = c(_EXP_TERMS[0], ty)
+  for term in _EXP_TERMS[1:]:
+    poly = mlir_math.fma(poly, r, c(term, ty))
+  return poly
 
-  `x = n + f` with `n` the nearest integer and `f` in [-1/2, 1/2]: `2^f` a
-  polynomial (`_EXP2_TERMS`), scaled by `2^n` as two exact powers of two built
-  from their exponent bits, so a result in the subnormal range rounds once.
-  Past 128 it is `inf`, under -152 zero, and a NaN stays NaN.
+
+def _times_power_of_two(x: ir.Value, value: ir.Value, n: ir.Value) -> ir.Value:
+  """`value * 2^n` for an integral f32 `n` in [-160, 130], NaN where `x` is.
+
+  `2^n` is two exact powers of two built from their exponent bits, so a result
+  in the subnormal range rounds once; past f32's range it is `inf` or zero.
   """
-  ty = x.type
+  ty = value.type
   i32 = ir.IntegerType.get_signless(32)
   int_ty = ir.VectorType.get(ir.VectorType(ty).shape, i32) if isinstance(ty, ir.VectorType) else i32
-  # Clamped so the scale's halves stay in f32's normal exponents; the bounds
-  # are outside the range where the result is neither inf nor zero.
-  clamped = arith.minimumf(arith.maximumf(x, c(-160.0, ty)), c(130.0, ty))
-  n = mlir_math.roundeven(clamped)
-  f = arith.subf(clamped, n)
-  poly = c(_EXP2_TERMS[0], ty)
-  for term in _EXP2_TERMS[1:]:
-    poly = mlir_math.fma(poly, f, c(term, ty))
   k = arith.fptosi(int_ty, n)
   half = arith.shrsi(k, c(1, int_ty))
   rest = arith.subi(k, half)
@@ -1154,10 +1157,44 @@ def _exact_exp2_f32(x: ir.Value) -> ir.Value:
     bits = arith.shli(arith.addi(e, c(127, int_ty)), c(23, int_ty))
     return arith.bitcast(ty, bits)
 
-  result = arith.mulf(arith.mulf(poly, power(half)), power(rest))
+  result = arith.mulf(arith.mulf(value, power(half)), power(rest))
   # NaN in, NaN out (the clamp of a NaN is unspecified).
   is_nan = arith.cmpf(arith.CmpFPredicate.UNO, x, x)
   return arith.select(is_nan, x, result)
+
+
+def _exact_exp2_f32(x: ir.Value) -> ir.Value:
+  """`2 ** x` for an f32 scalar or vector `x`, within about one ulp.
+
+  `x = n + f` with `n` the nearest integer and `f` in [-1/2, 1/2]: `2^f` the
+  series at `f ln 2` (`_exp_series`), scaled by `2^n` (`_times_power_of_two`).
+  Past 128 it is `inf`, under -152 zero, and a NaN stays NaN.
+  """
+  ty = x.type
+  # Clamped so the scale's halves stay in f32's normal exponents; the bounds
+  # are outside the range where the result is neither inf nor zero.
+  clamped = arith.minimumf(arith.maximumf(x, c(-160.0, ty)), c(130.0, ty))
+  n = mlir_math.roundeven(clamped)
+  f = arith.subf(clamped, n)
+  return _times_power_of_two(x, _exp_series(arith.mulf(f, c(math.log(2.0), ty))), n)
+
+
+def _exact_exp_f32(x: ir.Value) -> ir.Value:
+  """`e ** x` for an f32 scalar or vector `x`, within about one ulp.
+
+  `x = n ln 2 + r` with `n` the integer nearest `x log2(e)` and `r` within
+  ln 2 / 2 of zero, computed by Cody and Waite's split of ln 2 with fused
+  multiply-adds, so no product's rounding reaches `r`: `e^r` the series
+  (`_exp_series`), scaled by `2^n` (`_times_power_of_two`). Past 88.8 it is
+  `inf`, under -104 zero, and a NaN stays NaN.
+  """
+  ty = x.type
+  clamped = arith.minimumf(arith.maximumf(x, c(-110.0, ty)), c(90.0, ty))
+  n = mlir_math.roundeven(arith.mulf(clamped, c(1.4426950408889634, ty)))
+  negated = arith.negf(n)
+  r = mlir_math.fma(negated, c(_LN2_HI, ty), clamped)
+  r = mlir_math.fma(negated, c(_LN2_LO, ty), r)
+  return _times_power_of_two(x, _exp_series(r), n)
 
 
 def _can_splat_unreduced(value: ir.Value, op: str) -> bool:
@@ -2182,8 +2219,11 @@ class FragmentedArray:
       return self._pointwise(
           mulf, log2e, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
       ).exp2(approx=True)
+    # NVPTX lowers `math.exp` on f32 through `ex2.approx.ftz.f32` (about 2 ulp,
+    # subnormals flushed), so the exact form is computed here.
+    expf = _exact_exp_f32 if isinstance(self.mlir_dtype, ir.F32Type) else mlir_math.exp
     return self._pointwise(
-        mlir_math.exp, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
+        expf, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
     )
 
   def exp2(self, *, approx: bool = False) -> FragmentedArray:
