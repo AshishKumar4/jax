@@ -1136,7 +1136,9 @@ def _platform_branch_lowering(ctx, jaxpr, args):
       ctx.module_context, jaxpr, ctx.name_stack.extend('platform'), tokens_in,
       consts, *args, dim_var_values=ctx.dim_var_values,
       const_lowering=ctx.const_lowering, outer_traceback=ctx.traceback)
-  ctx.set_tokens_out(tokens_out)
+  # The conditional's ordered effects a dropped branch states pass their tokens
+  # through (`_cond_lowering`'s joined effects).
+  ctx.set_tokens_out(ctx.tokens_in.update_tokens(tokens_out))
   return [mlir.lower_with_sharding_in_types(ctx, o, aval)
           for o, aval in zip(out_vals, ctx.avals_out)]
 
