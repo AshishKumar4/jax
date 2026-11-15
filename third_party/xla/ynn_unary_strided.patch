@@ -1,0 +1,281 @@
+From 22e565e0867a1a68c7ebed1a565922baa57f8bfd Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 16:50:40 -0600
+Subject: [PATCH] [XLA:CPU] YNNPACK's unary kernels read an input of any
+ innermost stride as given
+
+YNN's unary kernels read their input contiguously in its innermost dimension, and make_unary_elementwise_impl
+asserted it, an assert compiled out of a release: a bf16 convert of a broadcast scalar, a stride-zero alias,
+read past the scalar as contiguous memory (NaN or garbage by process). The implementation gathers a block of
+an input whose innermost dimension is not contiguous into a buffer of the call's own, never writing the input,
+which its producer and other consumers share. Tested: a shared broadcast converted twice, reductions beside a
+shared clamp broadcast, and row sums of squares and softmax rows.
+---
+ third_party/xnnpack/BUILD                   |   5 +-
+ third_party/xnnpack/workspace.bzl           |   1 +
+ third_party/xnnpack/ynn_unary_strided.patch |  63 +++++++++
+ xla/backends/cpu/tests/BUILD                |   3 +
+ xla/backends/cpu/tests/ynn_fusion_test.cc   | 139 ++++++++++++++++++++
+ 5 files changed, 210 insertions(+), 1 deletion(-)
+ create mode 100644 third_party/xnnpack/ynn_unary_strided.patch
+
+diff --git a/third_party/xnnpack/BUILD b/third_party/xnnpack/BUILD
+index 0d978ffd2e..f68df4c10d 100644
+--- a/third_party/xnnpack/BUILD
++++ b/third_party/xnnpack/BUILD
+@@ -1,3 +1,6 @@
+ licenses(["notice"])
+ 
+-exports_files(["cl_clang.patch"])
++exports_files([
++    "cl_clang.patch",
++    "ynn_unary_strided.patch",
++])
+diff --git a/third_party/xnnpack/workspace.bzl b/third_party/xnnpack/workspace.bzl
+index d56ec2b0a8..8ce8da8021 100644
+--- a/third_party/xnnpack/workspace.bzl
++++ b/third_party/xnnpack/workspace.bzl
+@@ -21,6 +21,7 @@ def repo():
+     # LINT.IfChange
+     tf_http_archive(
+         name = "XNNPACK",
++        patch_file = ["//third_party/xnnpack:ynn_unary_strided.patch"],
+         sha256 = "cb485a0fe76dec243568ec6ce6c0b75e18909ed7df5459921b46eaada332fe8f",
+         strip_prefix = "XNNPACK-0a66ebb5817fce48df605451444dcfc27a5e4ee4",
+         urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/0a66ebb5817fce48df605451444dcfc27a5e4ee4.zip"),
+diff --git a/third_party/xnnpack/ynn_unary_strided.patch b/third_party/xnnpack/ynn_unary_strided.patch
+new file mode 100644
+index 0000000000..aa9f4bc738
+--- /dev/null
++++ b/third_party/xnnpack/ynn_unary_strided.patch
+@@ -0,0 +1,63 @@
++diff --git a/ynnpack/subgraph/elementwise.cc b/ynnpack/subgraph/elementwise.cc
++--- a/ynnpack/subgraph/elementwise.cc
+++++ b/ynnpack/subgraph/elementwise.cc
++@@ -7,7 +7,9 @@
++ #include <cassert>
++ #include <cstddef>
++ #include <cstdint>
+++#include <cstring>
++ #include <utility>
+++#include <vector>
++ 
++ #include "ynnpack/base/log.h"
++ #include "ynnpack/base/to_string.h"
++@@ -46,18 +48,43 @@
++       return 0;
++     }
++ 
++-    // We don't support broadcasting of `a` here in the innermost
++-    // dimension (and it would waste computation).
++-    assert(is_contiguous(a_dims[0], a.elem_size));
++-
++     const slinky::index_t x_n_extent = x_dims[0].extent();
++     const slinky::index_t a_m_stride = a_dims[1].stride();
++     const slinky::index_t x_m_extent = x_dims[1].extent();
++     const slinky::index_t x_m_stride = x_dims[1].stride();
++ 
+++    if (is_contiguous(a_dims[0], a.elem_size)) {
+++      slinky::for_each_element(
+++          [=, &params](void* x, const void* a) {
+++            kernel(x_m_extent, x_n_extent, a_m_stride, a, x_m_stride, x,
+++                   &params);
+++          },
+++          x, a);
+++      return 0;
+++    }
+++
+++    // The kernels read `a` contiguously in its innermost dimension. A
+++    // broadcast of `a` there (a stride of zero) or any other stride is
+++    // gathered into a buffer of this call's own, read as given and never
+++    // written.
+++    const slinky::index_t a_n_extent = a_dims[0].extent();
+++    const slinky::index_t a_n_stride = a_dims[0].stride();
+++    const std::size_t elem_size = a.elem_size;
+++    const slinky::index_t dense_m_stride = a_n_extent * elem_size;
+++    std::vector<char> dense(x_m_extent * dense_m_stride);
++     slinky::for_each_element(
++-        [=, &params](void* x, const void* a) {
++-          kernel(x_m_extent, x_n_extent, a_m_stride, a, x_m_stride, x, &params);
+++        [=, &params, &dense](void* x, const void* a) {
+++          const char* row = static_cast<const char*>(a);
+++          char* to = dense.data();
+++          for (slinky::index_t i = 0; i < x_m_extent; ++i, row += a_m_stride) {
+++            const char* from = row;
+++            for (slinky::index_t j = 0; j < a_n_extent;
+++                 ++j, from += a_n_stride, to += elem_size) {
+++              std::memcpy(to, from, elem_size);
+++            }
+++          }
+++          kernel(x_m_extent, x_n_extent, dense_m_stride, dense.data(),
+++                 x_m_stride, x, &params);
++         },
++         x, a);
++     return 0;
+diff --git a/xla/backends/cpu/tests/BUILD b/xla/backends/cpu/tests/BUILD
+index e4e5e3541f..020a30460f 100644
+--- a/xla/backends/cpu/tests/BUILD
++++ b/xla/backends/cpu/tests/BUILD
+@@ -47,6 +47,9 @@ xla_test(
+     name = "ynn_fusion_test",
+     srcs = ["ynn_fusion_test.cc"],
+     backends = ["cpu"],
++    # The build hides a shared object's symbols (as assembly_to_binary_test's comment says): linked
++    # statically, the test reaches the test base and absl it calls.
++    linkstatic = True,
+     deps = [
+         "//xla:error_spec",
+         "//xla:literal",
+diff --git a/xla/backends/cpu/tests/ynn_fusion_test.cc b/xla/backends/cpu/tests/ynn_fusion_test.cc
+index 14260ee557..62c7f50793 100644
+--- a/xla/backends/cpu/tests/ynn_fusion_test.cc
++++ b/xla/backends/cpu/tests/ynn_fusion_test.cc
+@@ -208,6 +208,145 @@ TEST_P(YnnFusionTest, Concatenate) {
+   RunTest(kModuleStr);
+ }
+ 
++TEST_P(YnnFusionTest, SharedBroadcastThenConvert) {
++  // The two converts keep the broadcast shared during YNN's fusion pass.
++  // After common-subgraph elimination, the remaining unary kernel must not
++  // treat a stride-zero alias of the scalar as a contiguous array.
++  constexpr absl::string_view kModuleStr = R"(
++    HloModule shared_broadcast_then_convert
++
++    ynn_fusion {
++      %input = $dtype[] parameter(0)
++      %broadcast = $dtype[17] broadcast(%input), dimensions={}
++      %lhs = f32[17] convert(%broadcast)
++      %rhs = f32[17] convert(%broadcast)
++      ROOT %sum = f32[17] add(%lhs, %rhs)
++    }
++
++    ENTRY entry {
++      %p0 = $dtype[] parameter(0)
++      ROOT %fusion = f32[17] fusion(%p0), kind=kCustom, calls=ynn_fusion,
++        backend_config={"fusion_config": {kind: "__ynn_fusion"}}
++    })";
++
++  RunTest(kModuleStr);
++}
++
++TEST_P(YnnFusionTest, ReductionsWithSharedClampBroadcast) {
++  constexpr absl::string_view kModuleStr = R"(
++    HloModule reductions_with_shared_clamp_broadcast
++
++    add {
++      %lhs = f32[] parameter(0)
++      %rhs = f32[] parameter(1)
++      ROOT %sum = f32[] add(%lhs, %rhs)
++    }
++
++    ynn_fusion {
++      %lhs = $dtype[4096,2] parameter(0)
++      %rhs = $dtype[4096,2] parameter(1)
++      %lhs_f32 = f32[4096,2] convert(%lhs)
++      %rhs_f32 = f32[4096,2] convert(%rhs)
++      %zero = f32[] constant(0)
++      %lhs_sum = f32[4096] reduce(%lhs_f32, %zero), dimensions={1},
++        to_apply=add
++      %rhs_sum = f32[4096] reduce(%rhs_f32, %zero), dimensions={1},
++        to_apply=add
++      %lhs_narrow = $dtype[4096] convert(%lhs_sum)
++      %rhs_narrow = $dtype[4096] convert(%rhs_sum)
++      %one = $dtype[] constant(1)
++      %broadcast = $dtype[4096] broadcast(%one), dimensions={}
++      %lhs_clamp = $dtype[4096] maximum(%lhs_narrow, %broadcast)
++      %rhs_clamp = $dtype[4096] maximum(%rhs_narrow, %broadcast)
++      %lhs_result = f32[4096] convert(%lhs_clamp)
++      %rhs_result = f32[4096] convert(%rhs_clamp)
++      ROOT %sum = f32[4096] add(%lhs_result, %rhs_result)
++    }
++
++    ENTRY entry {
++      %p0 = $dtype[4096,2] parameter(0)
++      %p1 = $dtype[4096,2] parameter(1)
++      ROOT %fusion = f32[4096] fusion(%p0, %p1), kind=kCustom,
++        calls=ynn_fusion,
++        backend_config={"fusion_config": {kind: "__ynn_fusion"}}
++    })";
++
++  RunTest(kModuleStr);
++}
++
++TEST_P(YnnFusionTest, RowSumsOfSquares) {
++  // A sum of squares over a row's innermost dimension, as an RMS norm takes
++  // it: row 6829's trapping reductions, which must run as compiled.
++  constexpr absl::string_view kModuleStr = R"(
++    HloModule row_sums_of_squares
++
++    add {
++      %lhs = f32[] parameter(0)
++      %rhs = f32[] parameter(1)
++      ROOT %sum = f32[] add(%lhs, %rhs)
++    }
++
++    ynn_fusion {
++      %input = $dtype[8,512,16] parameter(0)
++      %wide = f32[8,512,16] convert(%input)
++      %square = f32[8,512,16] multiply(%wide, %wide)
++      %zero = f32[] constant(0)
++      ROOT %sums = f32[8,512] reduce(%square, %zero), dimensions={2},
++        to_apply=add
++    }
++
++    ENTRY entry {
++      %p0 = $dtype[8,512,16] parameter(0)
++      ROOT %fusion = f32[8,512] fusion(%p0), kind=kCustom, calls=ynn_fusion,
++        backend_config={"fusion_config": {kind: "__ynn_fusion"}}
++    })";
++
++  RunTest(kModuleStr);
++}
++
++TEST_P(YnnFusionTest, SoftmaxRows) {
++  // A softmax over each row's innermost dimension, its maximum and its sum each
++  // broadcast back over the row: row 6829's trapping reductions.
++  constexpr absl::string_view kModuleStr = R"(
++    HloModule softmax_rows
++
++    max {
++      %lhs = f32[] parameter(0)
++      %rhs = f32[] parameter(1)
++      ROOT %max = f32[] maximum(%lhs, %rhs)
++    }
++
++    add {
++      %lhs = f32[] parameter(0)
++      %rhs = f32[] parameter(1)
++      ROOT %sum = f32[] add(%lhs, %rhs)
++    }
++
++    ynn_fusion {
++      %input = $dtype[8,64,512] parameter(0)
++      %logits = f32[8,64,512] convert(%input)
++      %lowest = f32[] constant(-inf)
++      %row_max = f32[8,64] reduce(%logits, %lowest), dimensions={2},
++        to_apply=max
++      %max_broadcast = f32[8,64,512] broadcast(%row_max), dimensions={0,1}
++      %shifted = f32[8,64,512] subtract(%logits, %max_broadcast)
++      %exp = f32[8,64,512] exponential(%shifted)
++      %zero = f32[] constant(0)
++      %row_sum = f32[8,64] reduce(%exp, %zero), dimensions={2}, to_apply=add
++      %sum_broadcast = f32[8,64,512] broadcast(%row_sum), dimensions={0,1}
++      ROOT %softmax = f32[8,64,512] divide(%exp, %sum_broadcast)
++    }
++
++    ENTRY entry {
++      %p0 = $dtype[8,64,512] parameter(0)
++      ROOT %fusion = f32[8,64,512] fusion(%p0), kind=kCustom,
++        calls=ynn_fusion,
++        backend_config={"fusion_config": {kind: "__ynn_fusion"}}
++    })";
++
++  RunTest(kModuleStr);
++}
++
+ TEST_P(YnnFusionTest, Slice) {
+   constexpr absl::string_view kModuleStr = R"(
+     HloModule slice
+-- 
+2.53.0
+
