@@ -15,6 +15,7 @@
 import ctypes
 import functools
 import importlib
+import importlib.metadata
 import logging
 import os
 import pathlib
@@ -48,6 +49,16 @@ def _import_extensions():
       break
 
 logger = logging.getLogger(__name__)
+
+
+def _build() -> str | None:
+  """This plugin's own build: the version of the package it is installed from
+  (jax-cuda12-pjrt's, jax-cuda13-pjrt's); None in a source tree."""
+  name = pathlib.Path(__file__).resolve().parent.name
+  try:
+    return importlib.metadata.version(f"jax-{name.removeprefix('xla_')}-pjrt")
+  except importlib.metadata.PackageNotFoundError:
+    return None
 
 
 def _get_library_path():
@@ -370,7 +381,8 @@ def initialize():
 
   options = xla_client.generate_pjrt_gpu_plugin_options()
   c_api = xb.register_plugin(
-      'cuda', priority=500, library_path=str(path), options=options
+      'cuda', priority=500, library_path=str(path), options=options,
+      build=_build(),
   )
 
   if cuda_plugin_extension:
