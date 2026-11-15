@@ -194,6 +194,8 @@ _threefry2x32_cpu_lowering_rule = mlir.lower_fun(
 
 def _threefry2x32_gpu_lowering_rule(ctx, k1, k2, x1, x2, *, platform):
   if not config.threefry_gpu_kernel_lowering.value:  # back to default lowering
+    if config.threefry_rolled_lowering.value:
+      return _threefry2x32_cpu_lowering_rule(ctx, k1, k2, x1, x2)
     return _threefry2x32_lowering_rule(ctx, k1, k2, x1, x2)
 
   aval_out, aval_out_2 = ctx.avals_out

@@ -1421,6 +1421,16 @@ threefry_gpu_kernel_lowering = bool_state(
     include_in_jit_key=True,
     include_in_trace_context=True)
 
+threefry_rolled_lowering = bool_state(
+    name='jax_threefry_rolled_lowering',
+    default=False,
+    help=('On GPU, lower threefry PRNG operations as rolled loops over their '
+          'rounds, as on CPU, in place of the rounds unrolled: a smaller '
+          'program that compiles faster, its rounds no longer fused into what '
+          'reads them. Partitioned as elementwise ops are.'),
+    include_in_jit_key=True,
+    include_in_trace_context=True)
+
 use_direct_linearize = bool_state(
     name='jax_use_direct_linearize',
     default=True,
