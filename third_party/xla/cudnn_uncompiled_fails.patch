@@ -1,0 +1,952 @@
+diff --git a/xla/backends/gpu/autotuner/BUILD b/xla/backends/gpu/autotuner/BUILD
+index 8003f53fc7..aa3bcea851 100644
+--- a/xla/backends/gpu/autotuner/BUILD
++++ b/xla/backends/gpu/autotuner/BUILD
+@@ -328,6 +328,7 @@ cc_library(
+         "//xla/service:compiler",
+         "//xla/service/gpu:backend_configs_cc",
+         "//xla/service/gpu:cublas_cudnn",
++        "//xla/service/gpu:cudnn_support_utils",
+         "//xla/service/gpu:gpu_conv_runner",
+         "//xla/service/gpu:ir_emission_utils",
+         "//xla/service/gpu:stream_executor_util",
+diff --git a/xla/backends/gpu/autotuner/cudnn.cc b/xla/backends/gpu/autotuner/cudnn.cc
+index 52f4ba762f..abb46c31a3 100644
+--- a/xla/backends/gpu/autotuner/cudnn.cc
++++ b/xla/backends/gpu/autotuner/cudnn.cc
+@@ -40,6 +40,7 @@ limitations under the License.
+ #include "xla/service/compiler.h"
+ #include "xla/service/gpu/backend_configs.pb.h"
+ #include "xla/service/gpu/cublas_cudnn.h"
++#include "xla/service/gpu/cudnn_support_utils.h"
+ #include "xla/service/gpu/gpu_conv_runner.h"
+ #include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/service/gpu/stream_executor_util.h"
+@@ -263,33 +264,17 @@ GetCudnnFusionConfigs(const HloInstruction& instr,
+                       se::StreamExecutor* stream_executor,
+                       const GpuTargetConfig& target_config,
+                       const DebugOptions& debug_options) {
+-  std::vector<std::unique_ptr<BackendConfig>> configs;
+-  bool use_deviceless = false;
+-  switch (debug_options.xla_gpu_cudnn_deviceless_compilation_mode()) {
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_UNSET:
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED:
+-      use_deviceless = false;
+-      break;
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_ALWAYS:
+-      use_deviceless = true;
+-      break;
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO:
+-    default:
+-      use_deviceless = (stream_executor == nullptr);
+-      break;
+-  }
+-  if (use_deviceless) {
+-    stream_executor = nullptr;
+-  } else if (stream_executor == nullptr) {
+-    return absl::InvalidArgumentError(
+-        "Null stream executor is not supported when cuDNN deviceless "
+-        "compilation is disabled.");
+-  }
++  ABSL_ASSIGN_OR_RETURN(
++      se::dnn::DnnSupport * dnn_support,
++      ResolveCudnnSupport(debug_options, stream_executor,
++                          target_config.device_description.dnn_version()));
+   ABSL_ASSIGN_OR_RETURN(int plan_count,
+                         CuDnnFusionCompiler::GetAvailablePlanCount(
+-                            stream_executor, target_config.device_description,
++                            dnn_support, target_config.device_description,
+                             *DynCast<HloFusionInstruction>(&instr)));
+ 
++  std::vector<std::unique_ptr<BackendConfig>> configs;
++
+   VLOG(2) << "Found " << plan_count << " plans for cudnn fusion.";
+   configs.reserve(plan_count);
+   for (int plan_id = 0; plan_id < plan_count; ++plan_id) {
+diff --git a/xla/backends/gpu/codegen/cudnn_scaled_dot_test.cc b/xla/backends/gpu/codegen/cudnn_scaled_dot_test.cc
+index 63b54bb2d4..88e444d7c7 100644
+--- a/xla/backends/gpu/codegen/cudnn_scaled_dot_test.cc
++++ b/xla/backends/gpu/codegen/cudnn_scaled_dot_test.cc
+@@ -469,9 +469,8 @@ ENTRY %main {
+     HloModule& optimized_module = **optimized_module_or;
+     if (custom_call_or_fusion->opcode() == HloOpcode::kFusion) {
+       BinaryMap compilation_results;
+-      CuDnnFusionCompiler cudnn_compiler(stream_executor()->AsDnn(),
+-                                         device_description(),
+-                                         compilation_results);
++      CuDnnFusionCompiler cudnn_compiler(
++          stream_executor(), device_description(), compilation_results);
+       auto cloned = optimized_module.Clone();
+       auto res = cudnn_compiler.Run(cloned.get());
+       if (res.ok()) {
+@@ -481,9 +480,8 @@ ENTRY %main {
+       }
+     } else if (custom_call_or_fusion->opcode() == HloOpcode::kCustomCall) {
+       BinaryMap compilation_results;
+-      CuDnnCustomCallCompiler custom_call_compiler(stream_executor()->AsDnn(),
+-                                                   device_description(),
+-                                                   compilation_results);
++      CuDnnCustomCallCompiler custom_call_compiler(
++          stream_executor(), device_description(), compilation_results);
+       auto cloned = optimized_module.Clone();
+       auto res = custom_call_compiler.Run(cloned.get());
+       if (res.ok() && !compilation_results.empty()) {
+diff --git a/xla/backends/gpu/codegen/cudnn_test.cc b/xla/backends/gpu/codegen/cudnn_test.cc
+index 0400395c90..08a9cde83a 100644
+--- a/xla/backends/gpu/codegen/cudnn_test.cc
++++ b/xla/backends/gpu/codegen/cudnn_test.cc
+@@ -145,8 +145,8 @@ class CuDnnFusionFileCheckTest : public CuDnnFusionTest {
+     const std::string root_name(
+         module->entry_computation()->root_instruction()->name());
+     BinaryMap dnn_compiled_graphs;
+-    CuDnnFusionCompiler cudnn_compiler(
+-        stream_executor()->AsDnn(), device_description(), dnn_compiled_graphs);
++    CuDnnFusionCompiler cudnn_compiler(stream_executor(), device_description(),
++                                       dnn_compiled_graphs);
+     // Run filecheck even if CuDnnFusionCompiler failed.
+     cudnn_compiler.Run(module.get()).IgnoreError();
+     std::string dump;
+@@ -290,8 +290,8 @@ ENTRY e {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        ParseAndReturnVerifiedModule(kHloText));
+   BinaryMap dnn_compiled_graphs;
+-  CuDnnFusionCompiler cudnn_compiler(stream_executor()->AsDnn(),
+-                                     device_description(), dnn_compiled_graphs);
++  CuDnnFusionCompiler cudnn_compiler(stream_executor(), device_description(),
++                                     dnn_compiled_graphs);
+   ASSERT_OK_AND_ASSIGN(bool changed, cudnn_compiler.Run(module.get()));
+   EXPECT_TRUE(changed);
+   EXPECT_THAT(module->entry_computation()->root_instruction(),
+@@ -324,8 +324,8 @@ e {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        ParseAndReturnVerifiedModule(kHloText));
+   BinaryMap dnn_compiled_graphs;
+-  CuDnnFusionCompiler cudnn_compiler(stream_executor()->AsDnn(),
+-                                     device_description(), dnn_compiled_graphs);
++  CuDnnFusionCompiler cudnn_compiler(stream_executor(), device_description(),
++                                     dnn_compiled_graphs);
+   EXPECT_THAT(cudnn_compiler.Run(module.get()),
+               absl_testing::IsOkAndHolds(false));
+   // Single dot is not supported by cuDNN, so Triton should be used.
+@@ -373,8 +373,8 @@ ENTRY e {
+   ROOT r = tuple(f0, f1)
+ })"));
+   BinaryMap dnn_compiled_graphs;
+-  CuDnnFusionCompiler cudnn_compiler(stream_executor()->AsDnn(),
+-                                     device_description(), dnn_compiled_graphs);
++  CuDnnFusionCompiler cudnn_compiler(stream_executor(), device_description(),
++                                     dnn_compiled_graphs);
+   ASSERT_OK_AND_ASSIGN(bool changed, cudnn_compiler.Run(module.get()));
+   EXPECT_TRUE(changed);
+   EXPECT_THAT(module->entry_computation()->root_instruction(),
+@@ -596,10 +596,14 @@ ENTRY e {
+   {
+     ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
++    module->mutable_config()
++        .mutable_debug_options()
++        .set_xla_gpu_cudnn_deviceless_compilation_mode(
++            DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO);
+     const se::DeviceDescription& device_description =
+         this->device_description();
+     BinaryMap dnn_compiled_graphs;
+-    CuDnnFusionCompiler cudnn_compiler(/*dnn_support=*/nullptr,
++    CuDnnFusionCompiler cudnn_compiler(/*stream_exec=*/nullptr,
+                                        device_description, dnn_compiled_graphs);
+     ASSERT_OK_AND_ASSIGN(bool changed, cudnn_compiler.Run(module.get()));
+     EXPECT_TRUE(changed);
+@@ -704,21 +708,25 @@ ENTRY e {
+   const se::DeviceDescription& device_description =
+       executor->GetDeviceDescription();
+ 
+-  // Compile with live dnn_support.
++  // Compile with live StreamExecutor.
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module_live,
+                        ParseAndReturnVerifiedModule(kHlo));
+   BinaryMap binary_map_live;
+-  CuDnnFusionCompiler live_compiler(executor->AsDnn(), device_description,
++  CuDnnFusionCompiler live_compiler(executor, device_description,
+                                     binary_map_live);
+   ASSERT_OK_AND_ASSIGN(bool changed_live, live_compiler.Run(module_live.get()));
+   ASSERT_TRUE(changed_live);
+ 
+-  // Compile deviceless (null dnn_support, same DeviceDescription).
++  // Compile deviceless (null stream_exec, same DeviceDescription).
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module_deviceless,
+                        ParseAndReturnVerifiedModule(kHlo));
++  module_deviceless->mutable_config()
++      .mutable_debug_options()
++      .set_xla_gpu_cudnn_deviceless_compilation_mode(
++          DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO);
+   BinaryMap binary_map_deviceless;
+   CuDnnFusionCompiler deviceless_compiler(
+-      /*dnn_support=*/nullptr, device_description, binary_map_deviceless);
++      /*stream_exec=*/nullptr, device_description, binary_map_deviceless);
+   ASSERT_OK_AND_ASSIGN(bool changed_deviceless,
+                        deviceless_compiler.Run(module_deviceless.get()));
+   ASSERT_TRUE(changed_deviceless);
+diff --git a/xla/backends/gpu/transforms/BUILD b/xla/backends/gpu/transforms/BUILD
+index ca69006f97..79e19067ba 100644
+--- a/xla/backends/gpu/transforms/BUILD
++++ b/xla/backends/gpu/transforms/BUILD
+@@ -1171,6 +1171,7 @@ cc_library(
+         "//xla/stream_executor/cuda:cudnn_plugin",
+         "//xla/tsl/platform:errors",
+         "@com_google_absl//absl/algorithm:container",
++        "@com_google_absl//absl/base:nullability",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/container:flat_hash_set",
+         "@com_google_absl//absl/log",
+@@ -1248,6 +1249,7 @@ xla_test(
+         "//xla/tsl/cuda:cudnn",  # build_cleaner: keep
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
++        "@com_google_absl//absl/status:status_matchers",
+         "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/strings",
+         "@com_google_absl//absl/strings:string_view",
+@@ -1420,15 +1422,17 @@ cc_library(
+         "//xla/hlo/pass:hlo_pass",
+         "//xla/service:pattern_matcher",
+         "//xla/service/gpu:backend_configs_cc",
+-        "//xla/service/gpu:cublas_cudnn",
++        "//xla/service/gpu:cudnn_support_utils",
+         "//xla/service/gpu:ir_emission_utils",
+         "//xla/service/gpu:stream_executor_util",
+         "//xla/stream_executor:device_description",
+         "//xla/stream_executor:dnn",
++        "//xla/stream_executor:stream_executor_h",
+         "//xla/stream_executor/cuda:cudnn_frontend_helpers",
+         "//xla/stream_executor/cuda:cudnn_plugin",
+         "//xla/stream_executor/cuda:cudnn_sdpa_score_mod",
+         "//xla/tsl/protobuf:dnn_proto_cc",
++        "@com_google_absl//absl/base:nullability",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/container:flat_hash_set",
+         "@com_google_absl//absl/log",
+diff --git a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
+index 5449bbd7a1..adba9b7364 100644
+--- a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
++++ b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
+@@ -37,7 +37,7 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_instructions.h"
+ #include "xla/hlo/ir/hlo_module.h"
+ #include "xla/service/gpu/backend_configs.pb.h"
+-#include "xla/service/gpu/cublas_cudnn.h"
++#include "xla/service/gpu/cudnn_support_utils.h"
+ #include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/service/gpu/stream_executor_util.h"
+ #include "xla/service/pattern_matcher.h"
+@@ -49,6 +49,7 @@ limitations under the License.
+ #include "xla/stream_executor/cuda/cudnn_sdpa_score_mod.h"
+ #include "xla/stream_executor/device_description.h"
+ #include "xla/stream_executor/dnn.h"
++#include "xla/stream_executor/stream_executor.h"
+ #include "xla/tsl/protobuf/dnn.pb.h"
+ #include "xla/util.h"
+ #include "xla/xla_data.pb.h"
+@@ -537,10 +538,10 @@ absl::StatusOr<se::gpu::CudnnGraph> HloCustomCallToCuDnnGraph(
+ 
+ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+  public:
+-  explicit CuDnnCustomCallVisitor(se::dnn::DnnSupport* dnn_support,
++  explicit CuDnnCustomCallVisitor(se::StreamExecutor* stream_exec,
+                                   const se::DeviceDescription& gpu_device_info,
+                                   BinaryMap& compilation_results)
+-      : dnn_support_(dnn_support),
++      : stream_exec_(stream_exec),
+         gpu_device_info_(gpu_device_info),
+         compilation_results_(compilation_results) {}
+ 
+@@ -565,9 +566,15 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+     auto workspace_size_it =
+         workspace_sizes_.find(fingerprint_without_workspace);
+     if (workspace_size_it == workspace_sizes_.cend()) {
++      ABSL_ASSIGN_OR_RETURN(
++          se::dnn::DnnSupport * dnn_support,
++          ResolveCudnnSupport(hlo->GetModule()->config().debug_options(),
++                              stream_exec_, gpu_device_info_.dnn_version()),
++          _ << "failed to resolve cuDNN support for custom call: "
++            << hlo->custom_call_target());
+       ABSL_ASSIGN_OR_RETURN(
+           se::gpu::CudnnGraph graph,
+-          HloCustomCallToCuDnnGraph(dnn_support_, gpu_device_info_,
++          HloCustomCallToCuDnnGraph(dnn_support, gpu_device_info_,
+                                     DynCast<HloCustomCallInstruction>(hlo)));
+ 
+       const int64_t workspace_size = graph.Graph().get_workspace_size();
+@@ -595,7 +602,7 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+   }
+ 
+  private:
+-  se::dnn::DnnSupport* dnn_support_;
++  se::StreamExecutor* stream_exec_;
+   const se::DeviceDescription& gpu_device_info_;
+   BinaryMap& compilation_results_;
+   absl::flat_hash_map<std::string, int64_t> workspace_sizes_;
+@@ -607,7 +614,7 @@ absl::StatusOr<bool> CuDnnCustomCallCompiler::RunImpl(
+     HloModule* module,
+     const absl::flat_hash_set<absl::string_view>& execution_threads) {
+   XLA_SCOPED_LOGGING_TIMER_LEVEL("cuDNN custom call compiler", 8);
+-  return CuDnnCustomCallVisitor(dnn_support_, gpu_device_info_,
++  return CuDnnCustomCallVisitor(stream_exec_, gpu_device_info_,
+                                 compilation_results_)
+       .RunOnModule(module, execution_threads);
+ }
+diff --git a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.h b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.h
+index c4a6402349..c4f652650a 100644
+--- a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.h
++++ b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.h
+@@ -16,6 +16,7 @@ limitations under the License.
+ #ifndef XLA_BACKENDS_GPU_TRANSFORMS_CUDNN_CUSTOM_CALL_COMPILER_H_
+ #define XLA_BACKENDS_GPU_TRANSFORMS_CUDNN_CUSTOM_CALL_COMPILER_H_
+ 
++#include "absl/base/nullability.h"
+ #include "absl/container/flat_hash_set.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
+@@ -23,6 +24,7 @@ limitations under the License.
+ #include "xla/hlo/pass/hlo_pass_interface.h"
+ #include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/stream_executor/dnn.h"
++#include "xla/stream_executor/stream_executor.h"
+ 
+ namespace xla {
+ namespace gpu {
+@@ -31,10 +33,11 @@ namespace gpu {
+ // Also adjust them in HLO to have correct workspace size.
+ class CuDnnCustomCallCompiler : public HloModulePass {
+  public:
+-  explicit CuDnnCustomCallCompiler(se::dnn::DnnSupport* dnn_support,
+-                                   const se::DeviceDescription& gpu_device_info,
+-                                   BinaryMap& compilation_results)
+-      : dnn_support_(dnn_support),
++  explicit CuDnnCustomCallCompiler(
++      se::StreamExecutor* absl_nullable stream_exec,
++      const se::DeviceDescription& gpu_device_info,
++      BinaryMap& compilation_results)
++      : stream_exec_(stream_exec),
+         gpu_device_info_(gpu_device_info),
+         compilation_results_(compilation_results) {}
+ 
+@@ -48,7 +51,7 @@ class CuDnnCustomCallCompiler : public HloModulePass {
+       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+ 
+  private:
+-  se::dnn::DnnSupport* dnn_support_;
++  se::StreamExecutor* absl_nullable stream_exec_;
+   const se::DeviceDescription& gpu_device_info_;
+   BinaryMap& compilation_results_;
+ };
+diff --git a/xla/backends/gpu/transforms/cudnn_fusion_compiler.cc b/xla/backends/gpu/transforms/cudnn_fusion_compiler.cc
+index 3e908db2f5..7d744315c0 100644
+--- a/xla/backends/gpu/transforms/cudnn_fusion_compiler.cc
++++ b/xla/backends/gpu/transforms/cudnn_fusion_compiler.cc
+@@ -1324,10 +1324,10 @@ absl::StatusOr<HloInstruction*> AddWorkspace(HloInstruction& fusion,
+ 
+ class CuDnnFusionVisitor : public DfsHloRewriteVisitor {
+  public:
+-  explicit CuDnnFusionVisitor(se::dnn::DnnSupport* dnn_support,
++  explicit CuDnnFusionVisitor(se::StreamExecutor* stream_exec,
+                               const se::DeviceDescription& gpu_device_info,
+                               BinaryMap& compilation_results)
+-      : dnn_support_(dnn_support),
++      : stream_exec_(stream_exec),
+         gpu_device_info_(gpu_device_info),
+         compilation_results_(compilation_results) {}
+ 
+@@ -1358,9 +1358,16 @@ class CuDnnFusionVisitor : public DfsHloRewriteVisitor {
+         gpu_config.fusion_backend_config();
+ 
+     auto compile_graph = [&]() -> absl::StatusOr<se::gpu::CudnnGraph> {
+-      ABSL_ASSIGN_OR_RETURN(se::gpu::CudnnGraph graph,
+-                            PrepareGraph(dnn_support_, gpu_device_info_,
+-                                         *DynCast<HloFusionInstruction>(hlo)));
++      HloFusionInstruction* fusion = DynCast<HloFusionInstruction>(hlo);
++      ABSL_ASSIGN_OR_RETURN(
++          se::dnn::DnnSupport * dnn_support,
++          ResolveCudnnSupport(hlo->GetModule()->config().debug_options(),
++                              stream_exec_, gpu_device_info_.dnn_version()),
++          _ << "failed to resolve cuDNN support for fusion: "
++            << fusion->ToString());
++      ABSL_ASSIGN_OR_RETURN(
++          se::gpu::CudnnGraph graph,
++          PrepareGraph(dnn_support, gpu_device_info_, *fusion));
+ 
+       if (fusion_backend_config.has_cudnn_fusion_config() &&
+           fusion_backend_config.cudnn_fusion_config().has_plan_id()) {
+@@ -1372,14 +1379,14 @@ class CuDnnFusionVisitor : public DfsHloRewriteVisitor {
+           return absl::InternalError("cuDNN graph plan does not exist.");
+         }
+         ABSL_RETURN_IF_ERROR(
+-            graph.Build(dnn_support_, gpu_device_info_, plan_id));
++            graph.Build(dnn_support, gpu_device_info_, plan_id));
+       } else {
+         // Build plans one by one till first successful when no plan_id was
+         // provided.
+         int64_t plan_id = 0;
+         for (; plan_id < graph.Graph().get_execution_plan_count(); ++plan_id) {
+           VLOG(7) << "Trying plan ID " << plan_id;
+-          if (graph.Build(dnn_support_, gpu_device_info_, plan_id).ok()) {
++          if (graph.Build(dnn_support, gpu_device_info_, plan_id).ok()) {
+             VLOG(7) << "Successfully built plan ID " << plan_id;
+             break;
+           }
+@@ -1452,7 +1459,7 @@ class CuDnnFusionVisitor : public DfsHloRewriteVisitor {
+   }
+ 
+  private:
+-  se::dnn::DnnSupport* dnn_support_;
++  se::StreamExecutor* stream_exec_;
+   const se::DeviceDescription& gpu_device_info_;
+   // <HLO computation fingerprint, serialized compiled cuDNN graph>.
+   BinaryMap& compilation_results_;
+@@ -1465,17 +1472,17 @@ absl::StatusOr<bool> CuDnnFusionCompiler::RunImpl(
+     HloModule* module,
+     const absl::flat_hash_set<absl::string_view>& execution_threads) {
+   XLA_SCOPED_LOGGING_TIMER("cuDNN fusion compiler");
+-  return CuDnnFusionVisitor(dnn_support_, gpu_device_info_,
++  return CuDnnFusionVisitor(stream_exec_, gpu_device_info_,
+                             compilation_results_)
+       .RunOnModule(module, execution_threads);
+ }
+ 
+ absl::StatusOr<int> CuDnnFusionCompiler::GetAvailablePlanCount(
+-    se::StreamExecutor* stream_exec,
++    se::dnn::DnnSupport* dnn_support,
+     const se::DeviceDescription& gpu_device_info,
+     const HloFusionInstruction& hlo) {
+-  se::dnn::DnnSupport* dnn = stream_exec ? stream_exec->AsDnn() : nullptr;
+-  ABSL_ASSIGN_OR_RETURN(auto graph, PrepareGraph(dnn, gpu_device_info, hlo));
++  ABSL_ASSIGN_OR_RETURN(auto graph,
++                        PrepareGraph(dnn_support, gpu_device_info, hlo));
+   return std::min(
+       static_cast<int32_t>(graph.Graph().get_execution_plan_count()),
+       hlo.GetModule()->config().debug_options().xla_gpu_cudnn_gemm_max_plans());
+diff --git a/xla/backends/gpu/transforms/cudnn_fusion_compiler.h b/xla/backends/gpu/transforms/cudnn_fusion_compiler.h
+index 843f3a3c8b..0f43afd2b7 100644
+--- a/xla/backends/gpu/transforms/cudnn_fusion_compiler.h
++++ b/xla/backends/gpu/transforms/cudnn_fusion_compiler.h
+@@ -16,6 +16,7 @@ limitations under the License.
+ #ifndef XLA_BACKENDS_GPU_TRANSFORMS_CUDNN_FUSION_COMPILER_H_
+ #define XLA_BACKENDS_GPU_TRANSFORMS_CUDNN_FUSION_COMPILER_H_
+ 
++#include "absl/base/nullability.h"
+ #include "absl/container/flat_hash_set.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
+@@ -34,17 +35,17 @@ namespace gpu {
+ // compiles them using a cuDNN handle and serializes them.
+ class CuDnnFusionCompiler : public HloModulePass {
+  public:
+-  explicit CuDnnFusionCompiler(se::dnn::DnnSupport* dnn_support,
++  explicit CuDnnFusionCompiler(se::StreamExecutor* absl_nullable stream_exec,
+                                const se::DeviceDescription& gpu_device_info,
+                                BinaryMap& compilation_results)
+-      : dnn_support_(dnn_support),
++      : stream_exec_(stream_exec),
+         gpu_device_info_(gpu_device_info),
+         compilation_results_(compilation_results) {}
+ 
+   absl::string_view name() const override { return "cudnn-fusion-compiler"; }
+ 
+   static absl::StatusOr<int> GetAvailablePlanCount(
+-      se::StreamExecutor* stream_exec,
++      se::dnn::DnnSupport* dnn_support,
+       const se::DeviceDescription& gpu_device_info,
+       const HloFusionInstruction& hlo);
+ 
+@@ -75,7 +76,7 @@ class CuDnnFusionCompiler : public HloModulePass {
+       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+ 
+  private:
+-  se::dnn::DnnSupport* dnn_support_;
++  se::StreamExecutor* absl_nullable stream_exec_;
+   const se::DeviceDescription& gpu_device_info_;
+   BinaryMap& compilation_results_;
+ };
+diff --git a/xla/backends/gpu/transforms/cudnn_fusion_compiler_deviceless_test.cc b/xla/backends/gpu/transforms/cudnn_fusion_compiler_deviceless_test.cc
+index b8c69eea8e..0f50dc03bf 100644
+--- a/xla/backends/gpu/transforms/cudnn_fusion_compiler_deviceless_test.cc
++++ b/xla/backends/gpu/transforms/cudnn_fusion_compiler_deviceless_test.cc
+@@ -32,6 +32,7 @@ limitations under the License.
+ 
+ #include "absl/status/status.h"
+ #include "absl/status/status_macros.h"
++#include "absl/status/status_matchers.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/string_view.h"
+@@ -64,6 +65,8 @@ namespace {
+ 
+ namespace se = ::stream_executor;
+ 
++using ::absl_testing::IsOk;
++using ::absl_testing::StatusIs;
+ using DevicelessFusionSupport = CuDnnFusionCompiler::DevicelessFusionSupport;
+ 
+ // Deviceless probing/compilation only works on cuDNN >=
+@@ -467,8 +470,9 @@ TEST_F(CudnnFusionCompilerDevicelessTest,
+     // Live enumeration reports unsupported fusions as an error from
+     // PrepareGraph, not as a zero count.
+     const absl::StatusOr<int> live_plan_count =
+-        CuDnnFusionCompiler::GetAvailablePlanCount(executor, device_description,
+-                                                   *fusion);
++        CuDnnFusionCompiler::GetAvailablePlanCount(
++            executor != nullptr ? executor->AsDnn() : nullptr,
++            device_description, *fusion);
+     const bool live_has_plans = live_plan_count.ok() && *live_plan_count > 0;
+     EXPECT_EQ(CuDnnFusionCompiler::SupportsFusionDeviceless(device_description,
+                                                             *fusion),
+@@ -477,6 +481,104 @@ TEST_F(CudnnFusionCompilerDevicelessTest,
+   }
+ }
+ 
++TEST_F(CudnnFusionCompilerDevicelessTest,
++       NullStreamExecWithCudnnFusionFailsWhenDevicelessDisabled) {
++  constexpr absl::string_view kHlo = R"hlo(
++    fusion1 {
++      p0 = f32[32,96] parameter(0)
++      p1 = f32[96,64] parameter(1)
++      r = f32[32,64] dot(p0, p1),
++        lhs_contracting_dims={1}, rhs_contracting_dims={0}
++      neg = f32[32,64] negate(r)
++      ROOT a = f32[32,64] add(neg, neg)
++    }
++
++    ENTRY e {
++      p0 = f32[32,96] parameter(0)
++      p1 = f32[96,64] parameter(1)
++      ROOT _ = f32[32,64] fusion(p0, p1), kind=kCustom, calls=fusion1,
++        backend_config={"fusion_backend_config": {kind: "__cudnn$fusion"}}
++})hlo";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(kHlo));
++  module->mutable_config()
++      .mutable_debug_options()
++      .set_xla_gpu_cudnn_deviceless_compilation_mode(
++          DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED);
++
++  ASSERT_OK_AND_ASSIGN(GpuTargetConfig target_config,
++                       DevicelessTargetConfig(GpuModel::H100_SXM));
++  BinaryMap dnn_compiled_graphs;
++  CuDnnFusionCompiler compiler(/*stream_exec=*/nullptr,
++                               target_config.device_description,
++                               dnn_compiled_graphs);
++  EXPECT_THAT(compiler.Run(module.get()),
++              StatusIs(absl::StatusCode::kInvalidArgument));
++}
++
++TEST_F(CudnnFusionCompilerDevicelessTest,
++       NullStreamExecWithoutCudnnFusionSucceedsWhenDevicelessDisabled) {
++  constexpr absl::string_view kHlo = R"hlo(
++    ENTRY e {
++      p0 = f32[32,96] parameter(0)
++      p1 = f32[96,64] parameter(1)
++      ROOT r = f32[32,64] dot(p0, p1),
++        lhs_contracting_dims={1}, rhs_contracting_dims={0}
++})hlo";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(kHlo));
++  module->mutable_config()
++      .mutable_debug_options()
++      .set_xla_gpu_cudnn_deviceless_compilation_mode(
++          DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED);
++
++  ASSERT_OK_AND_ASSIGN(GpuTargetConfig target_config,
++                       DevicelessTargetConfig(GpuModel::H100_SXM));
++  BinaryMap dnn_compiled_graphs;
++  CuDnnFusionCompiler compiler(/*stream_exec=*/nullptr,
++                               target_config.device_description,
++                               dnn_compiled_graphs);
++  EXPECT_THAT(compiler.Run(module.get()), IsOk());
++}
++
++TEST_F(CudnnFusionCompilerDevicelessTest,
++       DevicelessCompilationWithOldDnnVersionFails) {
++  constexpr absl::string_view kHlo = R"hlo(
++    fusion1 {
++      p0 = f32[32,96] parameter(0)
++      p1 = f32[96,64] parameter(1)
++      dot = f32[32,64] dot(p0, p1),
++        lhs_contracting_dims={1}, rhs_contracting_dims={0}
++      neg = f32[32,64] negate(dot)
++      ROOT a = f32[32,64] add(neg, neg)
++    }
++
++    ENTRY e {
++      p0 = f32[32,96] parameter(0)
++      p1 = f32[96,64] parameter(1)
++      ROOT _ = f32[32,64] fusion(p0, p1), kind=kCustom, calls=fusion1,
++        backend_config={"fusion_backend_config": {kind: "__cudnn$fusion"}}
++})hlo";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(kHlo));
++  module->mutable_config()
++      .mutable_debug_options()
++      .set_xla_gpu_cudnn_deviceless_compilation_mode(
++          DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO);
++
++  ASSERT_OK_AND_ASSIGN(GpuTargetConfig target_config,
++                       DevicelessTargetConfig(GpuModel::H100_SXM));
++  target_config.device_description.set_dnn_version(
++      se::SemanticVersion(9, 7, 0));
++  BinaryMap dnn_compiled_graphs;
++  CuDnnFusionCompiler compiler(/*stream_exec=*/nullptr,
++                               target_config.device_description,
++                               dnn_compiled_graphs);
++  EXPECT_THAT(compiler.Run(module.get()),
++              StatusIs(absl::StatusCode::kFailedPrecondition));
++}
++
+ }  // namespace
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/xla/backends/gpu/transforms/cudnn_fusion_compiler_test.cc b/xla/backends/gpu/transforms/cudnn_fusion_compiler_test.cc
+index d2239f871b..afed26fd58 100644
+--- a/xla/backends/gpu/transforms/cudnn_fusion_compiler_test.cc
++++ b/xla/backends/gpu/transforms/cudnn_fusion_compiler_test.cc
+@@ -94,7 +94,7 @@ TEST_P(CudnnFusionCompilerConstTest,
+ 
+   ASSERT_OK_AND_ASSIGN(int plan_count,
+                        CuDnnFusionCompiler::GetAvailablePlanCount(
+-                           stream_executor(),
++                           stream_executor()->AsDnn(),
+                            stream_executor()->GetDeviceDescription(), *fusion));
+   EXPECT_GT(plan_count, 0);
+ }
+@@ -158,7 +158,7 @@ TEST_P(CudnnFusionCompilerWgradTest,
+ 
+   ASSERT_OK_AND_ASSIGN(int plan_count,
+                        CuDnnFusionCompiler::GetAvailablePlanCount(
+-                           stream_executor(),
++                           stream_executor()->AsDnn(),
+                            stream_executor()->GetDeviceDescription(), *fusion));
+   EXPECT_GT(plan_count, 0);
+ }
+@@ -203,7 +203,7 @@ TEST_F(CudnnFusionCompilerConstTest,
+ 
+   ASSERT_OK_AND_ASSIGN(int plan_count,
+                        CuDnnFusionCompiler::GetAvailablePlanCount(
+-                           stream_executor(),
++                           stream_executor()->AsDnn(),
+                            stream_executor()->GetDeviceDescription(), *fusion));
+   EXPECT_GT(plan_count, 0);
+ }
+@@ -244,7 +244,7 @@ TEST_F(CudnnFusionCompilerConstTest,
+ 
+   ASSERT_OK_AND_ASSIGN(int plan_count,
+                        CuDnnFusionCompiler::GetAvailablePlanCount(
+-                           stream_executor(),
++                           stream_executor()->AsDnn(),
+                            stream_executor()->GetDeviceDescription(), *fusion));
+   EXPECT_GT(plan_count, 0);
+ }
+@@ -285,7 +285,7 @@ TEST_F(CudnnFusionCompilerConstTest,
+ 
+   ASSERT_OK_AND_ASSIGN(int plan_count,
+                        CuDnnFusionCompiler::GetAvailablePlanCount(
+-                           stream_executor(),
++                           stream_executor()->AsDnn(),
+                            stream_executor()->GetDeviceDescription(), *fusion));
+   EXPECT_GT(plan_count, 0);
+ }
+diff --git a/xla/service/BUILD b/xla/service/BUILD
+index bdf2186e3c..01a2fe692d 100644
+--- a/xla/service/BUILD
++++ b/xla/service/BUILD
+@@ -5957,7 +5957,7 @@ xla_aot_compile_gpu(
+         "b200",
+     ],
+     module = "xla_aot_compile_test_convolution.mlir",
+-    xla_flags = "--xla_gpu_use_new_autotune_cache_format=true --xla_gpu_experimental_enable_conv_fusion=true",
++    xla_flags = "--xla_gpu_use_new_autotune_cache_format=true",
+ )
+ 
+ xla_aot_compile_gpu(
+@@ -5968,7 +5968,7 @@ xla_aot_compile_gpu(
+         "b200",
+     ],
+     module = "xla_aot_compile_test_convolution.mlir",
+-    xla_flags = "--xla_gpu_use_new_autotune_cache_format=false --xla_gpu_experimental_enable_conv_fusion=true",
++    xla_flags = "--xla_gpu_use_new_autotune_cache_format=false",
+ )
+ 
+ xla_aot_compile_gpu(
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index ebf0f297ef..8785c0c2d4 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -1499,11 +1499,16 @@ cc_library(
+         "//xla:util",
+         "//xla:window_util",
+         "//xla:xla_data_proto_cc",
++        "//xla:xla_proto_cc",
+         "//xla/hlo/ir:hlo",
+-        "//xla/stream_executor:device_description",
++        "//xla/stream_executor:dnn",
++        "//xla/stream_executor:semantic_version",
++        "//xla/stream_executor:stream_executor_h",
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/base:nullability",
+         "@com_google_absl//absl/log",
++        "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
+         "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/strings:string_view",
+diff --git a/xla/service/gpu/cudnn_support_utils.cc b/xla/service/gpu/cudnn_support_utils.cc
+index baed4901da..e8faca3f46 100644
+--- a/xla/service/gpu/cudnn_support_utils.cc
++++ b/xla/service/gpu/cudnn_support_utils.cc
+@@ -18,7 +18,9 @@ limitations under the License.
+ #include <cstdint>
+ #include <vector>
+ 
++#include "absl/base/nullability.h"
+ #include "absl/log/log.h"
++#include "absl/status/status.h"
+ #include "absl/status/status_macros.h"
+ #include "absl/status/statusor.h"
+ #include "xla/hlo/ir/hlo_instructions.h"
+@@ -28,9 +30,13 @@ limitations under the License.
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
++#include "xla/stream_executor/dnn.h"
++#include "xla/stream_executor/semantic_version.h"
++#include "xla/stream_executor/stream_executor.h"
+ #include "xla/tsl/platform/statusor.h"
+ #include "xla/util.h"
+ #include "xla/window_util.h"
++#include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
+ 
+ namespace xla {
+@@ -229,5 +235,36 @@ bool IsAmaxRoot(const HloInstruction& root) {
+   return root.IsRoot() && root.opcode() == HloOpcode::kTuple &&
+          root.operand(1)->opcode() == HloOpcode::kReduce;
+ }
++
++absl::StatusOr<se::dnn::DnnSupport* absl_nullable> ResolveCudnnSupport(
++    const DebugOptions& debug_options,
++    se::StreamExecutor* absl_nullable stream_exec,
++    se::SemanticVersion dnn_version) {
++  const DebugOptions::CudnnDevicelessCompilationMode mode =
++      debug_options.xla_gpu_cudnn_deviceless_compilation_mode();
++  const bool use_deviceless =
++      mode == DebugOptions::CUDNN_DEVICELESS_COMPILATION_ALWAYS ||
++      (mode == DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO &&
++       stream_exec == nullptr);
++  if (use_deviceless) {
++    // TODO(b/568668570): Guard with cuDNN version 9.23.
++    if (dnn_version < se::SemanticVersion(9, 8, 0)) {
++      return absl::FailedPreconditionError(
++          "Deviceless cuDNN compilation requires cuDNN >= 9.8");
++    }
++    return nullptr;
++  }
++  if (stream_exec == nullptr) {
++    return absl::InvalidArgumentError(
++        "StreamExecutor is null and deviceless cuDNN compilation is not "
++        "enabled");
++  }
++  se::dnn::DnnSupport* dnn_support = stream_exec->AsDnn();
++  if (dnn_support == nullptr) {
++    return absl::FailedPreconditionError("DnnSupport is null");
++  }
++  return dnn_support;
++}
++
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/xla/service/gpu/cudnn_support_utils.h b/xla/service/gpu/cudnn_support_utils.h
+index d3697c9aba..2cb54ba01a 100644
+--- a/xla/service/gpu/cudnn_support_utils.h
++++ b/xla/service/gpu/cudnn_support_utils.h
+@@ -19,11 +19,17 @@ limitations under the License.
+ #include <cstdint>
+ #include <vector>
+ 
++#include "absl/base/nullability.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
++#include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_instructions.h"
+ #include "xla/shape.h"
+-#include "xla/stream_executor/device_description.h"
++#include "xla/stream_executor/cuda/cuda_compute_capability.h"
++#include "xla/stream_executor/dnn.h"
++#include "xla/stream_executor/semantic_version.h"
++#include "xla/stream_executor/stream_executor.h"
++#include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
+ 
+ namespace xla {
+@@ -33,7 +39,8 @@ namespace gpu {
+ // implementation of the given `conv` operation vectorized to `vector_size`.
+ //
+ // This function does not guarantee that a convolution will be padded and/or
+-// vectorized. It only checks that it is a valid candiate for such optimization.
++// vectorized. It only checks that it is a valid candidate for such
++// optimization.
+ absl::StatusOr<bool> CudnnSupportsOptimizedIntegerConvolution(
+     const se::CudaComputeCapability& compute_capability,
+     HloCustomCallInstruction& conv, int vector_size);
+@@ -78,6 +85,21 @@ inline constexpr absl::string_view kWorkspaceAllocationCustomCallTarget =
+ // Detects `ROOT tuple(..., custom-call())` used to allocate workspace buffers.
+ bool IsWorkspaceAllocationRoot(const HloInstruction& root);
+ bool IsAmaxRoot(const HloInstruction& root);
++
++// Resolves the DnnSupport pointer to use for cuDNN graph compilation.
++//
++// When compiling with a device, returns `stream_exec->AsDnn()`.
++//
++// When compiling devicelessly, returns `nullptr` (which is a valid input to
++// cuDNN functions when deviceless compilation is enabled)
++//
++// Returns an error if there's no device, and deviceless cuDNN compilation is
++// not supported.
++absl::StatusOr<se::dnn::DnnSupport* absl_nullable> ResolveCudnnSupport(
++    const DebugOptions& debug_options,
++    se::StreamExecutor* absl_nullable stream_exec,
++    se::SemanticVersion dnn_version);
++
+ }  // namespace gpu
+ }  // namespace xla
+ 
+diff --git a/xla/service/gpu/nvptx_compiler.cc b/xla/service/gpu/nvptx_compiler.cc
+index 5694970887..cfe90e30d8 100644
+--- a/xla/service/gpu/nvptx_compiler.cc
++++ b/xla/service/gpu/nvptx_compiler.cc
+@@ -386,31 +386,6 @@ absl::Status NVPTXCompiler::RunCudnnCompilerPasses(
+     return absl::OkStatus();
+   }
+ 
+-  // Decide whether to run cuDNN compilation deviceless (no live cuDNN handle).
+-  bool use_deviceless_cudnn = false;
+-  switch (debug_options.xla_gpu_cudnn_deviceless_compilation_mode()) {
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_UNSET:
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED:
+-      use_deviceless_cudnn = false;
+-      break;
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_ALWAYS:
+-      // Force deviceless even if we have a device.
+-      use_deviceless_cudnn = true;
+-      break;
+-    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO:
+-    default:
+-      // Deviceless only when there is no live device to query.
+-      use_deviceless_cudnn = (stream_exec == nullptr);
+-      break;
+-  }
+-  // Without a live device and without deviceless compilation there is nothing
+-  // to do.
+-  if (stream_exec == nullptr && !use_deviceless_cudnn) {
+-    return absl::OkStatus();
+-  }
+-  se::dnn::DnnSupport* dnn_support =
+-      use_deviceless_cudnn ? nullptr : stream_exec->AsDnn();
+-
+   tsl::profiler::ScopedAnnotation annotation([&] {
+     return absl::StrFormat("XlaCompileCudnnFusion:#module=%s,program_id=%d#",
+                            module->name(), module->unique_id());
+@@ -422,10 +397,10 @@ absl::Status NVPTXCompiler::RunCudnnCompilerPasses(
+   const absl::flat_hash_set<absl::string_view> execution_threads = {
+       HloInstruction::kMainExecutionThread,
+       HloInstruction::kParallelExecutionThread};
+-  CuDnnFusionCompiler fusion_compiler(dnn_support, gpu_device_info,
++  CuDnnFusionCompiler fusion_compiler(stream_exec, gpu_device_info,
+                                       *dnn_compiled_graphs);
+   ABSL_RETURN_IF_ERROR(fusion_compiler.Run(module, execution_threads).status());
+-  CuDnnCustomCallCompiler call_compiler(dnn_support, gpu_device_info,
++  CuDnnCustomCallCompiler call_compiler(stream_exec, gpu_device_info,
+                                         *dnn_compiled_graphs);
+   return call_compiler.Run(module, execution_threads).status();
+ }
+diff --git a/xla/service/xla_aot_compile_test_autotune_cache.txtpb b/xla/service/xla_aot_compile_test_autotune_cache.txtpb
+index 4c2562e792..b751af4b04 100644
+--- a/xla/service/xla_aot_compile_test_autotune_cache.txtpb
++++ b/xla/service/xla_aot_compile_test_autotune_cache.txtpb
+@@ -58,7 +58,7 @@ entries {
+         }
+       }
+     }
+-    optimal_backend_version: "9.10.0"
++    optimal_backend_version: "9.23.0"
+   }
+ }
+ entries {
+@@ -104,6 +104,6 @@ entries {
+         }
+       }
+     }
+-    optimal_backend_version: "9.10.0"
++    optimal_backend_version: "9.23.0"
+   }
+ }
+diff --git a/xla/service/xla_aot_compile_test_autotune_results.txtpb b/xla/service/xla_aot_compile_test_autotune_results.txtpb
+index fc330e18d8..ac512dafa8 100644
+--- a/xla/service/xla_aot_compile_test_autotune_results.txtpb
++++ b/xla/service/xla_aot_compile_test_autotune_results.txtpb
+@@ -17,7 +17,7 @@
+ 
+ version: 3
+ results {
+-  device: "CUDA: 9.0, Cores: 132, GPU clock: 1.98 GHz, Memory bandwidth: 3352 GB/s, L2 cache: 50 MB, DNN version: 9.10.0"
++  device: "CUDA: 9.0, Cores: 132, GPU clock: 1.98 GHz, Memory bandwidth: 3352 GB/s, L2 cache: 50 MB, DNN version: 9.23.0"
+   hlo: "(f32[3,3]{1,0}, s8[72]{0}) custom-call(f32[3,3]{1,0}, f32[3,3]{1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"beta\":0,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[],\"lhs_contracting_dimensions\":[\"1\"],\"rhs_batch_dimensions\":[],\"rhs_contracting_dimensions\":[\"0\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"9\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"DEFAULT\",\"DEFAULT\"]},\"rhs_stride\":\"9\"},\"operation_queue_id\":\"0\"}"
+   result {
+     gemm {
+@@ -26,7 +26,7 @@ results {
+   }
+ }
+ results {
+-  device: "CUDA: 9.0, Cores: 132, GPU clock: 1.98 GHz, Memory bandwidth: 3352 GB/s, L2 cache: 50 MB, DNN version: 9.10.0"
++  device: "CUDA: 9.0, Cores: 132, GPU clock: 1.98 GHz, Memory bandwidth: 3352 GB/s, L2 cache: 50 MB, DNN version: 9.23.0"
+   hlo: "(f32[1,2,3,1]{3,2,1,0}, u8[0]{0}) custom-call(f32[1,4,4,2]{3,2,1,0}, f32[1,3,2,2]{3,2,1,0}), window={size=3x2}, dim_labels=b01f_o01i->b01f, custom_call_target=\"__cudnn$convForward\", backend_config={\"cudnn_conv_backend_config\":{\"activation_mode\":\"kNone\",\"conv_result_scale\":1,\"leakyrelu_alpha\":0,\"side_input_scale\":0},\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"operation_queue_id\":\"0\",\"reification_cost\":[]}"
+   result {
+     run_time {
+@@ -48,7 +48,7 @@ results {
+   }
+ }
+ results {
+-  device: "CUDA: 10.0, Cores: 148, GPU clock: 1.965 GHz, Memory bandwidth: 7672 GB/s, L2 cache: 126.5 MB, DNN version: 9.10.0"
++  device: "CUDA: 10.0, Cores: 148, GPU clock: 1.965 GHz, Memory bandwidth: 7672 GB/s, L2 cache: 126.5 MB, DNN version: 9.23.0"
+   hlo: "(f32[3,3]{1,0}, s8[72]{0}) custom-call(f32[3,3]{1,0}, f32[3,3]{1,0}), custom_call_target=\"__cublas$gemm\", backend_config={\"force_earliest_schedule\":false,\"gemm_backend_config\":{\"alpha_imag\":0,\"alpha_real\":1,\"beta\":0,\"dot_dimension_numbers\":{\"lhs_batch_dimensions\":[],\"lhs_contracting_dimensions\":[\"1\"],\"rhs_batch_dimensions\":[],\"rhs_contracting_dimensions\":[\"0\"]},\"epilogue\":\"DEFAULT\",\"grad_x\":false,\"grad_y\":false,\"lhs_stride\":\"9\",\"precision_config\":{\"algorithm\":\"ALG_UNSET\",\"operand_precision\":[\"DEFAULT\",\"DEFAULT\"]},\"rhs_stride\":\"9\"},\"operation_queue_id\":\"0\"}"
+   result {
+     gemm {
+@@ -57,7 +57,7 @@ results {
+   }
+ }
+ results {
+-  device: "CUDA: 10.0, Cores: 148, GPU clock: 1.965 GHz, Memory bandwidth: 7672 GB/s, L2 cache: 126.5 MB, DNN version: 9.10.0"
++  device: "CUDA: 10.0, Cores: 148, GPU clock: 1.965 GHz, Memory bandwidth: 7672 GB/s, L2 cache: 126.5 MB, DNN version: 9.23.0"
+   hlo: "(f32[1,2,3,1]{3,2,1,0}, u8[0]{0}) custom-call(f32[1,4,4,2]{3,2,1,0}, f32[1,3,2,2]{3,2,1,0}), window={size=3x2}, dim_labels=b01f_o01i->b01f, custom_call_target=\"__cudnn$convForward\", backend_config={\"cudnn_conv_backend_config\":{\"activation_mode\":\"kNone\",\"conv_result_scale\":1,\"leakyrelu_alpha\":0,\"side_input_scale\":0},\"device_type\":\"DEVICE_TYPE_INVALID\",\"force_earliest_schedule\":false,\"operation_queue_id\":\"0\",\"reification_cost\":[]}"
+   result {
+     run_time {
+diff --git a/xla/tools/xla_compile_lib.cc b/xla/tools/xla_compile_lib.cc
+index fae6eab08e..8bdf342c46 100644
+--- a/xla/tools/xla_compile_lib.cc
++++ b/xla/tools/xla_compile_lib.cc
+@@ -172,6 +172,19 @@ static absl::StatusOr<std::string> CompileGpuExecutable(
+                             GetStreamExecutor(platform, 0));
+ 
+       aot_options.set_executor(stream_executor);
++    } else {
++      // Needed to make existing paths that compile CuDNN FMHA custom calls
++      // pass.
++      // TODO(b/505264161): Remove this when the flag is enabled by default.
++      DebugOptions& debug_options =
++          hlo_module->mutable_config().mutable_debug_options();
++      const DebugOptions::CudnnDevicelessCompilationMode mode =
++          debug_options.xla_gpu_cudnn_deviceless_compilation_mode();
++      if (mode == DebugOptions::CUDNN_DEVICELESS_COMPILATION_UNSET ||
++          mode == DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED) {
++        debug_options.set_xla_gpu_cudnn_deviceless_compilation_mode(
++            DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO);
++      }
+     }
+ 
+     // We need the optimized module, so we call RunHloPasses ourselves above.
