@@ -397,7 +397,8 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
     jaxlib = wheel(tmp_path, "jaxlib", "0.12.0.1.post101")
     unpinned = wheel(tmp_path, "jax_cuda13_plugin", "0.12.0.1.post101")
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    lock = (f"jax==0.12.0.1.post101 \\\n    --hash=sha256:{digest(jax)}\n    # via dewml\n"
+    lock = (f"jax[cuda12]==0.12.0.1.post101 ; sys_platform == 'linux' \\\n"
+            f"    --hash=sha256:{digest(jax)}\n    # via dewml\n"
             f"jaxlib==0.12.0.1.post101 \\\n    --hash=sha256:{'0' * 64} \\\n    --hash=sha256:{digest(jaxlib)}\n"
             f"numpy==2.3.0 \\\n    --hash=sha256:{'1' * 64}\n")
     pins = patch_stack.pinned([lock])

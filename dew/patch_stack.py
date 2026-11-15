@@ -300,15 +300,21 @@ STAGED = ("jax", "jaxlib", "jax-cuda12-plugin", "jax-cuda12-pjrt", "jax-cuda13-p
 """The projects a release stages on its GitHub releases before Dew's index lists them (`indexable`)."""
 
 
+def canonical(name: str) -> str:
+    """A project's name as PEP 503 normalizes it."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def pinned(locks: list[str]) -> dict[str, set[str]]:
     """What Dew's locks (`uv pip compile --generate-hashes` files, given as their text) pin of STAGED: each
-    `project==version`, the sha256 of every file the locks allow for it (every machine's and Python's)."""
+    `project==version` (its name normalized, its extras dropped), the sha256 of every file the locks allow for it
+    (every machine's and Python's)."""
     pins: dict[str, set[str]] = {}
     for text in locks:
         for block in re.split(r"\n(?=[^\s#-])", text):
-            found = re.match(r"([A-Za-z0-9_.-]+)==(\S+)", block)
-            if found and found[1].lower().replace("_", "-") in STAGED:
-                pins.setdefault(f"{found[1].lower().replace('_', '-')}=={found[2]}", set()).update(
+            found = re.match(r"([A-Za-z0-9_.-]+)(?:\[[^]]*\])?==([^\s;\\]+)", block)
+            if found and canonical(found[1]) in STAGED:
+                pins.setdefault(f"{canonical(found[1])}=={found[2]}", set()).update(
                     re.findall(r"--hash=sha256:([0-9a-f]{64})", block))
     return pins
 
@@ -323,7 +329,11 @@ def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> li
     chosen = []
     for wheel in wheels:
         project, wheel_version = wheel.name.split("-")[:2]
-        pin = f"{project.lower().replace('_', '-')}=={wheel_version}"
+        pin = f"{canonical(project)}=={wheel_version}"
+        # A wheel's file name holds its project as the wheel spec normalizes it (lowercase, underscores), which the
+        # index step's per-project globs read; another spelling is refused, never left out unsaid (review).
+        if pin in pins and project != canonical(project).replace("-", "_"):
+            raise SystemExit(f"{wheel.name}: its project is not spelled as a wheel's file name normalizes it")
         if pin not in pins:
             continue
         digest = hashlib.sha256(wheel.read_bytes()).hexdigest()

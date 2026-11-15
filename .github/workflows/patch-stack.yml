@@ -351,6 +351,8 @@ jobs:
           if-no-files-found: error
 
   # A published release's wheels staged on GitHub releases, never indexed at publish: jax's own on jax-<version>
+  # (the stock release's own wheels, which the index must list beside a build of it, are indexed ahead through
+  # publish-package's upstream path: `index` refuses a build whose base the index lacks)
   # (its native wheels are on plugin-<version> already). Dew's pin head locks them from there (constraints.txt's
   # --find-links), its train runs them, and only once it has landed are they indexed (`index`), byte for byte
   # (Main, 2026-11-15: the workflow indexed post98 and post99 before any Dew test ran on them, and post99's jaxlib
@@ -380,8 +382,16 @@ jobs:
             gh release create "jax-$version" --repo "$GITHUB_REPOSITORY" --target "$commit" --title "jax-$version" \
               --notes "jax $version, staged: Dew's pin head locks it from here, and it is indexed once that head has passed Dew's train (patch-stack's index)."
           fi
-          gh release upload "jax-$version" --repo "$GITHUB_REPOSITORY" "$wheel"
-          echo "staged $(basename "$wheel") on jax-$version; its native wheels are on their plugin release"
+          # Staged once: a publish run again (another machine's plugins added beside) finds its wheel there; the same
+          # bytes are kept, other bytes under the name refused, never replaced (a lock may hold their sha256).
+          name=$(basename "$wheel")
+          if gh release download "jax-$version" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir staged 2> /dev/null; then
+            [ "$(sha256sum < "staged/$name")" = "$(sha256sum < "$wheel")" ] || { echo "::error::jax-$version holds another $name"; exit 1; }
+            echo "kept $name: staged already, the same bytes"
+          else
+            gh release upload "jax-$version" --repo "$GITHUB_REPOSITORY" "$wheel"
+            echo "staged $name on jax-$version; its native wheels are on their plugin release"
+          fi
 
   index:
     needs: [carry]
