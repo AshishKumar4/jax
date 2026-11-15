@@ -44,6 +44,7 @@ from jax._src import hijax
 from jax._src import jaxpr_util
 from jax._src import literals
 from jax._src import custom_derivatives
+from jax._src.lax import eval_jaxpr
 from jax._src import test_util as jtu
 from jax._src.interpreters import ad
 from jax._src.interpreters import partial_eval as pe
@@ -67,6 +68,315 @@ class CheckingNode:
   @classmethod
   def tree_unflatten(cls, _, children):
     return cls(*children)
+
+
+@jtu.with_config(jax_custom_jvp3=False)
+class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
+
+  def test_tangent_becomes_mapped_only_at_higher_order(self):
+    @jax.custom_jvp
+    def coefficient(c):
+      return jnp.float32(1)
+
+    @coefficient.defjvp
+    def coefficient_jvp(primals, tangents):
+      return jnp.float32(1), tangents[0]
+
+    @jax.custom_jvp
+    def f(x, c):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      x, c = primals
+      return 3 * x, coefficient(c) * tangents[0]
+
+    cs = jnp.array([2., 6.])
+    shared = jax.vmap(jax.jit(f), in_axes=(None, 0), out_axes=None)
+    with self.assertRaisesRegex(
+        ValueError, "custom_jvp 'f'.*staged application.*out_axes=0.*unjitted"):
+      shared(jnp.float32(1), cs)
+    mapped = lambda x, c: jax.vmap(
+        jax.jit(f), in_axes=(None, 0))(x, c).mean()
+    second = api.grad(lambda c: api.grad(mapped)(jnp.float32(1), c))
+    self.assertAllClose(second(cs), jnp.full_like(cs, .5))
+
+  def test_recursive_primal_used_in_tangent_higher_order(self):
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      y = f(x, coefficient)
+      return y, coefficient * y * dx
+
+    coefficients = jnp.array([2., 6.])
+    eager = lambda x: jax.vmap(f, in_axes=(None, 0))(x, coefficients).mean()
+    staged = lambda x: jax.vmap(jax.jit(f), in_axes=(None, 0))(
+        x, coefficients).mean()
+    for order in range(1, 4):
+      eager, staged = api.grad(eager), api.grad(staged)
+      self.assertAllClose(staged(jnp.float32(1)), eager(jnp.float32(1)))
+
+  @parameterized.parameters(False, True)
+  def test_shared_mixed_and_symbolic_zero_outputs(self, symbolic_zeros):
+    Zero = jax.custom_derivatives.SymbolicZero
+
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x, 5 * x, jnp.int32(7), 7 * x
+
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      out = f(x, coefficient)
+      zeros = ((Zero.from_primal_value(out[2]), Zero.from_primal_value(out[3]))
+               if symbolic_zeros else
+               (np.zeros((), jax.dtypes.float0), jnp.zeros_like(out[3])))
+      return out, (coefficient * dx, 5 * dx,
+                   *zeros)
+
+    f.defjvp(f_jvp, symbolic_zeros=symbolic_zeros)
+    coefficients = jnp.array([2., 6.])
+    mapped = jax.vmap(jax.jit(f), in_axes=(None, 0),
+                      out_axes=(0, 0, 0, 0))
+    for g in (mapped, jax.jit(mapped)):
+      out, tangent = api.jvp(
+          lambda x: g(x, coefficients), (jnp.float32(1),),
+          (jnp.float32(1),))
+      self.assertAllClose(out, (jnp.array([3., 3.]), jnp.array([5., 5.]),
+                               jnp.array([7, 7], dtype=jnp.int32),
+                               jnp.array([7., 7.])))
+      self.assertAllClose(tangent[0], coefficients)
+      self.assertAllClose(tangent[1], jnp.array([5., 5.]))
+      self.assertEqual(tangent[2].shape, (2,))
+      self.assertEqual(tangent[2].dtype, jax.dtypes.float0)
+      self.assertAllClose(tangent[3], jnp.array([0., 0.]))
+      self.assertAllClose(api.grad(
+          lambda x: g(x, coefficients)[0].mean() + g(x, coefficients)[1].mean())(
+              jnp.float32(1)), 9.)
+
+  @parameterized.parameters(False, True)
+  def test_forward_only_jvp_laziness(self, symbolic_zeros):
+    calls = []
+    Zero = jax.custom_derivatives.SymbolicZero
+
+    @jax.custom_jvp
+    def f(x, ignored):
+      return 3 * x
+
+    def f_jvp(primals, tangents):
+      x, _ = primals
+      dx, di = tangents
+      calls.append((isinstance(dx, Zero), isinstance(di, Zero)))
+      return 3 * x, 3 * dx
+
+    f.defjvp(f_jvp, symbolic_zeros=symbolic_zeros)
+    x, ignored = jnp.float32(1), jnp.float32(2)
+    coefficients = jnp.array([2., 6.])
+    staged = jax.jit(f)
+    self.assertAllClose(f(x, ignored), 3.)
+    self.assertAllClose(staged(x, ignored), 3.)
+    self.assertAllClose(jax.vmap(f, in_axes=(None, 0))(x, coefficients),
+                        jnp.array([3., 3.]))
+    self.assertAllClose(jax.vmap(
+        lambda _: staged(x, ignored), out_axes=None)(coefficients), 3.)
+    self.assertEmpty(calls)  # No staged mapped argument: JVP remains lazy.
+
+    mapped = jax.vmap(staged, in_axes=(None, 0))
+    self.assertAllClose(mapped(x, coefficients), jnp.array([3., 3.]))
+    self.assertEmpty(calls)  # Even the staged mapped call leaves the JVP lazy.
+    primal, tangent = api.jvp(
+        mapped, (x, coefficients), (jnp.ones_like(x), jnp.ones_like(coefficients)))
+    self.assertAllClose((primal, tangent),
+                        (jnp.array([3., 3.]), jnp.array([3., 3.])))
+    self.assertEqual(calls, [(False, False)])
+    for _ in range(2):
+      self.assertAllClose(api.grad(lambda x: mapped(x, coefficients).mean())(x), 3.)
+    self.assertEqual(calls, [(False, False), (False, True)]
+                     if symbolic_zeros else [(False, False)])
+
+  def test_nonleading_batch_axis(self):
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      return 3 * x, coefficient * dx
+
+    x = jnp.arange(4., dtype=jnp.float32)
+    coefficients = jnp.arange(12., dtype=x.dtype).reshape(4, 3)
+    mapped = lambda x: jax.vmap(jax.jit(f), in_axes=(None, 1), out_axes=1)(
+        x, coefficients)
+    primal, tangent = api.jvp(mapped, (x,), (jnp.ones_like(x),))
+    self.assertAllClose(primal, jnp.broadcast_to((3 * x)[:, None], (4, 3)))
+    self.assertAllClose(tangent, coefficients)
+    self.assertAllClose(api.grad(lambda x: mapped(x).sum() / 3)(x),
+                        coefficients.mean(1))
+
+  @parameterized.parameters('jit', 'nested_jit', 'remat', 'scan')
+  def test_staging_compositions(self, composition):
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      return 3 * x, coefficient * dx
+
+    staged = jax.jit(f)
+    if composition == 'nested_jit':
+      staged = jax.jit(lambda x, c: jax.jit(f)(x, c))
+    elif composition == 'remat':
+      staged = jax.remat(staged)
+    elif composition == 'scan':
+      def staged(x, c):
+        return lax.scan(
+            lambda carry, _: (carry, jax.jit(f)(x, c)),
+            None, None, length=2)[1].mean(0)
+    coefficients = jnp.array([2., 6.])
+    mapped = jax.jit(lambda x: jax.vmap(staged, in_axes=(None, 0))(
+        x, coefficients))
+    x = jnp.arange(4., dtype=jnp.float32)
+    primal, tangent = api.jvp(mapped, (x,), (jnp.ones_like(x),))
+    self.assertEqual(primal.shape, (2, 4))
+    self.assertAllClose(tangent, jnp.broadcast_to(coefficients[:, None], (2, 4)))
+    self.assertAllClose(api.grad(lambda x: mapped(x).sum() / 2)(x),
+                        jnp.full_like(x, 4.))
+
+  def test_forward_only_does_not_require_abstractly_traceable_jvp(self):
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      return 3 * x, float(coefficient) * dx
+
+    self.assertAllClose(jax.jit(f)(1., 2.), 3.)  # Still lazy without vmap.
+    self.assertAllClose(
+        jax.vmap(jax.jit(f), in_axes=(None, 0))(1., jnp.array([2., 6.])),
+        jnp.array([3., 3.]))
+    with self.assertRaises(jax.errors.ConcretizationTypeError):
+      api.grad(lambda x: jax.vmap(jax.jit(f), in_axes=(None, 0))(
+          x, jnp.array([2., 6.])).sum())(1.)
+
+  def test_staged_shared_output_error_and_fully_shared_call(self):
+    @jax.custom_jvp
+    def f(x, ignored):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      return 3 * primals[0], 3 * tangents[0]
+
+    staged = jax.jit(f)
+    x, ignored = jnp.float32(1), jnp.array([2., 6.])
+    self.assertAllClose(jax.vmap(staged, in_axes=(None, 0))(x, ignored),
+                        jnp.array([3., 3.]))
+    for _ in range(2):  # The explanation also survives cached jit batching.
+      with self.assertRaisesRegex(
+          ValueError, "custom_jvp 'f'.*staged application.*batched over a mapped "
+          "input.*out_axes=0.*unjitted under vmap"):
+        jax.vmap(staged, in_axes=(None, 0), out_axes=None)(x, ignored)
+    # sum_match would sum the conservative broadcast into a wrong result, primal and gradient alike: refused too.
+    for read in (lambda x: jax.vmap(staged, in_axes=(None, 0), out_axes=None, sum_match=True)(x, ignored),
+                 api.grad(lambda x: jax.vmap(staged, in_axes=(None, 0), out_axes=None,
+                                             sum_match=True)(x, ignored))):
+      with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
+        read(x)
+    self.assertAllClose(
+        jax.vmap(f, in_axes=(None, 0), out_axes=None, sum_match=True)(x, ignored), 3.)
+    self.assertAllClose(
+        jax.vmap(f, in_axes=(None, 0), out_axes=None)(x, ignored), 3.)
+    shared = jax.vmap(lambda _: staged(x, jnp.float32(2)), out_axes=None)
+    self.assertAllClose(shared(ignored), 3.)
+    self.assertAllClose(api.grad(lambda x: jax.vmap(
+        lambda _: staged(x, jnp.float32(2)), out_axes=None)(ignored))(x), 3.)
+
+  @parameterized.parameters("eval_jaxpr", "registered_call", "cond", "scan",
+                            "while_loop")
+  def test_staged_shared_output_refused_through_a_call_primitive(self, through):
+    @jax.custom_jvp
+    def f(x, ignored):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      return 3 * primals[0], 3 * tangents[0]
+
+    body = jax.make_jaxpr(f)(jnp.float32(1), jnp.float32(2))
+    registered = eval_jaxpr.create_call_primitive("staged_shared_call")
+
+    def called(x, ignored):
+      if through in ("eval_jaxpr", "registered_call"):
+        primitive = core.eval_jaxpr_p if through == "eval_jaxpr" else registered
+        out, = primitive.bind(x, ignored, call_jaxpr=body)
+        return out
+      if through == "cond":
+        return lax.cond(x > 0, f, lambda x, _: 3 * x, x, ignored)
+      if through == "scan":
+        _, ys = lax.scan(lambda carry, _: (carry, f(x, ignored)), x, length=1)
+        return ys[0]
+      return lax.while_loop(lambda state: state[0] < 1,
+                            lambda state: (state[0] + 1, f(x, ignored)),
+                            (0, x))[1]
+
+    x, ignored = jnp.float32(1), jnp.array([2., 6.])
+    self.assertAllClose(jax.vmap(called, in_axes=(None, 0))(x, ignored),
+                        jnp.array([3., 3.]))
+    # The primitive's batching keeps its body's staged custom_jvp outputs
+    # marked, so a shared read refuses them as a direct jit's does, never
+    # summing the conservative broadcast (6. here) as though each value were
+    # mapped.
+    for sum_match in (False, True):
+      with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
+        jax.vmap(called, in_axes=(None, 0), out_axes=None,
+                 sum_match=sum_match)(x, ignored)
+
+  @parameterized.product(batch_size=[2, 3], symbolic_zeros=[False, True])
+  def test_tangent_only_batched_output(self, batch_size, symbolic_zeros):
+    @jax.custom_jvp
+    def f(x, coefficient):
+      return 3 * x
+
+    def f_jvp(primals, tangents):
+      x, coefficient = primals
+      dx, _ = tangents
+      return 3 * x, coefficient * dx
+
+    f.defjvp(f_jvp, symbolic_zeros=symbolic_zeros)
+    x = jnp.arange(4., dtype=jnp.float32)
+    coefficients = jnp.arange(batch_size, dtype=x.dtype) * 4 + 2
+    expected_primal = jnp.broadcast_to(3 * x, (batch_size, *x.shape))
+    expected_tangent = coefficients[:, None] * jnp.ones_like(x)[None, :]
+
+    for staged in (f, jax.jit(f)):
+      def mapped(x):
+        return jax.vmap(staged, in_axes=(None, 0))(x, coefficients)
+
+      primal, tangent = api.jvp(mapped, (x,), (jnp.ones_like(x),))
+      self.assertEqual(primal.shape, expected_primal.shape)
+      self.assertEqual(tangent.shape, expected_tangent.shape)
+      self.assertAllClose(primal, expected_primal)
+      self.assertAllClose(tangent, expected_tangent)
+      for transformed in (mapped, jax.jit(mapped)):
+        gradient = api.grad(lambda x: transformed(x).sum() / batch_size)(x)
+        self.assertAllClose(gradient, jnp.full_like(x, coefficients.mean()))
+      primal, linear = api.linearize(mapped, x)
+      self.assertAllClose(linear(jnp.ones_like(x)), expected_tangent)
+      transposed, = api.linear_transpose(linear, x)(jnp.ones_like(primal))
+      self.assertAllClose(transposed, jnp.full_like(x, coefficients.sum()))
 
 
 @jtu.with_config(jax_custom_jvp3=False)
