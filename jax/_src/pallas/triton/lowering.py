@@ -1442,6 +1442,9 @@ _JAX_FN_MAPPING = {
     lax.clamp_p: lambda min, a, max: jnp.minimum(jnp.maximum(min, a), max),
     lax.logistic_p: lambda a, accuracy: 1 / (1 + jnp.exp(-a)),
     lax.is_finite_p: lambda x: jnp.logical_and(~jnp.isnan(x), ~jnp.isinf(x)),
+    # A multiply-add may round once or twice (`lax.fmuladd`); erf_inv's
+    # polynomial is one.
+    lax.fmuladd_p: lambda a, b, c: a * b + c,
 }
 
 for prim, fn in _JAX_FN_MAPPING.items():
