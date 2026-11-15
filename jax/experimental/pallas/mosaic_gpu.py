@@ -20,6 +20,7 @@ These APIs are highly unstable and can change weekly. Use at your own risk.
 from jax._src.pallas.mosaic_gpu.core import PlainTransform as PlainTransform
 from jax._src.pallas.mosaic_gpu.core import alloc_semaphore as alloc_semaphore
 from jax._src.pallas.mosaic_gpu.core import Barrier as Barrier
+from jax._src.pallas.mosaic_gpu.core import SMEM_ALIGNMENT as SMEM_ALIGNMENT
 from jax._src.pallas.mosaic_gpu.core import BlockSpec as BlockSpec
 from jax._src.pallas.mosaic_gpu.core import cluster_ref as cluster_ref
 from jax._src.pallas.mosaic_gpu.core import ClusterBarrier as ClusterBarrier
