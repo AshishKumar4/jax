@@ -108,7 +108,7 @@ class ResourceEstimatorContext:
     )
 
 
-AnyBarrier = mgpu.Barrier | mgpu.ClusterBarrier
+AnyBarrier = mgpu.Barrier | mgpu.ClusterBarrier | mgpu.CtaBarrier
 
 
 def _get_barrier(
@@ -120,6 +120,14 @@ def _get_barrier(
   if not (orders_tc := aval.dtype.orders_tensor_core):
     num_arrivals *= arrival_multiplier
   return mgpu.Barrier(num_arrivals, num_barriers, orders_tc)
+
+
+def _get_cta_barrier(aval: ShapedAbstractValue) -> mgpu.CtaBarrier:
+  """A named CTA barrier counting threads: `num_arrivals` warpgroups' whole."""
+  assert isinstance(aval.dtype, gpu_core.CtaBarrierType)
+  return mgpu.CtaBarrier(
+      aval.dtype.num_arrivals * WARPGROUP_SIZE, math.prod(aval.shape)
+  )
 
 
 def _get_cluster_barrier(
@@ -366,6 +374,10 @@ def _run_scoped_resource_estimator(
       barrier = _get_cluster_barrier(aval, ctx.axis_names)
       rs += Resources(barrier_counts=collections.Counter([barrier]))
       continue
+    if isinstance(aval.dtype, gpu_core.CtaBarrierType):
+      barrier = _get_cta_barrier(aval)
+      rs += Resources(barrier_counts=collections.Counter([barrier]))
+      continue
     assert isinstance(aval, state_types.AbstractRef)
     if aval.memory_space == gpu_core.TMEM:
       if len(aval.shape) != 2:
@@ -434,7 +446,10 @@ class _AxisNames:
 
 
 AnyBarrierRef = (
-    mgpu.BarrierRef | mgpu.DialectBarrierRef | mgpu.CollectiveBarrierRef
+    mgpu.BarrierRef
+    | mgpu.DialectBarrierRef
+    | mgpu.CollectiveBarrierRef
+    | mgpu.CtaBarrierRef
 )
 
 
@@ -510,10 +525,8 @@ class ModuleContext:
 
   @contextlib.contextmanager
   def reserve_barrier(
-      self, barrier: mgpu.Barrier | mgpu.ClusterBarrier
-  ) -> Generator[
-      mgpu.BarrierRef | mgpu.DialectBarrierRef | mgpu.CollectiveBarrierRef,
-  ]:
+      self, barrier: AnyBarrier
+  ) -> Generator[AnyBarrierRef]:
     """Reserves a barrier.
 
     Raises:
@@ -3952,6 +3965,12 @@ def _run_scoped_lowering_rule(
         continue
       if isinstance(aval.dtype, gpu_core.ClusterBarrierType):
         barrier = _get_cluster_barrier(aval, ctx.module_ctx.axis_names)
+        barrier_ctx = ctx.module_ctx.reserve_barrier(barrier)
+        input_refs.append(alloc_stack.enter_context(barrier_ctx))
+        should_discharge.append(False)
+        continue
+      if isinstance(aval.dtype, gpu_core.CtaBarrierType):
+        barrier = _get_cta_barrier(aval)
         barrier_ctx = ctx.module_ctx.reserve_barrier(barrier)
         input_refs.append(alloc_stack.enter_context(barrier_ctx))
         should_discharge.append(False)
