@@ -66,6 +66,9 @@ setup(
         'ml_dtypes>=0.5.0',
         'numpy>=2.2',
         'opt_einsum',
+        # jax.extend.xla's reader of a compiled module's instructions parses XLA's HloModuleProto
+        # (jax._src.hlo_reader, its descriptors jax._src.xla_protos), message classes from a pool of its own.
+        'protobuf>=5.26',
         'scipy>=1.15',
     ],
     extras_require={
