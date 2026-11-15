@@ -106,6 +106,27 @@ Remember to align the itemized text with the first line of an item within a list
   * Added support for im2col TMA copies to
     {func}`jax.experimental.pallas.mosaic_gpu.copy_gmem_to_smem` via the
     {func}`jax.experimental.pallas.mosaic_gpu.im2col_ref` transformation.
+  * Added the `jax_pallas_lowering_cache_dir` flag (environment variable
+    `JAX_PALLAS_LOWERING_CACHE_DIR`), a persistent cache of Mosaic GPU kernels'
+    lowerings. A kernel lowered before, by this process or another, is read
+    back instead of lowered again. The contract is the one of the persistent
+    compilation cache: no stale hit in a process that has not changed JAX's
+    internals. The key is the identity of the installed `jax`, `jaxlib` and
+    CUDA plugin files (each must match its wheel's `RECORD`) and what the
+    lowering is given, encoded strictly: the kernel's jaxpr, params and avals,
+    the GPU and what the process says of its devices, every `jax.config` value,
+    the rules registered for the lowering, and the lowering's constants. What
+    can be seen to differ from the installed code (a file that is not its
+    wheel's, an unsealed rule or constant) or cannot be encoded exactly (a
+    layout class of the user's) is lowered afresh, and counted by the
+    `/jax/pallas/mosaic_gpu/lowering_cache/*` {mod}`jax.monitoring` events. A
+    process that rebinds functions of JAX is out of contract, and is not
+    detected. A cached lowering carries no source locations, whether it is a
+    miss or a hit. An entry carries a checksum of what it holds, and one that
+    does not match it is lowered again. `jax_pallas_lowering_cache_verify`
+    (`JAX_PALLAS_LOWERING_CACHE_VERIFY=1`) also lowers each hit afresh and
+    raises when the two differ, and a process that used the cache with it and
+    verified no hit exits with status 3.
 
 * Deprecations
 
