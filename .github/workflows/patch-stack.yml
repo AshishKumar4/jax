@@ -84,6 +84,7 @@ jobs:
       - name: Test the candidate
         env:
           CANDIDATE: ${{ inputs.test }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$CANDIDATE" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::test: a ref"; exit 1; }
           git clone -q --filter=blob:none "https://github.com/$GITHUB_REPOSITORY.git" jax
@@ -93,7 +94,18 @@ jobs:
           release=$(sed -n 's/^_version = "\(.*\)"$/\1/p' jax/version.py)
           git fetch -q --no-tags https://github.com/jax-ml/jax.git "refs/tags/jax-v$release:refs/tags/jax-v$release"
           uv venv -q --python 3.12 ../venv
-          uv pip install -q --python ../venv/bin/python "jaxlib==$release" . $TEST_DEPENDENCIES
+          # Its jaxlib: the one the plugin release holding its native code carries (`patch_stack.py plugins`, for a
+          # candidate named release/X.postN-candidate), which a test of an XLA patch reads (post98's buffer
+          # assignment); else its release's stock one.
+          jaxlib="jaxlib==$release"
+          version=$(echo "$CANDIDATE" | sed -n 's|^release/\(.*\)-candidate$|\1|p')
+          plugins=$([ -z "$version" ] || python3 ../dew/dew/patch_stack.py plugins "$version")
+          if [ -n "$plugins" ] && gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir ../native \
+              --pattern "jaxlib-*-cp312-cp312-manylinux_*_x86_64.whl" 2> /dev/null; then
+            jaxlib=$(ls ../native/jaxlib-*.whl)
+          fi
+          echo "jaxlib: $jaxlib"
+          uv pip install -q --python ../venv/bin/python "$jaxlib" . $TEST_DEPENDENCIES
           tests="$TESTS $(python3 ../dew/dew/patch_stack.py tests "$release")"
           echo "tests: $tests"
           ../venv/bin/python -m pytest -q -n auto -p no:cacheprovider $tests
