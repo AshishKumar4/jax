@@ -451,6 +451,42 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
                      program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
 
+  def test_a_mosaic_gpu_kernel_written_at_two_places_keys_alike(self):
+    # A real Pallas Mosaic GPU kernel, lowered for an H100 on any host, its
+    # source lines moved: its module carries their locations, which the key
+    # leaves out.
+    try:
+      from jax.experimental.pallas import mosaic_gpu as plgpu
+    except ImportError:
+      self.skipTest("this jaxlib has no Mosaic GPU")
+    # A TMA copy and its barrier: operations whose properties only Mosaic
+    # GPU's dialect reads.
+    source = ("def kernel(x_ref, o_ref, smem, barrier):\n"
+              "  plgpu.copy_gmem_to_smem(x_ref, smem, barrier)\n"
+              "  plgpu.barrier_wait(barrier)\n"
+              "  o_ref[...] = smem[...] + 1.0\n")
+
+    def lowered(pad):
+      namespace = {"plgpu": plgpu}
+      exec(compile("\n" * pad + source, "kernels.py", "exec"), namespace)
+      call = plgpu.kernel(
+          namespace["kernel"],
+          out_type=jax.ShapeDtypeStruct((128,), np.float32),
+          scratch_types=[plgpu.SMEM((128,), np.float32), plgpu.Barrier()],
+          num_threads=1, thread_name="wg")
+      device = jax.sharding.AbstractDevice(
+          device_kind="NVIDIA H100 80GB HBM3", platform="gpu", num_cores=132,
+          compute_capability="9.0")
+      mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+      with jax.sharding.use_abstract_mesh(mesh):
+        return jax.jit(call).trace(
+            jax.ShapeDtypeStruct((128,), np.float32)).lower(
+                lowering_platforms=("cuda",)).compiler_ir("stablehlo")
+
+    first, second = lowered(0), lowered(7)
+    self.assertEqual(cache_key._canonicalize_ir(first, False),
+                     cache_key._canonicalize_ir(second, False))
+
   def test_kernels_key_alike_from_threads_sharing_one_context(self):
     # Programs lowered back to back on a thread share one MLIR context
     # (`mlir.make_ir_context`), which another thread's lowerings may share too:
