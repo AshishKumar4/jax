@@ -691,7 +691,7 @@ def _insert_reduce_precision(jaxpr: core.Jaxpr, num_res: int) -> core.Jaxpr:
         # A named residual is reduced before it is named, so its name tags
         # the op defining the residual's buffer (`_name_lowering`).
         new_eqn = core.new_jaxpr_eqn(
-            [newvar], [eqn.invars[0]], lax_internal.reduce_precision_p, params,
+            [eqn.invars[0]], [newvar], lax_internal.reduce_precision_p, params,
             set(), eqn.source_info, eqn.ctx)
         eqns[eqn_idx] = eqn.replace(invars=[newvar])
         eqns.insert(eqn_idx, new_eqn)
