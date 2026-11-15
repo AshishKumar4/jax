@@ -202,7 +202,7 @@ def call_initialize_shared_memory(
     num_blocks_per_cluster: jax.Array,
     interpret_params: InterpretGPUParams,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _initialize_shared_memory,
           interpret_params=interpret_params,
@@ -223,7 +223,7 @@ def _clean_up_shared_memory(token):
 
 
 def call_clean_up_shared_memory(token):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _clean_up_shared_memory, TOKEN_SHAPE_DTYPE, token
   )
 
@@ -236,7 +236,7 @@ def _update_clocks_for_device_barrier(token, device: memory.Device):
 
 
 def call_update_clocks_for_device_barrier(token, device: memory.Device):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _update_clocks_for_device_barrier,
       TOKEN_SHAPE_DTYPE,
       token,
@@ -289,7 +289,7 @@ def call_tag_ref_union(
     member_keys_as_array: jax.Array,
     alias_group_idxs: Sequence[int],
 ) -> jax.Array:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _tag_ref_union, alias_group_idxs=tuple(alias_group_idxs)
       ),
@@ -306,7 +306,7 @@ def call_make_allocation_request_array(
     memory_space_id: int,
     initial_ref_count: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _make_allocation_request_array,
       (TOKEN_SHAPE_DTYPE, HostAllocationRequest.shape_and_dtype()),
       token=token,
@@ -407,7 +407,7 @@ def call_allocate_buffer_for_all_threads(
     value: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _allocate_buffer_for_all_threads, source_info=source_info
       ),
@@ -484,7 +484,7 @@ def call_allocate_buffer(
     value: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_allocate_buffer, source_info=source_info),
       (TOKEN_SHAPE_DTYPE, HostAllocationKey.shape_and_dtype()),
       token,
@@ -522,7 +522,7 @@ def call_deallocate_buffer(
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_deallocate_buffer, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -690,7 +690,7 @@ def call_get(
     source_info=None,
     input_name=None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_get, source_info=source_info, input_name=input_name),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
@@ -787,7 +787,7 @@ def call_swap(
     clock=None,
     source_info=None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_swap, source_info=source_info),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
@@ -871,7 +871,7 @@ def call_allocate_barriers(
   result_shape_and_dtype = jax.ShapeDtypeStruct(
       result_shape, shape_and_dtype.dtype
   )
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _allocate_barriers,
           source_info=source_info,
@@ -938,7 +938,7 @@ def call_deallocate_barrier(
     source_info: source_info_util.SourceInfo | None = None,
     cluster_barrier: bool = False,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_deallocate_barrier, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -980,7 +980,7 @@ def call_barrier_wait(
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_barrier_wait, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -1032,7 +1032,7 @@ def call_barrier_arrive(
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_barrier_arrive, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -1090,7 +1090,7 @@ def call_named_barrier(
     sync: bool,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _named_barrier,
           num_threads=num_threads,
@@ -1112,7 +1112,7 @@ def _assert_no_barriers_allocated(token):
 
 
 def call_assert_no_barriers_allocated(token):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token
   )
 
@@ -1193,7 +1193,7 @@ def call_allocate_cluster_barriers(
   result_shape_and_dtype = jax.ShapeDtypeStruct(
       result_shape, shape_and_dtype.dtype
   )
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _allocate_cluster_barriers,
           source_info=source_info,
