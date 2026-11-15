@@ -22,6 +22,19 @@ index d56ec2b0a8..62fc5378da 100644
          sha256 = "cb485a0fe76dec243568ec6ce6c0b75e18909ed7df5459921b46eaada332fe8f",
          strip_prefix = "XNNPACK-0a66ebb5817fce48df605451444dcfc27a5e4ee4",
          urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/0a66ebb5817fce48df605451444dcfc27a5e4ee4.zip"),
+diff --git a/xla/backends/cpu/tests/BUILD b/xla/backends/cpu/tests/BUILD
+--- a/xla/backends/cpu/tests/BUILD
++++ b/xla/backends/cpu/tests/BUILD
+@@ -47,6 +47,9 @@ xla_test(
+     name = "ynn_fusion_test",
+     srcs = ["ynn_fusion_test.cc"],
+     backends = ["cpu"],
++    # The build hides a shared object's symbols (as assembly_to_binary_test's comment says): linked
++    # statically, the test reaches the test base and absl it calls.
++    linkstatic = True,
+     deps = [
+         "//xla:error_spec",
+         "//xla:literal",
 diff --git a/xla/backends/cpu/tests/ynn_fusion_test.cc b/xla/backends/cpu/tests/ynn_fusion_test.cc
 index 14260ee557..911149e04e 100644
 --- a/xla/backends/cpu/tests/ynn_fusion_test.cc
