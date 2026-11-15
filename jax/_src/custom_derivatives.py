@@ -425,6 +425,7 @@ def lift_jvp(num_consts: int, jvp_jaxpr_fun: lu.WrappedFun) -> lu.WrappedFun:
   return lu.wrap_init(jvp, debug_info=jvp_jaxpr_fun.debug_info)
 
 custom_jvp_call_p = CustomJVPCallPrimitive('custom_jvp_call')
+custom_jvp_call_p.inlined_call = True
 
 def _custom_jvp_call_typecheck(_, *in_avals, call_jaxpr, jvp_jaxpr_fun,
                                num_consts, symbolic_zeros):
@@ -1216,6 +1217,7 @@ def _handle_consts_in_bwd(f, const_avals, *args):
   return [Zero(a) for a in const_avals] + list(cts), logs
 
 custom_vjp_call_p = CustomVJPCallPrimitive('custom_vjp_call')
+custom_vjp_call_p.inlined_call = True
 # TODO(phawkins,mattjj): make this primitive cacheable.
 mlir.register_lowering(custom_vjp_call_p, _custom_jvp_vjp_call_lowering,
                        cacheable=False)

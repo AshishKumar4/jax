@@ -38,6 +38,7 @@ def add_jaxvals(x: ArrayLike, y: ArrayLike) -> Array:
   return add_jaxvals_p.bind(x, y)
 
 add_jaxvals_p = Primitive('add_any')
+add_jaxvals_p.elementwise = True
 add_any_p = add_jaxvals_p
 
 @add_jaxvals_p.def_impl
@@ -101,6 +102,7 @@ def _stop_gradient_impl[T](x: T) -> T:
   return x
 
 stop_gradient_p : Primitive = Primitive('stop_gradient')
+stop_gradient_p.elementwise = True
 stop_gradient_p.def_impl(_stop_gradient_impl)
 stop_gradient_p.def_abstract_eval(lambda x: x)
 
