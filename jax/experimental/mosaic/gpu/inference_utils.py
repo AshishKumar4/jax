@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+import contextlib
+import contextvars
+import functools
 from functools import partial
 
 from jax._src.lib import mosaic_gpu_dialect as mgpu
@@ -91,6 +94,39 @@ def _array_attr(op: MlirOperation, name: str) -> Sequence[ir.Attribute]:
   return result  # pyrefly: ignore[bad-return]
 
 
+_ASKED: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "asked", default=None)
+
+
+@contextlib.contextmanager
+def asked_once() -> Iterator[None]:
+  """Within the block, each `should_have_*` predicate is computed once an op.
+
+  A predicate reads only the types of an op's operands and results, which no
+  pass in the block may change: layout inference sets attributes alone.
+  """
+  token = _ASKED.set({})
+  try:
+    yield
+  finally:
+    _ASKED.reset(token)
+
+
+def _once(predicate: Callable[[MlirOperation], bool]):
+  @functools.wraps(predicate)
+  def asked(op: MlirOperation) -> bool:
+    memo = _ASKED.get()
+    if memo is None:
+      return predicate(op)
+    key = (predicate.__name__, op.operation)
+    if (found := memo.get(key)) is None:
+      found = memo[key] = predicate(op)
+    return found
+
+  return asked
+
+
+@_once
 def should_have_in_tmem_layout(op: MlirOperation) -> bool:
   """Returns 'true' if the operation operands should be assigned a TMEM layout."""
   return any(
@@ -99,6 +135,7 @@ def should_have_in_tmem_layout(op: MlirOperation) -> bool:
   )
 
 
+@_once
 def should_have_out_tmem_layout(op: MlirOperation) -> bool:
   """Returns 'true' if the operation results should be assigned a TMEM layout."""
   return any(
@@ -112,11 +149,13 @@ def should_have_tmem_layout(op: MlirOperation) -> bool:
   return should_have_in_tmem_layout(op) or should_have_out_tmem_layout(op)
 
 
+@_once
 def should_have_in_layout(op: MlirOperation) -> bool:
   """Returns 'true' if the operation operands should be assigned a layout."""
   return any(isinstance(v.type, ir.VectorType) for v in op.operands)
 
 
+@_once
 def should_have_out_layout(op: MlirOperation) -> bool:
   """Returns 'true' if the operation results should be assigned a layout."""
   return any(isinstance(v.type, ir.VectorType) for v in op.results)
@@ -193,11 +232,13 @@ in_transforms_for_operand = partial(
 )
 
 
+@_once
 def should_have_in_transforms(op: ir.OpView) -> bool:
   """Returns 'True' if the operation should be assigned in transforms."""
   return any(map(is_transformable_smem_memref, op.operands))
 
 
+@_once
 def should_have_out_transforms(op: ir.OpView) -> bool:
   """Returns 'True' if the operation should be assigned out transforms."""
   return any(map(is_transformable_smem_memref, op.results))
