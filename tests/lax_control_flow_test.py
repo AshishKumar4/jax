@@ -2982,6 +2982,25 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       jax.grad(lambda x: f(x).sum())(x),
       np.cos(x) if jtu.device_under_test() == "cpu" else -np.sin(x))
 
+  def test_platform_dependent_lowers_where_a_dropped_branch_has_ordered_effects(self):
+    # A branch the lowering platforms drop still states its ordered effect in
+    # the conditional's, inside an enclosing conditional too, so the kept
+    # branch passes the effect's token through: a CPU branch calling back to
+    # the host, lowered for a GPU, failed for want of the token.
+    def f(x):
+      def calls_back(x):
+        io_callback(lambda: None, None, ordered=True)
+        return jnp.sin(x)
+      return lax.platform_dependent(x, cpu=calls_back, default=jnp.cos)
+
+    def g(x):
+      return lax.cond(x > 0, f, jnp.tan, x)
+
+    x = np.float32(1.)
+    for h in (f, g):
+      lowered = jax.jit(h).trace(x).lower(lowering_platforms=("cuda",))
+      self.assertNotIn("callback", lowered.as_text())
+
   def test_platform_dependent_with_non_existent_custom_call(self):
     if not jtu.test_device_matches(["cpu"]):
       self.skipTest("Only for CPU")
