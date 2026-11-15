@@ -24,7 +24,8 @@ are defined in.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+import json
+from typing import Any, Optional
 
 from jax._src import hlo_reader
 
@@ -45,6 +46,11 @@ class LiveBuffer:
     names: the ``jax.ad_checkpoint.checkpoint_name`` names of the value that
       instruction defines, where it carries them (a fusion its named root's).
     parameter: the entry parameter's number, for a ``parameter`` buffer.
+    dims: for each of its dimensions the (entry parameter number, axis) pairs
+      it descends from through the dimension maps of the ops that made it
+      (``provenance``): empty where its size descends from none, None where
+      an op on its path states no map (a custom call stating no
+      ``output_dims``).
   """
   bytes: int
   shape: tuple[int, ...]
@@ -55,6 +61,7 @@ class LiveBuffer:
   source: str
   names: tuple[str, ...] = ()
   parameter: int | None = None
+  dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
 def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
@@ -64,11 +71,12 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
   allocation's are none."""
   proto = hlo_reader.message_class("xla.BufferAssignmentProto").FromString(
       assignment)
+  compiled = hlo_reader.message_class("xla.HloModuleProto").FromString(module)
   instructions = {
       instruction.id: instruction
-      for computation in hlo_reader.message_class("xla.HloModuleProto")
-      .FromString(module).computations
+      for computation in compiled.computations
       for instruction in computation.instructions}
+  descended = provenance(compiled)
   primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
   buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
   kinds = {allocation.index: _kind(allocation)
@@ -83,9 +91,10 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
     for buffer_id in peak.logical_buffer_ids:
       buffer = buffers[buffer_id]
       instruction = instructions[buffer.defined_at.instruction_id]
-      shape = instruction.shape
+      shape, dims = instruction.shape, descended.get(instruction.id)
       for index in buffer.defined_at.shape_index:
         shape = shape.tuple_shapes[index]
+        dims = None if dims is None else dims[index]
       if shape.tuple_shapes:
         continue  # A tuple's index table, no array.
       metadata = instruction.metadata
@@ -98,7 +107,9 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
           op_name=metadata.op_name,
           source=f"{metadata.source_file}:{metadata.source_line}",
           names=tuple(named.split(",")) if named else (),
-          parameter=parameters.get(peak.index)))
+          parameter=parameters.get(peak.index),
+          dims=(tuple(None for _ in shape.dimensions) if dims is None
+                else tuple(dims))))
   return tuple(found)
 
 
@@ -110,3 +121,378 @@ def _kind(allocation: Any) -> str | None:
   if allocation.is_entry_computation_parameter:
     return "parameter"
   return "output" if allocation.maybe_live_out else "temporary"
+
+
+Dims = tuple[Optional[frozenset[tuple[int, int]]], ...]
+"""An array's provenance: for each of its dimensions the (entry parameter number,
+axis) pairs it descends from, empty where its size descends from none (an
+iota's, a constant's), None where no op on its path states its dimensions (a
+custom call that states none)."""
+
+_SAME_POSITIONS = frozenset((
+    "abs", "add", "and", "atan2", "bitcast-convert", "cbrt", "ceil", "clamp",
+    "clz", "compare", "complex", "convert", "cos", "divide", "erf", "exp",
+    "expm1", "floor", "imag", "is-finite", "log", "log1p", "logistic", "map",
+    "maximum", "minimum", "multiply", "negate", "not", "or", "popcnt", "power",
+    "real", "reduce-precision", "remainder", "round-nearest-afz",
+    "round-nearest-even", "rsqrt", "select", "shift-left",
+    "shift-right-arithmetic", "shift-right-logical", "sign", "sin", "sqrt",
+    "stochastic-convert", "subtract", "tan", "tanh", "xor", "copy", "reverse",
+    "cholesky", "triangular-solve", "fft", "slice", "dynamic-slice", "pad",
+    "dynamic-update-slice", "concatenate", "set-dimension-size",
+    "add-dependency", "domain", "reduce-window", "select-and-scatter",
+    "all-reduce", "all-reduce-start", "all-reduce-done", "all-gather",
+    "reduce-scatter", "all-to-all", "collective-permute",
+    "collective-broadcast", "all-gather-done", "collective-permute-done",
+    "copy-done", "async-update",
+))
+"""Ops each of whose output dimensions descends from its array operands'
+dimensions at the same position (every operand of the output's rank): those
+computing elementwise, slicing, padding, joining, reversing, or exchanging an
+array across devices along a dimension it keeps."""
+
+_DESCENDED_FROM_NONE = frozenset((
+    "constant", "iota", "rng-bit-generator", "rng-get-and-update-state",
+    "partition-id", "replica-id", "get-dimension-size", "after-all", "infeed",
+    "recv", "recv-done", "rng",
+))
+"""Ops whose outputs' sizes descend from no parameter's axis."""
+
+_PER_OPERAND = frozenset(("sort", "scatter"))
+"""Ops whose outputs are their leading operands', one each, as they are."""
+
+_GEMMS = frozenset((
+    "__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8",
+))
+"""cuBLAS custom calls, whose backend config states their dot's dimension
+numbers (``gemm_backend_config.dot_dimension_numbers``)."""
+
+
+def provenance(module: Any) -> dict[int, Any]:
+  """Each instruction's provenance in ``HloModuleProto`` ``module``, by its id:
+  an array's ``Dims``, a tuple's a list of its elements'. Read through the
+  dimension maps each op states (a dot's and a cuBLAS call's dimension numbers,
+  a reduce's, broadcast's and transpose's dimensions, a reshape's and bitcast's
+  merges, a gather's and a convolution's dimension numbers), into fusion, call
+  and conditional bodies from their callers' operands, and over a while loop's
+  body to a fixed point; a custom call states its own in its ``output_dims``
+  frontend attribute, else its dimensions are unknown. An instruction a
+  computation called from several places reaches holds them all."""
+  computations = {computation.id: computation
+                  for computation in module.computations}
+  found: dict[int, Any] = {}
+
+  def evaluate(computation: Any, parameters: dict[int, Any]) -> Any:
+    held: dict[int, Any] = {}
+    shapes: dict[int, Any] = {}
+    for instruction in computation.instructions:
+      operands = [held[operand] for operand in instruction.operand_ids]
+      operand_shapes = [shapes[operand] for operand in instruction.operand_ids]
+      called = [computations[index]
+                for index in instruction.called_computation_ids]
+      value = _of(instruction, operands, operand_shapes, parameters, called,
+                  evaluate)
+      held[instruction.id], shapes[instruction.id] = value, instruction.shape
+      found[instruction.id] = (_joined(found[instruction.id], value)
+                               if instruction.id in found else value)
+    return held[computation.root_id]
+
+  entry = computations[module.entry_computation_id]
+  evaluate(entry, {
+      instruction.parameter_number: _parameter(instruction.parameter_number,
+                                               instruction.shape, ())
+      for instruction in entry.instructions
+      if instruction.opcode == "parameter"})
+  return found
+
+
+def _of(instruction: Any, operands: list[Any], operand_shapes: list[Any],
+        parameters: dict[int, Any], called: list[Any], evaluate: Any) -> Any:
+  """``instruction``'s provenance from its operands'."""
+  opcode, shape = instruction.opcode, instruction.shape
+  if opcode == "parameter":
+    return parameters[instruction.parameter_number]
+  if opcode in _DESCENDED_FROM_NONE:
+    return _filled(shape, frozenset())
+  if opcode == "tuple":
+    return list(operands)
+  if opcode == "optimization-barrier":
+    return operands[0]
+  if opcode == "get-tuple-element":
+    return operands[0][instruction.tuple_index]
+  if opcode in _SAME_POSITIONS:
+    return _same_positions(shape, operands)
+  if opcode in _PER_OPERAND:
+    return operands[0] if not shape.tuple_shapes else list(
+        operands[:len(shape.tuple_shapes)])
+  if opcode == "broadcast":
+    dims: list[Any] = [frozenset()] * len(shape.dimensions)
+    for axis, placed in enumerate(instruction.dimensions):
+      dims[placed] = operands[0][axis]
+    return tuple(dims)
+  if opcode == "transpose":
+    return tuple(operands[0][axis] for axis in instruction.dimensions)
+  if opcode == "reshape":
+    return _merged(operands[0], list(operand_shapes[0].dimensions),
+                   list(shape.dimensions))
+  if opcode == "bitcast":
+    return _bitcast(operands[0], operand_shapes[0], shape)
+  if opcode == "dot":
+    return _dot(operands[0], operands[1], instruction.dot_dimension_numbers)
+  if opcode == "convolution":
+    return _convolution(instruction, operands)
+  if opcode == "reduce":
+    return _reduced(instruction, operands, shape)
+  if opcode == "gather":
+    return _gathered(instruction, operands)
+  if opcode in ("fusion", "call"):
+    return evaluate(called[0], dict(enumerate(operands)))
+  if opcode == "while":
+    return _loop(shape, operands[0], called, evaluate)
+  if opcode == "conditional":
+    joined = None
+    for branch, operand in zip(called, operands[1:]):
+      root = evaluate(branch, {0: operand})
+      joined = root if joined is None else _joined(joined, root)
+    return joined
+  if opcode == "async-start":
+    # ((its operands), (its wrapped computation's outputs), its context...).
+    return [list(operands), evaluate(called[0], dict(enumerate(operands))),
+            *(_filled(element, frozenset())
+              for element in shape.tuple_shapes[2:])]
+  if opcode in ("all-gather-start", "collective-permute-start", "copy-start"):
+    # (its operand, its output, its context...), the output its operand's.
+    head = operands[0] if len(operands) == 1 else list(operands)
+    return [head, head, *(_filled(element, frozenset())
+                          for element in shape.tuple_shapes[2:])]
+  if opcode == "async-done":
+    return operands[0][1]
+  if opcode == "custom-call":
+    return _custom(instruction, operands, shape)
+  return _filled(shape, None)
+
+
+def _parameter(number: int, shape: Any, index: tuple[int, ...]) -> Any:
+  """Entry parameter ``number``'s provenance: each dimension its own axis (an
+  element of a tuple parameter by its index, which the pairs do not name: a
+  tuple parameter's dimensions are unknown)."""
+  if shape.tuple_shapes:
+    return [_parameter(number, element, (*index, position))
+            for position, element in enumerate(shape.tuple_shapes)]
+  if index:
+    return tuple(None for _ in shape.dimensions)
+  return tuple(frozenset({(number, axis)})
+               for axis in range(len(shape.dimensions)))
+
+
+def _filled(shape: Any, dimension: Any) -> Any:
+  """``shape``'s provenance with every dimension ``dimension``."""
+  if shape.tuple_shapes:
+    return [_filled(element, dimension) for element in shape.tuple_shapes]
+  return tuple(dimension for _ in shape.dimensions)
+
+
+def _union(left: Any, right: Any) -> Any:
+  """Two dimensions' provenance together: unknown where either is."""
+  return None if left is None or right is None else left | right
+
+
+def _joined(left: Any, right: Any) -> Any:
+  """Two provenances of one shape together, dimension by dimension."""
+  if isinstance(left, list) and isinstance(right, list):
+    return [_joined(a, b) for a, b in zip(left, right)]
+  if isinstance(left, tuple) and isinstance(right, tuple) and len(left) == len(
+      right):
+    return tuple(_union(a, b) for a, b in zip(left, right))
+  raise ValueError(f"provenances of two shapes joined: {left!r}, {right!r}")
+
+
+def _same_positions(shape: Any, operands: list[Any]) -> Any:
+  """Each output dimension its operands' at its position: a tuple output's
+  elements each their tuple operands' element, or the array operand at their
+  index (a variadic collective's, reduce-window's)."""
+  if shape.tuple_shapes:
+    tuples = [operand for operand in operands if isinstance(operand, list)]
+    return [_same_positions(element, [operand[index] for operand in tuples]
+                            if tuples else [operands[index]])
+            for index, element in enumerate(shape.tuple_shapes)]
+  rank = len(shape.dimensions)
+  dims: list[Any] = [frozenset()] * rank
+  for operand in operands:
+    if isinstance(operand, tuple) and len(operand) == rank:
+      dims = [_union(held, given) for held, given in zip(dims, operand)]
+  return tuple(dims)
+
+
+def _merged(operand: Dims, sizes: list[int], merged: list[int]) -> Dims:
+  """A reshape's provenance: each output dimension descends from each operand
+  dimension whose span of the row-major index it overlaps (a dimension spans
+  the strides from the product of the sizes after it to that times its own),
+  so a merged dimension from all it merges and a split one's parts each from
+  the one it splits; a dimension of size one spans none."""
+  def spans(shape: list[int]) -> list[tuple[int, int]]:
+    found, stride = [], 1
+    for size in reversed(shape):
+      found.append((stride, stride * size))
+      stride *= size
+    return list(reversed(found))
+
+  given = spans(sizes)
+  dims = []
+  for low, high in spans(merged):
+    descended: Any = frozenset()
+    for axis, (start, end) in enumerate(given):
+      if max(low, start) < min(high, end):
+        descended = _union(descended, operand[axis])
+    dims.append(descended)
+  return tuple(dims)
+
+
+def _bitcast(operand: Dims, operand_shape: Any, shape: Any) -> Dims:
+  """A bitcast's provenance: a reshape of the dimensions as laid out, major to
+  minor (its layout's), so a bitcast that transposes is read as one."""
+  if list(operand_shape.dimensions) == list(shape.dimensions) and list(
+      operand_shape.layout.minor_to_major) == list(shape.layout.minor_to_major):
+    return operand
+  source = _major_to_minor(operand_shape)
+  target = _major_to_minor(shape)
+  laid = _merged(tuple(operand[axis] for axis in source),
+                 [operand_shape.dimensions[axis] for axis in source],
+                 [shape.dimensions[axis] for axis in target])
+  dims: list[Any] = [frozenset()] * len(shape.dimensions)
+  for position, axis in enumerate(target):
+    dims[axis] = laid[position]
+  return tuple(dims)
+
+
+def _major_to_minor(shape: Any) -> list[int]:
+  order = list(shape.layout.minor_to_major)
+  return list(reversed(order)) if order else list(range(len(shape.dimensions)))
+
+
+def _dot(lhs: Dims, rhs: Dims, numbers: Any) -> Dims:
+  """A dot's provenance: its batch dimensions, then the left operand's free
+  ones, then the right's, each from those it is made of."""
+  lhs_batch, rhs_batch = list(numbers.lhs_batch_dimensions), list(
+      numbers.rhs_batch_dimensions)
+  lhs_kept = set(lhs_batch) | set(numbers.lhs_contracting_dimensions)
+  rhs_kept = set(rhs_batch) | set(numbers.rhs_contracting_dimensions)
+  return (*(_union(lhs[a], rhs[b]) for a, b in zip(lhs_batch, rhs_batch)),
+          *(lhs[axis] for axis in range(len(lhs)) if axis not in lhs_kept),
+          *(rhs[axis] for axis in range(len(rhs)) if axis not in rhs_kept))
+
+
+def _convolution(instruction: Any, operands: list[Any]) -> Dims:
+  """A convolution's provenance: its batch dimension the input's, its feature
+  dimension the kernel's output feature (with the input's feature or batch
+  dimension where it groups them), each spatial dimension the input's and the
+  kernel's at its place."""
+  numbers, (lhs, rhs) = instruction.convolution_dimension_numbers, operands[:2]
+  dims: list[Any] = [frozenset()] * (2 + len(numbers.output_spatial_dimensions))
+  dims[numbers.output_batch_dimension] = lhs[numbers.input_batch_dimension]
+  feature = rhs[numbers.kernel_output_feature_dimension]
+  if instruction.feature_group_count > 1:
+    feature = _union(feature, lhs[numbers.input_feature_dimension])
+  if instruction.batch_group_count > 1:
+    feature = _union(feature, lhs[numbers.input_batch_dimension])
+  dims[numbers.output_feature_dimension] = feature
+  for output, given, kernel in zip(numbers.output_spatial_dimensions,
+                                   numbers.input_spatial_dimensions,
+                                   numbers.kernel_spatial_dimensions):
+    dims[output] = _union(lhs[given], rhs[kernel])
+  return tuple(dims)
+
+
+def _reduced(instruction: Any, operands: list[Any], shape: Any) -> Any:
+  """A reduce's provenance: each output its input's dimensions but those it
+  reduces, in order."""
+  inputs = operands[:len(operands) // 2]
+  removed = set(instruction.dimensions)
+  outputs = [tuple(dimension for axis, dimension in enumerate(operand)
+                   if axis not in removed) for operand in inputs]
+  return outputs if shape.tuple_shapes else outputs[0]
+
+
+def _gathered(instruction: Any, operands: list[Any]) -> Dims:
+  """A gather's provenance: its offset dimensions the operand's it keeps, in
+  order; its batch dimensions the start indices', in order, with an operand
+  batching dimension's beside its indices' own."""
+  numbers, (operand, indices) = instruction.gather_dimension_numbers, operands[:2]
+  offsets = list(numbers.offset_dims)
+  dropped = set(numbers.collapsed_slice_dims) | set(numbers.operand_batching_dims)
+  kept = [axis for axis in range(len(operand)) if axis not in dropped]
+  batched = dict(zip(numbers.start_indices_batching_dims,
+                     numbers.operand_batching_dims))
+  indexed = [axis for axis in range(len(indices))
+             if axis != numbers.index_vector_dim]
+  rank = len(offsets) + len(indexed)
+  dims: list[Any] = [frozenset()] * rank
+  batch = iter(indexed)
+  offset = iter(kept)
+  for axis in range(rank):
+    if axis in offsets:
+      dims[axis] = operand[next(offset)]
+    else:
+      index = next(batch)
+      dims[axis] = indices[index]
+      if index in batched:
+        dims[axis] = _union(dims[axis], operand[batched[index]])
+  return tuple(dims)
+
+
+def _loop(shape: Any, initial: Any, called: list[Any], evaluate: Any) -> Any:
+  """A while loop's provenance: its state's, its body's output joined into it
+  until the body adds nothing (sets only grow, so it ends)."""
+  body = next(computation for computation in called
+              if _root_shape(computation) == shape)
+  state = initial
+  while True:
+    joined = _joined(state, evaluate(body, {0: state}))
+    if joined == state:
+      return state
+    state = joined
+
+
+def _root_shape(computation: Any) -> Any:
+  return next(instruction.shape for instruction in computation.instructions
+              if instruction.id == computation.root_id)
+
+
+def _custom(instruction: Any, operands: list[Any], shape: Any) -> Any:
+  """A custom call's provenance: as its ``output_dims`` frontend attribute
+  states it (one list an output, one entry a dimension, each a list of
+  [operand, axis] pairs, empty for a size descending from none, null for one
+  unknown); a cuBLAS call's from its dot's dimension numbers, its workspace's
+  from none; else unknown."""
+  stated = instruction.frontend_attributes.map.get("output_dims")
+  if stated:
+    outputs = [tuple(None if entry is None else _from_operands(entry, operands)
+                     for entry in output) for output in json.loads(stated)]
+    return list(outputs) if shape.tuple_shapes else outputs[0]
+  if instruction.custom_call_target in _GEMMS:
+    config = json.loads(instruction.backend_config or "{}")
+    numbers = config.get("gemm_backend_config", {}).get("dot_dimension_numbers")
+    if numbers is not None:
+      result = _dot(operands[0], operands[1], _Numbers(numbers))
+      if shape.tuple_shapes:
+        return [result, *(_filled(element, frozenset())
+                          for element in shape.tuple_shapes[1:])]
+      return result
+  return _filled(shape, None)
+
+
+def _from_operands(entry: list[list[int]], operands: list[Any]) -> Any:
+  descended: Any = frozenset()
+  for operand, axis in entry:
+    descended = _union(descended, operands[operand][axis])
+  return descended
+
+
+class _Numbers:
+  """A dot's dimension numbers as a cuBLAS call's backend config states them
+  (JSON: lists of strings), read as ``DotDimensionNumbers`` is."""
+
+  def __init__(self, numbers: dict[str, list[str]]):
+    for field in ("lhs_contracting_dimensions", "rhs_contracting_dimensions",
+                  "lhs_batch_dimensions", "rhs_batch_dimensions"):
+      setattr(self, field, [int(axis) for axis in numbers.get(field, [])])
