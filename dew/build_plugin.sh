@@ -35,8 +35,11 @@ tree=${DEW_PLUGIN_TREE:-$(mktemp -d /tmp/dew-plugin-XXXX)}
 mkdir -p "$tree"
 rm -rf "$tree/jax"
 # On its way out, Bazel's server stopped (its output base kept for the next build): a server left idle is the node's
-# user's work to the fleet's watch, which would keep the node up for its idle hours.
-trap '(cd "$tree/jax" 2>/dev/null && "${DEW_BAZEL:-bazel}" shutdown); rm -rf "$tree/jax" "$tree/token" "$tree/credentials"' EXIT
+# user's work to the fleet's watch, which would keep the node up for its idle hours. A server that will not stop
+# (Bazel's exit 36, its SIGKILL not taken in time) fails nothing: under errexit it ended the trap and turned a green
+# build's exit into 36 (post98 x86_64, 2026-11-15).
+trap '(cd "$tree/jax" 2>/dev/null && "${DEW_BAZEL:-bazel}" shutdown) || true
+      rm -rf "$tree/jax" "$tree/token" "$tree/credentials"' EXIT
 # Where the token is the secret DEW_BAZEL_TOKEN in the environment, it is kept in a file of the build's own for the
 # credential helper; a file named explicitly wins.
 if [ -z "${DEW_BAZEL_TOKEN_FILE:-}" ] && [ -n "${DEW_BAZEL_TOKEN:-}" ]; then
