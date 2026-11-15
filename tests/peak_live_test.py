@@ -284,6 +284,38 @@ class DimensionProvenanceTest(jtu.JaxTestCase):
     self.assertEqual(descended["s"], (_of((0, 0)),))
 
   @jtu.run_on_devices("cpu")
+  def test_dimensions_name_the_calls_arguments_past_the_ones_it_drops(self):
+    # The first argument unused, so pruned from the module: x is the call's
+    # argument 1 though it is the module's parameter 0.
+    def f(unused, x):
+      del unused
+      return jnp.tanh(x).sum(axis=1)
+
+    rows = jax.ShapeDtypeStruct((24, 40), jnp.float32)
+    live = jax.jit(f).lower(rows, rows).compile().peak_live()
+    self.assertIsNotNone(live)
+    parameter, = (buffer for buffer in live if buffer.kind == "parameter")
+    self.assertEqual(parameter.dims, (_of((1, 0)), _of((1, 1))))
+    self.assertTrue(any(buffer.dims == (_of((1, 0)),) for buffer in live
+                        if buffer.kind != "parameter"), live)
+
+  @jtu.run_on_devices("cpu")
+  def test_an_ordered_effects_token_is_no_argument(self):
+    # An ordered callback's token comes first among the module's parameters:
+    # x is still the call's argument 0.
+    def f(x):
+      jax.debug.callback(lambda: None, ordered=True)
+      return jnp.tanh(x).sum(axis=1)
+
+    rows = jax.ShapeDtypeStruct((24, 40), jnp.float32)
+    live = jax.jit(f).lower(rows).compile().peak_live()
+    self.assertIsNotNone(live)
+    self.assertIn((_of((0, 0)), _of((0, 1))),
+                  [buffer.dims for buffer in live if buffer.kind == "parameter"])
+    self.assertTrue(any(buffer.dims == (_of((0, 0)),) for buffer in live
+                        if buffer.kind != "parameter"), live)
+
+  @jtu.run_on_devices("cpu")
   def test_each_live_buffer_states_which_dimensions_hold_the_batchs_rows(self):
     # A step over 64 rows of 512 features: every live dimension of 64 descends
     # from the rows of x (parameter 0, axis 0) and no other does, the weight
@@ -297,7 +329,7 @@ class DimensionProvenanceTest(jtu.JaxTestCase):
     x = jax.ShapeDtypeStruct((64, 512), jnp.float32)
     live = jax.jit(jax.grad(loss)).lower([w, w], x).compile().peak_live()
     self.assertIsNotNone(live)
-    rows = (2, 0)  # x, after the two weights in the flattened arguments.
+    rows = (2, 0)  # x, after the two weights among the call's arguments.
     for buffer in live:
       self.assertLen(buffer.dims, len(buffer.shape))
       for size, dimension in zip(buffer.shape, buffer.dims):
