@@ -231,6 +231,11 @@ def reduce_reshape_expression(
               )
           )
         case fa.TiledLayout() as tiled_layout:
+          unit_layout = fa.reshape_unit_axis_layout(
+              tiled_layout, reshape.source_shape, reshape.target_shape
+          )
+          if unit_layout is not None:
+            return RegisterLayout(unit_layout)
           tile_shape = tiled_layout.base_tile_shape
           if len(reshape.target_shape) < len(tile_shape):
             return dataclasses.replace(reshape, expression=reduced_expr)
@@ -302,8 +307,22 @@ def reduce_reduce_expression(
     case Unsatisfiable():
       return Unsatisfiable()
     case RegisterLayout(value=fa.TiledLayout() as layout):
-      # TODO(allanrenucci): Add support for reducing tiled layouts when keep_dims=True.
       if expr.keep_dims:
+        if (
+            expr.rank == 2 and len(expr.axes) == 1
+            and len(layout.base_tile_shape) == 2
+        ):
+          reduced_layout = layout.reduce(expr.axes)
+          # Use a tileable shape so the reshape preserves an existing legal
+          # layout when inserting a leading unit axis.
+          source_shape = reduced_layout.base_tile_shape
+          target_shape = list(source_shape)
+          target_shape.insert(expr.axes[0], 1)
+          result = fa.reshape_unit_axis_layout(
+              reduced_layout, source_shape, tuple(target_shape)
+          )
+          if result is not None:
+            return RegisterLayout(result)
         return default()
       num_untiled_dims = expr.rank - len(layout.base_tile_shape)
       reduced_tiling_axes = [
