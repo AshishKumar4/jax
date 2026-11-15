@@ -6168,9 +6168,14 @@ class PallasCallWGTest(
 
     with (jtu.set_env(MOSAIC_GPU_DUMP_RESOURCES="1"),
           self.capture_stdout() as rs):
-      jax.jit(kernel).lower(x)
+      ir_text = str(jax.jit(kernel).lower(x).compiler_ir())
     self.assertIn(f"smem_scratch_bytes={expected_smem_bytes}", rs())
     self.assertIn(f"tmem_scratch_cols={expected_tmem_cols}", rs())
+    # The estimate names its kernel and the hash of the module its custom call
+    # carries, which carries no estimate.
+    (named,) = re.findall(r"^(\S+) [0-9a-f]{64} Resources\(", rs(), re.M)
+    self.assertIn("kernel", named)
+    self.assertNotIn("mosaic_gpu.resources", ir_text)
 
   def test_identical_kernels_share_a_kernel_hash(self):
     x = jnp.ones((64, 64), dtype=jnp.float32)
