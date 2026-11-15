@@ -699,12 +699,11 @@ _DECODED_HELD = 1 << 14
 
 def _decoded_access(mesh_location, allocation_key_as_array, transforms, *rest):
   """An access's arguments as its callback takes them: its buffer's key, its
-  transforms but the layout's (`_remove_noop_transforms`) with their indices as
-  Python ints, and each index tuple as one."""
+  transforms with their indices as Python ints, and each index tuple as one."""
   return (
       mesh_location,
       HostAllocationKey.from_array(allocation_key_as_array),
-      jax.tree.map(int, _remove_noop_transforms(transforms)),
+      jax.tree.map(int, transforms),
       *(None if part is None else tuple(int(x) for x in part)
         for part in rest),
   )
