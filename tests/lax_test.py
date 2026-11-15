@@ -6403,6 +6403,49 @@ class RaggedTest(jtu.JaxTestCase):
           batch_res[i, 0:upper_bound, :], ref_res, rtol=tol, atol=tol
       )
 
+  @parameterized.parameters(
+      ((0, None, None),), ((1, 0, None),), ((0, None, 0),), ((None, 0, 0),))
+  def test_ragged_dot_vmap_with_operands_batched_anywhere_or_shared(
+      self, in_axes):
+    # A ragged dot mapped with its operands batched along any dimension, or
+    # shared (unbatched): each example the ragged dot of its own operands, and
+    # its gradient each example's, as a loop over the examples computes them.
+    if jtu.test_device_matches(["tpu"]):
+      raise SkipTest("batched ragged_dot not yet supported on TPU")
+    batch, m, k, n, groups = 3, 16, 8, 4, 2
+    rng = jtu.rand_small(self.rng())
+    lhs = rng((batch, m, k), np.float32)
+    rhs = rng((batch, groups, k, n), np.float32)
+    sizes = np.array([[5, 11], [8, 8], [16, 0]], np.int32)
+    args = []
+    for operand, axis in zip((lhs, rhs, sizes), in_axes):
+      args.append(operand[0] if axis is None else np.moveaxis(operand, 0, axis))
+    dot = partial(lax.ragged_dot, precision=lax.Precision.HIGHEST)
+
+    def each(b):
+      return tuple(a if axis is None else np.take(a, b, axis=axis)
+                   for a, axis in zip(args, in_axes))
+
+    mapped = jax.vmap(dot, in_axes=in_axes)(*args)
+    for b in range(batch):
+      self.assertAllClose(mapped[b], dot(*each(b)), rtol=1e-6, atol=1e-6)
+
+    def mapped_loss(l, r):
+      return jnp.sum(jax.vmap(dot, in_axes=in_axes)(l, r, args[2])**2)
+
+    def looped_loss(l, r):
+      total = 0.0
+      for b in range(batch):
+        operands = [a if axis is None else jnp.take(a, b, axis=axis)
+                    for a, axis in zip((l, r, args[2]), in_axes)]
+        total += jnp.sum(dot(*operands)**2)
+      return total
+
+    grads = jax.grad(mapped_loss, argnums=(0, 1))(args[0], args[1])
+    looped = jax.grad(looped_loss, argnums=(0, 1))(args[0], args[1])
+    for got, want in zip(grads, looped):
+      self.assertAllClose(got, want, rtol=1e-5, atol=1e-5)
+
   @jtu.with_explicit_mesh((1,), ("x",))
   def test_ragged_dot_out_sharding(self, mesh):
     args = [jnp.ones((16, 4)), jnp.ones((2, 4, 3)), jnp.array([8, 8])]
