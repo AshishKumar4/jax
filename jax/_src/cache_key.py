@@ -311,6 +311,23 @@ def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
   m.operation.walk(_strip_kernel)
 
 
+def _mosaic_gpu_dialect(ctx: ir.Context) -> bool:
+  """Registers Mosaic GPU's dialect in `ctx`, where this jaxlib has it.
+
+  A Mosaic GPU kernel is serialized at the default bytecode version, whose
+  operations keep their properties in a form only its dialect reads: read
+  without it, the kernel did not parse and kept its source locations in the
+  key, so one kernel keyed apart from two places in a file, or from two
+  processes that interned its locations in another order.
+  """
+  try:
+    from jax._src.lib import mosaic_gpu_dialect  # pytype: disable=import-error
+  except ImportError:
+    return False
+  mosaic_gpu_dialect.register_dialect(ctx)
+  return True
+
+
 def _triton_dialect(ctx: ir.Context) -> bool:
   """Registers Triton's dialect in `ctx`, where this jaxlib has it.
 
@@ -349,7 +366,8 @@ def _canonicalize_ir(
     _strip_mosaic_debug_info(m)
     _strip_kernel_debug_info(m, custom_call_targets.TRITON, "ir",
                              dialect=_triton_dialect)
-    _strip_kernel_debug_info(m, custom_call_targets.MOSAIC_GPU, "module", digest="kernel_hash")
+    _strip_kernel_debug_info(m, custom_call_targets.MOSAIC_GPU, "module", digest="kernel_hash",
+                             dialect=_mosaic_gpu_dialect)
     return _serialize_ir(m, ignore_custom_partitioning)
 
 
