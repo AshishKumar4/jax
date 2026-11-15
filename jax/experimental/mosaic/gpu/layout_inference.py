@@ -2900,21 +2900,6 @@ def infer_layout(
     module: ir.Module, *, fuel: int = _DEFAULT_LAYOUT_INFERENCE_FUEL,
     arch: tuple[int, int] = (9, 0)
 ):
-  """Infers layouts for the given module (`_infer_layout`).
-
-  The inference sets attributes alone, so each op is asked whether it should
-  have a layout, a TMEM layout or transforms once (`asked_once`): asked again
-  by every pass over its constraints, the predicates were about a sixth of a
-  kernel's lowering.
-  """
-  with inference_utils.asked_once():
-    _infer_layout(module, fuel=fuel, arch=arch)
-
-
-def _infer_layout(
-    module: ir.Module, *, fuel: int = _DEFAULT_LAYOUT_INFERENCE_FUEL,
-    arch: tuple[int, int] = (9, 0)
-):
   """Infers layouts for the given module.
 
   * If there are vector (respectively SMEM refs, TMEM refs) operands,
