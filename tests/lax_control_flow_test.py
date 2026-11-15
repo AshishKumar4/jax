@@ -40,6 +40,7 @@ from jax._src import test_util as jtu
 from jax import tree_util
 from jax._src.util import unzip2, split_list
 from jax import checkpoint_policies
+from jax.experimental import io_callback
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
 from jax._src import dispatch
