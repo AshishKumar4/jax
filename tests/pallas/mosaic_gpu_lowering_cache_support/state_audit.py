@@ -121,6 +121,9 @@ ACCEPTED = {
     "jax.experimental.mosaic.gpu.launch_context._DYNAMIC_PEER_TABLE": "a sentinel",
     "jax._src.numpy.ufuncs.add": "a jnp.ufunc: an immutable wrapper of sealed functions",
     "jax._src.numpy.ufuncs.subtract": "a jnp.ufunc: an immutable wrapper of sealed functions",
+    "jax.experimental.mosaic.gpu.utils.HOPPER": "an immutable value (a frozen Arch)",
+    "jax.experimental.mosaic.gpu.utils.BLACKWELL": "an immutable value (a frozen Arch)",
+    "jax.experimental.mosaic.gpu.utils.RUBIN": "an immutable value (a frozen Arch)",
 }
 
 # Tables that the installed code defines and fills at import, which no process
@@ -136,8 +139,11 @@ _DEFINED_BY_THE_INSTALLED_CODE = (
 ACCEPTED.update({name: _DEFINED_BY_THE_INSTALLED_CODE for name in (
     "jax._src.core.literalable_scalar_types",
     "jax._src.core.literalable_types",
+    "jax._src.config._jaxpr_eqn_ctx_configs",
     "jax._src.core.pytype_aval_mappings",
     "jax._src.dtypes._DEFAULT_TYPEMAP",
+    "jax._src.dtypes._custom_complex_dtypes",
+    "jax._src.dtypes._custom_complex_scalar_types",
     "jax._src.dtypes._custom_float_dtypes",
     "jax._src.dtypes._custom_float_scalar_types",
     "jax._src.dtypes._dtype_to_32bit_dtype",
