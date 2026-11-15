@@ -20,6 +20,7 @@ for wheel in "$@"; do
 done
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+. "$here/index_lib.sh"
 if aws s3api head-object --endpoint-url "$R2" --bucket "$BUCKET" --key "packages/$package/manifest.json" \
     > /dev/null 2> "$work/head.txt"; then
   aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$package/manifest.json" "$work/manifest.json"
@@ -33,35 +34,18 @@ else
   cat "$work/head.txt"
   exit 1
 fi
-# The index's other projects, as its published root lists them: a project is listed once its pages are, never for
-# objects under packages/ alone, which a publish that failed part-way through its uploads leaves (review,
-# 2026-11-15: jaxlib's first publish). No root yet, none.
-if aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/simple/index.html" "$work/root.html" \
-    > /dev/null 2> "$work/root.txt"; then
-  projects=$(sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p' "$work/root.html")
-elif grep -q "(404)" "$work/root.txt"; then
-  projects=
-else
-  cat "$work/root.txt"
-  exit 1
-fi
+projects=$(published_projects) || exit 1
 read -ra names <<< "$(printf '%s' "${YANK:-}" | tr '\r\n' '  ')"
 yanks=()
 if [ ${#names[@]} -gt 0 ]; then yanks=(--yank "${names[@]}" "--reason=${REASON:-}"); fi
 python3 "$here/patch_stack.py" index "$work/manifest.json" "$site" "$@" "${yanks[@]}" --package "$package" \
   --projects $projects > "$work/new.txt"
 cat "$work/new.txt"
-put() { aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$1" --body "$2" --content-type "$3" \
-          ${4:+--cache-control "$4"} > /dev/null; }
 while read -r name; do
   put "packages/$package/$name" "$site/packages/$package/$name" application/octet-stream
   put "packages/$package/$name.metadata" "$site/packages/$package/$name.metadata" text/plain
 done < "$work/new.txt"
 put "packages/$package/manifest.json" "$work/manifest.json" application/json
-# Each page under both names installers ask for (simple/, simple/PROJECT/), revalidated at every request
-# (no-cache: R2 answers a conditional request with 304), so no installer resolves from a page older than the index;
-# the project's pages before the root's, so a root that lists a project has its pages published already.
-for page in "simple/$package/" simple/; do
-  put "$page" "$site/${page}index.html" text/html no-cache
-  put "${page}index.html" "$site/${page}index.html" text/html no-cache
-done
+# The project's pages before the root's, so a root that lists a project has its pages published already.
+put_page "simple/$package/"
+put_page simple/

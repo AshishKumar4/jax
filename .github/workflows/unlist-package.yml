@@ -1,0 +1,46 @@
+# A project taken back off Dew's package index, https://pypi.dewml.dev/simple (dew/unlist.sh): the undoing of a
+# project's first publication that broke what it must not (ledger 3116), so installers that list the index first
+# resolve it from PyPI again. Its root is rewritten without it, its pages and manifest deleted; its files stay.
+name: unlist package
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "the project to take off the index, e.g. jaxlib"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency: patch-stack
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  unlist:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      PROJECT: ${{ inputs.project }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+          persist-credentials: false
+      - name: The project and the index's storage
+        run: |
+          [[ "$PROJECT" =~ ^[a-z0-9-]+$ ]] || { echo "::error::project"; exit 1; }
+          for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!name}" ] || { echo "::error::the R2 secrets are not set"; exit 1; }
+          done
+      - name: Unlist it
+        run: bash dew/dew/unlist.sh site "$PROJECT"

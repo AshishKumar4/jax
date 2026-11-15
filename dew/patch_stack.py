@@ -286,12 +286,21 @@ def index(manifest: Path, site: Path, files: list[Path], yank: list[str] = (), r
         + (f' data-yanked="{html.escape(entry["yanked"])}"' if "yanked" in entry else "")
         + f'>{name}</a><br>\n'
         for name, entry in sorted(listed.items()))
-    page = ('<!DOCTYPE html>\n<html><head><meta name="pypi:repository-version" content="1.1">'
-            "<title>{title}</title></head>\n<body><h1>{title}</h1>\n{body}</body></html>\n")
     (site / "simple" / package).mkdir(parents=True, exist_ok=True)
-    listing = "".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted({package, *projects}))
-    (site / "simple" / "index.html").write_text(page.format(title="Simple index", body=listing))
-    (site / "simple" / package / "index.html").write_text(page.format(title=f"Links for {package}", body=links))
+    root(site, [package, *projects])
+    (site / "simple" / package / "index.html").write_text(PAGE.format(title=f"Links for {package}", body=links))
+
+
+PAGE = ('<!DOCTYPE html>\n<html><head><meta name="pypi:repository-version" content="1.1">'
+        "<title>{title}</title></head>\n<body><h1>{title}</h1>\n{body}</body></html>\n")
+"""A page of PEP 503's simple API (PEP 629's repository version 1.1: PEP 658's and 714's metadata attributes)."""
+
+
+def root(site: Path, projects: list[str]) -> None:
+    """The index's root page, site/simple/index.html, listing each of `projects`."""
+    (site / "simple").mkdir(parents=True, exist_ok=True)
+    listing = "".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted(set(projects)))
+    (site / "simple" / "index.html").write_text(PAGE.format(title="Simple index", body=listing))
 
 
 def main() -> int:
@@ -312,6 +321,9 @@ def main() -> int:
     indexing.add_argument("--reason", default="", help="why they are yanked, shown by installers")
     indexing.add_argument("--package", default="jax", help="the package the files and the manifest are of")
     indexing.add_argument("--projects", nargs="*", default=[], help="the index's other packages, for its root")
+    rooting = commands.add_parser("root")
+    rooting.add_argument("site", type=Path)
+    rooting.add_argument("--projects", nargs="*", default=[], help="every package the root lists")
     args = parser.parse_args()
     if args.command == "next":
         print(following())
@@ -324,6 +336,9 @@ def main() -> int:
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))
+        return 0
+    if args.command == "root":
+        root(args.site, args.projects)
         return 0
     if args.command == "index":
         index(args.manifest, args.site, args.files, args.yank, args.reason, args.package, args.projects)
