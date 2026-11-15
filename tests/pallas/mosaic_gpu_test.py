@@ -2398,6 +2398,34 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     np.testing.assert_array_equal(kernel(), np.ones((128,), np.float32))
 
+  def test_cta_barrier_arrive_and_wait(self):
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[
+            plgpu.SMEM((128,), jnp.float32), plgpu.CtaBarrier(num_arrivals=2)
+        ],
+        num_threads=2,
+        thread_name="threads",
+    )
+    def kernel(o_ref, smem_ref, barrier):
+      t_idx = lax.axis_index("threads")
+
+      @pl.when(t_idx == 0)
+      def _():
+        smem_ref[...] = jnp.full((128,), 42.0, dtype=jnp.float32)
+        plgpu.commit_smem()
+        plgpu.barrier_arrive(barrier)
+
+      @pl.when(t_idx == 1)
+      def _():
+        plgpu.barrier_arrive_and_wait(barrier)
+        o_ref[...] = smem_ref[...]
+
+    np.testing.assert_array_equal(
+        kernel(), np.full((128,), 42.0, dtype=jnp.float32)
+    )
+
   def test_barrier_arrive_and_wait(self):
     @functools.partial(
         self.kernel,

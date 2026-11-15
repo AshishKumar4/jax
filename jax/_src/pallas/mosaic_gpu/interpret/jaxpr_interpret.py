@@ -504,10 +504,15 @@ class JaxprInterpreter:
             inner = apply_layout_transforms(transforms, inner)
           match inner:
             case jax_core.ShapedArray(shape=shape, dtype=dtype):
-              if isinstance(dtype, mosaic_gpu_core.BarrierType):
+              if isinstance(
+                  dtype,
+                  (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
+              ):
                 # A barrier is shared between the threads in a block. Hence its
                 # ref count, when computed based on the collective axes, should
-                # equal the number of threads in a block.
+                # equal the number of threads in a block. A CTA barrier's arrive
+                # and arrive-and-wait are an mbarrier's arrive and its arrive
+                # then wait at the phase arrived in.
                 assert ref_count == self.num_threads_per_block
                 # TODO(nrink): Simplify the interface to
                 # `call_allocate_barriers`. Consider making it similar to
@@ -517,7 +522,9 @@ class JaxprInterpreter:
                     mesh_location=self.mesh_location,
                     thread=self.thread,
                     num_arrivals=jnp.int32(dtype.num_arrivals),
-                    orders_tensor_core=dtype.orders_tensor_core,
+                    orders_tensor_core=getattr(
+                        dtype, "orders_tensor_core", False
+                    ),
                     flat_num_barriers=math.prod(shape),
                     ref_count=jnp.int32(ref_count),
                     source_info=eqn.source_info,
@@ -575,7 +582,10 @@ class JaxprInterpreter:
         case state_types.AbstractRef(inner_aval=inner, memory_space=_, kind=_):
           match inner:
             case jax_core.ShapedArray(shape=_, dtype=dtype):
-              is_barrier = isinstance(dtype, mosaic_gpu_core.BarrierType)
+              is_barrier = isinstance(
+                  dtype,
+                  (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
+              )
               is_cluster_barrier = isinstance(
                   dtype, mosaic_gpu_core.ClusterBarrierType
               )
@@ -807,6 +817,14 @@ class JaxprInterpreter:
         gpu_primitives.barrier_wait_p,
         gpu_primitives.barrier_arrive_and_wait_p,
     )
+    if eqn.primitive is gpu_primitives.barrier_wait_p and isinstance(
+        getattr(eqn.invars[0].aval, "inner_aval", eqn.invars[0].aval).dtype,
+        mosaic_gpu_core.CtaBarrierType,
+    ):
+      raise NotImplementedError(
+          "A CTA barrier has no wait apart from its arrival: use"
+          " barrier_arrive_and_wait"
+      )
     invals = get_invals()
     if eqn.params.get("has_phase", False):
       *invals, phase = invals
