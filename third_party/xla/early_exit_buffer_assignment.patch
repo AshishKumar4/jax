@@ -1,4 +1,4 @@
-From 8548b21730bbe60729c5c971f0e69f4b4c31846a Mon Sep 17 00:00:00 2001
+From 096b4836478bfcea49e6ff9d3f31304fbb93a73d Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 01:49:25 -0600
 Subject: [PATCH] [XLA:GPU] A compile can stop after buffer assignment and
@@ -17,7 +17,7 @@ cost of its HLO passes alone.
  xla/pjrt/compiled_memory_stats.cc             | 30 +++++++
  xla/pjrt/compiled_memory_stats.h              |  8 ++
  xla/pjrt/gpu/se_gpu_pjrt_compiler.cc          |  4 +
- xla/service/gpu/BUILD                         | 21 ++++-
+ xla/service/gpu/BUILD                         | 24 ++++-
  xla/service/gpu/compile_module_to_llvm_ir.h   |  6 ++
  .../gpu/early_exit_compilation_result.cc      | 10 ++-
  .../gpu/early_exit_compilation_result.h       |  9 ++
@@ -26,7 +26,7 @@ cost of its HLO passes alone.
  xla/service/gpu/gpu_compiler.h                | 13 +++
  .../gpu/gpu_compiler_early_exit_test.cc       | 88 +++++++++++++++++++
  xla/xla.proto                                 |  2 +
- 14 files changed, 262 insertions(+), 54 deletions(-)
+ 14 files changed, 265 insertions(+), 54 deletions(-)
  create mode 100644 xla/service/gpu/gpu_compiler_early_exit_test.cc
 
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
@@ -154,16 +154,19 @@ index 25576bb3a2..693c2f214a 100644
    }
    const int num_replicas = hlo_module->config().replica_count();
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 8785c0c2d4..9127d9e185 100644
+index 8785c0c2d4..daf95fd535 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -2166,6 +2166,25 @@ cc_library(
+@@ -2166,6 +2166,28 @@ cc_library(
      ] + xla_internal(["//xla/service/gpu/google:export_hlo"]),
  )
  
 +xla_test(
 +    name = "gpu_compiler_early_exit_test",
 +    srcs = ["gpu_compiler_early_exit_test.cc"],
++    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against its
++    # libraries' shared objects finds none of their functions.
++    linkstatic = True,
 +    backends = ["gpu"],
 +    deps = [
 +        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
@@ -183,7 +186,7 @@ index 8785c0c2d4..9127d9e185 100644
  xla_test(
      name = "gpu_compiler_test",
      srcs = ["gpu_compiler_test.cc"],
-@@ -2313,6 +2332,7 @@ cc_library(
+@@ -2313,6 +2335,7 @@ cc_library(
          "//xla/pjrt:compiled_memory_stats",
          "//xla/service:compiled_module",
          "//xla/service:executable",
@@ -191,7 +194,7 @@ index 8785c0c2d4..9127d9e185 100644
          "//xla/stream_executor:device_description",
          "//xla/stream_executor:platform",
          "@com_google_absl//absl/status",
-@@ -2331,7 +2351,6 @@ cc_library(
+@@ -2331,7 +2354,6 @@ cc_library(
          "//xla:xla_proto_cc",
          "//xla/hlo/ir:hlo",
          "//xla/pjrt:compiled_memory_stats",
