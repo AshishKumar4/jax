@@ -1,4 +1,4 @@
-From 6aa3819c84998d1c84f750789ebfb34afdd7f5cd Mon Sep 17 00:00:00 2001
+From aa77cc23ec2a5c6eb457f3311f444276a6d93d8e Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 08:18:38 -0600
 Subject: [PATCH] [XLA:GPU] A compile over a device memory limit stops after
@@ -13,12 +13,12 @@ stopped after buffer assignment followed by a whole one.
  xla/debug_options_flags.cc                    |   9 ++
  xla/service/gpu/BUILD                         |  27 ++++
  xla/service/gpu/compile_module_to_llvm_ir.cc  |  15 ++
- .../gpu/gpu_compiler_memory_limit_test.cc     | 130 ++++++++++++++++++
- xla/service/gpu/gpu_executable.cc             |  38 ++++-
+ .../gpu/gpu_compiler_memory_limit_test.cc     | 148 ++++++++++++++++++
+ xla/service/gpu/gpu_executable.cc             |  40 ++++-
  xla/service/gpu/gpu_executable.h              |  13 ++
  xla/service/gpu/gpu_executable.proto          |   5 +
  xla/xla.proto                                 |  10 +-
- 8 files changed, 245 insertions(+), 2 deletions(-)
+ 8 files changed, 265 insertions(+), 2 deletions(-)
  create mode 100644 xla/service/gpu/gpu_compiler_memory_limit_test.cc
 
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
@@ -121,10 +121,10 @@ index 36df696e0d..fa1250ec34 100644
  
 diff --git a/xla/service/gpu/gpu_compiler_memory_limit_test.cc b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
 new file mode 100644
-index 0000000000..fcb0d814be
+index 0000000000..0f55266fa4
 --- /dev/null
 +++ b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,148 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,6 +142,8 @@ index 0000000000..fcb0d814be
 +
 +#include <cstdint>
 +#include <memory>
++#include <string>
++#include <utility>
 +#include <vector>
 +
 +#include <gmock/gmock.h>
@@ -191,8 +193,8 @@ index 0000000000..fcb0d814be
 +    return ParseAndReturnVerifiedModule(kHloText, config);
 +  }
 +
-+  // Its memory as compiled ahead of time for this GPU under `limit`.
-+  absl::StatusOr<CompiledMemoryStats> CompiledAhead(int64_t limit) {
++  // It compiled ahead of time for this GPU under `limit`.
++  absl::StatusOr<std::unique_ptr<CompiledModule>> CompiledAhead(int64_t limit) {
 +    AotCompilationOptions aot_options(compiler()->PlatformId());
 +    aot_options.set_gpu_topology(GetSingleDeviceGpuTopology(
 +        /*platform_version=*/"", gpu_target_config()));
@@ -203,7 +205,7 @@ index 0000000000..fcb0d814be
 +    if (results.size() != 1) {
 +      return absl::InternalError("expected one compiled module");
 +    }
-+    return results[0]->GetCompiledMemoryStats();
++    return std::move(results[0]);
 +  }
 +};
 +
@@ -214,18 +216,28 @@ index 0000000000..fcb0d814be
 +
 +TEST_F(GpuCompilerMemoryLimitTest,
 +       ACompileOverItsLimitStatesTheWholeCompilesMemoryAndRefusesToRun) {
-+  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole, CompiledAhead(0));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> unlimited,
++                          CompiledAhead(0));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole,
++                          unlimited->GetCompiledMemoryStats());
 +  const int64_t limit = DeviceBytes(whole) - 1;
-+  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stopped, CompiledAhead(limit));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> limited,
++                          CompiledAhead(limit));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stopped,
++                          limited->GetCompiledMemoryStats());
 +
 +  // The compile stopped past its limit states the whole compile's memory and
-+  // buffer assignment, and emits no code.
++  // buffer assignment, and carries no code: its serialized form is the whole
++  // one's less the kernels it did not emit.
 +  EXPECT_EQ(DeviceBytes(stopped), DeviceBytes(whole));
 +  EXPECT_EQ(stopped.temp_size_in_bytes, whole.temp_size_in_bytes);
 +  EXPECT_EQ(stopped.serialized_buffer_assignment,
 +            whole.serialized_buffer_assignment);
-+  EXPECT_LT(stopped.generated_code_size_in_bytes,
-+            whole.generated_code_size_in_bytes);
++  TF_ASSERT_OK_AND_ASSIGN(std::string stopped_bytes,
++                          limited->SerializeAsString());
++  TF_ASSERT_OK_AND_ASSIGN(std::string whole_bytes,
++                          unlimited->SerializeAsString());
++  EXPECT_LT(stopped_bytes.size(), whole_bytes.size());
 +
 +  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Limited(limit));
 +  Literal x = LiteralUtil::CreateFullWithDescendingLayout<float>({256, 256},
@@ -237,11 +249,17 @@ index 0000000000..fcb0d814be
 +}
 +
 +TEST_F(GpuCompilerMemoryLimitTest, ACompileWithinItsLimitRunsAsAnUnlimitedOne) {
-+  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole, CompiledAhead(0));
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> unlimited,
++                          CompiledAhead(0));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole,
++                          unlimited->GetCompiledMemoryStats());
 +  const int64_t limit = DeviceBytes(whole);
-+  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats within, CompiledAhead(limit));
-+  EXPECT_EQ(within.generated_code_size_in_bytes,
-+            whole.generated_code_size_in_bytes);
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> within,
++                          CompiledAhead(limit));
++  TF_ASSERT_OK_AND_ASSIGN(std::string within_bytes, within->SerializeAsString());
++  TF_ASSERT_OK_AND_ASSIGN(std::string whole_bytes,
++                          unlimited->SerializeAsString());
++  EXPECT_EQ(within_bytes.size(), whole_bytes.size());
 +
 +  Literal x = LiteralUtil::CreateFullWithDescendingLayout<float>({256, 256},
 +                                                                 0.5f);
@@ -256,7 +274,7 @@ index 0000000000..fcb0d814be
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
-index 4b2538aa95..33c598da0d 100644
+index 4b2538aa95..60950cabbb 100644
 --- a/xla/service/gpu/gpu_executable.cc
 +++ b/xla/service/gpu/gpu_executable.cc
 @@ -71,6 +71,7 @@ limitations under the License.
@@ -280,10 +298,11 @@ index 4b2538aa95..33c598da0d 100644
    if (has_module() && enable_debug_info_manager_) {
      XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                 buffer_assignment_proto_);
-@@ -1098,6 +1103,13 @@ absl::StatusOr<ScopedShapedBuffer> GpuExecutable::ExecuteAsyncOnStream(
- absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
-     const ServiceExecutableRunOptions* run_options,
-     VariantArguments arguments) {
+@@ -1365,6 +1370,15 @@ absl::Status GpuExecutable::ExecuteThunks(
+         {{"module_name", module_name_}});
+   });
+ 
++  // Every execution reaches its thunks here, a PjRt client's directly.
 +  if (over_memory_limit_.has_value()) {
 +    return absl::FailedPreconditionError(absl::StrCat(
 +        "Module ", module_name_, " holds ", *over_memory_limit_,
@@ -291,10 +310,11 @@ index 4b2538aa95..33c598da0d 100644
 +        memory_limit_early_exit_bytes_,
 +        ": its compile stopped after buffer assignment and emitted no code"));
 +  }
-   if (has_module() && module_config().has_static_device_assignment()) {
-     const DeviceAssignment& static_device_assignment =
-         module_config().static_device_assignment();
-@@ -1408,6 +1420,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
++
+   if (VLOG_IS_ON(5)) {
+     LogChangedAllocationsInBetweenExecutions(buffer_allocations, run_options);
+   }
+@@ -1408,6 +1422,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
    return size;
  }
  
@@ -322,7 +342,7 @@ index 4b2538aa95..33c598da0d 100644
  absl::StatusOr<absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>>
  GetOutputInfo(const HloModule& hlo_module, const BufferAssignment& assignment) {
    const HloInstruction* root =
-@@ -1532,6 +1565,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+@@ -1532,6 +1567,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
  
    *proto.mutable_buffer_assignment() = buffer_assignment_proto_;
    proto.set_buffer_allocations_debug_summary(buffer_allocations_debug_summary_);
@@ -330,7 +350,7 @@ index 4b2538aa95..33c598da0d 100644
  
    if (has_module()) {
      *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
-@@ -1575,6 +1609,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
+@@ -1575,6 +1611,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
      std::shared_ptr<HloModule> debug_module) {
    Params params;
    params.debug_options = std::move(debug_options);
