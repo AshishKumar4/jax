@@ -89,6 +89,26 @@ class MMALayouts:
     )
 
 
+M_WARPS_ATTRIBUTE = "mosaic_gpu.m_warps"
+"""The discardable attribute an `MMAOp` may carry naming its `m_warps`, which
+then sets its layouts in place of `MMALayouts.for_shape`'s."""
+
+
+def layouts_for_op(op: ir.OpView, element_type, m: int, n: int) -> "MMALayouts":
+  """The `MMALayouts` of an `MMAOp`: its `M_WARPS_ATTRIBUTE`'s split where it
+  states one, else `MMALayouts.for_shape`'s."""
+  if M_WARPS_ATTRIBUTE in op.attributes:
+    m_warps = ir.IntegerAttr(op.attributes[M_WARPS_ATTRIBUTE]).value
+    n_warps = 4 // m_warps
+    if m % (m_warps * 16) or n % (n_warps * 8):
+      raise ValueError(
+          f"An MMA of shape {(m, n)=} cannot split its warps {m_warps=}: the "
+          f"accumulator tile {(m_warps * 16, n_warps * 8)} must evenly divide it."
+      )
+    return MMALayouts(element_type, m_warps=m_warps)
+  return MMALayouts.for_shape(element_type, m, n)
+
+
 def can_relayout_acc_to_lhs(
     src: fa.FragmentedLayout, dst: fa.FragmentedLayout, bitwidth: int
 ) -> bool:
