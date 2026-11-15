@@ -1,0 +1,758 @@
+From a27135d9a4409582db40e7207858370e12dbc77b Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 02:12:49 -0600
+Subject: [PATCH] [XLA:GPU] FFI handlers that instantiate concurrently are
+ instantiated together on the compile threads
+
+A custom call's FFI instantiate stage ran inside thunk emission, one call at a time (CustomCallThunk::Create),
+though the emitter's own kernels compile on the compile thread pool: a program of many Mosaic GPU kernels
+compiled each serially (36 kernels, 16.3 s). A handler registered with
+XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY (ffi::Traits::kInstantiateConcurrently) states its instantiate
+stage may run beside others; ThunkEmitter::InstantiateConcurrently instantiates every such call of the module
+together before it emits thunks (KernelCompiler::RunConcurrently, the calling thread claiming tasks beside
+the pool's), outside the LLVM options lock, and each call's thunk takes its state (CustomCallThunk::Create's
+execution_state, CustomCallThunk::Instantiated the one instantiate). An instantiation's error is the compile's.
+---
+ xla/backends/gpu/codegen/BUILD                |   4 +
+ .../codegen/cubin_custom_kernel_compiler.cc   |  42 +++++
+ .../codegen/cubin_custom_kernel_compiler.h    |   3 +
+ xla/backends/gpu/codegen/kernel_compiler.h    |  11 ++
+ xla/backends/gpu/runtime/custom_call_thunk.cc |  51 ++++--
+ xla/backends/gpu/runtime/custom_call_thunk.h  |  12 ++
+ xla/ffi/api/api.h                             |   6 +
+ xla/ffi/api/c_api.h                           |   5 +
+ xla/ffi/ffi_registry.h                        |   6 +
+ xla/service/gpu/BUILD                         |  27 ++++
+ .../gpu/instantiate_concurrently_test.cc      | 133 ++++++++++++++++
+ xla/service/gpu/thunk_emitter.cc              | 149 ++++++++++++++----
+ xla/service/gpu/thunk_emitter.h               |  29 ++++
+ 13 files changed, 431 insertions(+), 47 deletions(-)
+ create mode 100644 xla/service/gpu/instantiate_concurrently_test.cc
+
+diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
+index 0580f1faff..3694b0cb84 100644
+--- a/xla/backends/gpu/codegen/BUILD
++++ b/xla/backends/gpu/codegen/BUILD
+@@ -292,6 +292,7 @@ cc_library(
+         "//xla/service/gpu:mlir_context_pool",
+         "//xla/stream_executor:device_description",
+         "@com_google_absl//absl/functional:any_invocable",
++        "@com_google_absl//absl/functional:function_ref",
+         "@com_google_absl//absl/strings:string_view",
+         "@llvm-project//llvm:Core",
+         "@llvm-project//llvm:TargetParser",
+@@ -325,11 +326,14 @@ cc_library(
+         "//xla/service/gpu:launch_dimensions",
+         "//xla/stream_executor:device_description",
+         "//xla/tsl/platform:env",
++        "@com_google_absl//absl/base:core_headers",
+         "@com_google_absl//absl/functional:any_invocable",
++        "@com_google_absl//absl/functional:function_ref",
+         "@com_google_absl//absl/status:status_macros",
+         "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/strings",
+         "@com_google_absl//absl/strings:string_view",
++        "@com_google_absl//absl/synchronization",
+         "@llvm-project//llvm:Core",
+         "@llvm-project//llvm:OrcJIT",
+         "@llvm-project//llvm:TargetParser",
+diff --git a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
+index 93711c6f17..11794e885e 100644
+--- a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
++++ b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
+@@ -15,16 +15,21 @@ limitations under the License.
+ 
+ #include "xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h"
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
++#include "absl/base/thread_annotations.h"
++#include "absl/functional/function_ref.h"
+ #include "absl/status/status_macros.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/string_view.h"
++#include "absl/synchronization/mutex.h"
+ #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/TargetParser/Triple.h"
+@@ -102,6 +107,43 @@ xla::Future<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::Compile(
+       });
+ }
+ 
++void CubinCustomKernelCompiler::RunConcurrently(
++    int64_t count, absl::FunctionRef<void(int64_t)> task) {
++  if (thread_pool_ == nullptr || count < 2) {
++    KernelCompiler::RunConcurrently(count, task);
++    return;
++  }
++  // The calling thread claims tasks beside the pool's, so the tasks finish
++  // however busy the pool is (it may be the calling thread's own); a helper
++  // the pool starts after every task is claimed runs none.
++  struct Shared {
++    explicit Shared(int64_t count) : count(count) {}
++    bool Done() const ABSL_SHARED_LOCKS_REQUIRED(mu) { return done == count; }
++
++    const int64_t count;
++    std::atomic<int64_t> next{0};
++    absl::Mutex mu;
++    int64_t done ABSL_GUARDED_BY(mu) = 0;
++  };
++  auto shared = std::make_shared<Shared>(count);
++  auto claim = [shared, task]() {
++    for (int64_t i = shared->next.fetch_add(1); i < shared->count;
++         i = shared->next.fetch_add(1)) {
++      task(i);
++      absl::MutexLock lock(shared->mu);
++      ++shared->done;
++    }
++  };
++  const int64_t helpers =
++      std::min<int64_t>(count - 1, thread_pool_->NumThreads());
++  for (int64_t helper = 0; helper < helpers; ++helper) {
++    thread_pool_->Schedule(claim);
++  }
++  claim();
++  absl::MutexLock lock(shared->mu);
++  shared->mu.Await(absl::Condition(shared.get(), &Shared::Done));
++}
++
+ xla::Future<LlvmKernelSource> CubinCustomKernelCompiler::CompileMlirToLlvm(
+     const se::DeviceDescription& device, const HloModule& hlo_module,
+     const std::string& entry_function_name, int unroll_factor,
+diff --git a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
+index 10e013bc61..97dbfb12cd 100644
+--- a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
++++ b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
+@@ -86,6 +86,9 @@ class CubinCustomKernelCompiler final : public KernelCompiler {
+   xla::Future<std::vector<uint8_t>> CompileToTargetBinary(
+       LlvmKernelSource kernel_source) override;
+ 
++  void RunConcurrently(int64_t count,
++                       absl::FunctionRef<void(int64_t)> task) override;
++
+   xla::Future<TritonWrapperResult> CompileTritonToLlvm(
+       absl::string_view kernel_name, const HloModule& hlo_module,
+       const se::DeviceDescription& device_info,
+diff --git a/xla/backends/gpu/codegen/kernel_compiler.h b/xla/backends/gpu/codegen/kernel_compiler.h
+index dbebbdffe9..af7eabc87f 100644
+--- a/xla/backends/gpu/codegen/kernel_compiler.h
++++ b/xla/backends/gpu/codegen/kernel_compiler.h
+@@ -23,6 +23,7 @@ limitations under the License.
+ #include <vector>
+ 
+ #include "absl/functional/any_invocable.h"
++#include "absl/functional/function_ref.h"
+ #include "absl/strings/string_view.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/TargetParser/Triple.h"
+@@ -93,6 +94,16 @@ class KernelCompiler {
+       LlvmKernelSource kernel_source) = 0;
+ 
+   // Sets a callback to be called prior to llvm::Module compilation.
++  // Runs `task` for each index below `count` where this compiler runs its
++  // compiles, concurrently where it holds a thread pool, and returns once every
++  // one has run.
++  virtual void RunConcurrently(int64_t count,
++                               absl::FunctionRef<void(int64_t)> task) {
++    for (int64_t i = 0; i < count; ++i) {
++      task(i);
++    }
++  }
++
+   void SetPreOptimizationHook(ModuleHook hook) {
+     pre_optimization_hook_ = std::move(hook);
+   }
+diff --git a/xla/backends/gpu/runtime/custom_call_thunk.cc b/xla/backends/gpu/runtime/custom_call_thunk.cc
+index 08bd40b7ee..a026dae0a4 100644
+--- a/xla/backends/gpu/runtime/custom_call_thunk.cc
++++ b/xla/backends/gpu/runtime/custom_call_thunk.cc
+@@ -201,6 +201,34 @@ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
+                 std::move(cpu_target_machine_options), use_pdl);
+ }
+ 
++absl::StatusOr<std::unique_ptr<ffi::ExecutionState>>
++CustomCallThunk::Instantiated(
++    const XLA_FFI_Handler_Bundle& bundle,
++    const std::vector<NullableShapedSlice>& operands,
++    const std::vector<NullableShapedSlice>& results,
++    const ffi::AttributesMap& attributes,
++    const se::GpuComputeCapability& gpu_compute_capability,
++    std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options) {
++  auto execution_state = std::make_unique<ffi::ExecutionState>();
++  if (bundle.instantiate == nullptr) {
++    return execution_state;
++  }
++  // Build a call frame with placeholder buffers so the instantiate handler
++  // can read operand/result types and shapes. Data pointers are nullptr.
++  ABSL_ASSIGN_OR_RETURN(CallFrame call_frame,
++                        BuildCallFramePrototype(operands, results, attributes));
++  if (!cpu_target_machine_options.has_value()) {
++    cpu_target_machine_options = xla::cpu::TargetMachineOptions();
++  }
++  InvokeContext call_options = BuildInstantiateInvokeContext(
++      execution_state.get(), &gpu_compute_capability,
++      &*cpu_target_machine_options);
++  ABSL_RETURN_IF_ERROR(Invoke(ffi::GetXlaFfiApi(), bundle.instantiate,
++                              call_frame, call_options,
++                              XLA_FFI_ExecutionStage_INSTANTIATE));
++  return execution_state;
++}
++
+ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
+     ThunkInfo thunk_info, std::string target_name,
+     XLA_FFI_Handler_Bundle bundle, std::vector<NullableShapedSlice> operands,
+@@ -217,24 +245,13 @@ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
+           << (bundle.instantiate == nullptr ? "NULL" : "NON-NULL");
+   // Initialize FFI handler state if it has an instantiate callback.
+   if (execution_state == nullptr) {
+-    execution_state = std::make_unique<ffi::ExecutionState>();
+-    if (bundle.instantiate) {
+-      // Build a call frame with placeholder buffers so the instantiate handler
+-      // can read operand/result types and shapes. Data pointers are nullptr.
+-      ABSL_ASSIGN_OR_RETURN(
+-          CallFrame call_frame,
+-          BuildCallFramePrototype(operands, results, attributes));
+-
+-      if (!cpu_target_machine_options.has_value()) {
+-        cpu_target_machine_options = xla::cpu::TargetMachineOptions();
+-      }
+-      InvokeContext call_options = BuildInstantiateInvokeContext(
+-          execution_state.get(), &gpu_compute_capability,
+-          &*cpu_target_machine_options);
+-      ABSL_RETURN_IF_ERROR(Invoke(ffi::GetXlaFfiApi(), bundle.instantiate,
+-                                  call_frame, call_options,
+-                                  XLA_FFI_ExecutionStage_INSTANTIATE));
++    if (bundle.instantiate && !cpu_target_machine_options.has_value()) {
++      cpu_target_machine_options = xla::cpu::TargetMachineOptions();
+     }
++    ABSL_ASSIGN_OR_RETURN(
++        execution_state,
++        Instantiated(bundle, operands, results, attributes,
++                     gpu_compute_capability, cpu_target_machine_options));
+   }
+ 
+   ABSL_ASSIGN_OR_RETURN(CallFrame call_frame,
+diff --git a/xla/backends/gpu/runtime/custom_call_thunk.h b/xla/backends/gpu/runtime/custom_call_thunk.h
+index 4f57d273e0..12ae3196fe 100644
+--- a/xla/backends/gpu/runtime/custom_call_thunk.h
++++ b/xla/backends/gpu/runtime/custom_call_thunk.h
+@@ -107,6 +107,18 @@ class CustomCallThunk : public TracedCommand {
+           std::nullopt,
+       bool use_pdl = false);
+ 
++  // The state `bundle`'s instantiate stage makes for a call of `operands`,
++  // `results` and `attributes`, which `Create` takes as the call's
++  // `execution_state`; an empty state where the bundle has no instantiate
++  // stage.
++  static absl::StatusOr<std::unique_ptr<xla::ffi::ExecutionState>> Instantiated(
++      const XLA_FFI_Handler_Bundle& bundle,
++      const std::vector<NullableShapedSlice>& operands,
++      const std::vector<NullableShapedSlice>& results,
++      const xla::ffi::AttributesMap& attributes,
++      const se::GpuComputeCapability& gpu_compute_capability,
++      std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options);
++
+   // Creates a serializable custom call thunk from the given XLA FFI handler
+   // bundle. Note that `target_name` needs to refer to a registered XLA FFI
+   // handler which matches the given bundle.
+diff --git a/xla/ffi/api/api.h b/xla/ffi/api/api.h
+index e2284f8d6b..2cc2f4a1b4 100644
+--- a/xla/ffi/api/api.h
++++ b/xla/ffi/api/api.h
+@@ -266,6 +266,12 @@ enum class Traits : uint32_t {
+   //      allocations);
+   //   3. the FFI handler may not query the execution status of the stream.
+   kCmdBufferCompatible = XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE,
++
++  // Indicates that calls to the handler's instantiate stage may run
++  // concurrently, with each other and with other handlers'. XLA:GPU then
++  // instantiates them in parallel on its compile threads, outside the LLVM
++  // options lock, before it emits a program's thunks.
++  kInstantiateConcurrently = XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY,
+ };
+ 
+ // Forward declare template defined below.
+diff --git a/xla/ffi/api/c_api.h b/xla/ffi/api/c_api.h
+index f9cd1139f5..0ecfc0d7cd 100644
+--- a/xla/ffi/api/c_api.h
++++ b/xla/ffi/api/c_api.h
+@@ -530,6 +530,11 @@ enum XLA_FFI_Handler_TraitsBits {
+   // that calls to FFI handler always launch exactly the same device operations
+   // (can depend on attribute values) that can be captured and then replayed.
+   XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE = 1u << 0,
++
++  // Calls to the handler's instantiate stage may run concurrently, with each
++  // other and with other handlers': XLA:GPU instantiates them in parallel on
++  // its compile threads before it emits a program's thunks.
++  XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY = 1u << 1,
+ };
+ 
+ typedef uint32_t XLA_FFI_Handler_Traits;
+diff --git a/xla/ffi/ffi_registry.h b/xla/ffi/ffi_registry.h
+index 517f6fd9c9..15fd9da67f 100644
+--- a/xla/ffi/ffi_registry.h
++++ b/xla/ffi/ffi_registry.h
+@@ -89,6 +89,9 @@ inline std::vector<Traits> DecodeTraits(XLA_FFI_Handler_Traits traits) {
+   if (traits & XLA_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE) {
+     result.push_back(Traits::kCmdBufferCompatible);
+   }
++  if (traits & XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY) {
++    result.push_back(Traits::kInstantiateConcurrently);
++  }
+   return result;
+ }
+ 
+@@ -102,6 +105,9 @@ static void AbslStringify(Sink& sink, Traits traits) {
+     case Traits::kCmdBufferCompatible:
+       absl::Format(&sink, "cmd_buffer_compatible");
+       break;
++    case Traits::kInstantiateConcurrently:
++      absl::Format(&sink, "instantiate_concurrently");
++      break;
+   }
+ }
+ 
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index 9127d9e185..e83c68dc44 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -561,6 +561,8 @@ cc_library(
+         "//xla/core/host_offloading:host_offloading_executable_proto_cc",
+         "//xla/ffi:attribute_map",
+         "//xla/ffi:attributes",
++        "//xla/ffi:execution_state",
++        "//xla/ffi:ffi_registry",
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/ir:hlo_instruction_utils",
+         "//xla/mlir/utils:error_util",
+@@ -2185,6 +2187,31 @@ xla_test(
+     ],
+ )
+ 
++xla_test(
++    name = "instantiate_concurrently_test",
++    srcs = ["instantiate_concurrently_test.cc"],
++    backends = ["gpu"],
++    deps = [
++        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
++        "//xla/ffi",
++        "//xla/ffi:ffi_api",
++        "//xla/ffi/api:c_api",
++        "//xla/hlo/ir:hlo",
++        "//xla/service:compiler",
++        "//xla/service:executable",
++        "//xla/service:gpu_topology",
++        "//xla/service:hlo_module_config",
++        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings:string_view",
++        "@com_google_absl//absl/time",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "gpu_compiler_test",
+     srcs = ["gpu_compiler_test.cc"],
+diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
+new file mode 100644
+index 0000000000..bcbda9047d
+--- /dev/null
++++ b/xla/service/gpu/instantiate_concurrently_test.cc
+@@ -0,0 +1,133 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <atomic>
++#include <memory>
++
++#include <gmock/gmock.h>
++#include <gtest/gtest.h>
++#include "absl/status/status.h"
++#include "absl/status/status_matchers.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
++#include "absl/time/clock.h"
++#include "absl/time/time.h"
++#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
++#include "xla/ffi/api/c_api.h"
++#include "xla/ffi/ffi.h"
++#include "xla/ffi/ffi_api.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/service/compiler.h"
++#include "xla/service/executable.h"
++#include "xla/service/gpu_topology.h"
++#include "xla/service/hlo_module_config.h"
++#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/statusor.h"
++
++namespace xla::gpu {
++namespace {
++
++using ::testing::HasSubstr;
++
++// Calls arrived at the instantiate stage of `xla.gpu.instantiate_together`.
++static std::atomic<int> instantiate_together_arrived = 0;
++
++// An instantiate stage that holds until two calls have arrived at it, so calls
++// instantiated one at a time fail; a call whose `fail` is set fails at once.
++XLA_FFI_DEFINE_HANDLER(
++    kInstantiateTogether,
++    [](bool fail) -> absl::Status {
++      if (fail) {
++        return absl::InvalidArgumentError("instantiation refused");
++      }
++      instantiate_together_arrived.fetch_add(1);
++      absl::Time deadline = absl::Now() + absl::Seconds(60);
++      while (instantiate_together_arrived.load() < 2) {
++        if (absl::Now() > deadline) {
++          return absl::DeadlineExceededError("instantiated alone");
++        }
++        absl::SleepFor(absl::Milliseconds(1));
++      }
++      return absl::OkStatus();
++    },
++    ffi::Ffi::BindInstantiate().Attr<bool>("fail"));
++XLA_FFI_DEFINE_HANDLER(kInstantiateTogetherExecute,
++                       []() { return absl::OkStatus(); }, ffi::Ffi::Bind());
++
++class InstantiateConcurrentlyTest : public HloPjRtGpuTestBase {
++ protected:
++  void SetUp() override {
++    HloPjRtGpuTestBase::SetUp();
++    XLA_FFI_Handler_Bundle bundle = {
++        /*instantiate=*/kInstantiateTogether,
++        /*prepare=*/nullptr,
++        /*initialize=*/nullptr,
++        /*execute=*/kInstantiateTogetherExecute,
++    };
++    for (absl::string_view platform : {"CUDA", "ROCM"}) {
++      xla::ffi::Ffi::RegisterStaticHandler(
++          ffi::GetXlaFfiApi(), "xla.gpu.instantiate_together", platform,
++          bundle, XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
++    }
++    instantiate_together_arrived = 0;
++  }
++
++  absl::StatusOr<std::unique_ptr<Executable>> Compiled(
++      absl::string_view hlo_text) {
++    HloModuleConfig config = GetModuleConfigForTest();
++    // Two compile threads.
++    config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
++        2);
++    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
++                        ParseAndReturnVerifiedModule(hlo_text, config));
++    Compiler::CompileOptions compile_options;
++    compile_options.gpu_topology = GetSingleDeviceGpuTopology(
++        /*platform_version=*/"", gpu_target_config());
++    return compiler()->RunBackend(std::move(module), /*executor=*/nullptr,
++                                  compile_options);
++  }
++};
++
++TEST_F(InstantiateConcurrentlyTest,
++       HandlersInstantiatingConcurrentlyAreInstantiatedTogether) {
++  TF_ASSERT_OK(Compiled(R"(
++    HloModule m
++    ENTRY main {
++      p0 = f32[8] parameter(0)
++      p1 = f32[8] parameter(1)
++      a = f32[8] custom-call(p0), custom_call_target="xla.gpu.instantiate_together",
++        api_version=API_VERSION_TYPED_FFI, backend_config="{fail = false}"
++      b = f32[8] custom-call(p1), custom_call_target="xla.gpu.instantiate_together",
++        api_version=API_VERSION_TYPED_FFI, backend_config="{fail = false}"
++      ROOT t = (f32[8], f32[8]) tuple(a, b)
++    })").status());
++  EXPECT_EQ(instantiate_together_arrived.load(), 2);
++}
++
++TEST_F(InstantiateConcurrentlyTest,
++       AConcurrentInstantiationsErrorIsTheCompiles) {
++  EXPECT_THAT(Compiled(R"(
++    HloModule m
++    ENTRY main {
++      p0 = f32[8] parameter(0)
++      ROOT a = f32[8] custom-call(p0), custom_call_target="xla.gpu.instantiate_together",
++        api_version=API_VERSION_TYPED_FFI, backend_config="{fail = true}"
++    })").status(),
++              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
++                                     HasSubstr("instantiation refused")));
++}
++
++}  // namespace
++}  // namespace xla::gpu
+diff --git a/xla/service/gpu/thunk_emitter.cc b/xla/service/gpu/thunk_emitter.cc
+index 5d1be01679..d848540cab 100644
+--- a/xla/service/gpu/thunk_emitter.cc
++++ b/xla/service/gpu/thunk_emitter.cc
+@@ -119,6 +119,8 @@ limitations under the License.
+ #include "xla/core/host_offloading/host_offloading_executable.pb.h"
+ #include "xla/ffi/attribute_map.h"
+ #include "xla/ffi/attributes.h"
++#include "xla/ffi/execution_state.h"
++#include "xla/ffi/ffi_registry.h"
+ #include "xla/future.h"
+ #include "xla/hlo/ir/hlo_casting_utils.h"
+ #include "xla/hlo/ir/hlo_computation.h"
+@@ -1291,15 +1293,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitNativeCustomCallThunks(
+   return handler(*instr, ctx);
+ }
+ 
+-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+-    const HloCustomCallInstruction* instr) {
+-  const std::string& call_target_name = instr->custom_call_target();
+-
+-  // Typed FFI custom calls is a replacement for legacy custom calls
+-  // with a rich type safe API.
+-  bool is_ffi_custom_call =
+-      instr->api_version() == CustomCallApiVersion::API_VERSION_TYPED_FFI;
+-
++absl::StatusOr<std::pair<std::vector<NullableShapedSlice>,
++                         std::vector<NullableShapedSlice>>>
++ThunkEmitter::CustomCallSlices(const HloCustomCallInstruction* instr) const {
+   using Slices = std::vector<NullableShapedSlice>;
+ 
+   Slices operands;
+@@ -1333,11 +1329,113 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+         results.push_back(ShapedSlice{slice, subshape});
+         return absl::OkStatus();
+       }));
++  return std::make_pair(std::move(operands), std::move(results));
++}
++
++absl::StatusOr<ffi::AttributesMap> ThunkEmitter::FfiAttributes(
++    const HloCustomCallInstruction* instr) const {
++  // For XLA FFI handlers we decode opaque backend config into attributes map
++  // at IR emission time, so that we do not need to parse MLIR at run time. For
++  // FFI handlers backend config must be a compatible MLIR dictionary.
++  auto backend_config = instr->backend_config<GpuBackendConfig>();
++  const std::string& backend_config_str =
++      backend_config.ok()
++          ? backend_config->custom_call_backend_config().attributes()
++          : instr->raw_backend_config_string();
++  if (backend_config_str.empty()) {
++    return ffi::AttributesMap();
++  }
++  mlir::Attribute attr = mlir::parseAttribute(
++      backend_config_str, ir_emitter_context_->mlir_context());
++  auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(attr);
++  if (dict == nullptr) {
++    return absl::InternalError(
++        "Unsupported backend config. Expected a string "
++        "parsable into "
++        "dictionary attribute");
++  }
++  return xla::ffi::BuildAttributesMap(dict);
++}
++
++absl::Status ThunkEmitter::InstantiateConcurrently(const HloModule& module) {
++  struct Call {
++    const HloCustomCallInstruction* instr;
++    XLA_FFI_Handler_Bundle bundle;
++    std::vector<NullableShapedSlice> operands;
++    std::vector<NullableShapedSlice> results;
++    ffi::AttributesMap attributes;
++    absl::StatusOr<std::unique_ptr<ffi::ExecutionState>> state;
++  };
++  // A call the AOT allowlist refuses is refused as its thunk is emitted.
++  const auto& allowlist =
++      ir_emitter_context_->debug_options().xla_gpu_hlo_custom_call_allowlist();
++  std::vector<Call> calls;
++  for (const HloComputation* computation :
++       module.MakeNonfusionComputations()) {
++    for (const HloInstruction* instruction : computation->instructions()) {
++      auto* instr = DynCast<HloCustomCallInstruction>(instruction);
++      if (instr == nullptr ||
++          instr->api_version() != CustomCallApiVersion::API_VERSION_TYPED_FFI) {
++        continue;
++      }
++      absl::StatusOr<ffi::HandlerRegistration> registration =
++          ffi::FindHandler(instr->custom_call_target(), platform_name());
++      if (!registration.ok() || registration->bundle.instantiate == nullptr ||
++          !(registration->metadata.traits &
++            XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY) ||
++          (!allowlist.empty() &&
++           !IsInternalAotAllowlistedCustomCall(instr->custom_call_target()) &&
++           !absl::c_linear_search(allowlist, instr->custom_call_target()))) {
++        continue;
++      }
++      ABSL_ASSIGN_OR_RETURN(auto slices, CustomCallSlices(instr));
++      ABSL_ASSIGN_OR_RETURN(ffi::AttributesMap attributes,
++                            FfiAttributes(instr));
++      calls.push_back(Call{instr, registration->bundle,
++                           std::move(slices.first), std::move(slices.second),
++                           std::move(attributes),
++                           absl::UnknownError("not instantiated")});
++    }
++  }
++  if (calls.empty()) {
++    return absl::OkStatus();
++  }
++  {
++    // Foreign code instantiating may call into LLVM with its own options.
++    auto released_lock_keeper = llvm_options_lock_->TemporarilyReleaseLock();
++    ir_emitter_context_->kernel_compiler()->RunConcurrently(
++        static_cast<int64_t>(calls.size()), [&](int64_t i) {
++          Call& call = calls[i];
++          call.state = CustomCallThunk::Instantiated(
++              call.bundle, call.operands, call.results, call.attributes,
++              ir_emitter_context_->gpu_compute_capability(),
++              ir_emitter_context_->cpu_target_machine_options());
++        });
++  }
++  for (Call& call : calls) {
++    ABSL_ASSIGN_OR_RETURN(instantiated_[call.instr], std::move(call.state));
++  }
++  return absl::OkStatus();
++}
+ 
+-  // For XLA FFI handlers we decode opaque backend config into
+-  // attributes map at IR emission time, so that we do not need to
+-  // parse MLIR at run time. For FFI handlers backend config must be
+-  // a compatible MLIR dictionary.
++std::unique_ptr<ffi::ExecutionState> ThunkEmitter::TakeInstantiated(
++    const HloInstruction* instr) {
++  auto found = instantiated_.extract(instr);
++  return found.empty() ? nullptr : std::move(found.mapped());
++}
++
++absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
++    const HloCustomCallInstruction* instr) {
++  const std::string& call_target_name = instr->custom_call_target();
++
++  // Typed FFI custom calls is a replacement for legacy custom calls
++  // with a rich type safe API.
++  bool is_ffi_custom_call =
++      instr->api_version() == CustomCallApiVersion::API_VERSION_TYPED_FFI;
++
++  ABSL_ASSIGN_OR_RETURN(auto slices, CustomCallSlices(instr));
++  std::vector<NullableShapedSlice> operands = std::move(slices.first);
++  std::vector<NullableShapedSlice> results = std::move(slices.second);
+   ffi::AttributesMap attributes;
+ 
+   auto backend_config = instr->backend_config<GpuBackendConfig>();
+@@ -1364,22 +1462,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+                        "(--xla_gpu_hlo_custom_call_allowlist). "));
+     }
+     auto& called_computations = instr->called_computations();
+-    auto& backend_config_str =
+-        backend_config.ok()
+-            ? backend_config->custom_call_backend_config().attributes()
+-            : instr->raw_backend_config_string();
+-    if (!backend_config_str.empty()) {
+-      mlir::Attribute attr = mlir::parseAttribute(
+-          backend_config_str, ir_emitter_context_->mlir_context());
+-      auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(attr);
+-      if (dict == nullptr) {
+-        return absl::InternalError(
+-            "Unsupported backend config. Expected a string "
+-            "parsable into "
+-            "dictionary attribute");
+-      }
+-      ABSL_ASSIGN_OR_RETURN(attributes, xla::ffi::BuildAttributesMap(dict));
+-    }
++    ABSL_ASSIGN_OR_RETURN(attributes, FfiAttributes(instr));
+     const bool enable_pdl =
+         IsPdlEnabled(ir_emitter_context_->debug_options(),
+                      ir_emitter_context_->gpu_compute_capability());
+@@ -1392,7 +1475,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+         called_computations.empty() ? nullptr : called_computations[0],
+         ir_emitter_context_->platform_name(),
+         ir_emitter_context_->gpu_compute_capability(),
+-        /*execution_state=*/nullptr,
++        /*execution_state=*/TakeInstantiated(instr),
+         ir_emitter_context_->cpu_target_machine_options(), enable_pdl);
+   };
+ 
+@@ -2917,6 +3000,12 @@ Future<ThunkSequence> ThunkEmitter::EmitHloInstruction(
+ 
+ Future<ThunkSequence> ThunkEmitter::EmitHloEntryComputation(
+     const HloModule* module) {
++  // Handlers instantiating concurrently are instantiated together first, on
++  // the compile threads, each call's thunk then taking its state.
++  if (absl::Status instantiated = InstantiateConcurrently(*module);
++      !instantiated.ok()) {
++    return instantiated;
++  }
+   return EmitHloComputation(module->entry_computation());
+ }
+ 
+diff --git a/xla/service/gpu/thunk_emitter.h b/xla/service/gpu/thunk_emitter.h
+index 46df8a0b2d..b7f33071c9 100644
+--- a/xla/service/gpu/thunk_emitter.h
++++ b/xla/service/gpu/thunk_emitter.h
+@@ -35,6 +35,8 @@ limitations under the License.
+ #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
+ #include "xla/backends/gpu/runtime/thunk.h"
+ #include "xla/codegen/llvm_kernel_source.h"
++#include "xla/ffi/attribute_map.h"
++#include "xla/ffi/execution_state.h"
+ #include "xla/future.h"
+ #include "xla/hlo/ir/hlo_computation.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+@@ -250,6 +252,27 @@ class ThunkEmitter {
+   absl::StatusOr<ThunkSequence> EmitCublasLtMatmulMx(
+       const HloCustomCallInstruction* instr);
+ 
++  // The buffers a custom call's operands and results are assigned, each array
++  // its slice, a token none.
++  absl::StatusOr<std::pair<std::vector<NullableShapedSlice>,
++                           std::vector<NullableShapedSlice>>>
++  CustomCallSlices(const HloCustomCallInstruction* instr) const;
++
++  // An FFI custom call's attributes, decoded from its backend config.
++  absl::StatusOr<ffi::AttributesMap> FfiAttributes(
++      const HloCustomCallInstruction* instr) const;
++
++  // Instantiates every FFI custom call of `module` whose handler instantiates
++  // concurrently (`XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY`), together
++  // on the compile threads (`KernelCompiler::RunConcurrently`) outside the
++  // LLVM options lock, each call's state kept for its thunk
++  // (`TakeInstantiated`); an instantiation's error is the compile's.
++  absl::Status InstantiateConcurrently(const HloModule& module);
++
++  // The state `InstantiateConcurrently` made for `instr`, or null.
++  std::unique_ptr<ffi::ExecutionState> TakeInstantiated(
++      const HloInstruction* instr);
++
+   absl::StatusOr<ThunkSequence> EmitGenericCustomCall(
+       const HloCustomCallInstruction* instr);
+ 
+@@ -392,6 +415,12 @@ class ThunkEmitter {
+   }
+   AllocationOverrides allocation_overrides_;
+ 
++  // Each FFI custom call's state `InstantiateConcurrently` made, which its
++  // thunk takes.
++  absl::flat_hash_map<const HloInstruction*,
++                      std::unique_ptr<ffi::ExecutionState>>
++      instantiated_;
++
+   // Stores HloFusionAnalysis objects to ensure they outlive any asynchronous
+   // operations that may hold references to them.
+   std::vector<std::unique_ptr<HloFusionAnalysis>> analysis_garbage_collector_;
+-- 
+2.53.0
+
