@@ -634,6 +634,8 @@ def _random_split_batcher(
       keys, shape=shape, out_sharding=out_sharding), bd
 
 batching.fancy_primitive_batchers[random_split_p] = _random_split_batcher
+# Its rule maps each key of a batch alone, as a vectorized one does.
+random_split_p.positionwise = True
 
 def _random_split_sharding_rule(keys_aval, *, shape, out_sharding):
   if out_sharding is not None:
@@ -922,6 +924,8 @@ def _random_bits_batcher(
   return out, [bd] * len(out)
 
 batching.fancy_primitive_batchers[random_bits_p] = _random_bits_batcher
+# Its rule maps each key of a batch alone, as a vectorized one does.
+random_bits_p.positionwise = True
 
 
 @random_bits_p.def_abstract_eval
