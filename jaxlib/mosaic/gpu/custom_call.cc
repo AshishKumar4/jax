@@ -134,6 +134,7 @@ limitations under the License.
 #include "jaxlib/gpu/vendor.h"
 #include "jaxlib/mosaic/dialect/gpu/mosaic_gpu.h"
 #include "jaxlib/mosaic/gpu/assembly_to_binary.h"
+#include "jaxlib/mosaic/gpu/capture.h"
 #include "jaxlib/mosaic/gpu/dump.h"
 #include "jaxlib/mosaic/gpu/gpu_module_to_assembly.h"
 #include "jaxlib/mosaic/gpu/launch_config.h"
@@ -164,6 +165,7 @@ limitations under the License.
 #include "xla/ffi/record_ffi.h"
 #include "xla/ffi/type_registry.h"
 #include "xla/runtime/device_id.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/llvm_gpu_backend/nvptx_libdevice_path.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/status_macros.h"
@@ -1884,6 +1886,12 @@ absl::Status MosaicGpuRecord(
         << record_ctx.action();
   };
 
+  if (!mosaic::gpu::CaptureDirectory().empty()) {
+    return absl::FailedPreconditionError(
+        "A launch capture (MOSAIC_GPU_CAPTURE_LAUNCHES) writes each launch as "
+        "it runs, which a command buffer records once: run with "
+        "XLA_FLAGS=--xla_gpu_enable_command_buffer=");
+  }
   DeviceState& device_state = GetDeviceState(resources, device_ordinal);
   ASSIGN_OR_RETURN(
       (auto [cfg, comm]),
@@ -1989,8 +1997,35 @@ absl::Status MosaicGpuExecute(
       << ", " << cfg.cluster.y << ", " << cfg.cluster.z
       << " block: " << cfg.block.x << ", " << cfg.block.y << ", " << cfg.block.z
       << " smem_bytes: " << cfg.smem_bytes;
-  return MosaicGpuLaunchKernel(device_state.kernel_handle->function(),
-                               cuda_stream, &cfg, *kernel, device_ordinal);
+  auto launch = [&] {
+    return MosaicGpuLaunchKernel(device_state.kernel_handle->function(),
+                                 cuda_stream, &cfg, *kernel, device_ordinal);
+  };
+  if (mosaic::gpu::CaptureDirectory().empty()) {
+    return launch();
+  }
+  if (comm != nullptr || kernel->is_nvshmem_used) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "A launch capture runs one device's launch alone: Mosaic GPU kernel '",
+        kernel->kernel_name, "' synchronizes with other devices"));
+  }
+  ASSIGN_OR_RETURN(std::vector<ffi::AnyBuffer> buffers,
+                   GetBuffers(inputs, results));
+  std::vector<mosaic::gpu::CapturedBuffer> operands;
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    const ffi::AnyBuffer& buffer = buffers[i];
+    const bool input = i < inputs.size();
+    auto dims = buffer.dimensions();
+    operands.push_back(
+        {absl::StrCat(input ? "in" : "out", input ? i : i - inputs.size()),
+         buffer.untyped_data(), buffer.size_bytes(),
+         xla::primitive_util::LowercasePrimitiveTypeName(
+             static_cast<xla::PrimitiveType>(buffer.element_type())),
+         std::vector<int64_t>(dims.begin(), dims.end())});
+  }
+  return mosaic::gpu::CaptureLaunch(
+      kernel->kernel_name, kernel->gpu_binary,
+      reinterpret_cast<CUstream>(cuda_stream), cfg, operands, launch);
 }
 
 }  // namespace
