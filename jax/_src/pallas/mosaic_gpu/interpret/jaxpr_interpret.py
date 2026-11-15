@@ -365,7 +365,7 @@ class JaxprInterpreter:
     return self.are_thread_cluster_axes_collective(collective_axes)[-1]
 
   def _interpret_axis_index_p(self, eqn):
-    assert eqn.primitive is lax.axis_index_p
+    assert eqn.primitive in (lax.axis_index_p, gpu_primitives.fresh_axis_index_p)
     axis_name = eqn.params["axis_name"]
     if self.mesh is not None:
       if axis_name == self.mesh.thread_name:
@@ -1408,7 +1408,7 @@ class JaxprInterpreter:
         # jaxpr when this function is traced.
         deferred_invals = functools.partial(env.read_many, eqn.invars)
         match eqn.primitive:
-          case lax.axis_index_p:
+          case lax.axis_index_p | gpu_primitives.fresh_axis_index_p:
             out = self._interpret_axis_index_p(eqn)
           case primitives.program_id_p:
             # Currently we only support grids and clusters with a single device.
