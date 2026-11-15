@@ -948,6 +948,7 @@ def _name_lowering(ctx, x, *, name):
   # saves (`Compiled.peak_live`). A parameter has no defining op to carry them.
   del ctx
   op = x.owner
+  print('NAMERULE', type(x), type(op), op, flush=True)
   if op is None or isinstance(op, ir.Block):
     return [x]
   op = op.operation
@@ -958,6 +959,7 @@ def _name_lowering(ctx, x, *, name):
   names = (*ir.StringAttr(held).value.split(","), name) if held else (name,)
   attributes["checkpoint_name"] = ir.StringAttr.get(",".join(names))
   op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attributes)
+  print('NAMERULE AFTER', op, flush=True)
   return [x]
 
 mlir.register_lowering(name_p, _name_lowering)
