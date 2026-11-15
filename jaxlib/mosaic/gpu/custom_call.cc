@@ -2013,6 +2013,9 @@ XLA_FFI_DEFINE_HANDLER(
         .Attrs(),
     {ffi::Traits::kCmdBufferCompatible});
 
+// Its instantiate stage compiles the kernel into a cache that compiles
+// concurrently (`GetOrCreateKernel`), each compile in an MLIR context of its
+// own, so XLA instantiates a program's calls together.
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                          {
                              /*instantiate=*/kMosaicGPUInstantiate,
@@ -2020,7 +2023,8 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                              /*initialize=*/kMosaicGpuInitialize,
                              /*execute=*/kMosaicGpuExecute,
                              /*record=*/kMosaicGpuRecord,
-                         });
+                         },
+                         XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
 
 // Compiles `module` for `major`.`minor` with no device and writes its launch's
 // spec over `operands`, host buffers holding their contents before the launch
