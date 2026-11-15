@@ -1494,6 +1494,8 @@ def _commute_transform(
     t2'(t1'(aval)) == t1(t2(aval)).
   """
   match t1, t2:
+    case (gpu_core.PlainRef() as t1, t2):
+      return t1.commute(t2)
     case (
         (
             gpu_core.UntilingTransform()
@@ -1724,6 +1726,16 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
       ctx.module_ctx.lowering_semantics,
   )
 
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    # A ref that states no transforms is already plain under lane semantics.
+    kept = [
+        (t_aval, t)
+        for t_aval, t in zip(transform_avals, transforms)
+        if not isinstance(t, gpu_core.PlainRef)
+    ]
+    transform_avals = [t_aval for t_aval, _ in kept]
+    transforms = [t for _, t in kept]
+
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     # We only bubble up transforms here to verify that all the specified
     # transforms can be commuted correctly with the BlockSpec transforms.
@@ -1739,7 +1751,10 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
     spec_transforms = []
     num_block_spec_transforms = 0
     for t in transforms:
-      if isinstance(t, (gpu_core.UntilingTransform, gpu_core.UnswizzleRef)):
+      if isinstance(
+          t,
+          (gpu_core.UntilingTransform, gpu_core.UnswizzleRef, gpu_core.PlainRef),
+      ):
         spec_transforms = [t.undo(ref_aval)] + spec_transforms
         ref_aval = cast(state_types.AbstractRef, t.transform_type(ref_aval))
         num_block_spec_transforms += 1
@@ -1747,8 +1762,11 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
         break
     assert isinstance(ref, ir.Value)
     if spec_transforms:
+      # A plain ref states its transforms as none.
       transforms_attr = ir.ArrayAttr.get([
-          gpu_core.to_transform_attr(t) for t in spec_transforms
+          gpu_core.to_transform_attr(t)
+          for t in spec_transforms
+          if not isinstance(t, gpu_core.PlainTransform)
       ])
       ref = cast(
           T,
@@ -1756,7 +1774,13 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
       )
       transforms = transforms[num_block_spec_transforms:]
       transform_avals = transform_avals[num_block_spec_transforms:]
-      if any(isinstance(t, (gpu_core.UntilingTransform, gpu_core.UnswizzleRef)) for t in transforms):
+      if any(
+          isinstance(
+              t,
+              (gpu_core.UntilingTransform, gpu_core.UnswizzleRef, gpu_core.PlainRef),
+          )
+          for t in transforms
+      ):
         raise ValueError("Unexpected untiling or unswizzle transform found in "
                          f"remaining transforms: {transforms}.")
 

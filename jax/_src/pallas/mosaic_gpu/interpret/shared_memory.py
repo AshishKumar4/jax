@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # physical aval gives its logical one, and since every buffer is allocated at
 # that logical shape they are identities at every use site.
 LAYOUT_TRANSFORMS = (
+    mosaic_gpu_core.PlainRef,
     mosaic_gpu_core.UnswizzleRef,
     mosaic_gpu_core.UntilingTransform,
     # A TMEM ref of rank > 2 is stored as `(m, prod(batch) * n)` and carries
