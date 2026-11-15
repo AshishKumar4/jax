@@ -86,7 +86,8 @@ if [ -n "${DEW_PLUGIN_TESTS:-}" ]; then
       --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --test_output=all --keep_going \
       ${filter:+$([ "$filter" != "$test" ] && echo "--test_filter=$filter")} > "$log" 2>&1 || code=$?
     printf '%s\t%s\t%s\n' "$test" "$(( $(date +%s) - started ))" "$code" >> "$out/tests.tsv"
-    [ "$code" = 0 ] || { grep -E "error:|FAILED|NO STATUS" "$log" | head -60; red=$code; }
+    # grep -m, not grep | head: a head that closes its pipe early fails the pipeline under pipefail, and the job.
+    [ "$code" = 0 ] || { grep -m 60 -E "error:|FAILED|NO STATUS" "$log" || true; red=$code; }
   done
 fi
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
@@ -104,7 +105,7 @@ for python in $pythons; do
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
-    [ "$code" = 0 ] || { grep -E "error:|ERROR:" "$out/plugin-cp${python/./}-cuda$cuda.log" | head -60
+    [ "$code" = 0 ] || { grep -m 60 -E "error:|ERROR:" "$out/plugin-cp${python/./}-cuda$cuda.log" || true
                          echo "build_plugin: a build of $python, CUDA $cuda failed ($code)" >&2; exit "$code"; }
   done
 done
