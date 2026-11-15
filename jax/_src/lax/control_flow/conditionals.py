@@ -1136,12 +1136,19 @@ def _platform_branch_lowering(ctx, jaxpr, args):
       ctx.module_context, jaxpr, ctx.name_stack.extend('platform'), tokens_in,
       consts, *args, dim_var_values=ctx.dim_var_values,
       const_lowering=ctx.const_lowering, outer_traceback=ctx.traceback)
-  ctx.set_tokens_out(tokens_out)
+  # The conditional's ordered effects a dropped branch states pass their tokens
+  # through (`_cond_lowering`'s joined effects).
+  ctx.set_tokens_out(ctx.tokens_in.update_tokens(tokens_out))
   return [mlir.lower_with_sharding_in_types(ctx, o, aval)
           for o, aval in zip(out_vals, ctx.avals_out)]
 
 
 def _cond_lowering(ctx, index, *args, branches, **params):
+  # The tokens of every branch's ordered effects, the conditional's own: a
+  # branch the lowering platforms drop (a platform_dependent's CPU branch
+  # calling back to the host, lowered for a GPU) still states its effects in
+  # the conditional's, so the kept branches pass those tokens through.
+  joined_effects = core.join_effects(*(branch.effects for branch in branches))
   if (branches_platforms := params.get("branches_platforms", None)) is not None:
     branches_kept: list[core.Jaxpr] = []
     index_to_kept_index: dict[int, int] = {}
@@ -1178,7 +1185,6 @@ def _cond_lowering(ctx, index, *args, branches, **params):
     branches = branches_kept
     assert branches, "platform_index lowering should have failed first"
 
-  joined_effects = core.join_effects(*(branch.effects for branch in branches))
   ordered_effects = list(effects.ordered_effects.filter_in(joined_effects))
   num_tokens = len(ordered_effects)
   tokens_in = ctx.tokens_in.subset(ordered_effects)
