@@ -1324,7 +1324,35 @@ def as_slice_indices(arr: Any, idx: Index) -> tuple[
   return tuple(start_indices), tuple(limit_indices), tuple(removed_dims)
 
 
-def shard_device_array(x, devices, indices, sharding):
+def _copied_in_place(xs, devices, copy_semantics):
+  """`xs` as `batched_device_put` takes them, each single-device array already
+  on its target device copied there where `copy_semantics` asks a copy
+  (`ALWAYS_COPY`): that call wraps such an array's buffer in the result, which
+  would alias the source a `device_put(..., may_alias=False)` resharded."""
+  if copy_semantics != xc.ArrayCopySemantics.ALWAYS_COPY:
+    return xs
+  kept = [
+      i for i, (x, d) in enumerate(safe_zip(xs, devices))
+      if isinstance(x, ArrayImpl) and x.sharding.num_devices == 1
+      and x.devices() == {d}
+  ]
+  if not kept:
+    return xs
+  copies = xc.batched_copy_array_to_devices_with_sharding(
+      [xs[i] for i in kept],
+      [xs[i].sharding._internal_device_list.addressable_device_list
+       for i in kept],
+      [xs[i].sharding for i in kept],
+      [xc.ArrayCopySemantics.ALWAYS_COPY] * len(kept),
+  )
+  xs = list(xs)
+  for i, copy in safe_zip(kept, copies):
+    xs[i] = copy
+  return xs
+
+
+def shard_device_array(x, devices, indices, sharding,
+                       copy_semantics=xc.ArrayCopySemantics.REUSE_INPUT):
   if sharding.is_fully_replicated:
     shards = [x] * len(devices)
   else:
@@ -1346,10 +1374,13 @@ def shard_device_array(x, devices, indices, sharding):
     duplicate_shards = [idx_to_shard[idx] for idx in duplicate_indices]
     shards = merge_lists(is_duplicate, unique_shards, duplicate_shards)
   aval = core.shaped_abstractify(x)
+  shards = _copied_in_place(shards, devices, copy_semantics)
   return pxla.batched_device_put(aval, sharding, shards, devices)
 
 
-def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
+def shard_sharded_device_array_slow_path(
+    x, devices, indices, sharding,
+    copy_semantics=xc.ArrayCopySemantics.REUSE_INPUT):
   candidates = defaultdict(list)
   bufs = [buf.data for buf in x.addressable_shards]
   arr_indices = tuple(x.sharding.devices_indices_map(x.shape).values())
@@ -1361,8 +1392,7 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
     # Look up all buffers that contain the correct slice of the logical array.
     candidates_list = candidates[hashed_index(idx)]
     if not candidates_list:
-      return pxla.shard_args([sharding], [None],
-                             [xc.ArrayCopySemantics.REUSE_INPUT], [x._value],
+      return pxla.shard_args([sharding], [None], [copy_semantics], [x._value],
                              canonicalize=False)[0]
     # Try to find a candidate buffer already on the correct device,
     # otherwise copy one of them.
@@ -1372,6 +1402,7 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
         break
     else:
       bufs.append(candidates_list[-1])
+  bufs = _copied_in_place(bufs, devices, copy_semantics)
   return pxla.batched_device_put(x.aval, sharding, bufs, devices)
 
 
@@ -1428,10 +1459,12 @@ def _array_shard_arg(xs, shardings, layouts, copy_semantics):
       else:
         indices = sharding.addressable_devices_indices_map(x.shape).values()
         if x.sharding.num_devices == 1:
-          results.append(shard_device_array(x, devices, indices, sharding))
+          results.append(
+              shard_device_array(x, devices, indices, sharding, cs))
         else:
           results.append(
-              shard_sharded_device_array_slow_path(x, devices, indices, sharding))
+              shard_sharded_device_array_slow_path(
+                  x, devices, indices, sharding, cs))
 
   util.test_event("batched_copy_array")
   copy_outs = xc.batched_copy_array_to_devices_with_sharding(

@@ -522,6 +522,26 @@ class JitTest(jtu.BufferDonationTestCase):
                          may_alias=False, donate=False)
     self.assertNotEqual(id(arr), id(out))
 
+  def test_device_put_without_aliasing_copies_a_resharded_source(self):
+    # A replicated array placed on one of its devices, and a one-device array
+    # replicated over two, under may_alias=False: the result holds buffers of
+    # its own, so deleting the source leaves it whole (the resharding paths
+    # picked the source's buffer on the target device and wrapped it).
+    if jax.device_count() < 2:
+      raise unittest.SkipTest("Test requires >= 2 devices")
+    devices = jax.devices()[:2]
+    mesh = jax.sharding.Mesh(np.array(devices), ("x",))
+    replicated = jax.sharding.NamedSharding(mesh, P())
+    one = jax.sharding.SingleDeviceSharding(devices[0])
+    for source, target in ((replicated, one), (one, replicated)):
+      x = jax.device_put(np.arange(8.0), source)
+      y = jax.device_put(x, target, may_alias=False, donate=False)
+      held = {s.data.unsafe_buffer_pointer() for s in x.addressable_shards}
+      made = {s.data.unsafe_buffer_pointer() for s in y.addressable_shards}
+      self.assertFalse(held & made)
+      x.delete()
+      np.testing.assert_array_equal(np.asarray(y), np.arange(8.0))
+
   def test_device_put_aliasing_with_diff_compatible_sharding(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices")
