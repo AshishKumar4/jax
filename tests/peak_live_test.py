@@ -50,26 +50,34 @@ class PeakLiveTest(jtu.JaxTestCase):
                          compiled.memory_analysis().temp_size_in_bytes)
 
   @jtu.run_on_devices("cuda")
-  def test_a_compile_stopped_after_buffer_assignment_states_the_whole_compiles_peak(self):
-    # For a compile-only GPU of the attached one's kind: the compile that stops
-    # after buffer assignment, emitting no code, states the memory and the
-    # buffers live at its peak as the whole compile does.
-    target_config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
+  def test_a_probe_on_the_devices_twin_states_the_devices_own_compile(self):
+    # The probe: a compile for a compile-only twin of the attached device,
+    # its target config the device's own (its memory size, cores, clocks and
+    # library versions, as XLA reads them), so jax compiles it through the
+    # device's client (`_get_cross_compile_backend`), whose executor autotunes
+    # as the device's own compile does, stopping after buffer assignment. It
+    # states the memory and the buffers live at its peak as the device's own
+    # whole compile of the program does.
+    devices = jax.devices()[:1]
     topology = topologies.get_topology_desc(
-        platform="cuda", target_config=target_config, topology="1x1x1")
-    mesh = topologies.make_mesh(topology, (1,), ("x",))
-    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32,
-                                sharding=jax.sharding.NamedSharding(mesh, P()))
-    lowered = jax.jit(_step).lower(tile, tile)
-    whole = lowered.compile()
-    stopped = lowered.compile({
-        "xla_gpu_experimental_early_exit":
-            "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
-    self.assertEqual(stopped.memory_analysis().temp_size_in_bytes,
+        platform="cuda",
+        target_config=xc.get_topology_for_devices(devices).target_config,
+        topology="1x1x1")
+    twin = jax.sharding.NamedSharding(
+        topologies.make_mesh(topology, (1,), ("x",)), P())
+    probe = jax.jit(_step).lower(
+        *[jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=twin)] * 2
+    ).compile({"xla_gpu_experimental_early_exit":
+               "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
+    attached = jax.sharding.NamedSharding(
+        jax.sharding.Mesh(devices, ("x",)), P())
+    whole = jax.jit(_step).lower(
+        *[jax.ShapeDtypeStruct((256, 256), jnp.float32, sharding=attached)] * 2
+    ).compile()
+    self.assertEqual(probe.memory_analysis().temp_size_in_bytes,
                      whole.memory_analysis().temp_size_in_bytes)
     self.assertIsNotNone(whole.peak_live())
-    self.assertEqual(stopped.peak_live(), whole.peak_live())
-
+    self.assertEqual(probe.peak_live(), whole.peak_live())
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
