@@ -42,6 +42,9 @@ archive_override(
         # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
         # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+        # A bitcast commuted across a layout-changing copy in GEMM fusion drops the copy's permutation, so a
+        # Triton GEMM fusion reads its operand permuted (Dew ledger 5275; upstream a22dec8093, PR #51630).
+        "//third_party:xla/gemm_fusion_bitcast_layouts.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
