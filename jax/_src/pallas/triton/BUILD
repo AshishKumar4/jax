@@ -91,6 +91,7 @@ pytype_strict_library(
         ":gpu_info",
         ":lowering",
         "//jax/_src:core",
+        "//jax/_src:custom_call_targets",
         "//jax/_src:deprecations",
         "//jax/_src:frozen_dict",
         "//jax/_src:mlir",

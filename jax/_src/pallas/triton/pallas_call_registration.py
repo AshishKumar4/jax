@@ -21,6 +21,7 @@ import json
 from typing import Final
 
 from jax._src import core as jax_core
+from jax._src import custom_call_targets
 from jax._src import deprecations
 from jax._src import frozen_dict
 from jax._src.interpreters import mlir
@@ -31,7 +32,7 @@ from jax._src.pallas.triton import gpu_info as gpu_info_lib
 from jax._src.pallas.triton import lowering
 
 
-CUSTOM_CALL_TARGET_NAME: Final = "__gpu$xla.gpu.triton"
+CUSTOM_CALL_TARGET_NAME: Final = custom_call_targets.TRITON
 
 
 def normalize_grid(grid: pallas_core.StaticGrid) -> tuple[int, int, int]:
@@ -156,7 +157,7 @@ def pallas_call_lowering(
         serialized_metadata
     )
   return mlir.custom_call(
-      call_target_name="__gpu$xla.gpu.triton",
+      call_target_name=CUSTOM_CALL_TARGET_NAME,
       result_types=out_types,
       operands=in_nodes,
       backend_config=backend_config,
