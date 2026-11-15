@@ -49,10 +49,15 @@ archive_override(
         # A compile with no device and cuDNN's deviceless compilation off fails at a cuDNN call, rather than
         # returning an executable whose cuDNN thunk finds no serialized graph at load (upstream ecc9e27f91).
         "//third_party:xla/cudnn_uncompiled_fails.patch",
-        # A compile with no device fails at a cuDNN convolution none of its configs chose an algorithm for,
-        # rather than giving it the default's engine -1, which fails its first run with CUDNN_STATUS_BAD_PARAM
-        # (Dew's FS-DEVICELESS-CASES-h100).
-        "//third_party:xla/cudnn_conv_deviceless_fails.patch",
+        # A cuDNN convolution compiled with no algorithm (the autotuner's default, -1, which a compile with
+        # no device keeps) runs the first engine cuDNN's heuristics give it that needs no workspace, as none
+        # is allocated it, where engine -1 failed its first run with CUDNN_STATUS_BAD_PARAM (Dew's
+        # FS-DEVICELESS-AUTO-gh200).
+        "//third_party:xla/cudnn_conv_default_engine.patch",
+        # A deviceless compile's cuDNN device description states the global memory bus width, which cuDNN
+        # 9.27 requires of one ("!json_object.HasMember(key)" without it: every cuDNN graph compiled with no
+        # device failed, Dew's FS-CUDNNPROPS-gh200).
+        "//third_party:xla/cudnn_device_props_memory_bus_width.patch",
         # A cuDNN call the custom call compiler fingerprints as one it compiled takes that one's backend config
         # too, which the compile set (a backward's force_deterministic under deterministic ops): otherwise its
         # thunk's fingerprint names no serialized graph (Dew ledger 5322).
