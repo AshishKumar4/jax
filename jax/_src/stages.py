@@ -30,7 +30,7 @@ executable protocols described above.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 from dataclasses import dataclass
 import enum
@@ -39,6 +39,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from jax._src import config
 from jax._src import core
+from jax._src import hlo_reader
 from jax._src import peak_live
 from jax._src import sharding as sharding_lib
 from jax._src import source_info_util
@@ -829,7 +830,33 @@ class Compiled(Stage):
       return None
     module, = self.runtime_executable().hlo_modules()
     return peak_live.live(analysis.serialized_buffer_assignment_proto,
-                          module.as_serialized_hlo_module_proto())
+                          module.as_serialized_hlo_module_proto(),
+                          self._parameter_arguments())
+
+  def _parameter_arguments(self) -> Callable[[int], int | None]:
+    """The flat index among the call's arguments (``args_info``'s leaves) of
+    the compiled module's entry parameter numbered as given, None for one that
+    is no argument: a constant the computation closes over (a const arg), an
+    effect's token, a mutable array's state. Its entry parameters are the
+    tokens of its ordered effects, then the arguments it keeps (its const
+    args first), then its mutable arrays'."""
+    executable = self._executable
+    kept = sorted(getattr(executable, "_kept_var_idx", ()))
+    consts = len(self._params.const_args)
+    module, = self.runtime_executable().hlo_modules()
+    entry = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module.as_serialized_hlo_module_proto())
+    computation, = (computation for computation in entry.computations
+                    if computation.id == entry.entry_computation_id)
+    count = sum(instruction.opcode == "parameter"
+                for instruction in computation.instructions)
+    mutable = getattr(executable, "_mut", None)
+    after = 0 if mutable is None else len(mutable.in_mut)
+    front = count - len(kept) - after
+    arguments = [*(None,) * front,
+                 *(None if index < consts else index - consts for index in kept),
+                 *(None,) * after]
+    return lambda number: arguments[number] if 0 <= number < len(arguments) else None
 
   @property
   def in_avals(self):
