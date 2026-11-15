@@ -42,6 +42,7 @@ from jax._src.util import unzip2, split_list
 from jax import checkpoint_policies
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
+from jax.experimental import io_callback
 from jax._src import dispatch
 from jax._src.lax import control_flow as lax_control_flow
 from jax._src.interpreters import batching
@@ -2944,6 +2945,86 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     else:
       self.assertNotIn("stablehlo.sine", stablehlo)
       self.assertIn("stablehlo.cosine", stablehlo)
+
+  def test_platform_dependent_lowers_to_its_branch_without_a_conditional(self):
+    # A lowering whose platforms keep one branch lowers that branch alone: no
+    # conditional computes its index at run time, in the function, its
+    # gradient (AD's cotangent conditional) or its batching, where XLA keeps a
+    # conditional around a branch that holds collectives.
+    def f(x):
+      return lax.platform_dependent(x, cpu=jnp.sin, default=jnp.cos)
+
+    x = np.arange(3, dtype=np.float32)
+    for g, arg in ((f, x), (jax.grad(lambda x: f(x).sum()), x),
+                   (jax.vmap(f), x), (jax.grad(lambda y: f(y)), 1.)):
+      stablehlo = jax.jit(g).lower(arg).as_text()
+      self.assertNotIn("stablehlo.case", stablehlo)
+    self.assertAllClose(
+      jax.grad(lambda x: f(x).sum())(x),
+      np.cos(x) if jtu.device_under_test() == "cpu" else -np.sin(x))
+
+  def test_platform_dependent_kept_branch_threads_ordered_effects(self):
+    # The kept branch's ordered effect takes the token of the effect before
+    # the conditional and hands its own to the one after, as a conditional's
+    # branch does.
+    log = []
+
+    def mark(tag):
+      io_callback(lambda: log.append(tag), None, ordered=True)
+
+    def branch(tag, fun):
+      def kept(x):
+        mark(tag)
+        return fun(x)
+      return kept
+
+    def f(x):
+      mark("before")
+      y = lax.platform_dependent(x, cpu=branch("cpu", jnp.sin),
+                                 default=branch("default", jnp.cos))
+      mark("after")
+      return y
+
+    x = np.float32(1.)
+    self.assertNotIn("stablehlo.case", jax.jit(f).lower(x).as_text())
+    jax.jit(f)(x)
+    jax.effects_barrier()
+    kept = "cpu" if jtu.device_under_test() == "cpu" else "default"
+    self.assertEqual(log, ["before", kept, "after"])
+
+  def test_platform_dependent_kept_branch_reads_its_hoisted_constants(self):
+    # A custom JVP that captures an array brings it into the kept branch of
+    # the conditional AD makes. The lowering hoists the array, as an argument
+    # or as one constant, and the kept branch reads it, as a conditional's
+    # branch does, rather than embedding the array a second time.
+    c = jnp.arange(3, dtype=np.float32)
+
+    @jax.custom_jvp
+    def square(x):
+      return x * x
+
+    @square.defjvp
+    def square_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      return square(x), c * t
+
+    def f(x, t):
+      return jax.jvp(
+          lambda x: lax.platform_dependent(x, cpu=square, default=jnp.cos),
+          (x,), (t,))
+
+    x = np.ones(3, dtype=np.float32)
+    with (config.use_simplified_jaxpr_constants(True),
+          config.embedded_constants_max_bytes(0)):
+      text = jax.jit(f).lower(x, x).as_text()
+      self.assertNotIn("stablehlo.case", text)
+      hoisted = mlir.LoweringParameters().hoist_constants_as_args
+      self.assertEqual(
+          text.count("dense<[0.000000e+00, 1.000000e+00, 2.000000e+00]>"),
+          0 if hoisted else 1)
+      if jtu.device_under_test() == "cpu":
+        self.assertArraysEqual(jax.jit(f)(x, x)[1], c * x)
 
   def test_platform_dependent_with_non_existent_custom_call(self):
     if not jtu.test_device_matches(["cpu"]):
