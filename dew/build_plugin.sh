@@ -28,8 +28,13 @@ ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
 here=$(cd "$(dirname "$0")" && pwd)
 token_file=${DEW_BAZEL_TOKEN_FILE:-$here/bazel.token}
 cache=${DEW_BAZEL_CACHE:-https://dew-bazel.ashishkmr472.workers.dev/bazel}
-tree=$(mktemp -d /tmp/dew-plugin-XXXX)
-trap 'rm -rf "$tree"' EXIT
+# DEW_PLUGIN_TREE names the build's tree, where a later build on the same node reuses the earlier's Bazel output base
+# (keyed by the tree's path) and so rebuilds only the targets its change reaches (post99 on post98, 2026-11-15);
+# by default a tree of its own. Its checkout is made afresh either way.
+tree=${DEW_PLUGIN_TREE:-$(mktemp -d /tmp/dew-plugin-XXXX)}
+mkdir -p "$tree"
+rm -rf "$tree/jax"
+trap 'rm -rf "$tree/jax" "$tree/token" "$tree/credentials"' EXIT
 # Where the token is the secret DEW_BAZEL_TOKEN in the environment, it is kept in a file of the build's own for the
 # credential helper; a file named explicitly wins.
 if [ -z "${DEW_BAZEL_TOKEN_FILE:-}" ] && [ -n "${DEW_BAZEL_TOKEN:-}" ]; then
@@ -55,11 +60,14 @@ printf '#!/bin/sh\nexec python3 %q %q "$@"\n' "$here/bazel_credentials.py" "$(re
 chmod 700 "$helper"
 host=${cache#https://}
 host=${host%%/*}
-# Read by JAX's .bazelrc (try-import .bazelrc.user), after its own configs. DEW_BAZEL_CACHE=off builds cold, neither
-# reading nor writing the remote cache (row 6204's containment, until its token is rotated).
+# Read by JAX's .bazelrc (try-import .bazelrc.user), after its own configs. DEW_BAZEL_CACHE=off reads and writes no
+# remote cache (row 6204's containment, until its token is rotated); the node's own disk cache (DEW_BAZEL_DISK_CACHE)
+# serves either way, needing no token: an action's output is reused only for its exact inputs and command, as the
+# remote cache's are, so a second build on the node rebuilds only what its change reaches.
+printf 'common --disk_cache=%s\n' "${DEW_BAZEL_DISK_CACHE:-$HOME/.cache/dew-bazel-disk}" > .bazelrc.user
 [ "${DEW_BAZEL_CACHE:-}" = off ] || \
   printf 'common --remote_cache=%s\ncommon --credential_helper=%s=%s\ncommon --remote_upload_local_results=true\n' \
-    "$cache" "$host" "$helper" > .bazelrc.user
+    "$cache" "$host" "$helper" >> .bazelrc.user
 # DEW_PLUGIN_TESTS: Bazel test targets run in the same tree before the builds (a red one fails the job before hours
 # of builds), with the first CUDA's config, each `target` or `target=FILTER` (its cases alone, --test_filter); each
 # target's log and Bazel's exit in OUT/tests.tsv (0 passed, 3 a test failed), a red the job's failure.
