@@ -159,9 +159,16 @@ def normalize(result):
 # -- kernels
 
 def load_kernels(case):
-  """The kernels' file, copied to the work directory with `pad` lines above it."""
+  """The kernels' file, copied to the work directory with `pad` lines above it.
+
+  Processes that lower together share the work directory and the file: each
+  writes its copy whole beside it and renames it into place, so none reads a
+  copy another is still writing.
+  """
   path = pathlib.Path(case["workdir"]) / f"kernels_{case['pad']}.py"
-  path.write_text("\n" * case["pad"] + (_SUPPORT / "kernels.py").read_text())
+  written = path.with_name(f"{path.name}.{os.getpid()}")
+  written.write_text("\n" * case["pad"] + (_SUPPORT / "kernels.py").read_text())
+  os.replace(written, path)
   spec = importlib.util.spec_from_file_location(path.stem, path)
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
