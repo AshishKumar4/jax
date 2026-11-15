@@ -30,6 +30,7 @@ from jax._src import custom_derivatives
 from jax._src import dtypes
 from jax._src import effects
 from jax._src import lax
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import linear_util as lu
 from jax._src import mesh as mesh_lib
 from jax._src import numpy as jnp
@@ -351,6 +352,33 @@ def _record_num_codes(f, store, *invals):
   store.store(num_codes)
   return error, out
 
+def call_primitive_error_check(primitive: core.Primitive, ctx: CheckifyContext,
+                               error: Error, enabled_errors, *vals_in,
+                               call_jaxpr, **params):
+  """A call primitive's checks (one `create_call_primitive` makes), made within
+  its body: the body takes and returns the error values, and the call stays a
+  call of `primitive`, so the checked program keeps the span a library marks with
+  it, where inlining the body (`eval_jaxpr_error_check`, eval_jaxpr_p's) would
+  lose it. `default_checkify_rule`'s path for a `call_jaxpr` binds a final-style
+  call, which these primitives are not: their impl reads `call_jaxpr`."""
+  err_vals, err_tree = jtu.tree_flatten(error)
+  new_vals_in = [*err_vals, *vals_in]
+  in_avals = tuple(map(core.typeof, new_vals_in))
+  checked_jaxpr, out_tree, _ = jaxpr_to_checkify_jaxpr(
+      ctx, call_jaxpr, enabled_errors, err_tree, *in_avals)
+  err_and_out = primitive.bind(*new_vals_in, call_jaxpr=checked_jaxpr, **params)
+  return tree_unflatten(out_tree, err_and_out)
+
+
+def _unregistered_rule(primitive: core.Primitive) -> ErrorCheckRule:
+  """The rule of a primitive `error_checks` names none for: a call primitive's
+  (`eval_jaxpr.call_primitives`, `call_primitive_error_check`), else
+  `default_checkify_rule`."""
+  if primitive in eval_jaxpr_lib.call_primitives:
+    return functools.partial(call_primitive_error_check, primitive)
+  return functools.partial(default_checkify_rule, primitive)
+
+
 def default_checkify_rule(primitive: core.Primitive, ctx: CheckifyContext,
                           error: Error, enabled_errors, *invals: core.Value,
                           **params: Any) -> tuple[Error, Sequence[core.Value]]:
@@ -420,8 +448,7 @@ def checkify_jaxpr_flat(ctx: CheckifyContext, jaxpr: core.Jaxpr,
   # interpreter loop
   for eqn in jaxpr.eqns:
     invals = map(read_env, eqn.invars)
-    checkify_rule = error_checks.get(
-        eqn.primitive, functools.partial(default_checkify_rule, eqn.primitive))
+    checkify_rule = error_checks.get(eqn.primitive) or _unregistered_rule(eqn.primitive)
     name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
     with (source_info_util.user_context(eqn.source_info.traceback,
                                         name_stack=name_stack),
