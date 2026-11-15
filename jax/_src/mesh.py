@@ -448,13 +448,18 @@ class AbstractDevice:
   device_kind: str
   num_cores: int | None
   platform: str
+  # A GPU's compute capability (e.g. "8.0"): the architecture that lowering for
+  # this device targets where no such device is attached (Mosaic GPU's).
+  compute_capability: str | None = None
 
   def __repr__(self):
     return (f"AbstractDevice({self._repr()})")
 
   def _repr(self):
+    capability = ("" if self.compute_capability is None
+                  else f", compute_capability={self.compute_capability}")
     return (f"device_kind={self.device_kind}, num_cores={self.num_cores}, "
-            f"platform={self.platform}")
+            f"platform={self.platform}{capability}")
 
 
 def abstract_device_from(d) -> AbstractDevice | None:
