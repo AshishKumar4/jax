@@ -13,7 +13,8 @@ INDEX = Path(__file__).with_name("index.sh")
 
 AWS = r"""#!/usr/bin/env python3
 # aws s3api head-object|put-object|delete-object|list-objects-v2 --bucket B ..., aws s3 cp s3://B/K DEST: a
-# directory per bucket, each key a file named by the key quoted whole (R2's keys `simple/` and `simple/index.html` are two objects); every
+# directory per bucket, each key a file named by the key quoted whole (R2's keys `simple/` and
+# `simple/index.html` are two objects); every
 # put and delete named in order in $STORE.puts; a missing key answers as R2 does, (404).
 import os, shutil, sys
 from pathlib import Path
@@ -39,7 +40,7 @@ if args[:2] == ["s3api", "put-object"]:
 if args[:2] == ["s3api", "delete-object"]:
     path(option("--bucket"), option("--key")).unlink(missing_ok=True)
     with open(f"{store}.puts", "a") as puts:
-        puts.write("delete " + option("--key") + "\\n")
+        puts.write("delete " + option("--key") + "\n")
     sys.exit(0)
 if args[:2] == ["s3api", "list-objects-v2"]:
     prefix, keys = option("--prefix"), [unquote(found.name) for found in (store / option("--bucket")).glob("*")]
