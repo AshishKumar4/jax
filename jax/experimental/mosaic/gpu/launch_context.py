@@ -1713,9 +1713,9 @@ class LaunchContext:
 
     if implementation == AsyncCopyImplementation.TMA:
       gmem_transform, smem_ref = self._untile_partial(
-          gmem_ref, gmem_slice, gmem_transform, smem_ref
+          untransformed_gmem_ref, gmem_slice, gmem_transform, smem_ref
       )
-      if gmem_ref is src_ref:
+      if untransformed_gmem_ref is src_ref:
         dst_ref = smem_ref
       else:
         src_ref = smem_ref
