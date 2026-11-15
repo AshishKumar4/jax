@@ -39,6 +39,7 @@ from jax._src.interpreters.remat import remat_transform, reduce_precision as rem
 from jax._src.hijax import HiPrim, call_hi_primitive_p, Static
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import convolution as lax_convolution
+from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.state import discharge
 from jax._src.state.types import AbstractRef
@@ -940,7 +941,26 @@ def name_jvp(primals, tangents, *, name):
   return name_p.bind(x, name=name), xdot  # don't name the tangent value
 ad.primitive_jvps[name_p] = name_jvp
 
-mlir.register_lowering(name_p, lambda ctx, x, *, name: [x])
+def _name_lowering(ctx, x, *, name):
+  # The value's defining op carries its names (frontend attribute
+  # `checkpoint_name`, comma-separated), which XLA keeps on the instruction
+  # defining its buffer: a compile's live buffers name the residuals a policy
+  # saves (`Compiled.peak_live`). A parameter has no defining op to carry them.
+  del ctx
+  op = x.owner
+  if op is None or isinstance(op, ir.Block):
+    return [x]
+  op = op.operation
+  attributes = (
+      {a.name: a.attr for a in ir.DictAttr(op.attributes["mhlo.frontend_attributes"])}
+      if "mhlo.frontend_attributes" in op.attributes else {})
+  held = attributes.get("checkpoint_name")
+  names = (*ir.StringAttr(held).value.split(","), name) if held else (name,)
+  attributes["checkpoint_name"] = ir.StringAttr.get(",".join(names))
+  op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attributes)
+  return [x]
+
+mlir.register_lowering(name_p, _name_lowering)
 
 def name_batcher(args, dims, *, name):
   (x,), (d,) = args, dims
