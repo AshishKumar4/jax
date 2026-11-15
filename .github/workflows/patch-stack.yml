@@ -380,13 +380,18 @@ jobs:
           # jax (its wheels, or only the files `yank` names), then each native project, every one through
           # dew/index.sh, which reads each wheel's name and metadata and runs nothing of it.
           shopt -s nullglob
-          PACKAGE=jax bash dew/dew/index.sh site incoming/dist/*.whl
-          export YANK=
-          wheels=(incoming/native/jaxlib-*.whl)
-          [ ${#wheels[@]} -eq 0 ] || bash dew/dew/index.sh site "${wheels[@]}"
-          for cuda in $CUDAS; do
-            for project in pjrt plugin; do
-              wheels=(incoming/native/jax_cuda"$cuda"_"$project"-*.whl)
-              [ ${#wheels[@]} -eq 0 ] || bash dew/dew/index.sh site "${wheels[@]}"
-            done
+          # Each project yanks the files of `yank` that are its own (a wheel's name starts with its project's,
+          # dashes as underscores): a yank reaches jaxlib and the CUDA plugins as it does jax (2026-11-15: a jaxlib
+          # that crashed CPU processes could not be yanked, `yank` reached jax alone).
+          asked=$YANK
+          own() { local prefix=${1//-/_}- name; for name in $asked; do [[ $name == "$prefix"[0-9]* ]] && printf '%s ' "$name"; done; }
+          YANK=$(own jax) PACKAGE=jax bash dew/dew/index.sh site incoming/dist/*.whl
+          for project in jaxlib $(for cuda in $CUDAS; do printf 'jax-cuda%s-pjrt jax-cuda%s-plugin ' "$cuda" "$cuda"; done); do
+            wheels=(incoming/native/"${project//-/_}"-*.whl)
+            yanked=$(own "$project")
+            if [ ${#wheels[@]} -gt 0 ]; then
+              YANK=$yanked bash dew/dew/index.sh site "${wheels[@]}"
+            elif [ -n "$yanked" ]; then
+              YANK=$yanked PACKAGE=$project bash dew/dew/index.sh site
+            fi
           done
