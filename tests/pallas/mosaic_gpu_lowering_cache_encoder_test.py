@@ -39,6 +39,40 @@ class EncoderTest(harness.LoweringCacheTestCase):
         self.assertEqual(result["outcomes"][name], expected)
 
 
+class JaxprEncodedOnceTest(absltest.TestCase):
+
+  def test_a_jaxpr_met_before_is_read_and_keys_on_alike(self):
+    # A kernel's jaxpr met again (a held trace a caller lowers in each program
+    # calling it) takes its encoding without walking its equations, and the
+    # key's later parts encode on from the same state either way.
+    import jax
+    import jax.numpy as jnp
+    from jax._src.pallas.mosaic_gpu import lowering_cache
+    from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as encoding
+
+    jaxpr = jax.make_jaxpr(lambda x: jnp.sin(x) * 2 + 1)(jnp.ones((8,), jnp.float32)).jaxpr
+    walked = []
+    walk = encoding.Encoder._jaxpr
+
+    def counted(self, *args, **kwargs):
+      walked.append(args)
+      return walk(self, *args, **kwargs)
+
+    encoding.Encoder._jaxpr = counted
+    try:
+      first_encoder, first = lowering_cache._jaxpr_encoded(jaxpr)
+      met = len(walked)
+      second_encoder, second = lowering_cache._jaxpr_encoded(jaxpr)
+    finally:
+      encoding.Encoder._jaxpr = walk
+    self.assertGreater(met, 0)
+    self.assertLen(walked, met)
+    self.assertEqual(first, second)
+    later = (jax.typeof(jnp.ones((8,), jnp.float32)),)
+    self.assertEqual(first_encoder.encode(later), second_encoder.encode(later))
+    self.assertEqual(first_encoder.primitives, second_encoder.primitives)
+
+
 class ConstantNamesTest(absltest.TestCase):
   """Which names of a module's source are constants (an analysis of the source)."""
 
