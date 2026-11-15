@@ -107,6 +107,18 @@ class CacheKeyTest(jtu.JaxTestCase):
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
 
+  @jtu.run_on_devices("cuda")
+  def test_a_compile_only_gpu_client_keys_the_platform_its_live_client_does(self):
+    # A host compiling ahead over its own GPUs' topology writes the entries a
+    # live run there reads.
+    live = xla_bridge.get_backend()
+    topology = xla_client.get_topology_for_devices(jax.devices()[:1])
+    compile_only = topology._make_compile_only_devices()[0].client
+    self.assertEqual(
+        self.get_hashed_value(cache_key._hash_platform, compile_only),
+        self.get_hashed_value(cache_key._hash_platform, live),
+    )
+
   @jtu.thread_unsafe_test()  # patches cache_key.host_cpu for the process
   def test_a_cpu_program_s_key_names_its_host_s_cpu(self):
     # XLA:CPU compiles for the features of the host that compiles, so a CPU
