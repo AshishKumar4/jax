@@ -2034,10 +2034,19 @@ def explain(keys, fun, in_avals, debug_info, *context, **_):
   p(f"  for {func_name}{src_info}")
 
   key = (config.trace_context(), (in_avals, debug_info, *context), {})
-  min_diff = min(diff_tracing_cache_keys(key, k) for k in keys)[-1]
+  min_diff = min(diff_tracing_cache_keys(key, _positional(k)) for k in keys)[-1]
   p('  all previously seen cache keys differ. For the closest previous key:')
   p('  ' + min_diff)
   return logger.log(logging.WARNING, "\n".join(msg))
+
+def _positional(key):
+  """A tracing cache key with its `debug_info` among its positional arguments,
+  as `explain` builds the new key, where the call passed it by keyword."""
+  ctx, args, kwargs = key
+  named = dict(kwargs)
+  if len(args) < 2 and "debug_info" in named:
+    args = (*args, named.pop("debug_info"))
+  return ctx, args, named
 
 def diff_tracing_cache_keys(new_key, old_key) -> tuple[int, int, str]:
   """Explain the diff between two tracing cache keys.
@@ -2045,8 +2054,8 @@ def diff_tracing_cache_keys(new_key, old_key) -> tuple[int, int, str]:
     A tuple of (severity, num_diffs, explanation) for the diff between the two
     keys. Severity is an int, where lower is better.
   """
-  new_ctx, (new_tree, new_dbg, *_), () = new_key
-  old_ctx, (old_tree, old_dbg, *_), () = old_key
+  new_ctx, (new_tree, new_dbg, *_), _ = new_key
+  old_ctx, (old_tree, old_dbg, *_), _ = old_key
   return (diff_tracing_ctx(new_ctx, old_ctx) or
           diff_trees(new_tree.tree, old_tree.tree) or
           diff_debug(new_dbg, old_dbg) or
