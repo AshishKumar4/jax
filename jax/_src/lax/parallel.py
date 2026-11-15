@@ -790,8 +790,10 @@ def ragged_all_to_all(
       an axis of size 4, [[0, 1], [2, 3]] would run ragged all to all over the
       first two and last two replicas). Groups must cover all axis indices
       exactly once, and all groups must be the same size. Otherwise, the
-      behavior is undefined. With groups, the ``all_to_all`` expressions in
-      this docstring also take ``axis_index_groups``.
+      behavior is undefined. With groups, the length of the offset and size
+      arrays must be divisible by the group size rather than the axis size,
+      and the ``all_to_all`` expressions in this docstring also take
+      ``axis_index_groups``.
 
   Returns:
     Array of shape (M, A, B, ...) with the same value as the ``output`` except
