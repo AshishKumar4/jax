@@ -464,6 +464,24 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       y = kernel(x)
     np.testing.assert_allclose(y, lax.sqrt(x), rtol=1e-5)
 
+  @parameterized.parameters(1, 3)
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_min_blocks_per_sm(self, min_blocks_per_sm):
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            min_blocks_per_sm=min_blocks_per_sm
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.0
+
+    x = jnp.arange(256).astype(jnp.float32)
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
+      y = jax.block_until_ready(kernel(x))
+    self.assertIn(f".minnctapersm {min_blocks_per_sm}", out())
+    np.testing.assert_array_equal(y, x + 1.0)
+
   @parameterized.product(
       approx_math=(False, True),
       dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
