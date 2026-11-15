@@ -26,9 +26,10 @@ _version = "0.12.0.1"
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
 # Dew's post-release of 0.12.0.1: the patch families it carries, one commit each
-# (AshishKumar4/jax), over the release; it installs beside jaxlib 0.12.0.1 and
+# (AshishKumar4/jax), over the release; it installs beside its own jaxlib (0.12.0.1.post98 on
+# Linux x86_64 and aarch64, stock 0.12.0.1 elsewhere) and
 # satisfies jax>=0.12.0.1.
-_release_version: str | None = "0.12.0.1.post97"
+_release_version: str | None = "0.12.0.1.post98"
 
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
