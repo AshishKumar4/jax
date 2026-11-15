@@ -92,6 +92,10 @@ archive_override(
         # states its memory and buffer assignment and refuses to run; within the limit it finishes. A start
         # compiles its step once whether it fits or not.
         "//third_party:xla/memory_limit_early_exit.patch",
+        # YNNPACK's unary kernels read an input of any innermost stride as given, a broadcast's stride zero among
+        # them, gathering it into a buffer of the call's own: a bf16 convert of a broadcast scalar read past it
+        # (row 5495), where writing the stride on the shared input crashed (row 6829).
+        "//third_party:xla/ynn_unary_strided.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
