@@ -6548,6 +6548,37 @@ class PallasCallSm90ATest(PallasSm90ATest):
         res, jnp.matmul(a, b, precision="high"), rtol=1e-3
     )
 
+  def test_wgmma_accumulator_negated_and_signed(self):
+    # A sign op on the accumulator's registers is a float instruction: as an
+    # integer op (`fneg`'s expansion into a sign-bit xor) ptxas 12.9 folded it
+    # through the accumulator's value before the MMA, storing -0.0.
+    def kernel(a_ref, b_ref, o_ref, s_ref):
+      def scope(acc_ref):
+        plgpu.wgmma(acc_ref, a_ref, b_ref)
+        return acc_ref[...]
+      acc = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+      plgpu.store(o_ref, -acc, optimized=False)
+      # sign's lowering takes copysign(1, acc) where acc is nonzero.
+      plgpu.store(s_ref, jnp.sign(acc), optimized=False)
+
+    key1, key2 = jax.random.split(jax.random.key(7), 2)
+    a = jax.random.randint(key1, (64, 128), -2, 3).astype(jnp.bfloat16)
+    b = jax.random.randint(key2, (128, 128), -2, 3).astype(jnp.bfloat16)
+
+    transforms = self.default_transforms(dtype=jnp.bfloat16)
+    out = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    negated, signed = self.pallas_call(
+        kernel,
+        in_specs=[
+            plgpu.BlockSpec(transforms=transforms),
+            plgpu.BlockSpec(transforms=transforms),
+        ],
+        out_shape=(out, out),
+    )(a, b)
+    product = jnp.matmul(a, b, preferred_element_type=jnp.float32)
+    np.testing.assert_array_equal(negated, -product)
+    np.testing.assert_array_equal(signed, jnp.sign(product))
+
   @parameterized.parameters(jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2)
   def test_wgmma_registers_8bit(self, input_dtype):
     if jnp.issubdtype(input_dtype, jnp.integer):
