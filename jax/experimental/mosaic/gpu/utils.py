@@ -1182,9 +1182,14 @@ def warpgroup_barrier_idx(sync: bool = True) -> ir.Value[ir.IntegerType]:
   return arith.addi(warpgroup_idx(sync=sync), c(1, i32))
 
 
+WARPGROUP_BARRIER_PTX = f"bar.sync $0, {WARPGROUP_SIZE};"
+"""The inline PTX of a warpgroup's sync (`warpgroup_barrier`), as a lowered
+module holds it: a reader of the module names a warpgroup sync by it."""
+
+
 def warpgroup_barrier():
   wg_idx = warpgroup_barrier_idx(sync=False)
-  inline_ptx(f"bar.sync $0, {WARPGROUP_SIZE};", wg_idx, has_side_effects=True)
+  inline_ptx(WARPGROUP_BARRIER_PTX, wg_idx, has_side_effects=True)
 
 
 def warp_barrier():
