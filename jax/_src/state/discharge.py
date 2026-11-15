@@ -1011,6 +1011,27 @@ def _pjit_state_discharge_rule(
   return new_invals, out_vals
 
 
+@register_discharge_rule(custom_derivatives.custom_jvp_call_p)
+def custom_jvp_call_discharge(ctx: DischargeContext, *args, call_jaxpr,
+                              jvp_jaxpr_fun, num_consts, symbolic_zeros):
+  # A custom_jvp whose primal makes and frees refs of its own (a kernel's
+  # in-place outputs) keeps its signature once they discharge: the call is
+  # rebound on the discharged primal with its custom JVP as it was, so a
+  # discharge that does not lower (`lower=False`) keeps the rule's tangents; one
+  # that lowers (`_run_state_jvp`'s) inlines the primal, as it does for every
+  # custom_jvp. A ref argument would change the signature its JVP takes, so it
+  # stays refused.
+  if any(isinstance(aval, AbstractRef) for aval in ctx.in_avals):
+    raise NotImplementedError(
+        "custom_jvp_call discharges the refs its primal makes, not ref arguments")
+  discharged = discharge_state(call_jaxpr, strip_memory_space=ctx.strip_memory_space)
+  params = dict(call_jaxpr=discharged, jvp_jaxpr_fun=jvp_jaxpr_fun,
+                num_consts=num_consts, symbolic_zeros=symbolic_zeros)
+  call = custom_derivatives.custom_jvp_call_p
+  out_vals = call.bind(*args, **call.get_bind_params(params))
+  return [None] * len(args), out_vals
+
+
 @register_discharge_rule(custom_derivatives.custom_vjp_call_p)
 def custom_vjp_call_discharge(ctx: DischargeContext, *args, call_jaxpr,
                               fwd_jaxpr_thunk, bwd, out_trees, symbolic_zeros,
