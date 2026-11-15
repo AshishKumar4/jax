@@ -121,6 +121,28 @@ class LRUCache(CacheInterface):
       if self.eviction_enabled:
         self.lock.release()
 
+  def delete(self, key: str) -> None:
+    """Removes the entry for the given key, if there is one.
+
+    A `put` of a key that has an entry takes no action, so an entry that
+    cannot be used is removed to be replaced.
+
+    Args:
+      key: The key whose entry is removed.
+    """
+    if not key:
+      raise ValueError("key cannot be empty")
+
+    if self.eviction_enabled:
+      self.lock.acquire(timeout=self.lock_timeout_secs)
+
+    try:
+      (self.path / f"{key}{_CACHE_SUFFIX}").unlink(missing_ok=True)
+      (self.path / f"{key}{_ATIME_SUFFIX}").unlink(missing_ok=True)
+    finally:
+      if self.eviction_enabled:
+        self.lock.release()
+
   def put(self, key: str, value: bytes) -> None:
     """Adds a new entry to the cache.
 

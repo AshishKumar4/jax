@@ -41,6 +41,8 @@ from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
 
+from . import lowering_inputs
+
 logger = logging.getLogger(__name__)
 
 WARP_SIZE: int = 32
@@ -2697,6 +2699,8 @@ RUBIN = Arch(10, 7)
 
 
 def _infer_arch() -> tuple[int, int]:
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.arch
   device: Any = jax.sharding.get_abstract_mesh().abstract_device
   default_device = jex_backend.get_default_device()
   if device is None:
