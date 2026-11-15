@@ -3244,6 +3244,7 @@ def _cumulative_reduction_primitive(name, reduce_fn, reduce_window_fn):
     vma_rule=partial(core.standard_vma_rule, name))
   batching.primitive_batchers[reducer_p] = partial(_cumred_batch_rule,
                                                    reducer_p)
+  reducer_p.cumulative = True
 
   def register_lowering(fn, platform=None):
     mlir.register_lowering(

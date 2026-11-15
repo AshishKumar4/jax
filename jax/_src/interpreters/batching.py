@@ -719,6 +719,7 @@ class PrimitiveBatchersProxy:
 primitive_batchers = PrimitiveBatchersProxy()
 
 def defvectorized(prim):
+  prim.positionwise = True
   fancy_primitive_batchers[prim] = partial(vectorized_batcher, prim)
 
 def vectorized_batcher(prim, axis_data, batched_args, batch_dims, **params):
@@ -730,6 +731,7 @@ def vectorized_batcher(prim, axis_data, batched_args, batch_dims, **params):
   return (o, [batch_dims[0]] * len(o)) if prim.multiple_results else (o, batch_dims[0])
 
 def defbroadcasting(prim):
+  prim.positionwise = True
   fancy_primitive_batchers[prim] = partial(broadcast_batcher, prim)
 
 def broadcast_batcher(prim, axis_data, args, dims, **params):
@@ -764,6 +766,7 @@ def _handle_scalar_broadcasting(nd, x, d):
           lax.expand_dims(x, tuple(range(np.ndim(x), nd))))
 
 def defreducer(prim):
+  prim.reduces = True
   fancy_primitive_batchers[prim] = partial(reducer_batcher, prim)
 
 def reducer_batcher(prim, axis_data, batched_args, batch_dims, axes,
