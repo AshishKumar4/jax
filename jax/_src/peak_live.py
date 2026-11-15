@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 from typing import Any
 
 from jax._src import hlo_reader
@@ -46,8 +47,9 @@ class LiveBuffer:
     names: the ``jax.ad_checkpoint.checkpoint_name`` names of the value that
       instruction defines, where it carries them (a fusion its named root's).
     parameter: the entry parameter's number, for a ``parameter`` buffer.
-    dims: for each of its dimensions the (entry parameter number, axis) pairs
-      it descends from through the dimension maps of the ops that made it
+    dims: for each of its dimensions the (argument, axis) pairs it descends
+      from, each argument by its flat index among the call's (``args_info``'s
+      leaves), through the dimension maps of the ops that made it
       (``provenance``): empty where its size descends from none, None where
       an op on its path states no map (a custom call stating no
       ``output_dims``).
@@ -64,7 +66,9 @@ class LiveBuffer:
   dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
-def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
+def live(assignment: bytes, module: bytes,
+         argument: Callable[[int], int | None] = lambda number: number
+         ) -> tuple[LiveBuffer, ...]:
   """The array buffers live at the peak of each allocation of serialized
   ``BufferAssignmentProto`` ``assignment``, whose buffers serialized
   ``HloModuleProto`` ``module`` defines; a constant's and a thread-local
@@ -76,7 +80,7 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
       instruction.id: instruction
       for computation in compiled.computations
       for instruction in computation.instructions}
-  descended = provenance(compiled)
+  descended = provenance(compiled, argument)
   primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
   buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
   kinds = {allocation.index: _kind(allocation)
@@ -124,10 +128,10 @@ def _kind(allocation: Any) -> str | None:
 
 
 Dims = tuple["frozenset[tuple[int, int]] | None", ...]
-"""An array's provenance: for each of its dimensions the (entry parameter number,
-axis) pairs it descends from, empty where its size descends from none (an
-iota's, a constant's), None where no op on its path states its dimensions (a
-custom call that states none)."""
+"""An array's provenance: for each of its dimensions the (argument, axis) pairs
+it descends from, empty where its size descends from none (an iota's, a
+constant's, a closed-over constant's), None where no op on its path states its
+dimensions (a custom call that states none)."""
 
 _SAME_POSITIONS = frozenset((
     "abs", "add", "and", "atan2", "bitcast-convert", "cbrt", "ceil", "clamp",
@@ -168,7 +172,9 @@ _GEMMS = frozenset((
 numbers (``gemm_backend_config.dot_dimension_numbers``)."""
 
 
-def provenance(module: Any) -> dict[int, Any]:
+def provenance(module: Any,
+               argument: Callable[[int], int | None] = lambda number: number
+               ) -> dict[int, Any]:
   """Each instruction's provenance in ``HloModuleProto`` ``module``, by its id:
   an array's ``Dims``, a tuple's a list of its elements'. Read through the
   dimension maps each op states (a dot's and a cuBLAS call's dimension numbers,
@@ -199,8 +205,8 @@ def provenance(module: Any) -> dict[int, Any]:
 
   entry = computations[module.entry_computation_id]
   evaluate(entry, {
-      instruction.parameter_number: _parameter(instruction.parameter_number,
-                                               instruction.shape, ())
+      instruction.parameter_number: _parameter(
+          argument(instruction.parameter_number), instruction.shape, ())
       for instruction in entry.instructions
       if instruction.opcode == "parameter"})
   return found
@@ -272,13 +278,17 @@ def _of(instruction: Any, operands: list[Any], operand_shapes: list[Any],
   return _filled(shape, None)
 
 
-def _parameter(number: int, shape: Any, index: tuple[int, ...]) -> Any:
-  """Entry parameter ``number``'s provenance: each dimension its own axis (an
-  element of a tuple parameter by its index, which the pairs do not name: a
-  tuple parameter's dimensions are unknown)."""
+def _parameter(number: int | None, shape: Any, index: tuple[int, ...]) -> Any:
+  """An entry parameter's provenance, numbered as the call's argument it is
+  (``number``): each dimension its own axis; none for a parameter that is no
+  argument (a closed-over constant, a token), whose sizes descend from none;
+  an element of a tuple parameter by its index, which the pairs do not name,
+  unknown."""
   if shape.tuple_shapes:
     return [_parameter(number, element, (*index, position))
             for position, element in enumerate(shape.tuple_shapes)]
+  if number is None:
+    return tuple(frozenset() for _ in shape.dimensions)
   if index:
     return tuple(None for _ in shape.dimensions)
   return tuple(frozenset({(number, axis)})
