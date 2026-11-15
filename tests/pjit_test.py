@@ -20,6 +20,7 @@ from functools import partial, wraps
 import json
 import math
 import textwrap
+import types
 import unittest
 
 from absl.testing import absltest
@@ -2623,6 +2624,18 @@ class ArrayPjitTest(jtu.JaxTestCase):
       with jax.set_mesh(cpu_mesh):
         f(inp)
     self.assertEqual(tracing_count(), 2)  # twice for f
+
+  def test_abstract_device_states_a_gpus_compute_capability(self):
+    # A compile-only GPU states the capability its lowering targets; its
+    # mesh's abstract device carries it, where a host has no such GPU.
+    gpu = types.SimpleNamespace(platform='gpu', device_kind='NVIDIA A100-SXM4-40GB',
+                                core_count=108, compute_capability='8.0')
+    abstract = mesh_lib.abstract_device_from(gpu)
+    self.assertEqual(abstract.compute_capability, '8.0')
+    self.assertEqual((abstract.device_kind, abstract.num_cores, abstract.platform),
+                     ('NVIDIA A100-SXM4-40GB', 108, 'gpu'))
+    cpu = types.SimpleNamespace(platform='cpu', device_kind='cpu')
+    self.assertIsNone(mesh_lib.abstract_device_from(cpu).compute_capability)
 
   def test_pjit_relayout_multi_slice(self):
     mesh = jtu.create_mesh((2, 2), ('x', 'y'))
