@@ -1498,6 +1498,8 @@ def _commute_transform(
     t2'(t1'(aval)) == t1(t2(aval)).
   """
   match t1, t2:
+    case (gpu_core.PlainRef() as t1, t2):
+      return t1.commute(t2)
     case (
         (
             gpu_core.UntilingTransform()
@@ -1695,6 +1697,12 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
   if isinstance(scratch_transforms, dict):
     assert isinstance(transforms[0], gpu_core.ExtractAliasedRef)
     scratch_transforms = scratch_transforms[transforms[0]]
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    # A ref that states no transforms is already plain under lane semantics.
+    scratch_transforms = tuple(
+        t for t in scratch_transforms
+        if not isinstance(t, gpu_core.PlainTransform)
+    )
 
   # Before we handle other transforms, we resolve any possible leading
   # aliasing transform. Only TMEM slices at the physical (2D) shape here; SMEM
@@ -1732,8 +1740,12 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
           handle_transposes=False,
           handle_reshapes=handle_reshapes,
       )
+      # A plain ref states its transforms as none, which layout inference
+      # takes as the ref's assignment rather than searching for one.
       transforms_attr = ir.ArrayAttr.get([
-          gpu_core.to_transform_attr(t) for t in scratch_transforms
+          gpu_core.to_transform_attr(t)
+          for t in scratch_transforms
+          if not isinstance(t, gpu_core.PlainTransform)
       ])
       ref = cast(
           T,
