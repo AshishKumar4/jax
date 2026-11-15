@@ -5,39 +5,48 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 from test_patch_stack import wheel
 
 INDEX = Path(__file__).with_name("index.sh")
 
 AWS = r"""#!/usr/bin/env python3
-# aws s3api head-object|put-object --bucket B --key K [--body F] ..., aws s3 cp s3://B/K DEST: a directory per
-# bucket ($STORE/B/K); every put named in order in $STORE.puts; a missing key answers as R2 does, (404).
+# aws s3api head-object|put-object|list-objects-v2 --bucket B ..., aws s3 cp s3://B/K DEST: a directory per bucket,
+# each key a file named by the key quoted whole (R2's keys `simple/` and `simple/index.html` are two objects); every
+# put named in order in $STORE.puts; a missing key answers as R2 does, (404).
 import os, shutil, sys
 from pathlib import Path
+from urllib.parse import quote, unquote
 store, args = Path(os.environ["STORE"]), sys.argv[1:]
 def option(name):
     return args[args.index(name) + 1]
+def path(bucket, key):
+    return store / bucket / quote(key, safe="")
 def missing(key):
     print(f"An error occurred (404) when calling the operation: Not Found ({key})", file=sys.stderr)
     sys.exit(254)
 if args[:2] == ["s3api", "head-object"]:
     key = option("--key")
-    sys.exit(0) if (store / option("--bucket") / key).is_file() else missing(key)
+    sys.exit(0) if path(option("--bucket"), key).is_file() else missing(key)
 if args[:2] == ["s3api", "put-object"]:
-    target = store / option("--bucket") / option("--key")
+    target = path(option("--bucket"), option("--key"))
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(option("--body"), target)
     with open(f"{store}.puts", "a") as puts:
         puts.write(option("--key") + "\n")
     sys.exit(0)
+if args[:2] == ["s3api", "list-objects-v2"]:
+    prefix, keys = option("--prefix"), [unquote(found.name) for found in (store / option("--bucket")).glob("*")]
+    print("\t".join(sorted({prefix + key[len(prefix):].split("/")[0] + "/" for key in keys
+                            if key.startswith(prefix) and "/" in key[len(prefix):]})))
+    sys.exit(0)
 if args[:2] == ["s3", "cp"]:
-    source = next(arg for arg in args if arg.startswith("s3://"))[len("s3://"):]
-    destination = args[args.index(f"s3://{source}") + 1]
-    found = store / source
-    if not found.is_file():
-        missing(source)
-    shutil.copyfile(found, destination)
+    source = next(arg for arg in args if arg.startswith("s3://"))
+    bucket, _, key = source[len("s3://"):].partition("/")
+    if not path(bucket, key).is_file():
+        missing(key)
+    shutil.copyfile(path(bucket, key), args[args.index(source) + 1])
     sys.exit(0)
 sys.exit(f"aws stand-in: no {args}")
 """
@@ -55,8 +64,12 @@ def published(tmp_path: Path, *wheels: Path, new_project: str = "") -> subproces
                                "TMPDIR": str(tmp_path)})
 
 
+def stored(tmp_path: Path, key: str) -> Path:
+    return tmp_path / "r2" / "index" / quote(key, safe="")
+
+
 def root(tmp_path: Path) -> str:
-    return (tmp_path / "r2" / "index" / "simple" / "index.html").read_text()
+    return stored(tmp_path, "simple/index.html").read_text()
 
 
 def test_the_root_lists_the_projects_it_listed_and_never_one_whose_publish_stopped_before_its_pages(tmp_path):
@@ -66,9 +79,7 @@ def test_the_root_lists_the_projects_it_listed_and_never_one_whose_publish_stopp
     (tmp_path / "wheels").mkdir()
     first = published(tmp_path, wheel(tmp_path / "wheels", "qwix", "0.1.8"), new_project="qwix")
     assert first.returncode == 0, first.stdout + first.stderr
-    stopped = tmp_path / "r2" / "index" / "packages" / "jaxlib" / "jaxlib-0.12.0.1-py3-none-any.whl"
-    stopped.parent.mkdir(parents=True)
-    stopped.write_bytes(b"uploaded before the run stopped")
+    stored(tmp_path, "packages/jaxlib/jaxlib-0.12.0.1-py3-none-any.whl").write_bytes(b"uploaded before the run stopped")
     second = published(tmp_path, wheel(tmp_path / "wheels", "jax", "0.12.0.1"), new_project="jax")
     assert second.returncode == 0, second.stdout + second.stderr
     listed = root(tmp_path)
@@ -85,5 +96,5 @@ def test_a_projects_pages_are_published_before_the_root_that_lists_it(tmp_path):
     pages = [key for key in puts if key.startswith("simple")]
     assert pages == ["simple/jaxlib/", "simple/jaxlib/index.html", "simple/", "simple/index.html"], puts
     assert puts.index("packages/jaxlib/manifest.json") < puts.index(pages[0])
-    manifest = json.loads((tmp_path / "r2" / "index" / "packages" / "jaxlib" / "manifest.json").read_text())
+    manifest = json.loads(stored(tmp_path, "packages/jaxlib/manifest.json").read_text())
     assert list(manifest) == ["jaxlib-0.12.0.1-py3-none-any.whl"], manifest
