@@ -7397,6 +7397,7 @@ class FragmentedArrayTest(TestCase):
   @parameterized.product(
       dtype=(
           jnp.float64,
+          jnp.float32,
           jnp.bfloat16,
           jnp.float16,
           jnp.float8_e4m3fn,
@@ -7444,8 +7445,18 @@ class FragmentedArrayTest(TestCase):
       b = self.prng.uniform(-1, 1, (n, k)).astype(dtype)
       acc = self.prng.uniform(-1, 1, (m, n)).astype(acc_dtype)
 
+    if dtype == jnp.float32:
+      # TF32 operands, each rounded to nearest, ties away (`cvt.rna`), whose
+      # products are exact in f32.
+      def tf32(x):
+        bits = np.asarray(x, np.float32).view(np.uint32)
+        return ((bits + np.uint32(0x1000)) & np.uint32(0xFFFFE000)).view(np.float32)
+      operands = (tf32(a), tf32(b))
+    else:
+      operands = (a, b)
     expected = acc + jax.lax.dot(
-        a.astype(acc_dtype), b.astype(acc_dtype).T, precision="high"
+        operands[0].astype(acc_dtype), operands[1].astype(acc_dtype).T,
+        precision="highest" if dtype == jnp.float32 else "high",
     )
     result = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), (acc, a, b), expected, ()
@@ -7458,7 +7469,7 @@ class FragmentedArrayTest(TestCase):
 
 
   @parameterized.product(
-      dtype=(jnp.float16, jnp.int8,),
+      dtype=(jnp.float16, jnp.int8, jnp.float32),
       m_warps=(4, 2, 1),
       mults=((1, 1), (2, 1), (1, 2), (3, 3)),
   )
@@ -7520,7 +7531,15 @@ class FragmentedArrayTest(TestCase):
       a = self.prng.uniform(-1, 1, (m, k)).astype(dtype)
       b = self.prng.uniform(-1, 1, (n, k)).astype(dtype)
 
-    expected = a.astype(acc_dtype) @ b.astype(acc_dtype).T
+    if dtype == jnp.float32:
+      # TF32 operands, each rounded to nearest, ties away (`cvt.rna`), whose
+      # products are exact in f32; the right one read transposed, by no ldmatrix.
+      def tf32(x):
+        bits = np.asarray(x, np.float32).view(np.uint32)
+        return ((bits + np.uint32(0x1000)) & np.uint32(0xFFFFE000)).view(np.float32)
+      expected = np.matmul(tf32(a), tf32(b).T, dtype=np.float64).astype(np.float32)
+    else:
+      expected = a.astype(acc_dtype) @ b.astype(acc_dtype).T
     smem_shapes = (
         jax.ShapeDtypeStruct(mgpu.tile_shape((m, k), a_tiling), dtype),
         jax.ShapeDtypeStruct(mgpu.tile_shape((n, k), b_tiling), dtype),
@@ -7533,10 +7552,11 @@ class FragmentedArrayTest(TestCase):
       )(a, b)
 
     sass_lines = sass().splitlines()
-    first_ldsm = next(i for i, line in enumerate(sass_lines) if "LDSM" in line)
-    last_mma = max(i for i, line in enumerate(sass_lines) if "MMA" in line)
-    interesting_sass = "\n".join(sass_lines[first_ldsm : last_mma + 1])
-    self.assertNotIn("MOV", interesting_sass)
+    if dtype != jnp.float32:  # TF32 fragments load by no ldmatrix.
+      first_ldsm = next(i for i, line in enumerate(sass_lines) if "LDSM" in line)
+      last_mma = max(i for i, line in enumerate(sass_lines) if "MMA" in line)
+      interesting_sass = "\n".join(sass_lines[first_ldsm : last_mma + 1])
+      self.assertNotIn("MOV", interesting_sass)
 
     if is_integer:
       np.testing.assert_array_equal(result, expected)

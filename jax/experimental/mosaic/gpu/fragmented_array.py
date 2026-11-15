@@ -5146,6 +5146,13 @@ class FragmentedArray:
     # the MMA instructions consume them. Otherwise, ptxas emits a bunch of extra
     # MOV instructions that destroy the performance.
     from .mma import MMALayouts
+    if utils.bitwidth(dtype) == 32 and any(
+        layout in (MMALayouts(dtype, m_warps=w).lhs, MMALayouts(dtype, m_warps=w).rhs)
+        for w in (1, 2, 4)
+    ):
+      # A 32-bit (TF32) MMA operand's fragments hold one element a register,
+      # in no order ldmatrix produces: such a transfer is a plain one.
+      raise TxMatrixIneligible("32-bit MMA operands are not loaded by ldmatrix")
     if any(layout == MMALayouts(dtype, m_warps=w).lhs for w in (1, 2, 4)):
       assert tiled_nested_shape[-6] == (2,)
       assert tiled_nested_shape[-5] == (2,)

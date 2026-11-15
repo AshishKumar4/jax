@@ -128,6 +128,9 @@ def can_relayout_acc_to_lhs(
 
 
 def _ptx_dtype_str(dtype: ir.Type, *, is_signed: bool | None = None) -> str:
+  if isinstance(dtype, ir.F32Type):
+    # f32 operands multiply as TF32 (`_rounded_to_tf32`).
+    return "tf32"
   if isinstance(dtype, ir.Float8E4M3FNType):
     return "e4m3"
   elif isinstance(dtype, ir.Float8E5M2Type):
@@ -138,6 +141,35 @@ def _ptx_dtype_str(dtype: ir.Type, *, is_signed: bool | None = None) -> str:
     prefix = "s" if is_signed else "u"
     return f"{prefix}{dtype.width}"
   return str(dtype)
+
+
+def _rounded_to_tf32(x: fa.FragmentedArray) -> fa.FragmentedArray:
+  """`x`'s f32 elements rounded to TF32 (`cvt.rna.tf32.f32`: to nearest, ties
+  away from zero), still f32: the 10-bit significand mma.sync's TF32 operands
+  take, which would otherwise ignore the lower 13 bits (truncate), as CUTLASS
+  and Triton round them first."""
+  i32 = ir.IntegerType.get_signless(32)
+  f32 = ir.F32Type.get()
+
+  def rounded(reg):
+    vector_type = ir.VectorType(reg.type)
+    out = llvm.mlir_undef(vector_type)
+    for i in range(vector_type.shape[0]):
+      element = vector.extract(
+          reg, dynamic_position=[], static_position=ir.DenseI64ArrayAttr.get([i])
+      )
+      bits = llvm.inline_asm(
+          i32, [element], "cvt.rna.tf32.f32 $0, $1;", "=r,f",
+          has_side_effects=False,
+      )
+      out = llvm.insertelement(out, utils.bitcast(bits, f32),
+                               position=utils.c(i, i32))
+    return out
+
+  registers = np.vectorize(rounded, otypes=[object])(x.registers)
+  return fa.FragmentedArray(
+      _registers=registers, _layout=x.layout, _is_signed=x.is_signed
+  )
 
 
 def _mma_single_tile(
@@ -249,7 +281,9 @@ def mma(
 
   All operands must have `TiledLayout`s. The layouts must be generated
   by the `MMALayouts` class, which ensures that the tiles are mapped
-  to the warps correctly.
+  to the warps correctly. f32 operands multiply as TF32 (`m16n8k8.tf32`),
+  each rounded to nearest first (`_rounded_to_tf32`), into an f32
+  accumulator.
 
   Args:
     acc: A `FragmentedArray` with a `TiledLayout` generated from
@@ -288,7 +322,7 @@ def mma(
   f8e5m2 = ir.Float8E5M2Type.get()
   if (element_type := a.mlir_dtype) != b.mlir_dtype:
     raise ValueError(f"Dtype mismatch: {a.mlir_dtype} != {b.mlir_dtype}")
-  if element_type not in (bf16, f16, f64, f8e4m3fn, f8e5m2, i8, i4):
+  if element_type not in (bf16, f16, f32, f64, f8e4m3fn, f8e5m2, i8, i4):
     raise NotImplementedError(f"Unsupported operand type: {element_type}")
   if isinstance(element_type, ir.IntegerType):
     if acc.mlir_dtype != i32:
@@ -331,6 +365,10 @@ def mma(
   assert n_tile2 == n_tile
 
   num_m_tiles, num_n_tiles, num_k_tiles = m // m_tile, n // n_tile, k // k_tile
+
+  if element_type == f32:
+    # TF32 operands, rounded once for every tile that reads them.
+    a, b = _rounded_to_tf32(a), _rounded_to_tf32(b)
 
   # Do not modify the accumualtor itself.
   acc = acc.copy()
