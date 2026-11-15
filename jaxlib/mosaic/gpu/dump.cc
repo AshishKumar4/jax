@@ -282,15 +282,6 @@ DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module) {
     } else {
       opts.dump_path = dump_to;
     }
-
-    opts.constraint_system = true;
-    opts.mlir_passes = true;
-    opts.ptx = true;
-    opts.ptxas = true;
-    opts.resources = true;
-    opts.sass = true;
-    opts.sass_ctrl = true;
-    return opts;
   }
 
   opts.constraint_system =
@@ -301,6 +292,20 @@ DumpOptions GetOrSetDumpOptionsForModule(mlir::ModuleOp module) {
   opts.sass_ctrl = getenv("MOSAIC_GPU_DUMP_SASS_CTRL") != nullptr;
   opts.sass = getenv("MOSAIC_GPU_DUMP_SASS") != nullptr || opts.sass_ctrl;
   opts.resources = getenv("MOSAIC_GPU_DUMP_RESOURCES") != nullptr;
+  // MOSAIC_GPU_DUMP_TO names where the dumps go. With no kind named, every
+  // kind is dumped there; with some named, only those (a caller reading the
+  // PTX and ptxas's log pays for no pass-by-pass IR or SASS disassembly).
+  if (getenv("MOSAIC_GPU_DUMP_TO") != nullptr &&
+      !(opts.constraint_system || opts.mlir_passes || opts.ptx ||
+        opts.ptxas || opts.sass || opts.resources)) {
+    opts.constraint_system = true;
+    opts.mlir_passes = true;
+    opts.ptx = true;
+    opts.ptxas = true;
+    opts.resources = true;
+    opts.sass = true;
+    opts.sass_ctrl = true;
+  }
   return opts;
 }
 
