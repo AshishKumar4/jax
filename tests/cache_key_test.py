@@ -222,6 +222,34 @@ class CacheKeyTest(jtu.JaxTestCase):
     cache_key.custom_hook = original_custom_hook
     self.assertNotEqual(key1, key2)
 
+  @jtu.thread_unsafe_test()
+  def test_a_rebuilt_plugin_keys_its_own_entries(self):
+    # A CUDA client's platform version names the runtime its plugin loads, not
+    # the plugin's build: two builds of one plugin under one jax and jaxlib key
+    # apart, the same build alike, and a platform no plugin build is stated for
+    # keys as before.
+    class Client:
+      platform = "gpu"
+      platform_version = "cuda 12090"
+
+    def platform_hash(build):
+      saved = dict(xla_bridge.plugin_builds)
+      xla_bridge.plugin_builds.clear()
+      if build is not None:
+        xla_bridge.plugin_builds["cuda"] = build
+      try:
+        hash_obj = hashlib.sha256()
+        cache_key._hash_platform(hash_obj, Client())
+        return hash_obj.digest()
+      finally:
+        xla_bridge.plugin_builds.clear()
+        xla_bridge.plugin_builds.update(saved)
+
+    earlier = platform_hash("0.12.0.1.post71")
+    self.assertEqual(earlier, platform_hash("0.12.0.1.post71"))
+    self.assertNotEqual(earlier, platform_hash("0.12.0.1.post72"))
+    self.assertEqual(platform_hash(None), platform_hash(""))
+
   def test_different_computations(self):
     computation1 = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
     computation2 = jax.jit(lambda x, y: x * y).lower(2, 2).compiler_ir()
