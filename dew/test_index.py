@@ -12,8 +12,8 @@ from test_patch_stack import wheel
 INDEX = Path(__file__).with_name("index.sh")
 
 AWS = r"""#!/usr/bin/env python3
-# aws s3api head-object|put-object|delete-object|list-objects-v2 --bucket B ..., aws s3 cp s3://B/K DEST: a directory per bucket,
-# each key a file named by the key quoted whole (R2's keys `simple/` and `simple/index.html` are two objects); every
+# aws s3api head-object|put-object|delete-object|list-objects-v2 --bucket B ..., aws s3 cp s3://B/K DEST: a
+# directory per bucket, each key a file named by the key quoted whole (R2's keys `simple/` and `simple/index.html` are two objects); every
 # put and delete named in order in $STORE.puts; a missing key answers as R2 does, (404).
 import os, shutil, sys
 from pathlib import Path
@@ -128,5 +128,6 @@ def test_an_unlisted_project_leaves_the_root_first_then_its_pages_and_manifest_a
     assert writes == ["simple/", "simple/index.html", "delete simple/jaxlib/", "delete simple/jaxlib/index.html",
                       "delete packages/jaxlib/manifest.json"], writes
     assert stored(tmp_path, "packages/jaxlib/jaxlib-0.12.0.1-py3-none-any.whl").is_file()
+    (tmp_path / "r2.puts").unlink()
     again = published(tmp_path, wheel(tmp_path / "wheels", "jaxlib", "0.12.0.1"))
-    assert again.returncode != 0 and "jaxlib is new to the index" in again.stdout + again.stderr
+    assert again.returncode != 0 and not (tmp_path / "r2.puts").exists(), again.stdout + again.stderr
