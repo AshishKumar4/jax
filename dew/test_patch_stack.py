@@ -1,9 +1,13 @@
 """The patch stack's choice of the release to carry next, over remotes' refs as git ls-remote lists them, and
 the test files it runs, over a repository of its own."""
 
+import hashlib
 import json
 import subprocess
+import zipfile
 from pathlib import Path
+
+import pytest
 
 import patch_stack
 
@@ -382,3 +386,30 @@ def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_pat
     assert run("show", "v0.12.1-cache-key-pool-fingerprints:jax/a.py") == "a fixed again\n"
     assert '_release_version: str | None = "0.12.1.post1"' in run(
         "show", "v0.12.1-cache-key-pool-fingerprints:jax/version.py")
+
+
+def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path):
+    """What patch-stack's index takes of a staged release: the wheels Dew's main pins (`pinned` of its locks), each
+    whose sha256 the pin allows; a pinned wheel whose bytes differ is refused, and nothing is indexed where main
+    pins no jax of the release (its pin head has not landed) (Main, 2026-11-15: post98 and post99 were indexed
+    before any Dew test ran on them)."""
+    jax = wheel(tmp_path, "jax", "0.12.0.1.post101")
+    jaxlib = wheel(tmp_path, "jaxlib", "0.12.0.1.post101")
+    unpinned = wheel(tmp_path, "jax_cuda13_plugin", "0.12.0.1.post101")
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    lock = (f"jax==0.12.0.1.post101 \\\n    --hash=sha256:{digest(jax)}\n    # via dewml\n"
+            f"jaxlib==0.12.0.1.post101 \\\n    --hash=sha256:{'0' * 64} \\\n    --hash=sha256:{digest(jaxlib)}\n"
+            f"numpy==2.3.0 \\\n    --hash=sha256:{'1' * 64}\n")
+    pins = patch_stack.pinned([lock])
+    assert set(pins) == {"jax==0.12.0.1.post101", "jaxlib==0.12.0.1.post101"}
+    assert patch_stack.indexable(pins, [jax, jaxlib, unpinned], "0.12.0.1.post101") == [jax, jaxlib]
+    other = tmp_path / "other"
+    other.mkdir()
+    changed = wheel(other, "jaxlib", "0.12.0.1.post101")
+    with zipfile.ZipFile(changed, "a") as archive:
+        archive.writestr("changed", "bytes")
+    with pytest.raises(SystemExit):
+        patch_stack.indexable(pins, [jax, changed], "0.12.0.1.post101")
+    with pytest.raises(SystemExit):
+        patch_stack.indexable(pins, [jax], "0.12.0.1.post102")
+

@@ -43,6 +43,12 @@ on:
       machines:
         description: "with `publish`, the machines whose native wheels it ships (default: every one, \"x86_64 aarch64\"); a machine left out keeps its earlier plugins, which a later publish of the same release adds beside"
         required: false
+      index:
+        description: "index a published release's staged wheels, e.g. 0.12.0.1.post101: only those `pins` names, byte for byte, once the pin head that uses them has passed Dew's train (instead of looking for a new release)"
+        required: false
+      pins:
+        description: "with `index`, what Dew's main pins of them: `patch_stack.py pinned` of its locks at the published commit"
+        required: false
 
 run-name: ${{ inputs.token && format('patch stack {0}', inputs.token) || 'patch stack' }}
 
@@ -130,7 +136,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: The release to carry
         id: next
-        if: inputs.publish == '' && inputs.yank == ''
+        if: inputs.publish == '' && inputs.yank == '' && inputs.index == ''
         env:
           REHEARSE: ${{ inputs.rehearse }}
         run: |
@@ -344,9 +350,42 @@ jobs:
             native/
           if-no-files-found: error
 
-  index:
+  # A published release's wheels staged on GitHub releases, never indexed at publish: jax's own on jax-<version>
+  # (its native wheels are on plugin-<version> already). Dew's pin head locks them from there (constraints.txt's
+  # --find-links), its train runs them, and only once it has landed are they indexed (`index`), byte for byte
+  # (Main, 2026-11-15: the workflow indexed post98 and post99 before any Dew test ran on them, and post99's jaxlib
+  # crashed CPU processes for four hours of fresh installs).
+  stage:
     needs: [carry, assemble]
-    if: always() && (needs.assemble.result == 'success' || (inputs.yank != '' && needs.carry.result == 'success' && needs.carry.outputs.release == ''))
+    if: needs.assemble.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE: ${{ needs.carry.outputs.release }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: artifacts
+          path: incoming
+      - name: Stage jax's own wheel on its release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          wheel=$(ls incoming/dist/jax-"$RELEASE".post*-py3-none-any.whl)
+          version=$(sed -n 's|^incoming/dist/jax-\(.*\)-py3-none-any.whl$|\1|p' <<< "$wheel")
+          commit=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/release/$version" | cut -f1)
+          [ -n "$commit" ] || { echo "::error::no release/$version branch"; exit 1; }
+          if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "jax-$version" --repo "$GITHUB_REPOSITORY" --target "$commit" --title "jax-$version" \
+              --notes "jax $version, staged: Dew's pin head locks it from here, and it is indexed once that head has passed Dew's train (patch-stack's index)."
+          fi
+          gh release upload "jax-$version" --repo "$GITHUB_REPOSITORY" "$wheel"
+          echo "staged $(basename "$wheel") on jax-$version; its native wheels are on their plugin release"
+
+  index:
+    needs: [carry]
+    if: always() && needs.carry.result == 'success' && needs.carry.outputs.release == '' && (inputs.yank != '' || inputs.index != '')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -369,12 +408,32 @@ jobs:
           for name in BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
             [ -n "${!name}" ] || { echo "::error::the R2 secrets (R2_BUCKET, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are not set"; exit 1; }
           done
-      # What assemble made, into a directory of its own: no file of it lands on this job's own scripts.
-      - uses: actions/download-artifact@v4
-        if: needs.assemble.result == 'success'
-        with:
-          name: artifacts
-          path: incoming
+      # The release's staged wheels, into a directory of their own (no file of them lands on this job's scripts):
+      # those main's locks pin, byte for byte, sorted as assemble's artifact was (dist/ jax, native/ the rest).
+      - name: The staged wheels main pins
+        if: inputs.index != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.index }}
+          PINS: ${{ inputs.pins }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+\.post[0-9]+$ ]] || { echo "::error::index: a release's version"; exit 1; }
+          printf '%s' "$PINS" > pins.json
+          mkdir -p staged incoming/dist incoming/native
+          gh release download "jax-$VERSION" --repo "$GITHUB_REPOSITORY" --dir staged --pattern "*.whl"
+          # Each native version main pins, from its plugin release, where one exists (a stock version has none).
+          for pinned in $(python3 -c 'import json; print(" ".join(json.load(open("pins.json"))))'); do
+            case $pinned in jax==*) continue ;; esac
+            tag=plugin-${pinned#*==}
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir staged --pattern "*.whl" --skip-existing
+            fi
+          done
+          chosen=$(python3 dew/dew/patch_stack.py indexable pins.json "$VERSION" staged/*.whl)
+          for wheel in $chosen; do
+            case $(basename "$wheel") in jax-*) mv "$wheel" incoming/dist/ ;; *) mv "$wheel" incoming/native/ ;; esac
+          done
+          echo "indexing, as main pins them:"; ls incoming/dist incoming/native
       - name: Index them
         run: |
           # jax (its wheels, or only the files `yank` names), then each native project, every one through

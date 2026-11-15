@@ -296,6 +296,43 @@ PAGE = ('<!DOCTYPE html>\n<html><head><meta name="pypi:repository-version" conte
 """A page of PEP 503's simple API (PEP 629's repository version 1.1: PEP 658's and 714's metadata attributes)."""
 
 
+STAGED = ("jax", "jaxlib", "jax-cuda12-plugin", "jax-cuda12-pjrt", "jax-cuda13-plugin", "jax-cuda13-pjrt")
+"""The projects a release stages on its GitHub releases before Dew's index lists them (`indexable`)."""
+
+
+def pinned(locks: list[str]) -> dict[str, set[str]]:
+    """What Dew's locks (`uv pip compile --generate-hashes` files, given as their text) pin of STAGED: each
+    `project==version`, the sha256 of every file the locks allow for it (every machine's and Python's)."""
+    pins: dict[str, set[str]] = {}
+    for text in locks:
+        for block in re.split(r"\n(?=[^\s#-])", text):
+            found = re.match(r"([A-Za-z0-9_.-]+)==(\S+)", block)
+            if found and found[1].lower().replace("_", "-") in STAGED:
+                pins.setdefault(f"{found[1].lower().replace('_', '-')}=={found[2]}", set()).update(
+                    re.findall(r"--hash=sha256:([0-9a-f]{64})", block))
+    return pins
+
+
+def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> list[Path]:
+    """Of a release's staged `wheels`, those Dew's main pins (`pinned`), byte for byte, to be indexed: a wheel of a
+    pinned project and version whose sha256 the pin does not allow is refused (the bytes differ from what main's train
+    ran), as is a set in which main pins no jax of `version` (a pin head that uses the release has not landed); a
+    wheel main does not pin is left unindexed."""
+    if f"jax=={version}" not in pins:
+        raise SystemExit(f"main's locks pin no jax=={version}: its pin head has not landed, so nothing is indexed")
+    chosen = []
+    for wheel in wheels:
+        project, wheel_version = wheel.name.split("-")[:2]
+        pin = f"{project.lower().replace('_', '-')}=={wheel_version}"
+        if pin not in pins:
+            continue
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        if digest not in pins[pin]:
+            raise SystemExit(f"{wheel.name}'s sha256 {digest} is none main's locks pin for {pin}: refused")
+        chosen.append(wheel)
+    return chosen
+
+
 def root(site: Path, projects: list[str]) -> None:
     """The index's root page, site/simple/index.html, listing each of `projects`."""
     (site / "simple").mkdir(parents=True, exist_ok=True)
@@ -321,6 +358,12 @@ def main() -> int:
     indexing.add_argument("--reason", default="", help="why they are yanked, shown by installers")
     indexing.add_argument("--package", default="jax", help="the package the files and the manifest are of")
     indexing.add_argument("--projects", nargs="*", default=[], help="the index's other packages, for its root")
+    pinning = commands.add_parser("pinned", help="what Dew's locks pin of the staged projects, for `indexable`")
+    pinning.add_argument("locks", type=Path, nargs="+")
+    choosing = commands.add_parser("indexable", help="the staged wheels main pins, byte for byte")
+    choosing.add_argument("pins", type=Path, help="`pinned`'s output")
+    choosing.add_argument("version", help="the release's jax version, e.g. 0.12.0.1.post101")
+    choosing.add_argument("wheels", type=Path, nargs="*")
     rooting = commands.add_parser("root")
     rooting.add_argument("site", type=Path)
     rooting.add_argument("--projects", nargs="*", default=[], help="every package the root lists")
@@ -336,6 +379,14 @@ def main() -> int:
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))
+        return 0
+    if args.command == "pinned":
+        print(json.dumps({pin: sorted(digests) for pin, digests in sorted(pinned([lock.read_text() for lock in
+                                                                                  args.locks]).items())}))
+        return 0
+    if args.command == "indexable":
+        pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}
+        print("\n".join(str(wheel) for wheel in indexable(pins, args.wheels, args.version)))
         return 0
     if args.command == "root":
         root(args.site, args.projects)
