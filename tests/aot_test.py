@@ -411,6 +411,43 @@ class JaxAotTest(jtu.JaxTestCase):
     result = compiled(input)
     self.assertEqual(result, 14.)
 
+  @jtu.run_on_devices('cuda')
+  @jtu.thread_unsafe_test()  # Mosaic GPU registers its passes once a process.
+  def test_mosaic_gpu_kernels_compile_ahead_for_two_capabilities_in_one_process(
+      self):
+    # Each Mosaic GPU kernel assembles for the capability its own compile
+    # targets, however many a process compiles for: a capability fixed when
+    # Mosaic GPU registered its passes assembled every later compile's PTX for
+    # the first's ("SM version specified by .target is higher than default SM
+    # version assumed").
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
+
+    def body(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.0
+
+    for major, minor, extension in ((8, 0, "NONE"),
+                                    (9, 0, "ACCELERATED_FEATURES")):
+      stated = re.sub(
+          r"cuda_compute_capability\s*\{[^}]*\}",
+          f"cuda_compute_capability {{ major: {major} minor: {minor} "
+          f"feature_extension: {extension} }}",
+          config)
+      topology = topologies.get_topology_desc(
+          platform="cuda", target_config=stated, topology="1x1x1")
+      mesh = topologies.make_mesh(
+          topo=topology, mesh_shape=(1,), axis_names=("x",))
+      x = jax.ShapeDtypeStruct(
+          (256,), jnp.float32,
+          sharding=jax.sharding.NamedSharding(mesh, P()))
+      kernel = pl.pallas_call(
+          body, out_shape=jax.ShapeDtypeStruct((256,), jnp.float32),
+          compiler_params=plgpu.CompilerParams())
+      with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        jax.jit(kernel).lower(x).compile()
+
   @jtu.run_on_devices('gpu')
   def test_cross_compile_with_real_gpu(self):
     """Test that cross-compilation uses the real GPU for autotuning."""
