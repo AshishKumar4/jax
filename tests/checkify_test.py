@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import concurrent.futures
+import contextlib
 from functools import partial
 import unittest
 
@@ -605,6 +606,36 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     self.assertEqual(u_err.get(), expected_err)
     self.assertIsNotNone(b_err.get())
     self.assertEqual(b_err.get(), expected_err)
+
+  @parameterized.product(
+      context=[True, False], check_first=[False, True],
+      manual=[("b",), ("a", "b")])
+  def test_check_flows_into_partially_manual_shard_map(
+      self, context, check_first, manual):
+    # A check whose error reaches a shard_map, manual over some of a mesh's
+    # axes or all of them, under a context mesh or with the mesh given.
+    mesh = jtu.create_mesh((2, 2), ("a", "b"),
+                           axis_types=(jax.sharding.AxisType.Auto,) * 2)
+    spec = P(manual)
+
+    def f(x):
+      if check_first:
+        checkify.check(jnp.all(x > -1.0), "x must be above -1")
+      mapped = partial(jax.shard_map, axis_names=set(manual), in_specs=spec,
+                       out_specs=spec)
+      doubled = (mapped if context else partial(mapped, mesh=mesh))(
+          lambda y: y * 2.0)
+      return doubled(x)
+
+    x = jnp.arange(8, dtype=jnp.float32)
+    with jax.set_mesh(mesh) if context else contextlib.nullcontext():
+      error, out = jax.jit(checkify.checkify(f))(x)
+      failed, _ = jax.jit(checkify.checkify(f))(x - 10.0)
+    error.throw()
+    self.assertArraysEqual(out, 2.0 * x)
+    if check_first:
+      self.assertIsNotNone(failed.get())
+      self.assertIn("x must be above -1", failed.get())
 
   def test_empty_enabled_errors(self):
     def multi_errors(x):
