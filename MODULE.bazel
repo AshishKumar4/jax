@@ -88,6 +88,9 @@ archive_override(
         # states its memory and buffer assignment and refuses to run; within the limit it finishes. A start
         # compiles its step once whether it fits or not.
         "//third_party:xla/memory_limit_early_exit.patch",
+        # YNNPACK's unary kernels read a stride-zero (broadcast) bf16 operand as contiguous: XLA:CPU's YNN
+        # fusion of a reduction beside a shared clamp scalar read past the scalar, garbage or NaN by process.
+        "//third_party:xla/ynn_unary_contiguous.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
