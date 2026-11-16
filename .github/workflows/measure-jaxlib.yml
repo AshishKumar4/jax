@@ -121,10 +121,16 @@ jobs:
       - name: The log of a run of no cache holds no token
         id: clean
         if: always() && inputs.cache == 'none'
+        env:
+          # As the build step was given it: empty in a run of no cache.
+          DEW_BAZEL_TOKEN: ${{ inputs.cache == 'dew' && secrets.DEW_BAZEL_TOKEN || '' }}
         run: |
-          [[ ! -e .bazelrc.user && ! -e "$RUNNER_TEMP/bazel.token" && -z "${DEW_BAZEL_TOKEN:-}" ]] || {
+          [[ ! -e .bazelrc.user && ! -e "$RUNNER_TEMP/bazel.token" && -z "$DEW_BAZEL_TOKEN" ]] || {
             echo "::error::a token or .bazelrc.user exists: the log stays on the runner"; exit 1; }
-          ! grep -q "dew-bazel" "$RUNNER_TEMP/build.log" || { echo "::error::the log names Dew's cache"; exit 1; }
+          [[ -f "$RUNNER_TEMP/build.log" ]] || { echo "::error::no build log"; exit 1; }
+          # grep's 1 alone (no line names Dew's cache) passes; a match or an error keeps the log.
+          code=0; grep -q "dew-bazel" "$RUNNER_TEMP/build.log" || code=$?
+          [[ $code -eq 1 ]] || { echo "::error::the log names Dew's cache, or grep failed ($code)"; exit 1; }
       - uses: actions/upload-artifact@v4
         # Only past the check above: a log it found a token's trace in stays on the runner.
         if: always() && inputs.cache == 'none' && steps.clean.outcome == 'success'
