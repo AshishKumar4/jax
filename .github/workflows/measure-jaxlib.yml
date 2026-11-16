@@ -67,6 +67,7 @@ jobs:
         with:
           python-version: ${{ inputs.python }}
       - name: Build
+        id: build
         env:
           # No token reaches a run of no cache, whose log leaves the runner.
           DEW_BAZEL_TOKEN: ${{ inputs.cache == 'dew' && secrets.DEW_BAZEL_TOKEN || '' }}
@@ -102,10 +103,27 @@ jobs:
               echo "::error::a run of no cache holds a token or a .bazelrc.user"; exit 1; }
             config+=(--bazel_options=--config=public_cache)
           fi
+          # The wheel's version the ref's, as a release names it (dew/build_plugin.sh): its suffix past jax's
+          # _version given to Bazel and the wheel builder alike, the tree's _release_version unset, where Bazel
+          # declared the bare version and the builder wrote the release's (macos-15, 43860907164).
+          suffix=$(python - "${REF#release/}" <<'PY'
+          import pathlib, re, sys
+          path = pathlib.Path("jax/version.py")
+          text = path.read_text()
+          base = re.search(r'^_version = "(.*)"$', text, re.M).group(1)
+          version = sys.argv[1]
+          assert version.startswith(base) and version != base, f"{version} is not {base} with a suffix"
+          path.write_text(re.sub(r"^_release_version: str \| None = .*$", "_release_version: str | None = None",
+                                 text, count=1, flags=re.M))
+          print(version[len(base):])
+          PY
+          )
           started=$(date +%s) code=0
           python build/build.py build --wheels=jaxlib --python_version="$PYTHON" "${config[@]}" \
-            --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_startup_options=--output_base="$base" \
+            --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
+            --bazel_startup_options=--output_base="$base" \
             --output_path="$RUNNER_TEMP/dist" > "$RUNNER_TEMP/build.log" 2>&1 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
           seconds=$(( $(date +%s) - started ))
           rm -f .bazelrc.user "$token"
           printf '%s\t%s\t%s\t%s\t%s\n' "$RUNNER" "$PYTHON" "$ATTEMPT" "$seconds" "$code" | tee "$RUNNER_TEMP/builds.tsv"
@@ -118,6 +136,24 @@ jobs:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
           # Its seconds and exit alone: no raw build log leaves the runner.
           path: ${{ runner.temp }}/builds.tsv
+      - name: A failed Windows genrule's paths, as its execroot holds them
+        # A run of no cache (no secret in the process) whose Windows build failed: each path its first failed
+        # genrule's command writes or reads, and whether it and its directory exist, a junction among them.
+        if: always() && inputs.cache == 'none' && runner.os == 'Windows' && steps.build.outputs.code != '0'
+        run: |
+          command=$(grep -A4 "cmd.exe failed: error executing Genrule command" "$RUNNER_TEMP/build.log" |
+            grep -m1 "cmd.exe /S" || true)
+          [[ -n "$command" ]] || { echo "no failed genrule"; exit 0; }
+          echo "$command"
+          cd C:/b/execroot/_main
+          printf '%s\n' "$command" | grep -oE '(>>?|type )[^ &]+' | sed -E 's/^(>>?|type )//' | sort -u |
+            while read -r path; do
+              unix=$(printf '%s' "$path" | tr '\\' '/')
+              echo "== $path"
+              ls -ld "$unix" "$(dirname "$unix")" 2>&1 | head -2
+              top=$(printf '%s' "$unix" | cut -d/ -f1-2)
+              cmd //c "dir /al $(cygpath -w "$(dirname "$top")")" 2>&1 | grep -F "$(basename "$top")" || echo "   $top: no junction"
+            done
       - name: The log of a run of no cache holds no token
         id: clean
         if: always() && inputs.cache == 'none'
