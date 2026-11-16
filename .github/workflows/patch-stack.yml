@@ -400,9 +400,9 @@ jobs:
             echo "staged $name on jax-$version; its native wheels are on their plugin release"
           fi
 
-  # A staged release's staging simple index, pypi.dewml.dev/staging/<version>/simple/, beside /simple and never part of
-  # it: /simple's projects as they are, each file linked at /packages, and the release's staged wheels linked at their
-  # GitHub assets with GitHub's sha256, so a pin head's lock names every machine's file with its hash (a find-links
+  # A staged release's staging simple index, pypi.dewml.dev/staging/<version>/<digest>/simple/, beside /simple and never
+  # part of it: the fork's own projects alone (every other package resolves from /simple, its authority), each with
+  # /simple's files of it at /packages and the release's staged wheels at their GitHub assets with GitHub's sha256, so a pin head's lock names every machine's file with its hash (a find-links
   # page gives uv the one wheel it picks: uv #10308) while installs, which read /simple, get nothing until the head
   # has landed (`index`). Written once: a page a lock may name is never rewritten (a page there with other bytes is
   # refused).
@@ -465,7 +465,7 @@ jobs:
               fi
             done
           done
-          echo "staging index: $INDEX/staging/$VERSION/simple/"
+          echo "staging index: $INDEX/$(tail -1 <<< "$pages")"
 
   index:
     needs: [carry]

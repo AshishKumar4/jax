@@ -344,15 +344,19 @@ def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> li
 
 
 def staged(site: Path, version: str, base: str, manifests: dict[str, dict], assets: list[dict]) -> list[str]:
-    """A staging simple index of release `version`, under site/staging/<version>/simple/: every project Dew's index
-    lists (`manifests`: each project's manifest, as index() keeps it) with each of its files linked absolutely at
-    `base` (its yanks kept), and beside them the release's staged wheels (`assets`: GitHub's {name, digest,
-    browser_download_url} of each, from `gh api releases/tags/<tag>`), each linked at its GitHub asset with GitHub's
-    sha256. A lock of the pin head that uses the release resolves from it, every file of every machine hashed (a
-    find-links page gives uv the one wheel it picks: uv #10308), while /simple, which installs read, gets nothing until
-    that head has landed (`indexable`). The pages written, relative to `site`."""
+    """A staging simple index of release `version`, under site/staging/<version>/<digest>/simple/: the fork's own
+    projects (STAGED) alone, each with the files Dew's index lists of it (`manifests`, as index() keeps them: linked
+    absolutely at `base`, their yanks kept) and the release's staged wheels of it (`assets`: GitHub's {name, digest,
+    browser_download_url} of each, from `gh api releases/tags/<tag>`, linked at the asset with GitHub's sha256). A
+    lock of the pin head that uses the release resolves those from it, every file of every machine hashed (a
+    find-links page gives uv the one wheel it picks: uv #10308), and every other package from /simple, which stays its
+    authority (a later release or yank there is seen: Main, 2026-11-16); installs read /simple, which gets nothing
+    until that head has landed (`indexable`). `<digest>` names the pages' content, so a page is never rewritten under
+    a path a lock names. The pages written, relative to `site`."""
     pages: dict[str, list[str]] = {}
     for project, listed in manifests.items():
+        if project not in STAGED:
+            continue
         pages[project] = [
             f'<a href="{base}/packages/{project}/{name}#sha256={entry["sha256"]}"'
             f' data-requires-python="{html.escape(entry["requires_python"])}"'
@@ -366,19 +370,22 @@ def staged(site: Path, version: str, base: str, manifests: dict[str, dict], asse
         if not digest.startswith("sha256:"):
             raise SystemExit(f"{name}: GitHub states no sha256 of it, so no page can name its digest")
         project = canonical(name.split("-")[0])
-        if name in manifests.get(project, {}):
+        if project not in STAGED or name in manifests.get(project, {}):
             continue
         pages.setdefault(project, []).append(
             f'<a href="{asset["browser_download_url"]}#sha256={digest.removeprefix("sha256:")}">{name}</a><br>\n')
+    rendered = {project: PAGE.format(title=f"Links for {project}", body="".join(links))
+                for project, links in sorted(pages.items())}
+    rendered[""] = PAGE.format(title="Simple index",
+                               body="".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted(pages)))
+    digest = hashlib.sha256("".join(f"{name}\0{page}\0" for name, page in sorted(rendered.items())).encode())
+    prefix = f"staging/{version}/{digest.hexdigest()[:16]}/simple/"
     written = []
-    simple = site / "staging" / version / "simple"
-    for project, links in sorted(pages.items()):
-        (simple / project).mkdir(parents=True, exist_ok=True)
-        (simple / project / "index.html").write_text(PAGE.format(title=f"Links for {project}", body="".join(links)))
-        written.append(f"staging/{version}/simple/{project}/")
-    listing = "".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted(pages))
-    (simple / "index.html").write_text(PAGE.format(title="Simple index", body=listing))
-    return [*written, f"staging/{version}/simple/"]
+    for project, page in rendered.items():
+        (site / prefix / project).mkdir(parents=True, exist_ok=True)
+        (site / prefix / project / "index.html").write_text(page)
+        written.append(prefix + (f"{project}/" if project else ""))
+    return sorted(written, key=lambda page: (page == prefix, page))
 
 
 def root(site: Path, projects: list[str]) -> None:
