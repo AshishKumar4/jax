@@ -153,7 +153,10 @@ jobs:
                             re.M | re.S)
           if found is None:
               sys.exit(print("no failed cmd.exe action"))
-          command = next(line.strip() for line in found.group(1).splitlines() if line.strip().startswith("cmd.exe"))
+          command = next((line.strip() for line in found.group(1).splitlines()
+                          if line.strip().startswith("cmd.exe")), None)
+          if command is None:
+              sys.exit(print("no command line"))
           print("COMMAND", command)
           os.chdir("C:/b/execroot/_main")
           batch = re.fullmatch(r"cmd\.exe /C (\S+\.bat)", command)
@@ -164,7 +167,11 @@ jobs:
               absolute = os.path.abspath(path)
               print("PATH", path, len(absolute), "exists" if os.path.exists(path) else "MISSING",
                     "| directory", "exists" if os.path.isdir(os.path.dirname(path)) else "MISSING")
-          done = subprocess.run(command, shell=True, capture_output=True, text=True)
+          try:
+              done = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=900,
+                                    stdin=subprocess.DEVNULL)
+          except subprocess.TimeoutExpired:
+              sys.exit(print("RERUN TimeoutExpired after 900 s"))
           print("RERUN exit", done.returncode)
           print("STDOUT", done.stdout[-3000:])
           print("STDERR", done.stderr[-3000:])
