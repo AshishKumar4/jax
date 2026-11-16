@@ -167,6 +167,22 @@ jobs:
               absolute = os.path.abspath(path)
               print("PATH", path, len(absolute), "exists" if os.path.exists(path) else "MISSING",
                     "| directory", "exists" if os.path.isdir(os.path.dirname(path)) else "MISSING")
+              # A missing path's components from the execroot: each one's kind (a link's target read) up to
+              # the first that is not there.
+              walked = ""
+              for part in re.split(r"[\\/]", path):
+                  walked = os.path.join(walked, part) if walked else part
+                  if not os.path.lexists(walked):
+                      print("   first missing", walked, "| its directory holds",
+                            sorted(os.listdir(os.path.dirname(walked)))[:12] if os.path.isdir(os.path.dirname(walked))
+                            else "(no directory)")
+                      break
+                  if os.path.islink(walked) or os.path.isjunction(walked):
+                      try:
+                          target = os.readlink(walked)
+                      except OSError as error:
+                          target = f"unreadable: {error}"
+                      print("   link", walked, "->", target, "| resolves", os.path.exists(walked))
           try:
               done = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=900,
                                     stdin=subprocess.DEVNULL)
