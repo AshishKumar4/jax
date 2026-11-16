@@ -96,6 +96,10 @@ archive_override(
         # them, gathering it into a buffer of the call's own: a bf16 convert of a broadcast scalar read past it
         # (row 5495), where writing the stride on the shared input crashed (row 6829).
         "//third_party:xla/ynn_unary_strided.patch",
+        # Triton's combine keeps a float add of a dot's result apart from its accumulator: a residual r + x @ w
+        # fused into a nested GEMM took r as the accumulator's start and rounded 1.7 times as far from float64
+        # as the add kept apart (row 6759).
+        "//third_party:xla/triton_dot_add_kept.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
