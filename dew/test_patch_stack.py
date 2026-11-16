@@ -425,7 +425,8 @@ def test_a_staging_index_lists_the_index_and_the_release_every_file_hashed(tmp_p
         "sha256": "1" * 64, "metadata_sha256": "2" * 64, "requires_python": ">=3.12", "yanked": "why"}}}
     url = "https://github.com/AshishKumar4/jax/releases/download"
     assets = [{"name": f"jaxlib-0.12.0.1.post101-cp312-cp312-manylinux_2_27_{machine}.whl",
-               "digest": f"sha256:{d * 64}", "browser_download_url": f"{url}/plugin-0.12.0.1.post101/jaxlib-{machine}.whl"}
+               "digest": f"sha256:{d * 64}",
+               "browser_download_url": f"{url}/plugin-0.12.0.1.post101/jaxlib-{machine}.whl"}
               for machine, d in (("x86_64", "3"), ("aarch64", "4"))]
     assets += [{"name": "debug-x86_64.tar.gz", "digest": "sha256:" + "5" * 64, "browser_download_url": f"{url}/d"},
                {"name": "jax-0.12.0.1.post101-py3-none-any.whl", "digest": "sha256:" + "6" * 64,
