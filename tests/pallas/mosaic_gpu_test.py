@@ -506,6 +506,21 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(x), op(x), rtol=1e-5 if approx_math else 3e-7
     )
 
+  @parameterized.parameters(jnp.int32, jnp.int8, jnp.float32)
+  def test_a_number_converts_to_a_boolean_by_comparing_with_zero(self, dtype):
+    # lax converts to a boolean by comparing with zero: 2 and 0.5 are True,
+    # where a truncation to the low bit read them as False.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.int32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...].astype(jnp.bool_).astype(jnp.int32)
+
+    x = (jnp.arange(256) % 4).astype(dtype)
+    if jnp.issubdtype(dtype, jnp.floating):
+      x = x / 2
+    np.testing.assert_array_equal(kernel(x), (x != 0).astype(jnp.int32))
+
   @parameterized.product(
       op=["exp", "exp2", "logistic", "tanh"],
       asked=["highest", "approximate", "default", "unmet"],
