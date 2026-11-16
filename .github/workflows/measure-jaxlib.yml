@@ -79,8 +79,13 @@ jobs:
             # ci_windows_amd64's clang-cl toolchain names the paths of Google's image (C:/tools/LLVM-19.1.7, VS 2022
             # BuildTools); on this runner none is there and Bazel resolved MSVC's cl, which refused clang's flags
             # (43927868094: D8021 '/Wno-gnu-offsetof-extensions'). win_clang's is Bazel's own, configured from the
-            # runner's MSVC and the LLVM build.py compiles with (BAZEL_LLVM), with ci_windows_amd64's links.
-            Windows) config=(--bazel_options=--config=win_clang
+            # runner's MSVC and the LLVM build.py compiles with (BAZEL_LLVM), with ci_windows_amd64's links; its
+            # repository by its canonical name, rules_cc's extension's, which the main repository does not import
+            # (43934254468: "No repository visible as '@local_config_cc'"), win_clang's other flags as it states them.
+            Windows) config=(--bazel_options=--config=clang_local --bazel_options=--compiler=clang-cl
+                             --bazel_options=--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc//:cc-toolchain-x64_windows-clang-cl
+                             --bazel_options=--extra_execution_platforms=//jax/tools/toolchains:x64_windows-clang-cl
+                             --bazel_options=--copt=-Werror=mismatched-tags
                              --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
                      BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
