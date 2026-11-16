@@ -113,8 +113,10 @@ jobs:
           base = re.search(r'^_version = "(.*)"$', text, re.M).group(1)
           version = sys.argv[1]
           assert version.startswith(base) and version != base, f"{version} is not {base} with a suffix"
-          path.write_text(re.sub(r"^_release_version: str \| None = .*$", "_release_version: str | None = None",
-                                 text, count=1, flags=re.M))
+          text, count = re.subn(r"^_release_version: str \| None = .*$", "_release_version: str | None = None",
+                                text, count=1, flags=re.M)
+          assert count == 1, "jax/version.py states no _release_version"
+          path.write_text(text)
           print(version[len(base):])
           PY
           )
@@ -141,6 +143,7 @@ jobs:
         # genrule's command writes or reads, and whether it and its directory exist, a junction among them.
         if: always() && inputs.cache == 'none' && runner.os == 'Windows' && steps.build.outputs.code != '0'
         run: |
+          [[ -f "$RUNNER_TEMP/build.log" && -d C:/b/execroot/_main ]] || { echo "no build ran"; exit 0; }
           command=$(grep -A4 "cmd.exe failed: error executing Genrule command" "$RUNNER_TEMP/build.log" |
             grep -m1 "cmd.exe /S" || true)
           [[ -n "$command" ]] || { echo "no failed genrule"; exit 0; }
