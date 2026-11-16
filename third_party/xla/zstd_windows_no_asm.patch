@@ -1,0 +1,46 @@
+From 398bdd8780df730ad1ed057c20d4781328b566d9 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Mon, 16 Nov 2026 10:39:43 -0600
+Subject: [PATCH] [XLA] zstd's x86-64 assembly is not built on Windows
+
+zstd's decompress/*_amd64.S are GNU assembler syntax, which MSVC's ml64 cannot
+assemble (a Windows build of a tool depending on zstd failed there), and zstd's
+own sources use them only on Linux and macOS (ZSTD_ASM_SUPPORTED). On an x86-64
+Windows target no .S is compiled.
+---
+ third_party/net_zstd.BUILD | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/third_party/net_zstd.BUILD b/third_party/net_zstd.BUILD
+index 6dd3eeb84b..b11aa874eb 100644
+--- a/third_party/net_zstd.BUILD
++++ b/third_party/net_zstd.BUILD
+@@ -29,6 +29,17 @@ config_setting(
+     ],
+ )
+ 
++# zstd's x86-64 assembly is GNU assembler syntax, which MSVC's ml64 cannot read,
++# and zstd's own sources take it only on Linux and macOS (ZSTD_ASM_SUPPORTED in
++# lib/common/portability_macros.h).
++config_setting(
++    name = "x86_64_windows",
++    constraint_values = [
++        "@platforms//cpu:x86_64",
++        "@platforms//os:windows",
++    ],
++)
++
+ cc_library(
+     name = "zstdlib",
+     srcs = glob([
+@@ -39,6 +50,7 @@ cc_library(
+         "decompress/*.c",
+         "decompress/*.h",
+     ]) + select({
++        ":x86_64_windows": [],
+         ":x86_64": glob(["decompress/*_amd64.S"]),
+         "//conditions:default": [],
+     }),
+-- 
+2.53.0
+

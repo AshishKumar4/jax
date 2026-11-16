@@ -100,6 +100,9 @@ archive_override(
         # fused into a nested GEMM took r as the accumulator's start and rounded 1.7 times as far from float64
         # as the add kept apart (row 6759).
         "//third_party:xla/triton_dot_add_kept.patch",
+        # zstd's x86-64 assembly is GNU assembler syntax, which MSVC's ml64 cannot read: no .S on a Windows
+        # target, as zstd's own sources take it only on Linux and macOS (a Windows jaxlib's tool build).
+        "//third_party:xla/zstd_windows_no_asm.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
