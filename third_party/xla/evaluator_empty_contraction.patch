@@ -1,0 +1,67 @@
+From 6678fbdc145cb77c101d7f0151b052f5f886b996 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Mon, 16 Nov 2026 02:25:42 -0600
+Subject: [PATCH] [XLA] HloEvaluator's float32 dot over an empty contraction is
+ zeros
+
+The float32 fast path contracted through Eigen, which divides by the contraction's depth as it blocks it: a
+dot over an empty contraction, [m, 0] by [0, n], raised SIGFPE, and XLA:CPU's constant folding died on one
+where the algebraic simplifier, which rewrites it first, was off. Its product is its sums of nothing, zeros,
+returned without contracting. hlo_evaluator_test holds it.
+---
+ xla/hlo/evaluator/hlo_evaluator.cc      |  6 ++++++
+ xla/hlo/evaluator/hlo_evaluator_test.cc | 21 +++++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/xla/hlo/evaluator/hlo_evaluator.cc b/xla/hlo/evaluator/hlo_evaluator.cc
+index f803233c14..d9bcb07e9c 100644
+--- a/xla/hlo/evaluator/hlo_evaluator.cc
++++ b/xla/hlo/evaluator/hlo_evaluator.cc
+@@ -5299,6 +5299,12 @@ static std::unique_ptr<Array2D<T>> MatmulArray2DImpl(const Array2D<T>& lhs,
+   int k = lhs.width();
+   int n = rhs.width();
+   auto result = std::make_unique<Array2D<T>>(m, n);
++  if (k == 0) {
++    // A product over an empty contraction is its sums of nothing, zeros:
++    // Eigen's contraction divides by its depth as it blocks it.
++    result->Fill(T(0));
++    return result;
++  }
+ 
+   using ConstTensor = Eigen::Tensor<const T, 2, Eigen::RowMajor>;
+   using Tensor = Eigen::Tensor<T, 2, Eigen::RowMajor>;
+diff --git a/xla/hlo/evaluator/hlo_evaluator_test.cc b/xla/hlo/evaluator/hlo_evaluator_test.cc
+index fed4b1e043..29251ce0c2 100644
+--- a/xla/hlo/evaluator/hlo_evaluator_test.cc
++++ b/xla/hlo/evaluator/hlo_evaluator_test.cc
+@@ -3464,6 +3464,27 @@ ENTRY main {
+   EXPECT_TRUE(LiteralTestUtil::Near(expected, result, fft_error_));
+ }
+ 
++// A dot over an empty contraction is zeros, as its sums of nothing are: the
++// float32 fast path's Eigen contraction divided by its depth, and constant
++// folding died of SIGFPE on one (XLA:CPU with the algebraic simplifier off).
++TEST_F(HloEvaluatorTest, DotOverAnEmptyContractionIsZeros) {
++  const char* hlo_text = R"(
++HloModule EmptyContraction
++
++ENTRY main {
++  lhs = f32[3,0] parameter(0)
++  rhs = f32[0,2] parameter(1)
++  ROOT dot = f32[3,2] dot(lhs, rhs), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++)";
++  Literal lhs = LiteralUtil::CreateR2FromArray2D<float>(Array2D<float>(3, 0));
++  Literal rhs = LiteralUtil::CreateR2FromArray2D<float>(Array2D<float>(0, 2));
++  TF_ASSERT_OK_AND_ASSIGN(m_, ParseAndReturnVerifiedModule(hlo_text));
++  TF_ASSERT_OK_AND_ASSIGN(Literal result, Evaluate({&lhs, &rhs}));
++  EXPECT_TRUE(LiteralTestUtil::Equal(
++      LiteralUtil::CreateR2<float>({{0, 0}, {0, 0}, {0, 0}}), result));
++}
++
+ TEST_F(HloEvaluatorTest, 1D_IFFT_4_on_c64x4) {
+   const char* hlo_text = R"(
+ HloModule Fft
+-- 
+2.53.0
+
