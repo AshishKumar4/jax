@@ -138,25 +138,37 @@ jobs:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
           # Its seconds and exit alone: no raw build log leaves the runner.
           path: ${{ runner.temp }}/builds.tsv
-      - name: A failed Windows genrule's paths, as its execroot holds them
-        # A run of no cache (no secret in the process) whose Windows build failed: each path its first failed
-        # genrule's command writes or reads, and whether it and its directory exist, a junction among them.
+      - name: A failed Windows action's command, run again in its execroot
+        # A run of no cache (no secret in the process) whose Windows build failed: its first failed cmd.exe
+        # action (a genrule's command, a copy's batch file), each bazel-out or external path it names with
+        # its length and whether it and its directory exist, and its command run again for what cmd prints.
         if: always() && inputs.cache == 'none' && runner.os == 'Windows' && steps.build.outputs.code != '0'
         run: |
           [[ -f "$RUNNER_TEMP/build.log" && -d C:/b/execroot/_main ]] || { echo "no build ran"; exit 0; }
-          command=$(grep -A4 "cmd.exe failed: error executing Genrule command" "$RUNNER_TEMP/build.log" |
-            grep -m1 "cmd.exe /S" || true)
-          [[ -n "$command" ]] || { echo "no failed genrule"; exit 0; }
-          echo "$command"
-          cd C:/b/execroot/_main
-          printf '%s\n' "$command" | grep -oE '(>>?|type )[^ &]+' | sed -E 's/^(>>?|type )//' | sort -u |
-            while read -r path; do
-              unix=$(printf '%s' "$path" | tr '\\' '/')
-              echo "== $path"
-              ls -ld "$unix" "$(dirname "$unix")" 2>&1 | head -2
-              top=$(printf '%s' "$unix" | cut -d/ -f1-2)
-              cmd //c "dir /al $(cygpath -w "$(dirname "$top")")" 2>&1 | grep -F "$(basename "$top")" || echo "   $top: no junction"
-            done
+          python - "$RUNNER_TEMP/build.log" <<'PY'
+          import os, re, subprocess, sys
+          # Bazel colours its ERROR lines: their codes stripped.
+          log = re.sub(r"\x1b\[[0-9;]*m", "", open(sys.argv[1], encoding="utf-8", errors="replace").read())
+          found = re.search(r"^ERROR: [^\n]*failed: \(Exit \d+\): cmd\.exe failed:[^\n]*\n(.*?)\n# Configuration", log,
+                            re.M | re.S)
+          if found is None:
+              sys.exit(print("no failed cmd.exe action"))
+          command = next(line.strip() for line in found.group(1).splitlines() if line.strip().startswith("cmd.exe"))
+          print("COMMAND", command)
+          os.chdir("C:/b/execroot/_main")
+          batch = re.fullmatch(r"cmd\.exe /C (\S+\.bat)", command)
+          text = open(batch.group(1), errors="replace").read() if batch else command
+          if batch:
+              print("BATCH\n" + text)
+          for path in sorted(set(re.findall(r"(?:bazel-out|external)[\\/][^\s\"'&>|]+", text))):
+              absolute = os.path.abspath(path)
+              print("PATH", path, len(absolute), "exists" if os.path.exists(path) else "MISSING",
+                    "| directory", "exists" if os.path.isdir(os.path.dirname(path)) else "MISSING")
+          done = subprocess.run(command, shell=True, capture_output=True, text=True)
+          print("RERUN exit", done.returncode)
+          print("STDOUT", done.stdout[-3000:])
+          print("STDERR", done.stderr[-3000:])
+          PY
       - name: The log of a run of no cache holds no token
         id: clean
         if: always() && inputs.cache == 'none'
