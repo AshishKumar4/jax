@@ -21,6 +21,10 @@ on:
       python:
         required: true
         default: "3.12"
+      cache:
+        description: "dew: Dew's Bazel cache, the log kept on the runner; none: no cache and no token in the process, the log uploaded"
+        required: true
+        default: "dew"
 
 permissions:
   contents: read
@@ -41,12 +45,14 @@ jobs:
       RUNNER: ${{ inputs.runner }}
       PYTHON: ${{ inputs.python }}
       ATTEMPT: ${{ matrix.attempt }}
+      CACHE: ${{ inputs.cache }}
     steps:
       - name: The inputs are of their forms
         run: |
           [[ "$REF" =~ ^release/[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::ref: a release branch"; exit 1; }
           [[ "$RUNNER" =~ ^(macos-1[4-9]|windows-latest|windows-202[2-9])$ ]] || { echo "::error::runner"; exit 1; }
           [[ "$PYTHON" =~ ^3\.1[0-9]$ ]] || { echo "::error::python"; exit 1; }
+          [[ "$CACHE" =~ ^(dew|none)$ ]] || { echo "::error::cache: dew or none"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -62,7 +68,8 @@ jobs:
           python-version: ${{ inputs.python }}
       - name: Build
         env:
-          DEW_BAZEL_TOKEN: ${{ secrets.DEW_BAZEL_TOKEN }}
+          # No token reaches a run of no cache, whose log leaves the runner.
+          DEW_BAZEL_TOKEN: ${{ inputs.cache == 'dew' && secrets.DEW_BAZEL_TOKEN || '' }}
         run: |
           case "$RUNNER_OS" in
             macOS) config=(--bazel_options=--config=clang_local --bazel_options=--macos_minimum_os=11.0)
@@ -72,22 +79,29 @@ jobs:
                      base="C:/b" ;;
             *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
           esac
-          # The token in a file of the runner's own, out of the build's sources; the variable gone before Bazel runs.
           token="$RUNNER_TEMP/bazel.token"
-          (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$token")
-          unset DEW_BAZEL_TOKEN
-          helper="$GITHUB_WORKSPACE/dew-tools/dew/bazel_credentials.py"
-          case "$RUNNER_OS" in
-            Windows) launcher="$RUNNER_TEMP/credentials.bat"
-                     printf '@"%s" "%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v python)")" "$(cygpath -w "$helper")" \
-                       "$(cygpath -w "$token")" > "$launcher"
-                     launcher=$(cygpath -m "$launcher") ;;
-            *) launcher="$RUNNER_TEMP/credentials"
-               printf '#!/bin/sh\nexec %q %q %q "$@"\n' "$(command -v python)" "$helper" "$token" > "$launcher"
-               chmod 700 "$launcher" ;;
-          esac
-          printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --credential_helper=dew-bazel.ashishkmr472.workers.dev=%s\ncommon --remote_upload_local_results=true\n' \
-            "$launcher" > .bazelrc.user
+          if [[ "$CACHE" == dew ]]; then
+            # The token in a file of the runner's own, out of the build's sources; the variable gone before Bazel runs.
+            (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$token")
+            unset DEW_BAZEL_TOKEN
+            helper="$GITHUB_WORKSPACE/dew-tools/dew/bazel_credentials.py"
+            case "$RUNNER_OS" in
+              Windows) launcher="$RUNNER_TEMP/credentials.bat"
+                       printf '@"%s" "%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v python)")" "$(cygpath -w "$helper")" \
+                         "$(cygpath -w "$token")" > "$launcher"
+                       launcher=$(cygpath -m "$launcher") ;;
+              *) launcher="$RUNNER_TEMP/credentials"
+                 printf '#!/bin/sh\nexec %q %q %q "$@"\n' "$(command -v python)" "$helper" "$token" > "$launcher"
+                 chmod 700 "$launcher" ;;
+            esac
+            printf 'common --remote_cache=https://dew-bazel.ashishkmr472.workers.dev/bazel\ncommon --credential_helper=dew-bazel.ashishkmr472.workers.dev=%s\ncommon --remote_upload_local_results=true\n' \
+              "$launcher" > .bazelrc.user
+          else
+            # No cache: nothing secret in the process, so its log may leave the runner.
+            [[ -z "$DEW_BAZEL_TOKEN" && ! -e .bazelrc.user && ! -e "$token" ]] || {
+              echo "::error::a run of no cache holds a token or a .bazelrc.user"; exit 1; }
+            config+=(--bazel_options=--config=public_cache)
+          fi
           started=$(date +%s) code=0
           python build/build.py build --wheels=jaxlib --python_version="$PYTHON" "${config[@]}" \
             --bazel_options=--repo_env=ML_WHEEL_TYPE=release --bazel_startup_options=--output_base="$base" \
@@ -104,3 +118,16 @@ jobs:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}
           # Its seconds and exit alone: no raw build log leaves the runner.
           path: ${{ runner.temp }}/builds.tsv
+      - name: The log of a run of no cache holds no token
+        id: clean
+        if: always() && inputs.cache == 'none'
+        run: |
+          [[ ! -e .bazelrc.user && ! -e "$RUNNER_TEMP/bazel.token" && -z "${DEW_BAZEL_TOKEN:-}" ]] || {
+            echo "::error::a token or .bazelrc.user exists: the log stays on the runner"; exit 1; }
+          ! grep -q "dew-bazel" "$RUNNER_TEMP/build.log" || { echo "::error::the log names Dew's cache"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        # Only past the check above: a log it found a token's trace in stays on the runner.
+        if: always() && inputs.cache == 'none' && steps.clean.outcome == 'success'
+        with:
+          name: measure-${{ inputs.runner }}-${{ matrix.attempt }}-log
+          path: ${{ runner.temp }}/build.log
