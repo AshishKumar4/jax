@@ -173,16 +173,16 @@ jobs:
               for part in re.split(r"[\\/]", path):
                   walked = os.path.join(walked, part) if walked else part
                   if not os.path.lexists(walked):
+                      parent = os.path.dirname(walked) or "."
                       print("   first missing", walked, "| its directory holds",
-                            sorted(os.listdir(os.path.dirname(walked)))[:12] if os.path.isdir(os.path.dirname(walked))
-                            else "(no directory)")
+                            sorted(os.listdir(parent))[:12] if os.path.isdir(parent) else "(no directory)")
                       break
-                  if os.path.islink(walked) or os.path.isjunction(walked):
-                      try:
-                          target = os.readlink(walked)
-                      except OSError as error:
-                          target = f"unreadable: {error}"
-                      print("   link", walked, "->", target, "| resolves", os.path.exists(walked))
+                  # A link or a junction alike: os.readlink reads either, on any Python, and refuses a plain entry.
+                  try:
+                      target = os.readlink(walked)
+                  except OSError:
+                      continue
+                  print("   link", walked, "->", target, "| resolves", os.path.exists(walked))
           try:
               done = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=900,
                                     stdin=subprocess.DEVNULL)
