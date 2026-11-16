@@ -343,6 +343,44 @@ def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> li
     return chosen
 
 
+def staged(site: Path, version: str, base: str, manifests: dict[str, dict], assets: list[dict]) -> list[str]:
+    """A staging simple index of release `version`, under site/staging/<version>/simple/: every project Dew's index
+    lists (`manifests`: each project's manifest, as index() keeps it) with each of its files linked absolutely at
+    `base` (its yanks kept), and beside them the release's staged wheels (`assets`: GitHub's {name, digest,
+    browser_download_url} of each, from `gh api releases/tags/<tag>`), each linked at its GitHub asset with GitHub's
+    sha256. A lock of the pin head that uses the release resolves from it, every file of every machine hashed (a
+    find-links page gives uv the one wheel it picks: uv #10308), while /simple, which installs read, gets nothing until
+    that head has landed (`indexable`). The pages written, relative to `site`."""
+    pages: dict[str, list[str]] = {}
+    for project, listed in manifests.items():
+        pages[project] = [
+            f'<a href="{base}/packages/{project}/{name}#sha256={entry["sha256"]}"'
+            f' data-requires-python="{html.escape(entry["requires_python"])}"'
+            + (f' data-yanked="{html.escape(entry["yanked"])}"' if "yanked" in entry else "")
+            + f'>{name}</a><br>\n' for name, entry in sorted(listed.items())]
+    for asset in sorted(assets, key=lambda found: found["name"]):
+        name = asset["name"]
+        if not name.endswith(".whl"):
+            continue
+        digest = asset.get("digest") or ""
+        if not digest.startswith("sha256:"):
+            raise SystemExit(f"{name}: GitHub states no sha256 of it, so no page can name its digest")
+        project = canonical(name.split("-")[0])
+        if name in manifests.get(project, {}):
+            continue
+        pages.setdefault(project, []).append(
+            f'<a href="{asset["browser_download_url"]}#sha256={digest.removeprefix("sha256:")}">{name}</a><br>\n')
+    written = []
+    simple = site / "staging" / version / "simple"
+    for project, links in sorted(pages.items()):
+        (simple / project).mkdir(parents=True, exist_ok=True)
+        (simple / project / "index.html").write_text(PAGE.format(title=f"Links for {project}", body="".join(links)))
+        written.append(f"staging/{version}/simple/{project}/")
+    listing = "".join(f'<a href="{name}/">{name}</a><br>\n' for name in sorted(pages))
+    (simple / "index.html").write_text(PAGE.format(title="Simple index", body=listing))
+    return [*written, f"staging/{version}/simple/"]
+
+
 def root(site: Path, projects: list[str]) -> None:
     """The index's root page, site/simple/index.html, listing each of `projects`."""
     (site / "simple").mkdir(parents=True, exist_ok=True)
@@ -374,6 +412,12 @@ def main() -> int:
     choosing.add_argument("pins", type=Path, help="`pinned`'s output")
     choosing.add_argument("version", help="the release's jax version, e.g. 0.12.0.1.post101")
     choosing.add_argument("wheels", type=Path, nargs="*")
+    staging = commands.add_parser("staged", help="a release's staging simple index, beside /simple")
+    staging.add_argument("site", type=Path)
+    staging.add_argument("version")
+    staging.add_argument("base", help="the index's address, e.g. https://pypi.dewml.dev")
+    staging.add_argument("manifests", type=Path, help="a directory of <project>.json, each project's manifest")
+    staging.add_argument("assets", type=Path, nargs="+", help="each release's `gh api releases/tags/<tag>` JSON")
     rooting = commands.add_parser("root")
     rooting.add_argument("site", type=Path)
     rooting.add_argument("--projects", nargs="*", default=[], help="every package the root lists")
@@ -397,6 +441,11 @@ def main() -> int:
     if args.command == "indexable":
         pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}
         print("\n".join(str(wheel) for wheel in indexable(pins, args.wheels, args.version)))
+        return 0
+    if args.command == "staged":
+        manifests = {path.stem: json.loads(path.read_text()) for path in sorted(args.manifests.glob("*.json"))}
+        assets = [asset for path in args.assets for asset in json.loads(path.read_text())["assets"]]
+        print("\n".join(staged(args.site, args.version, args.base, manifests, assets)))
         return 0
     if args.command == "root":
         root(args.site, args.projects)

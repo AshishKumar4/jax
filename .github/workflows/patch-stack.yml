@@ -49,6 +49,9 @@ on:
       pins:
         description: "with `index`, what Dew's main pins of them: `patch_stack.py pinned` of its locks at the published commit"
         required: false
+      staging:
+        description: "write a staged release's staging simple index, e.g. 0.12.0.1.post101 (one publish writes it after staging)"
+        required: false
 
 run-name: ${{ inputs.token && format('patch stack {0}', inputs.token) || 'patch stack' }}
 
@@ -136,7 +139,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: The release to carry
         id: next
-        if: inputs.publish == '' && inputs.yank == '' && inputs.index == ''
+        if: inputs.publish == '' && inputs.yank == '' && inputs.index == '' && inputs.staging == ''
         env:
           REHEARSE: ${{ inputs.rehearse }}
         run: |
@@ -363,6 +366,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.staged.outputs.version }}
     env:
       RELEASE: ${{ needs.carry.outputs.release }}
     steps:
@@ -371,6 +376,7 @@ jobs:
           name: artifacts
           path: incoming
       - name: Stage jax's own wheel on its release
+        id: staged
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -378,6 +384,7 @@ jobs:
           version=$(sed -n 's|^incoming/dist/jax-\(.*\)-py3-none-any.whl$|\1|p' <<< "$wheel")
           commit=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/heads/release/$version" | cut -f1)
           [ -n "$commit" ] || { echo "::error::no release/$version branch"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "jax-$version" --repo "$GITHUB_REPOSITORY" --target "$commit" --title "jax-$version" \
               --notes "jax $version, staged: Dew's pin head locks it from here, and it is indexed once that head has passed Dew's train (patch-stack's index)."
@@ -392,6 +399,61 @@ jobs:
             gh release upload "jax-$version" --repo "$GITHUB_REPOSITORY" "$wheel"
             echo "staged $name on jax-$version; its native wheels are on their plugin release"
           fi
+
+  # A staged release's staging simple index, pypi.dewml.dev/staging/<version>/simple/, beside /simple and never part of
+  # it: /simple's projects as they are, each file linked at /packages, and the release's staged wheels linked at their
+  # GitHub assets with GitHub's sha256, so a pin head's lock names every machine's file with its hash (a find-links
+  # page gives uv the one wheel it picks: uv #10308) while installs, which read /simple, get nothing until the head
+  # has landed (`index`). Written once: a page a lock may name is never rewritten (a page there with other bytes is
+  # refused).
+  staging:
+    needs: [carry, stage]
+    if: always() && needs.carry.result == 'success' && (needs.stage.result == 'success' || inputs.staging != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.staging || needs.stage.outputs.version }}
+      BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      INDEX: https://pypi.dewml.dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+          persist-credentials: false
+      - name: Write the staging index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+\.post[0-9]+$ ]] || { echo "::error::staging: a release's version"; exit 1; }
+          mkdir -p manifests assets
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/jax-$VERSION" > "assets/jax.json"
+          if gh release view "plugin-$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/plugin-$VERSION" > "assets/plugin.json"
+          fi
+          aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/simple/index.html" root.html > /dev/null
+          for project in $(sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p' root.html); do
+            aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$project/manifest.json" "manifests/$project.json" > /dev/null
+          done
+          pages=$(python3 dew/dew/patch_stack.py staged site "$VERSION" "$INDEX" manifests assets/*.json)
+          # Each page once: R2 refuses a second put of a key (If-None-Match: *); one there already must hold these
+          # bytes, else the staging index another lock may name would change under it.
+          for page in $pages; do
+            for key in "$page" "${page}index.html"; do
+              if ! aws s3api put-object --endpoint-url "$R2" --bucket "$BUCKET" --key "$key" \
+                  --body "site/${page}index.html" --content-type text/html --if-none-match '*' > /dev/null 2> put.txt; then
+                grep -q PreconditionFailed put.txt || { cat put.txt; exit 1; }
+                aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/$key" held.html > /dev/null
+                cmp -s held.html "site/${page}index.html" || { echo "::error::$key holds another page"; exit 1; }
+                echo "kept $key: the same page"
+              fi
+            done
+          done
+          echo "staging index: $INDEX/staging/$VERSION/simple/"
 
   index:
     needs: [carry]

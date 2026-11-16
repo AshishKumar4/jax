@@ -414,3 +414,31 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
     with pytest.raises(SystemExit):
         patch_stack.indexable(pins, [jax], "0.12.0.1.post102")
 
+
+
+def test_a_staging_index_lists_the_index_and_the_release_every_file_hashed(tmp_path):
+    """A release's staging simple index (`staged`): every project the index lists, each file linked absolutely at
+    the index with its digest and its yank kept, and the release's staged wheels linked at their GitHub assets with
+    GitHub's sha256, every machine's (a lock resolving from it hashes them all: uv #10308); a non-wheel asset is left
+    out, and an asset GitHub states no sha256 of is refused."""
+    manifests = {"jaxlib": {"jaxlib-0.12.0.1-cp312-cp312-manylinux_2_27_x86_64.whl": {
+        "sha256": "1" * 64, "metadata_sha256": "2" * 64, "requires_python": ">=3.12", "yanked": "why"}}}
+    url = "https://github.com/AshishKumar4/jax/releases/download"
+    assets = [{"name": f"jaxlib-0.12.0.1.post101-cp312-cp312-manylinux_2_27_{machine}.whl",
+               "digest": f"sha256:{d * 64}", "browser_download_url": f"{url}/plugin-0.12.0.1.post101/jaxlib-{machine}.whl"}
+              for machine, d in (("x86_64", "3"), ("aarch64", "4"))]
+    assets += [{"name": "debug-x86_64.tar.gz", "digest": "sha256:" + "5" * 64, "browser_download_url": f"{url}/d"},
+               {"name": "jax-0.12.0.1.post101-py3-none-any.whl", "digest": "sha256:" + "6" * 64,
+                "browser_download_url": f"{url}/jax-0.12.0.1.post101/jax.whl"}]
+    written = patch_stack.staged(tmp_path, "0.12.0.1.post101", "https://pypi.dewml.dev", manifests, assets)
+    simple = tmp_path / "staging" / "0.12.0.1.post101" / "simple"
+    assert written[-1] == "staging/0.12.0.1.post101/simple/"
+    jaxlib = (simple / "jaxlib" / "index.html").read_text()
+    assert 'href="https://pypi.dewml.dev/packages/jaxlib/jaxlib-0.12.0.1-cp312' in jaxlib
+    assert 'data-yanked="why"' in jaxlib
+    assert "#sha256=" + "3" * 64 in jaxlib and "#sha256=" + "4" * 64 in jaxlib and "debug" not in jaxlib
+    root = (simple / "index.html").read_text()
+    assert 'href="jax/"' in root and 'href="jaxlib/"' in root
+    with pytest.raises(SystemExit):
+        patch_stack.staged(tmp_path, "0.12.0.1.post102", "https://pypi.dewml.dev", manifests,
+                           [{**assets[0], "digest": None}])
