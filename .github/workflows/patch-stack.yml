@@ -432,11 +432,23 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+\.post[0-9]+$ ]] || { echo "::error::staging: a release's version"; exit 1; }
           mkdir -p manifests assets
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/jax-$VERSION" > "assets/jax.json"
-          if gh release view "plugin-$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/plugin-$VERSION" > "assets/plugin.json"
+          # Its native wheels from the plugin release whose native code the stack holds, as assemble chose it
+          # (`patch_stack.py plugins`): its own version's, or an earlier one's for a release of Python fixes alone,
+          # which may be staged and not yet indexed (review).
+          git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
+          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION")
+          if [ -n "$plugins" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$plugins" > "assets/plugin.json"
           fi
-          aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/simple/index.html" root.html > /dev/null
-          for project in $(sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p' root.html); do
+          # The index's projects as its root lists them; none where it has no root yet (review).
+          if aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/simple/index.html" root.html > /dev/null 2> root.txt; then
+            projects=$(sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p' root.html)
+          elif grep -q "(404)" root.txt; then
+            projects=
+          else
+            cat root.txt; exit 1
+          fi
+          for project in $projects; do
             aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$project/manifest.json" "manifests/$project.json" > /dev/null
           done
           pages=$(python3 dew/dew/patch_stack.py staged site "$VERSION" "$INDEX" manifests assets/*.json)
