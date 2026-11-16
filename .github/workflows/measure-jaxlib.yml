@@ -1,5 +1,6 @@
 # How long the fork's jaxlib takes to build on one of GitHub's hosted runners, by jax's own CI configuration of that
-# machine (.bazelrc ci_darwin_arm64 without its push to Google's cache; ci_windows_amd64), measured and published
+# machine (.bazelrc ci_darwin_arm64 without its push to Google's cache; win_clang, ci_windows_amd64's toolchain on
+# this runner's own MSVC and LLVM), measured and published
 # nowhere: one Python's build cold (as Dew's remote cache stands), then again from a fresh output base (what that cache
 # then serves). Each build's seconds and exit in the run's summary and its builds.tsv artifact (Main, 2026-11-14:
 # whether macOS arm64 and Windows jaxlib builds are cheap enough to keep those platforms).
@@ -75,8 +76,15 @@ jobs:
           case "$RUNNER_OS" in
             macOS) config=(--bazel_options=--config=clang_local --bazel_options=--macos_minimum_os=11.0)
                    base="$RUNNER_TEMP/base" ;;
-            Windows) config=(--bazel_options=--config=ci_windows_amd64
+            # ci_windows_amd64's clang-cl toolchain names the paths of Google's image (C:/tools/LLVM-19.1.7, VS 2022
+            # BuildTools); on this runner none is there and Bazel resolved MSVC's cl, which refused clang's flags
+            # (43927868094: D8021 '/Wno-gnu-offsetof-extensions'). win_clang's is Bazel's own, configured from the
+            # runner's MSVC and the LLVM build.py compiles with (BAZEL_LLVM), with ci_windows_amd64's links.
+            Windows) config=(--bazel_options=--config=win_clang
+                             --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
+                     BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
+                     export BAZEL_LLVM
                      base="C:/b" ;;
             *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
           esac
