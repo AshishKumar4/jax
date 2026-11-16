@@ -1,0 +1,56 @@
+From e6aea03cc123da436b534840e829c844026d62d2 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Mon, 16 Nov 2026 12:20:50 -0600
+Subject: [PATCH] [XLA] LLVM's overlay repository is not declared reproducible
+ on Windows
+
+llvm_configure's llvm-project links each llvm-raw entry into itself, a repository linking into another. Bazel
+9 replants a reproducible repository's links into another as relative paths (RepositoryUtils.replantSymlinks),
+which Windows resolves by the path they are reached through: an action reaching
+external/llvm-project/llvm/lib through the execroot's junction to the repository resolves
+..\..\llvm-raw\llvm\lib against the execroot, where llvm-raw is not planted, and finds no path (a Windows
+jaxlib's MLIR genrule: 'The system cannot find the path specified'). On Windows the repository is not
+declared reproducible, so its links stay as made, absolute.
+---
+ third_party/llvm/windows_overlay_links.patch | 16 ++++++++++++++++
+ third_party/llvm/workspace.bzl               |  1 +
+ 2 files changed, 17 insertions(+)
+ create mode 100644 third_party/llvm/windows_overlay_links.patch
+
+diff --git a/third_party/llvm/windows_overlay_links.patch b/third_party/llvm/windows_overlay_links.patch
+new file mode 100644
+index 0000000000..9ea5bb0cc4
+--- /dev/null
++++ b/third_party/llvm/windows_overlay_links.patch
+@@ -0,0 +1,16 @@
++diff --git a/utils/bazel/configure.bzl b/utils/bazel/configure.bzl
++--- a/utils/bazel/configure.bzl
+++++ b/utils/bazel/configure.bzl
++@@ -198,7 +198,11 @@
++         executable = False,
++     )
++ 
++-    if hasattr(repository_ctx, "repo_metadata"):
+++    # Its overlay links into llvm-raw, a repository of its own. Bazel replants a reproducible repository's
+++    # links into another as relative paths, which Windows resolves by the path they are reached through:
+++    # through the execroot's junction to this repository, where llvm-raw is not planted, an action reading
+++    # llvm/lib or mlir/lib finds no path. On Windows its links stay as made, absolute.
+++    if hasattr(repository_ctx, "repo_metadata") and not repository_ctx.os.name.lower().startswith("windows"):
++         return repository_ctx.repo_metadata(reproducible = True)
++ 
++ llvm_configure = repository_rule(
+diff --git a/third_party/llvm/workspace.bzl b/third_party/llvm/workspace.bzl
+index ba37bcd14f..216f4a7717 100644
+--- a/third_party/llvm/workspace.bzl
++++ b/third_party/llvm/workspace.bzl
+@@ -36,6 +36,7 @@ def repo(name):
+             "//third_party/llvm:repo_metadata.patch",
+             "//third_party/llvm:toolchains.patch",
+             "//third_party/llvm:run_lit.patch",
++            "//third_party/llvm:windows_overlay_links.patch",
+         ],
+         link_files = {"//third_party/llvm:run_lit.sh": "mlir/run_lit.sh"},
+     )
+-- 
+2.53.0
+
