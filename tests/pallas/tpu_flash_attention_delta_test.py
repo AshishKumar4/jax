@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The TPU flash attention backward's D, each query's sum of p * dp, run in TPU interpret mode."""
+"""The TPU flash attention backward's D, each query's sum of p * dp: on a TPU, in interpret mode elsewhere."""
+
+import contextlib
 
 from absl.testing import absltest
 import jax
@@ -49,7 +51,8 @@ class FlashAttentionDeltaTest(jtu.JaxTestCase):
           q, k, v, segment_ids=segment_ids, causal=True, sm_scale=0.125,
           block_sizes=_BLOCKS)
 
-    with pltpu.force_tpu_interpret_mode():
+    on_tpu = jtu.test_device_matches(["tpu"])
+    with contextlib.nullcontext() if on_tpu else pltpu.force_tpu_interpret_mode():
       dq, dk, dv = jax.vjp(attention, q, k, v)[1](do)
 
     def reference(q, k, v):

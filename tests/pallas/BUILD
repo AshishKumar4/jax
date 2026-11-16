@@ -778,7 +778,10 @@ jax_multiplatform_test(
     srcs = [
         "tpu_flash_attention_delta_test.py",
     ],
-    enable_backends = ["cpu"],
+    enable_backends = [
+        "cpu",
+        "tpu",
+    ],
     deps = [
         "//jax/experimental:pallas",
         "//jax/experimental:pallas_tpu",
