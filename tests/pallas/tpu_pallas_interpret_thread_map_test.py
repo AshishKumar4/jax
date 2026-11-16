@@ -14,6 +14,7 @@
 
 """Thread map test for TPU-specific interpret mode."""
 
+import functools
 import subprocess
 import sys
 import textwrap
@@ -108,6 +109,55 @@ class InterpretThreadMapTest(jtu.JaxTestCase):
     jax.block_until_ready(thread_map(f, 4, jnp.int32(0), x, unused, y))
     self.assertCountEqual([float(value) for value in seen],
                           [13.0, 14.0, 15.0, 16.0])
+
+  def _compiles(self, launch, times):
+    """The thread bodies' programs compiled over `times` calls of `launch`."""
+    with jax.log_compiles(), self.assertLogs("jax._src.dispatch",
+                                             level="WARNING") as logs:
+      for _ in range(times):
+        jax.block_until_ready(launch())
+    return sum("Finished XLA compilation of jit(_run) " in record
+               for record in logs.output)
+
+  def test_a_thread_body_traced_again_compiles_its_program_once(self):
+    # Each call traces a fresh body, as each call of a fresh jit or
+    # pallas_call traces its kernel anew: the body's program, the same at
+    # every call, compiles once.
+    x = jnp.arange(3, dtype=jnp.float32)
+    seen = []
+
+    def launch():
+      def f(core_index, token, x):
+        jax.experimental.io_callback(
+            seen.append, (), jnp.sin(x)[0] + core_index.astype(jnp.float32),
+            ordered=True)
+        return token
+      return thread_map(f, 2, jnp.int32(0), x)
+
+    self.assertEqual(self._compiles(launch, 3), 1)
+    self.assertLen(seen, 6)
+
+  def test_thread_bodies_calling_back_with_other_values_run_their_own(self):
+    # Bodies alike but for the value their callback is bound with each run
+    # their own callback, a program of their own each.
+    seen = []
+    x = jnp.arange(3, dtype=jnp.float32)
+
+    def record(tag, value):
+      del value
+      seen.append(tag)
+
+    def launch(tag):
+      def f(core_index, token, x):
+        jax.experimental.io_callback(
+            functools.partial(record, tag), (),
+            x[0] + core_index.astype(jnp.float32), ordered=True)
+        return token
+      return lambda: thread_map(f, 2, jnp.int32(0), x)
+
+    self.assertEqual(self._compiles(launch("first"), 1), 1)
+    self.assertEqual(self._compiles(launch("second"), 1), 1)
+    self.assertEqual(sorted(seen), ["first"] * 2 + ["second"] * 2)
 
 
 # A process whose CPU client holds every unit of its in-flight semaphore (32,

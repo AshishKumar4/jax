@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Hashable
 from concurrent import futures
 import contextlib
+import dataclasses
 import functools
 import threading
+from typing import Any
 
 import jax
 from jax._src import callback
+from jax._src import core
+from jax._src import util
 from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
@@ -73,16 +78,97 @@ def _run(jaxpr, consts, *args):
   jax_core.eval_jaxpr(jaxpr, consts, *args)
 
 
-def _run_jaxpr(jaxpr, consts, *args):
+@dataclasses.dataclass(eq=False)
+class _Programs:
+  """The executable each distinct thread body compiles to, by its program's
+  key (`_program_key`): a thread map traced again, as each call of a fresh
+  `jit` or `pallas_call` traces its kernel anew and with it its thread bodies'
+  jaxprs, runs the executable an identical one compiled, where jit's own cache,
+  keyed by the jaxpr's identity, compiled it again at every launch."""
+
+  compiled: dict[Hashable, Any] = dataclasses.field(default_factory=dict)
+  lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+  def cache_clear(self):
+    with self.lock:
+      self.compiled.clear()
+
+  def cache_info(self):
+    return len(self.compiled)
+
+  def cache_keys(self):
+    return list(self.compiled)
+
+
+_programs = _Programs()
+util.register_cache(_programs, "pallas interpret thread_map programs")
+
+
+def _value_key(value):
+  """`value` as it decides what a program computes: a callback by the function
+  it calls and the values it is bound with (each trace binds a fresh
+  `functools.partial`, equal to another by identity alone), a jaxpr by its
+  equations' keys (`_jaxpr_key`), anything else as itself, by its own
+  equality: an object equal to no other by value keys no other program."""
+  if isinstance(value, (callback._FlatCallback, callback._NumpyInputs)):
+    return type(value), tuple(_value_key(getattr(value, field.name))
+                              for field in dataclasses.fields(value))
+  if isinstance(value, functools.partial):
+    return (_value_key(value.func), tuple(map(_value_key, value.args)),
+            tuple(sorted((name, _value_key(each))
+                         for name, each in value.keywords.items())))
+  if isinstance(value, core.Jaxpr):
+    return _jaxpr_key(value)
+  if isinstance(value, (tuple, list)):
+    return type(value), tuple(map(_value_key, value))
+  return value
+
+
+def _jaxpr_key(jaxpr: core.Jaxpr) -> Hashable:
+  """The parameters of each of `jaxpr`'s equations, its sub-jaxprs' within,
+  each by `_value_key`: what its printed form, which names each opaque
+  parameter without its identity, does not decide."""
+  return tuple((eqn.primitive, tuple(sorted(
+      (name, _value_key(value)) for name, value in eqn.params.items())))
+               for eqn in jaxpr.eqns)
+
+
+def _program_key(jaxpr: core.Jaxpr) -> Hashable | None:
+  """What a thread body's program computes, its operands apart: its jaxpr's
+  printed form (its equations, their operands and literals, every aval) and
+  its parameters (`_jaxpr_key`); None where a parameter has no hash."""
+  key = (str(jaxpr), _jaxpr_key(jaxpr))
+  try:
+    hash(key)
+  except TypeError:
+    return None
+  return key
+
+
+def _run_jaxpr(jaxpr, key, consts, *args):
   # Every argument kept, so a role body's compiled signature is its jaxpr's:
   # with its unused arguments pruned, a Blackwell causal forward's role thread
   # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
   # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
   # Which pass drops the leaf is not established; keeping the arguments avoids
   # it, at the cost of passing buffers the body does not read.
-  traced = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
-      jaxpr, consts, *args)
-  traced.lower().compile()(consts, *args)
+  def compiled():
+    return jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
+        jaxpr, consts, *args).lower().compile()
+
+  if key is None:
+    compiled()(consts, *args)
+    return
+  # Its operands as the executable takes them: their avals and their devices.
+  key = key, tuple((jax.typeof(x), x.sharding)
+                   for x in jax.tree.leaves((consts, args)))
+  # Compiled under the lock, so a launch's threads compile their one program
+  # once between them.
+  with _programs.lock:
+    program = _programs.compiled.get(key)
+    if program is None:
+      program = _programs.compiled[key] = compiled()
+  program(consts, *args)
   return
 
 
@@ -93,6 +179,7 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   # the CPU device and back before that.
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
+  key = _program_key(jaxpr)
   threads = []
   with _leased_devices(num_threads) as devices, futures.ThreadPoolExecutor(
       max_workers=num_threads
@@ -114,7 +201,7 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
       args = (jax.device_put(np.int32(i), devices[device]), *thread_invals)
       flat_args, _ = jax.tree.flatten(args)
       threads.append(
-          executor.submit(_run_jaxpr, jaxpr, thread_consts, *flat_args))
+          executor.submit(_run_jaxpr, jaxpr, key, thread_consts, *flat_args))
     exceptions = []
     for i in range(num_threads):
       try:
@@ -136,8 +223,7 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
 def _call_threadmap_callback(token, device_id, jaxpr, num_threads, consts,
                              invals, use_ordered_callback, on_exception):
   # NOTE: At runtime, _thread_map_callback will lower and compile the
-  # given jaxpr.  (JAX's caches should ensure the jaxpr is only lowered and
-  # compiled once.)
+  # given jaxpr, once a process for each distinct program (`_programs`).
   #
   # TODO(jburnim): Would it be worth trying to lower/compile the jaxpr at
   # lowering/compilation time?  E.g., by using a custom primitive here, could
