@@ -88,6 +88,10 @@ jobs:
                              --bazel_options=--copt=-Werror=mismatched-tags
                              --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
+                     # Upstream's Windows toolchain's LLVM, 19.1.7 (XLA's tools/toolchains/win2022/t20260812,
+                     # C:/tools/LLVM-19.1.7): the runner's LLVM 20 declares _m_prefetchw static where the Windows
+                     # SDK's winnt.h declares it extern, which clang-cl refuses (43940037469, grpc's tsi).
+                     choco install llvm --version=19.1.7 --allow-downgrade -y --no-progress > "$RUNNER_TEMP/llvm.log"
                      BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
                      export BAZEL_LLVM
                      base="C:/b" ;;
