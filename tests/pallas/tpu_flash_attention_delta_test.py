@@ -51,8 +51,11 @@ class FlashAttentionDeltaTest(jtu.JaxTestCase):
           q, k, v, segment_ids=segment_ids, causal=True, sm_scale=0.125,
           block_sizes=_BLOCKS)
 
+    # At 'highest' a TPU's float32 products are float32's (its default is one
+    # bf16 pass, within 5e-3 of the gradients' scale, parent and patch alike).
     on_tpu = jtu.test_device_matches(["tpu"])
-    with contextlib.nullcontext() if on_tpu else pltpu.force_tpu_interpret_mode():
+    with (jax.default_matmul_precision("highest"),
+          contextlib.nullcontext() if on_tpu else pltpu.force_tpu_interpret_mode()):
       dq, dk, dv = jax.vjp(attention, q, k, v)[1](do)
 
     def reference(q, k, v):
