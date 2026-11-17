@@ -43,6 +43,7 @@ from jax.extend import (
     linear_util as linear_util,
     lowering as lowering,
     mlir as mlir,
+    mosaic_gpu as mosaic_gpu,
     pallas as pallas,
     random as random,
     sharding as sharding,
