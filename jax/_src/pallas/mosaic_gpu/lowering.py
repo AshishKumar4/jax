@@ -2572,9 +2572,21 @@ def _convert_element_type_lowering_rule(
     if x_aval.shape != ():
       raise NotImplementedError(
           "Non-scalar arithmetic is not supported in warp-level lowering.")
+  if _converts_to_bool(x_aval.dtype, new_dtype):
+    return _ensure_fa(x, x_aval.dtype) != _zero_of(x_aval.dtype)
   return _ensure_fa(x, x_aval.dtype).astype(
       mgpu_utils.dtype_to_ir_type(new_dtype), is_signed=mgpu_utils.is_signed(new_dtype)
   )
+
+
+def _converts_to_bool(dtype, new_dtype) -> bool:
+  # lax converts a number to a boolean by comparing it with zero (a NaN's is
+  # True): truncated to its low bit, 2 read as False.
+  return new_dtype == jnp.bool_ and dtype != jnp.bool_
+
+
+def _zero_of(dtype):
+  return 0.0 if jnp.issubdtype(dtype, jnp.floating) else 0
 
 
 @register_lowering_rule(
@@ -2595,6 +2607,13 @@ def _convert_element_type_lowering_rule_wg(
   x = _ensure_ir_value(x, x_aval.dtype)
 
   cur_dtype = mgpu_utils.dtype_to_ir_type(x_aval.dtype)
+  if _converts_to_bool(x_aval.dtype, y_aval.dtype):
+    zero = _ir_constant(_zero_of(x_aval.dtype), cur_dtype)
+    if x_aval.shape:
+      zero = vector_dialect.broadcast(x.type, zero)
+    if isinstance(cur_dtype, ir.FloatType):
+      return arith_dialect.cmpf(arith_dialect.CmpFPredicate.UNE, x, zero)
+    return arith_dialect.cmpi(arith_dialect.CmpIPredicate.ne, x, zero)
   new_dtype = mgpu_utils.dtype_to_ir_type(new_dtype)
 
   if cur_dtype == new_dtype:
@@ -2702,9 +2721,16 @@ def _neg_lowering_rule_wg(ctx: LoweringRuleContext, x):
 
 mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS].update({
     lax.neg_p: _neg_lowering_rule_wg,
+    # A boolean's complement through its integer is that integer's xor with 1:
+    # ~int(x), -1 or -2, is nonzero either way, true converted back to a
+    # boolean. An xor of the boolean itself with true lowers alike but held
+    # registers a decode step's kernel spilled 16 bytes for on sm120.
     lax.not_p: _lower_fun(
         lambda x: jnp.astype(
-            jnp.bitwise_xor(jnp.astype(x, int), -1), jnp.dtype(x)
+            jnp.bitwise_xor(
+                jnp.astype(x, int), 1 if jnp.dtype(x) == jnp.bool_ else -1
+            ),
+            jnp.dtype(x),
         )
     ),
 })
