@@ -56,7 +56,7 @@ _shared_memory_init_lock = threading.Lock()
 # under asynchronous dispatch, or from another Python thread) waits until the
 # live one is cleaned up, rather than joining (and corrupting) its memory.
 _shared_memory_cleared = threading.Condition(_shared_memory_init_lock)
-_shared_memory_devices_joined = 0
+_shared_memory_devices_joined: set[int] = set()
 _races: GPURaceDetectionState | None = None
 
 
@@ -69,7 +69,7 @@ def _clear_shared_memory():
   global _shared_memory, _shared_memory_devices_joined
   with _shared_memory_cleared:
     _shared_memory = None
-    _shared_memory_devices_joined = 0
+    _shared_memory_devices_joined = set()
     _shared_memory_cleared.notify_all()
 
 
@@ -95,7 +95,7 @@ def reset_gpu_interpret_mode_state():
   with _shared_memory_cleared:
     _shared_memory = None
     _races = None
-    _shared_memory_devices_joined = 0
+    _shared_memory_devices_joined = set()
     _shared_memory_cleared.notify_all()
 
 
@@ -173,6 +173,7 @@ def ordering_barrier(token):
 def _initialize_shared_memory(
     *,
     token: jax.Array,
+    device_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
@@ -180,21 +181,24 @@ def _initialize_shared_memory(
 ):
   global _shared_memory, _races, _shared_memory_devices_joined
 
+  device = int(device_id)
   num_gpus_as_int = int(num_gpus)
   num_threads_per_block_as_int = int(num_threads_per_block)
   num_blocks_per_cluster_as_int = int(num_blocks_per_cluster)
-  del num_gpus, num_threads_per_block, num_blocks_per_cluster
+  del device_id, num_gpus, num_threads_per_block, num_blocks_per_cluster
 
   with _shared_memory_cleared:
-    # Every device of the live kernel has joined its memory: this
-    # initialization is another kernel's, which waits for the live one's
-    # clean-up.
-    while (
-        _shared_memory is not None
-        and _shared_memory_devices_joined >= _shared_memory.num_devices
+    # Every device of the live kernel has joined its memory, or this device
+    # already has: this initialization is another kernel's, which waits for
+    # the live one's clean-up. A count of joins alone admitted another
+    # execution's first device into the live kernel's place, and the live
+    # kernel's own next device then waited forever for its clean-up.
+    while _shared_memory is not None and (
+        len(_shared_memory_devices_joined) >= _shared_memory.num_devices
+        or device in _shared_memory_devices_joined
     ):
       _shared_memory_cleared.wait()
-    _shared_memory_devices_joined += 1
+    _shared_memory_devices_joined.add(device)
     if _shared_memory is None:
       _races = GPURaceDetectionState(on_race=interpret_params.on_race)
       _shared_memory = memory.GPUSharedMemory(
@@ -219,6 +223,7 @@ def _initialize_shared_memory(
 def call_initialize_shared_memory(
     *,
     token: jax.Array,
+    device_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
@@ -231,6 +236,7 @@ def call_initialize_shared_memory(
       ),
       TOKEN_SHAPE_DTYPE,
       token=token,
+      device_id=device_id,
       num_gpus=num_gpus,
       num_threads_per_block=num_threads_per_block,
       num_blocks_per_cluster=num_blocks_per_cluster,
