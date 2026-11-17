@@ -188,6 +188,24 @@ CommonTmaParams prepare_tma_params(const CUtensorMap* tma_desc,
 // spec (`mosaic_gpu_build_kernel_spec`), each by its encoding's arguments.
 thread_local absl::InlinedVector<mosaic::gpu::TensorMapEncoding, 4> encoded;
 
+// Whether this thread's encodings record their arguments alone
+// (`mosaic_gpu_record_tensor_maps_only`): a deviceless capture's, which no
+// driver encodes.
+thread_local bool recorded_only = false;
+
+// Writes in place of a driver's encoding a placeholder no other encoding of
+// this thread holds, so `mosaic_gpu_build_kernel_spec` places each recorded
+// map at the host argument the host code copied it to.
+void Placeholder(CUtensorMap* tma_desc) {
+  static thread_local uint64_t count = 0;
+  std::memset(tma_desc, 0, sizeof(CUtensorMap));
+  constexpr char kMagic[8] = {'r', 'e', 'c', 'o', 'r', 'd', 'e', 'd'};
+  std::memcpy(tma_desc, kMagic, sizeof(kMagic));
+  const uint64_t index = ++count;
+  std::memcpy(reinterpret_cast<std::byte*>(tma_desc) + sizeof(kMagic), &index,
+              sizeof(index));
+}
+
 // `encoding`'s arguments shared by both encodings: those `params` holds.
 mosaic::gpu::TensorMapEncoding Encoding(const CUtensorMap* tma_desc,
                                         const CommonTmaParams& params,
@@ -243,13 +261,17 @@ void mosaic_gpu_init_tma_desc(CUtensorMap* tma_desc, void* base_addr,
     tma_window_shape[i] = tma_window_shape_i;
   }
   cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
-  abort_on_error(
-      cuTensorMapEncodeTiled(tma_desc, params.data_type, rank, base_addr,
-                             params.sizes, params.strides, tma_window_shape,
-                             element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                             params.swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-      "cuTensorMapEncodeTiled failed: %s\n");
+  if (recorded_only) {
+    Placeholder(tma_desc);
+  } else {
+    abort_on_error(
+        cuTensorMapEncodeTiled(tma_desc, params.data_type, rank, base_addr,
+                               params.sizes, params.strides, tma_window_shape,
+                               element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                               params.swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+        "cuTensorMapEncodeTiled failed: %s\n");
+  }
   mosaic::gpu::TensorMapEncoding encoding =
       Encoding(tma_desc, params, rank, base_addr);
   for (int64_t i = 0; i < rank; ++i) {
@@ -331,15 +353,19 @@ void mosaic_gpu_init_tma_im2col_desc(
     abort();
   }
 
-  abort_on_error(
-      cuTensorMapEncodeIm2col(
-          tma_desc, params.data_type, rank, base_addr, params.sizes,
-          params.strides, tma_lower_corner, tma_upper_corner,
-          static_cast<cuuint32_t>(channels_per_pixel),
-          static_cast<cuuint32_t>(pixels_per_column), element_strides,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, params.swizzle,
-          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-      "cuTensorMapEncodeIm2col failed: %s\n");
+  if (recorded_only) {
+    Placeholder(tma_desc);
+  } else {
+    abort_on_error(
+        cuTensorMapEncodeIm2col(
+            tma_desc, params.data_type, rank, base_addr, params.sizes,
+            params.strides, tma_lower_corner, tma_upper_corner,
+            static_cast<cuuint32_t>(channels_per_pixel),
+            static_cast<cuuint32_t>(pixels_per_column), element_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, params.swizzle,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+        "cuTensorMapEncodeIm2col failed: %s\n");
+  }
   mosaic::gpu::TensorMapEncoding encoding =
       Encoding(tma_desc, params, rank, base_addr);
   encoding.im2col = true;
@@ -412,4 +438,10 @@ void mosaic_gpu_build_kernel_spec(mosaic::gpu::MosaicKernelSpec* cfg,
   }
   encoded.clear();
 }
+
+// Whether this thread's tensor map encodings record their arguments alone,
+// with no driver (`on`), as a deviceless capture's host code runs: each
+// encoding a placeholder the spec's placement finds, the simulator encoding
+// the map from its arguments.
+void mosaic_gpu_record_tensor_maps_only(int32_t on) { recorded_only = on != 0; }
 }
