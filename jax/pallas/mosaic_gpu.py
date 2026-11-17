@@ -35,6 +35,7 @@ from jax._src.pallas.mosaic_gpu.core import PlainTransform as PlainTransform
 from jax._src.pallas.mosaic_gpu.core import RefUnion as RefUnion
 from jax._src.pallas.mosaic_gpu.core import remote_ref as remote_ref
 from jax._src.pallas.mosaic_gpu.core import SemaphoreType as SemaphoreType
+from jax._src.pallas.mosaic_gpu.core import SMEM_ALIGNMENT as SMEM_ALIGNMENT
 from jax._src.pallas.mosaic_gpu.core import SwizzleTransform as SwizzleTransform
 from jax._src.pallas.mosaic_gpu.core import TilingTransform as TilingTransform
 from jax._src.pallas.mosaic_gpu.core import TMEMLayout as TMEMLayout
