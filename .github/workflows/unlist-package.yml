@@ -13,7 +13,12 @@ on:
 permissions:
   contents: read
 
-concurrency: patch-stack
+# The index's writers' one queue, each waiting its turn: a run asked while another is pending waits behind it,
+# never cancelling it (GitHub's default keeps one pending run a group; review: an automatic index of one version
+# displaced a hand's pending operation on another).
+concurrency:
+  group: patch-stack
+  queue: max
 
 defaults:
   run:

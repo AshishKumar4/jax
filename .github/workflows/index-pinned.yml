@@ -53,15 +53,16 @@ jobs:
             # Its own index run under way (titled by its version, `token`), queued or running: asked again, it would
             # index the version twice; no other run of the workflow holds it (2026-11-17: a run of 11-06 GitHub still
             # lists as queued read as under way, and nothing was asked while main pinned post108 unindexed).
-            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 != "completed" { found = 1 }
-                                                                    END { exit !found }' <<< "$dispatched"; then
+            if awk -F'\t' -v title="patch stack index-$version" \
+                 '$1 == title && $2 != "completed" { found = 1 } END { exit !found }' <<< "$dispatched"; then
               echo "jax $version: its index run is under way"
               continue
             fi
             # One automatic attempt a version: one that failed or was cancelled waits for a hand to repair and run
             # it again (patch-stack's index), never asked every ten minutes (review).
-            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 == "completed" && $3 != "success"
-                                                                    { found = 1 } END { exit !found }' <<< "$dispatched"; then
+            if awk -F'\t' -v title="patch stack index-$version" \
+                 '$1 == title && $2 == "completed" && $3 != "success" { found = 1 } END { exit !found }' \
+                 <<< "$dispatched"; then
               echo "::warning::jax $version's automatic index did not succeed: index it by hand once repaired"
               continue
             fi

@@ -61,7 +61,12 @@ run-name: ${{ inputs.token && format('patch stack {0}', inputs.token) || 'patch 
 permissions:
   contents: read
 
-concurrency: patch-stack
+# The index's writers' one queue, each waiting its turn: a run asked while another is pending waits behind it,
+# never cancelling it (GitHub's default keeps one pending run a group; review: an automatic index of one version
+# displaced a hand's pending operation on another).
+concurrency:
+  group: patch-stack
+  queue: max
 
 env:
   # The stack's tests: the API its fixes change, and each test file the stack adds or changes over its release,
