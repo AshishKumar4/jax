@@ -330,6 +330,132 @@ class PallasBaseTest(ptu.PallasTest):
       self.skipTest("TODO: Mosaic GPU does not support this yet")
 
 
+class TritonHalfFloatLoweringTest(jtu.JaxTestCase):
+  """Pallas Triton lowers a 16-bit float division (and so logistic and a
+  negative power) and erf_inv for CUDA, on any host."""
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        jtu.ignore_warning(
+            category=DeprecationWarning,
+            message="The Pallas Triton backend is deprecated",
+        )
+    )
+
+  @parameterized.product(
+      op=["true_divide", "erf_inv", "logistic", "reciprocal"],
+      dtype=["bfloat16", "float16"],
+  )
+  def test_lowers(self, op, dtype):
+    try:
+      from jax.experimental.pallas import triton as pl_triton
+    except ImportError:
+      self.skipTest("Pallas Triton is unavailable")
+    fns = {
+        "true_divide": jnp.true_divide,
+        "erf_inv": lambda x, y: lax.erf_inv(x),
+        "logistic": lambda x, y: jax.nn.sigmoid(x),
+        "reciprocal": lambda x, y: x ** -2,
+    }
+
+    def kernel(x_ref, y_ref, o_ref):
+      o_ref[...] = fns[op](x_ref[...], y_ref[...])
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8, 128), dtype),
+        compiler_params=pl_triton.CompilerParams(num_warps=4, num_stages=1),
+    )
+    shape = jax.ShapeDtypeStruct((8, 128), dtype)
+    # An abstract A100, so no GPU is needed to lower for one.
+    gpu = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA A100-SXM4-40GB", num_cores=None, platform="cuda"
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=gpu)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(call).trace(shape, shape).lower(lowering_platforms=("cuda",))
+
+
+@jax.custom_vjp
+def _softcap(x):
+  return 0.5 * jnp.tanh(x / 0.5)
+
+
+def _softcap_fwd(x):
+  # The forward rule calls the function itself, as jax.custom_vjp's documented
+  # pattern does, so its trace holds a custom_vjp_call too.
+  capped = _softcap(x)
+  return capped, capped
+
+
+def _softcap_bwd(capped, cotangent):
+  return (cotangent * (1 - (capped / 0.5) ** 2),)
+
+
+_softcap.defvjp(_softcap_fwd, _softcap_bwd)
+
+
+@jax.custom_jvp
+def _scaled_tanh(x):
+  return 2.0 * jnp.tanh(x)
+
+
+@_scaled_tanh.defjvp
+def _scaled_tanh_jvp(primals, tangents):
+  (x,), (t,) = primals, tangents
+  y = _scaled_tanh(x)
+  return y, t * (2.0 - y * y / 2.0)
+
+
+_CUSTOM = {
+    "custom_vjp": _softcap,
+    "custom_vjp_in_vjp": lambda x: jax.vjp(_softcap, x)[1](x)[0],
+    "custom_jvp": _scaled_tanh,
+}
+"""Kernel bodies calling a custom-derivative function: a custom_vjp one, the
+pullback of one (whose trace keeps the call its forward rule makes), and a
+custom_jvp one."""
+
+
+class TritonCustomDerivativeLoweringTest(jtu.JaxTestCase):
+  """Pallas Triton lowers a custom_vjp or custom_jvp call in a kernel as its
+  primal function, for CUDA on any host."""
+
+  def setUp(self):
+    super().setUp()
+    self.enter_context(
+        jtu.ignore_warning(
+            category=DeprecationWarning,
+            message="The Pallas Triton backend is deprecated",
+        )
+    )
+
+  @parameterized.parameters(*_CUSTOM)
+  def test_lowers(self, name):
+    try:
+      from jax.experimental.pallas import triton as pl_triton
+    except ImportError:
+      self.skipTest("Pallas Triton is unavailable")
+
+    def kernel(x_ref, o_ref):
+      o_ref[...] = _CUSTOM[name](x_ref[...])
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        compiler_params=pl_triton.CompilerParams(num_warps=4, num_stages=1),
+    )
+    shape = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    # An abstract A100, so no GPU is needed to lower for one.
+    gpu = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA A100-SXM4-40GB", num_cores=None, platform="cuda"
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=gpu)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(call).trace(shape).lower(lowering_platforms=("cuda",))
+
+
 @jtu.thread_unsafe_test_class(condition=not htu.hypothesis_is_thread_safe())
 class OpsTest(PallasBaseTest):
 
@@ -1921,12 +2047,13 @@ class OpsTest(PallasBaseTest):
       ("int32", "float32"),
       ("float32", "float32"),
       ("bfloat16", "bfloat16"),
+      ("float16", "float16"),
   )
   def test_true_divide(self, dtype, out_dtype):
     self.skip_if_mosaic_gpu()
 
-    if jtu.test_device_matches(["gpu"]) and dtype == "bfloat16":
-      self.skipTest("bfloat16 not supported")
+    if jtu.test_device_matches(["tpu"]) and dtype == "float16":
+      self.skipTest("float16 not supported")
 
     @functools.partial(
         self.pallas_call,
@@ -1939,11 +2066,90 @@ class OpsTest(PallasBaseTest):
     y = jnp.array([3, 1, -4, -5, 2, -2, 2, 4]).astype(dtype)
     x = jnp.repeat(x, 8, axis=0).reshape(8, 8)
     y = jnp.tile(y, 8).reshape(8, 8)
-    rtol = 8e-3 if dtype == "bfloat16" else 1e-6
+    rtol = {"bfloat16": 8e-3, "float16": 1e-3}.get(dtype, 1e-6)
     np.testing.assert_allclose(
         jnp.true_divide(x, y).astype(jnp.float32),
         kernel(x, y).astype(jnp.float32),
         rtol=rtol,
+    )
+
+  @parameterized.parameters(*_CUSTOM)
+  def test_custom_derivative_call_computes_its_primal(self, name):
+    # A kernel takes no derivative of its own body: a custom-derivative call
+    # in it computes the primal function, as XLA does outside it.
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = _CUSTOM[name](x_ref[...])
+
+    x = jax.random.normal(jax.random.key(0), (8, 128), jnp.float32)
+    np.testing.assert_allclose(
+        kernel(x), jax.jit(_CUSTOM[name])(x), rtol=1e-6, atol=1e-6
+    )
+
+  @parameterized.parameters("bfloat16", "float16")
+  def test_half_float_true_divide_rounds_once(self, dtype):
+    # Pallas Triton divides 16-bit floats in float32, correctly rounded, so
+    # the quotient is XLA's exactly, subnormals and infinities included; a
+    # NaN is a NaN in both, whatever its payload.
+    self.skip_if_mosaic_gpu()
+    if self.INTERPRET or not jtu.test_device_matches(["cuda"]):
+      self.skipTest("Pallas Triton's lowering on CUDA")
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((8, 128), dtype),
+    )
+    def kernel(x_ref, y_ref, o_ref):
+      o_ref[...] = x_ref[...] / y_ref[...]
+
+    bits = jax.random.bits(jax.random.key(0), (2, 8, 128), jnp.uint16)
+    x, y = lax.bitcast_convert_type(bits, jnp.dtype(dtype))
+    actual, expected = kernel(x, y), x / y
+    nan = jnp.isnan(expected)
+    self.assertArraysEqual(jnp.isnan(actual), nan)
+    self.assertArraysEqual(jnp.where(nan, 0, actual), jnp.where(nan, 0, expected))
+
+  @parameterized.product(
+      op=["erf_inv", "logistic", "reciprocal"],
+      dtype=["bfloat16", "float16"],
+  )
+  def test_half_float_ops_through_float32(self, op, dtype):
+    self.skip_if_mosaic_gpu()
+    if self.INTERPRET or not jtu.test_device_matches(["cuda"]):
+      self.skipTest("Pallas Triton's lowering on CUDA")
+    fns = {
+        "erf_inv": lax.erf_inv,
+        "logistic": jax.nn.sigmoid,
+        "reciprocal": lambda x: x ** -2,
+    }
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((8, 128), dtype),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = fns[op](x_ref[...])
+
+    finfo = jnp.finfo(dtype)
+    below_one = 1 - finfo.epsneg
+    x = jax.random.uniform(
+        jax.random.key(0), (8, 128), jnp.float32, 0.25, 0.99
+    )
+    x = x * jnp.where(jnp.arange(128) % 2 == 0, 1.0, -1.0)[None, :]
+    x = x.astype(dtype).at[0, :4].set([1, -1, below_one, -below_one])
+    # erf_inv is float32's erf_inv rounded once, which the target's float32
+    # functions may put one 16-bit ulp from XLA's. Logistic and the power
+    # round each 16-bit step (the power squares first, logistic
+    # exponentiates and adds), where XLA may keep float32 between them: two
+    # ulps. |x| >= 0.25 keeps the square normal in float16.
+    ulps = {"erf_inv": 1, "logistic": 2, "reciprocal": 2}[op]
+    np.testing.assert_allclose(
+        kernel(x).astype(jnp.float32),
+        fns[op](x).astype(jnp.float32),
+        rtol=ulps * float(finfo.eps),
     )
 
   def test_f16_true_divide_unsupported(self):
@@ -1951,6 +2157,8 @@ class OpsTest(PallasBaseTest):
 
     if self.INTERPRET:
       self.skipTest("No lowering in interpret mode")
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Pallas Triton divides float16 in float32")
 
     @functools.partial(
         self.pallas_call,
