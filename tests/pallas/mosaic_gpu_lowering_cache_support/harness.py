@@ -221,8 +221,8 @@ class LoweringCacheTestCase(absltest.TestCase):
         stderr=subprocess.PIPE, text=True)
 
   def collect_child(self, process: subprocess.Popen) -> dict[str, Any]:
-    """What a started case reported, with its exit status and what it wrote to
-    stderr (`_returncode`, `_stderr`)."""
+    """What a started case reported, with its exit status, what it wrote to
+    stderr and what else it printed (`_returncode`, `_stderr`, `_printed`)."""
     stdout, stderr = process.communicate()
     lines = [l for l in stdout.splitlines() if l.startswith(RESULT)]
     self.assertTrue(lines, f"no result from the process: {stderr[-3000:]}")
@@ -230,6 +230,7 @@ class LoweringCacheTestCase(absltest.TestCase):
     self.assertNotIn("crash", result, stderr[-3000:])
     result["_returncode"] = process.returncode
     result["_stderr"] = stderr[-3000:]
+    result["_printed"] = [l for l in stdout.splitlines() if not l.startswith(RESULT)]
     return result
 
   def run_child(self, **kwargs: Any) -> dict[str, Any]:
