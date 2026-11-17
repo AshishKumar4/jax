@@ -1646,10 +1646,13 @@ def _shard_map_batch(
   with (core.set_current_trace(trace.parent_trace),
         core.remove_explicit_mesh_axis_names(trace.axis_data.explicit_mesh_axis)):
     out_vals = prim.bind(*in_vals, subfuns=(fun_batched,), **new_params)
-  make_tracer = partial(batching.BatchTracer, trace,
-                        source_info=source_info_util.current())
+  src = source_info_util.current()
   out_vals, out_dims = out_vals.unpack_aux()
-  return out_vals.map2(out_dims, make_tracer)
+  # Each output's staged custom_jvp, as the body's subtrace gave it
+  # (`batch_subtrace_2`), so vmap refuses an out_axes=None output of one.
+  return out_vals.map3(
+      out_dims, batching._staged_custom_jvps(out_dims),
+      lambda v, d, origin: batching.BatchTracer(trace, v, d, src, origin))
 batching.BatchTrace.process_shard_map = _shard_map_batch
 
 def _batch_out_specs(spmd_name, explicit_mesh_axis, dims, out_specs):
