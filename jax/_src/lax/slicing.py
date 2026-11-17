@@ -1506,6 +1506,7 @@ slice_p = standard_primitive(_slice_shape_rule, input_dtype, 'slice',
                              vma_rule=partial(core.standard_vma_rule, 'slice'),
                              ur_rule=_slice_ur_rule,
                              layout_rule=_slice_layout_rule)
+slice_p.rearranges = True
 ad.primitive_jvps[slice_p] = _slice_jvp_rule
 ad.fancy_transposes[slice_p] = _slice_transpose_fancy
 batching.primitive_batchers[slice_p] = _slice_batching_rule
@@ -1702,6 +1703,7 @@ dynamic_slice_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'dynamic_slice'),
     ur_rule=_dynamic_slice_ur_rule,
     layout_rule=_dynamic_slice_layout_rule)
+dynamic_slice_p.rearranges = True
 ad.primitive_jvps[dynamic_slice_p] = _dynamic_slice_jvp
 ad.fancy_transposes[dynamic_slice_p] = _dynamic_slice_transpose_fancy
 batching.fancy_primitive_batchers[dynamic_slice_p] = _dynamic_slice_batching_rule
@@ -1871,6 +1873,7 @@ dynamic_update_slice_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'dynamic_update_slice'),
     ur_rule=_dynamic_update_slice_ur_rule,
     layout_rule=_dynamic_update_slice_layout_rule)
+dynamic_update_slice_p.rearranges = True
 ad.primitive_jvps[dynamic_update_slice_p] = _dynamic_update_slice_jvp
 ad.primitive_transposes[dynamic_update_slice_p] = \
     _dynamic_update_slice_transpose_rule
@@ -2503,6 +2506,7 @@ gather_p = standard_primitive(
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_gather_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'gather'),
     ur_rule=_gather_ur_rule)
+gather_p.rearranges = True
 ad.defjvp(gather_p, _gather_jvp_rule, None)
 ad.fancy_transposes[gather_p] = _gather_transpose_fancy
 batching.fancy_primitive_batchers[gather_p] = _gather_batching_rule
@@ -3342,6 +3346,13 @@ def _scatter_batching_rule(scatter_op, axis_data, batched_args, batch_dims, *,
       out_sharding=out_sharding), 0
 
 
+
+def _def_scatter_batching(prim):
+  """`prim`'s batching rule a scatter's, and `prim` a scatter (`Primitive.scatters`)."""
+  prim.scatters = True
+  batching.fancy_primitive_batchers[prim] = partial(_scatter_batching_rule, prim)
+
+
 scatter_add_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-add',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
@@ -3350,7 +3361,7 @@ scatter_add_p = standard_primitive(
     ur_rule=_scatter_ur_rule)
 ad.primitive_jvps[scatter_add_p] = partial(_scatter_addsub_jvp, scatter_add_p)
 ad.primitive_transposes[scatter_add_p] = partial(_scatter_addsub_transpose_rule, scatter_add_p)
-batching.fancy_primitive_batchers[scatter_add_p] = partial(_scatter_batching_rule, scatter_add_p)
+_def_scatter_batching(scatter_add_p)
 lax_utils.register_unreduced_lojax(scatter_add_p, 'out_sharding')
 
 scatter_sub_p = standard_primitive(
@@ -3361,14 +3372,14 @@ scatter_sub_p = standard_primitive(
 )
 ad.primitive_jvps[scatter_sub_p] = partial(_scatter_addsub_jvp, scatter_sub_p)
 ad.primitive_transposes[scatter_sub_p] = partial(_scatter_addsub_transpose_rule, scatter_sub_p)
-batching.fancy_primitive_batchers[scatter_sub_p] = partial(
-    _scatter_batching_rule, scatter_sub_p)
+_def_scatter_batching(scatter_sub_p)
 
 scatter_mul_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-mul',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'scatter_mul'),
     memory_space_rule=_scatter_memory_space_rule)
+
 
 def _scatter_mul_jvp_rhs(g, x, i, y, *, dimension_numbers,
                          indices_are_sorted, unique_indices, mode,
@@ -3386,8 +3397,7 @@ ad.defjvp(scatter_mul_p,
           None,
           _scatter_mul_jvp_rhs)
 ad.primitive_transposes[scatter_mul_p] = _scatter_mul_transpose_rule
-batching.fancy_primitive_batchers[scatter_mul_p] = (
-  partial(_scatter_batching_rule, scatter_mul_p))
+_def_scatter_batching(scatter_mul_p)
 
 def _scatter_extremal_jvp(scatter_op, primals, tangents, update_jaxpr,
                           update_consts, dimension_numbers,
@@ -3523,8 +3533,7 @@ scatter_min_p = standard_primitive(
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'scatter_min'),
     memory_space_rule=_scatter_memory_space_rule)
-batching.fancy_primitive_batchers[scatter_min_p] = (
-  partial(_scatter_batching_rule, scatter_min_p))
+_def_scatter_batching(scatter_min_p)
 ad.primitive_jvps[scatter_min_p] = partial(_scatter_extremal_jvp, scatter_min_p)
 
 scatter_max_p = standard_primitive(
@@ -3532,8 +3541,7 @@ scatter_max_p = standard_primitive(
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'scatter_max'),
     memory_space_rule=_scatter_memory_space_rule)
-batching.fancy_primitive_batchers[scatter_max_p] = (
-  partial(_scatter_batching_rule, scatter_max_p))
+_def_scatter_batching(scatter_max_p)
 ad.primitive_jvps[scatter_max_p] = partial(_scatter_extremal_jvp, scatter_max_p)
 
 def _scatter_jvp(primals, tangents, *, update_jaxpr, update_consts,
@@ -3701,8 +3709,7 @@ scatter_p = standard_primitive(
     memory_space_rule=_scatter_memory_space_rule)
 ad.primitive_jvps[scatter_p] = _scatter_jvp
 ad.primitive_transposes[scatter_p] = _scatter_transpose_rule
-batching.fancy_primitive_batchers[scatter_p] = (
-  partial(_scatter_batching_rule, scatter_p))
+_def_scatter_batching(scatter_p)
 
 def _scatter_to_lojax(*args, update_jaxpr, update_consts, **params):
   lo_jaxpr = pe.lower_jaxpr2(update_jaxpr)
