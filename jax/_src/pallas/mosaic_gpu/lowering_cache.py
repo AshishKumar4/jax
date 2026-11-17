@@ -78,6 +78,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Sequence
 from typing import Any
 
@@ -267,6 +268,32 @@ def _eligible(params: gpu_core.CompilerParams) -> None:
       raise encoding.Uncacheable(f"{name} dumps this lowering")
 
 
+# Each kernel jaxpr's encoding and the encoder's state after it, by the jaxpr: a
+# lowering of a jaxpr met before (a kernel a caller traced once and lowers in
+# each program that calls it) reads its encoding, where the walk of a large
+# kernel's equations was most of its key's time.
+_ENCODED_JAXPRS: weakref.WeakKeyDictionary[
+    jax_core.Jaxpr, tuple[encoding.Encoder, bytes]
+] = weakref.WeakKeyDictionary()
+_ENCODED_JAXPRS_LOCK = threading.Lock()
+
+
+def _jaxpr_encoded(
+    jaxpr: jax_core.Jaxpr,
+) -> tuple[encoding.Encoder, bytes]:
+  """An encoder that has encoded `jaxpr`, and its encoding: the state a key's
+  later parts are encoded on from, the same whether `jaxpr` was met before."""
+  with _ENCODED_JAXPRS_LOCK:
+    found = _ENCODED_JAXPRS.get(jaxpr)
+  if found is None:
+    enc = encoding.Encoder()
+    found = enc, enc.encode(jaxpr)
+    with _ENCODED_JAXPRS_LOCK:
+      _ENCODED_JAXPRS[jaxpr] = found
+  enc, encoded = found
+  return enc.copy(), encoded
+
+
 def _key(
     ctx: mlir.LoweringRuleContext,
     gpu_mesh: gpu_core.Mesh,
@@ -280,8 +307,7 @@ def _key(
     dispatch: bytes,
     constants: bytes,
 ) -> str:
-  enc = encoding.Encoder()
-  jaxpr_enc = enc.encode(jaxpr)
+  enc, jaxpr_enc = _jaxpr_encoded(jaxpr)
   registries_lib.check_primitives(enc.primitives)
   parts = {
       "version": b"mosaic-gpu-lowering-cache-key-v1",
