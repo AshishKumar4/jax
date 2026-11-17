@@ -1,4 +1,4 @@
-From 77be12132b9cf3794f19de047f1197190fa1c099 Mon Sep 17 00:00:00 2001
+From 096b4836478bfcea49e6ff9d3f31304fbb93a73d Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 01:49:25 -0600
 Subject: [PATCH] [XLA:GPU] A compile can stop after buffer assignment and
@@ -17,16 +17,17 @@ cost of its HLO passes alone.
  xla/pjrt/compiled_memory_stats.cc             | 30 +++++++
  xla/pjrt/compiled_memory_stats.h              |  8 ++
  xla/pjrt/gpu/se_gpu_pjrt_compiler.cc          |  4 +
- xla/service/gpu/BUILD                         |  3 +-
+ xla/service/gpu/BUILD                         | 24 ++++-
  xla/service/gpu/compile_module_to_llvm_ir.h   |  6 ++
  .../gpu/early_exit_compilation_result.cc      | 10 ++-
  .../gpu/early_exit_compilation_result.h       |  9 ++
- xla/service/gpu/gpu_aot_compilation_result.cc | 34 +-------
- xla/service/gpu/gpu_compiler.cc               | 85 +++++++++++++++----
+ xla/service/gpu/gpu_aot_compilation_result.cc | 34 +------
+ xla/service/gpu/gpu_compiler.cc               | 85 ++++++++++++++----
  xla/service/gpu/gpu_compiler.h                | 13 +++
- xla/service/gpu/gpu_compiler_test.cc          | 50 +++++++++++
+ .../gpu/gpu_compiler_early_exit_test.cc       | 88 +++++++++++++++++++
  xla/xla.proto                                 |  2 +
- 14 files changed, 206 insertions(+), 54 deletions(-)
+ 14 files changed, 265 insertions(+), 54 deletions(-)
+ create mode 100644 xla/service/gpu/gpu_compiler_early_exit_test.cc
 
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
 index 81bc1bbf2a..f2d6329c44 100644
@@ -153,18 +154,39 @@ index 25576bb3a2..693c2f214a 100644
    }
    const int num_replicas = hlo_module->config().replica_count();
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 8785c0c2d4..54be8fda6a 100644
+index 8785c0c2d4..daf95fd535 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -2209,6 +2209,7 @@ xla_test(
-         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
-         "//xla/hlo/testlib:pattern_matcher_gmock",
-         "//xla/hlo/testlib:verified_hlo_module",
+@@ -2166,6 +2166,28 @@ cc_library(
+     ] + xla_internal(["//xla/service/gpu/google:export_hlo"]),
+ )
+ 
++xla_test(
++    name = "gpu_compiler_early_exit_test",
++    srcs = ["gpu_compiler_early_exit_test.cc"],
++    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against its
++    # libraries' shared objects finds none of their functions.
++    linkstatic = True,
++    backends = ["gpu"],
++    deps = [
++        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
++        "//xla/hlo/ir:hlo",
 +        "//xla/pjrt:compiled_memory_stats",
-         "//xla/service:compiled_module",
-         "//xla/service:compiler",
-         "//xla/service:device_assignment",
-@@ -2313,6 +2314,7 @@ cc_library(
++        "//xla/service:compiled_module",
++        "//xla/service:compiler",
++        "//xla/service:gpu_topology",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings:string_view",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "gpu_compiler_test",
+     srcs = ["gpu_compiler_test.cc"],
+@@ -2313,6 +2335,7 @@ cc_library(
          "//xla/pjrt:compiled_memory_stats",
          "//xla/service:compiled_module",
          "//xla/service:executable",
@@ -172,7 +194,7 @@ index 8785c0c2d4..54be8fda6a 100644
          "//xla/stream_executor:device_description",
          "//xla/stream_executor:platform",
          "@com_google_absl//absl/status",
-@@ -2331,7 +2333,6 @@ cc_library(
+@@ -2331,7 +2354,6 @@ cc_library(
          "//xla:xla_proto_cc",
          "//xla/hlo/ir:hlo",
          "//xla/pjrt:compiled_memory_stats",
@@ -458,23 +480,49 @@ index fae1025645..a3cfac8746 100644
    // Schedule and compile the module.
    absl::StatusOr<CompileResultWithMetadata> CompileToBackendResult(
        HloModule* module, llvm::LLVMContext* llvm_context,
-diff --git a/xla/service/gpu/gpu_compiler_test.cc b/xla/service/gpu/gpu_compiler_test.cc
-index 09c46a5c89..ba4bd75582 100644
---- a/xla/service/gpu/gpu_compiler_test.cc
-+++ b/xla/service/gpu/gpu_compiler_test.cc
-@@ -74,6 +74,7 @@ limitations under the License.
- #include "xla/literal.h"
- #include "xla/literal_util.h"
- #include "xla/primitive_util.h"
+diff --git a/xla/service/gpu/gpu_compiler_early_exit_test.cc b/xla/service/gpu/gpu_compiler_early_exit_test.cc
+new file mode 100644
+index 0000000000..c35ec4b2b0
+--- /dev/null
++++ b/xla/service/gpu/gpu_compiler_early_exit_test.cc
+@@ -0,0 +1,88 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <memory>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
++#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
++#include "xla/hlo/ir/hlo_module.h"
 +#include "xla/pjrt/compiled_memory_stats.h"
- #include "xla/service/compiled_module.h"
- #include "xla/service/compiler.h"
- #include "xla/service/device_assignment.h"
-@@ -3643,6 +3644,55 @@ TEST_F(GpuCompilerTest, EarlyExitAfterConfigAssignment) {
-                                     "config-assigner"}));
- }
- 
-+TEST_F(GpuCompilerTest, EarlyExitAfterBufferAssignmentStatesTheCompilesMemory) {
++#include "xla/service/compiled_module.h"
++#include "xla/service/compiler.h"
++#include "xla/service/gpu_topology.h"
++#include "xla/tsl/platform/statusor.h"
++
++namespace xla::gpu {
++namespace {
++
++using GpuCompilerEarlyExitTest = HloPjRtGpuTestBase;
++
++TEST_F(GpuCompilerEarlyExitTest,
++       AfterBufferAssignmentStatesTheWholeCompilesMemory) {
 +  absl::string_view hlo_text = R"hlo(
 +    HloModule gemm_tanh
 +
@@ -495,9 +543,9 @@ index 09c46a5c89..ba4bd75582 100644
 +    aot_options.set_gpu_topology(GetSingleDeviceGpuTopology(
 +        /*platform_version=*/"", gpu_target_config()));
 +    aot_options.set_early_exit_point(point);
-+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
-+                          ParseAndReturnVerifiedModule(hlo_text));
-+    ABSL_ASSIGN_OR_RETURN(
++    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
++                        ParseAndReturnVerifiedModule(hlo_text));
++    TF_ASSIGN_OR_RETURN(
 +        std::vector<std::unique_ptr<CompiledModule>> results,
 +        compiler()->CompileAheadOfTime(std::move(module), aot_options));
 +    if (results.size() != 1) {
@@ -506,26 +554,26 @@ index 09c46a5c89..ba4bd75582 100644
 +    return results[0]->GetCompiledMemoryStats();
 +  };
 +
-+  ASSERT_OK_AND_ASSIGN(
++  TF_ASSERT_OK_AND_ASSIGN(
 +      CompiledMemoryStats early,
 +      compiled(AotCompilationOptions::EarlyExitPoint::kAfterBufferAssignment));
-+  ASSERT_OK_AND_ASSIGN(CompiledMemoryStats full,
-+                       compiled(AotCompilationOptions::EarlyExitPoint::kNone));
++  TF_ASSERT_OK_AND_ASSIGN(
++      CompiledMemoryStats whole,
++      compiled(AotCompilationOptions::EarlyExitPoint::kNone));
 +
 +  // The stop after buffer assignment states what the whole compile does.
 +  EXPECT_GT(early.temp_size_in_bytes, 0);
-+  EXPECT_EQ(early.temp_size_in_bytes, full.temp_size_in_bytes);
-+  EXPECT_EQ(early.argument_size_in_bytes, full.argument_size_in_bytes);
-+  EXPECT_EQ(early.output_size_in_bytes, full.output_size_in_bytes);
-+  EXPECT_EQ(early.alias_size_in_bytes, full.alias_size_in_bytes);
-+  EXPECT_EQ(early.peak_memory_in_bytes, full.peak_memory_in_bytes);
++  EXPECT_EQ(early.temp_size_in_bytes, whole.temp_size_in_bytes);
++  EXPECT_EQ(early.argument_size_in_bytes, whole.argument_size_in_bytes);
++  EXPECT_EQ(early.output_size_in_bytes, whole.output_size_in_bytes);
++  EXPECT_EQ(early.alias_size_in_bytes, whole.alias_size_in_bytes);
++  EXPECT_EQ(early.peak_memory_in_bytes, whole.peak_memory_in_bytes);
 +  EXPECT_EQ(early.serialized_buffer_assignment,
-+            full.serialized_buffer_assignment);
++            whole.serialized_buffer_assignment);
 +}
 +
- TEST_F(GpuCompilerTest, DevicelessCollectiveFusionWithTopologyFlag) {
-   if (device_description().gpu_compute_capability().IsRocm()) {
-     GTEST_SKIP() << "Test requires CUDA backend.";
++}  // namespace
++}  // namespace xla::gpu
 diff --git a/xla/xla.proto b/xla/xla.proto
 index b0e6702981..ccdd1b9304 100644
 --- a/xla/xla.proto
