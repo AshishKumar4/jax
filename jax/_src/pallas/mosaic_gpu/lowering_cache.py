@@ -296,7 +296,9 @@ def _key(
       # The rule's arguments.
       "input avals": enc.encode(tuple(in_shapes)),
       "output avals": enc.encode(tuple(out_shapes)),
-      "compiler params": enc.encode(params),
+      # Not the caller's metadata: no lowering reads it, and the call carries
+      # the caller's own beside a hit's module (`_emit_mosaic_gpu_custom_call`).
+      "compiler params": enc.encode(dataclasses.replace(params, metadata=b"")),
       "gpu mesh": enc.encode(gpu_mesh),
       "jax mesh": enc.encode(jax_mesh),
       "axis environment": enc.encode(jax_core.get_axis_env()),
