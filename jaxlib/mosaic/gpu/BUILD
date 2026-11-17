@@ -96,6 +96,7 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@llvm-project//mlir:GPUDialect",
         "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:NVVMDialect",
     ],
 )
 

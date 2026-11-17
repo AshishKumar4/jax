@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
@@ -77,12 +78,12 @@ TEST_F(SassDiscoveryTest, DisassemblerInSeparatePackageRemainsDiscoverable) {
   ASSERT_EQ(setenv("PATH", (cu13 / "bin").c_str(), 1), 0);
 
   mlir::MLIRContext ctx;
-  ctx.loadDialect<mlir::gpu::GPUDialect>();
+  ctx.loadDialect<mlir::gpu::GPUDialect, mlir::NVVM::NVVMDialect>();
   auto location = mlir::UnknownLoc::get(&ctx);
   mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(location);
   mlir::OpBuilder builder(module->getBodyRegion());
   auto object = mlir::gpu::ObjectAttr::get(
-      &ctx, builder.getStringAttr("unused-target"),
+      mlir::NVVM::NVVMTargetAttr::get(&ctx),
       mlir::gpu::CompilationTarget::Binary, builder.getStringAttr("ELF"));
   mlir::OperationState state(location, mlir::gpu::BinaryOp::getOperationName());
   state.addAttribute("sym_name", builder.getStringAttr("kernel"));
