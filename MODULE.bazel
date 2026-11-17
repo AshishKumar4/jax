@@ -28,6 +28,9 @@ archive_override(
     integrity = "sha256-P7BJQ3ExN21wEg+hITdln+PCAFJPiFe9QibjC+1ZXKc=",
     strip_prefix = "rules_ml_toolchain-cd8176c0dd2ff1f2f8cf3fc8e098e2577d227235",
     urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/cd8176c0dd2ff1f2f8cf3fc8e098e2577d227235.tar.gz"],
+    # Its compiles' dependency files list every header they read (-MD), external repositories' included, so a kept
+    # output base rebuilds what a changed header reaches (Dew row 6757).
+    patches = ["//third_party:rules_ml_toolchain/dependency_file.patch"],
 )
 
 bazel_dep(name = "xla")
