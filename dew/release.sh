@@ -107,9 +107,11 @@ case $ended in
     "completed neutral" | "completed skipped" | "completed stale" | "completed startup_failure")
     # A run that staged its wheels before it ended (jax-NEW holds them, which are never replaced) is resumed, not
     # composed again: its release branch stays for its jobs run again (review, 2026-11-17).
-    if gh release view "jax-$new" -R AshishKumar4/jax > /dev/null 2>&1; then
+    # Absent only where GitHub says so (404): a lookup that failed otherwise touches nothing (review).
+    if looked=$(gh api "repos/AshishKumar4/jax/releases/tags/jax-$new" --silent 2>&1); then
       unread "run $run ended ${ended#completed } after staging jax-$new: run its failed jobs again (gh run rerun $run --failed), then push $composed to $stack"
     fi
+    [[ $looked == *"HTTP 404"* ]] || unread "run $run ended ${ended#completed }, and whether jax-$new is staged could not be read ($looked)"
     failed "run $run ended ${ended#completed }" ;;
   *) unread "run $run has not ended as known ($ended)" ;;
 esac
