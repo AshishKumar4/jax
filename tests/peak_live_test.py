@@ -14,6 +14,7 @@
 
 from absl.testing import absltest
 import jax
+from jax import ad_checkpoint
 from jax._src import test_util as jtu
 from jax._src.lib import xla_client as xc
 import jax.experimental.topologies as topologies
@@ -48,6 +49,28 @@ class PeakLiveTest(jtu.JaxTestCase):
         and "tanh" in buffer.op_name for buffer in temporaries), live)
     self.assertLessEqual(sum(buffer.bytes for buffer in temporaries),
                          compiled.memory_analysis().temp_size_in_bytes)
+
+  @jtu.run_on_devices("cpu", "cuda")
+  def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
+    # tanh(x @ w) @ w's gradient under a policy saving the residual named
+    # "hidden" alone: at the backward's peak the saved tanh is live, its
+    # buffer named as jax.ad_checkpoint.checkpoint_name named it; each
+    # parameter's buffer states its entry parameter's number.
+    def step(x, w):
+      hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
+      return jnp.sum(jnp.sin(hidden @ w))
+
+    saved = jax.checkpoint(
+        step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    live = jax.jit(jax.grad(saved, argnums=1)).lower(tile, tile).compile().peak_live()
+    self.assertIsNotNone(live)
+    named = [buffer for buffer in live if buffer.names]
+    self.assertTrue(named, live)
+    self.assertEqual({buffer.names for buffer in named}, {("hidden",)})
+    self.assertEqual(
+        sorted(buffer.parameter for buffer in live if buffer.kind == "parameter"),
+        [0, 1])
 
   @jtu.run_on_devices("cuda")
   def test_a_probe_on_the_devices_twin_states_the_devices_own_compile(self):
