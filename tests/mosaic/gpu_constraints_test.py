@@ -270,9 +270,22 @@ class ConstraintSystemTest(parameterized.TestCase):
         layout,
     )
 
-  # TODO(allanrenucci): Add support for reducing tiled layouts when keep_dims=True.
-  def test_reduce_reduce_expression_does_not_reduce_tiled_layout_if_keep_dims_is_true(self):
-    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=(0,), rank=2, keep_dims=True)
+  @parameterized.named_parameters(
+      ("keep_rows", (0,), mgpu.WGMMA_COL_LAYOUT),
+      ("keep_cols", (1,), mgpu.WGMMA_ROW_LAYOUT),
+  )
+  def test_reduce_reduce_expression_keeps_a_unit_axis_of_a_tiled_layout(self, axes, reduced):
+    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=axes, rank=2, keep_dims=True)
+    shape = list(reduced.base_tile_shape)
+    shape.insert(axes[0], 1)
+    expected = fa.reshape_unit_axis_layout(
+        reduced, reduced.base_tile_shape, tuple(shape)
+    )
+    self.assertIsNotNone(expected)
+    self.assertEqual(cs.reduce_expression(expr, {}), RL(expected))
+
+  def test_reduce_reduce_expression_keeps_dims_of_a_tiled_layout_only_for_one_axis_of_two(self):
+    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=(0,), rank=3, keep_dims=True)
     self.assertEqual(cs.reduce_expression(expr, {}), expr)
 
   @parameterized.parameters(
