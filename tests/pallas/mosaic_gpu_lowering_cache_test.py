@@ -443,6 +443,18 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEqual(run["events"], ["uncacheable"], run)
     self.assertEmpty(self.entries())
 
+  def test_a_hit_dumps_the_resource_estimate_its_miss_dumped(self):
+    dumping = {"MOSAIC_GPU_DUMP_RESOURCES": "1"}
+    miss = self.run_child(env=dumping)
+    plain = self.lower()  # A process that dumps nothing shares the entry.
+    hit = self.run_child(env=dumping)
+    (miss_run,), (hit_run,) = miss["runs"], hit["runs"]
+    self.assertEqual([miss_run["events"], plain["events"], hit_run["events"]],
+                     [["miss"], ["hit"], ["hit"]])
+    self.assertEqual(hit_run["normalized"], miss_run["normalized"])
+    self.assertTrue(miss["_printed"])
+    self.assertEqual(hit["_printed"], miss["_printed"])
+
   def test_default_compiler_params_are_cacheable(self):
     # None, as `plgpu.kernel` is called without compiler_params, and the
     # default CompilerParams passed.
