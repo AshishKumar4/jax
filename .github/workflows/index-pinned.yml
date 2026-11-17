@@ -1,12 +1,16 @@
-# What Dew's main pins of the fork's releases, indexed as main comes to pin them: the land queue asks this workflow as
-# it publishes a train that changes main's locks (dew-ops queue/land_queue.py `indexed_pins`), nothing polling. It
-# reads main's locks (`patch_stack.py pinned`) against the index's page of each project they pin (`unindexed`); a
-# pinned release the index holds not whole is indexed by patch-stack's `index` with those pins, once a version, while
-# its own index run is not under way.
+# What Dew's main pins of the fork's releases, indexed as main comes to pin them: the land queue asks this workflow
+# for each main whose locks changed (dew-ops queue/land_queue.py `indexed_pins`), nothing polling. Once that commit
+# is on GitHub, it reads its locks (`patch_stack.py pinned`) against the index's page of each project they pin
+# (`unindexed`); each pinned release the index holds not whole is indexed by patch-stack's `index` with those pins,
+# once a version, while its own index run is not under way.
 name: index what main pins
 
 on:
   workflow_dispatch:
+    inputs:
+      main:
+        description: "the commit of Dew's main whose locks are read"
+        required: true
 
 permissions:
   contents: read
@@ -27,9 +31,17 @@ jobs:
       - name: Index each release main pins that the index lacks
         env:
           GH_TOKEN: ${{ github.token }}
+          MAIN: ${{ inputs.main }}
         run: |
+          # The commit asked for, once GitHub has it: the queue asks as it publishes, before its mirror may have
+          # pushed the commit here (review); 30 minutes without it fails the run, its asker's to repeat.
+          for attempt in $(seq 90); do
+            gh api "repos/AshishKumar4/dew/commits/$MAIN" > /dev/null 2>&1 && break
+            [ "$attempt" = 90 ] && { echo "::error::$MAIN is not on AshishKumar4/dew after 30 minutes"; exit 1; }
+            sleep 20
+          done
           mkdir locks
-          for url in $(gh api "repos/AshishKumar4/dew/contents/locks?ref=main" \
+          for url in $(gh api "repos/AshishKumar4/dew/contents/locks?ref=$MAIN" \
                          --jq '.[] | select(.name | endswith(".txt")) | .download_url'); do
             curl -fsSL "$url" -o "locks/$(basename "$url")"
           done
@@ -66,6 +78,5 @@ jobs:
             fi
             gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
               -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
-            echo "jax $version: indexed as main pins it; any other is asked at a later poll"
-            exit 0
+            echo "jax $version: indexed as main pins it"
           done
