@@ -13,7 +13,8 @@
 # limitations under the License.
 """A reader of a lowered program's Mosaic GPU kernels finds each warpgroup sync
 by the inline PTX Mosaic emits for one (`WARPGROUP_BARRIER_PTX`), in the
-kernel's module read back into its dialects (`deserialized`)."""
+kernel's module read back into its dialects (`deserialized`). Lowered for a
+compile-only H100, no GPU needed."""
 
 from absl.testing import absltest
 import jax
@@ -62,13 +63,21 @@ def _warpgroup_syncs(module: ir.Module) -> int:
   return syncs
 
 
+def _lowered_for_h100(call, *operands):
+  """`call` lowered for a compile-only H100: no GPU in the process."""
+  device = jax.sharding.AbstractDevice(
+      device_kind="GPU", platform="gpu", num_cores=132, compute_capability="9.0")
+  with jax.sharding.use_abstract_mesh(
+      jax.sharding.AbstractMesh((), (), abstract_device=device)):
+    return jax.jit(call).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 class WarpgroupSyncReaderTest(jtu.JaxTestCase):
 
   def _syncs(self, body) -> int:
     call = plgpu.kernel(
         body, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
-    lowered = jax.jit(call).trace(jnp.ones(128, jnp.float32)).lower(
-        lowering_platforms=("cuda",))
+    lowered = _lowered_for_h100(call, jnp.ones(128, jnp.float32))
     (module,) = _kernel_modules(lowered)
     return _warpgroup_syncs(module)
 
