@@ -25,7 +25,6 @@ import textwrap
 from absl.testing import absltest
 import jax
 from jax._src import test_util as jtu
-import numpy as np
 
 # The kernel, run where a GPU captures it (MOSAIC_GPU_CAPTURE_LAUNCHES, read once a process) and lowered
 # here: a swizzled TMA load of a 64 x 64 half tile, stored back.
