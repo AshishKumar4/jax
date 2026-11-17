@@ -428,7 +428,8 @@ def interpret_pallas_call(
 
   token = gpu_callbacks.call_initialize_shared_memory(
       token=token,
-      device_id=jnp.int32(device_info.device_id),
+      execution_id=gpu_callbacks.call_execution_id(
+          token, tuple(device_info.axis_sizes)),
       num_gpus=jnp.int32(device_info.num_devices),
       num_threads_per_block=jnp.int32(num_threads_per_block),
       num_blocks_per_cluster=jnp.int32(num_blocks_per_cluster),

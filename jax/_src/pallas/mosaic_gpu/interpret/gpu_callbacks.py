@@ -56,7 +56,10 @@ _shared_memory_init_lock = threading.Lock()
 # under asynchronous dispatch, or from another Python thread) waits until the
 # live one is cleaned up, rather than joining (and corrupting) its memory.
 _shared_memory_cleared = threading.Condition(_shared_memory_init_lock)
-_shared_memory_devices_joined: set[int] = set()
+_shared_memory_devices_joined = 0
+# The execution whose kernel holds the shared memory (`_initialize_shared_memory`).
+_live_execution: int | None = None
+_execution_tickets = itertools.count()
 _races: GPURaceDetectionState | None = None
 
 
@@ -69,7 +72,7 @@ def _clear_shared_memory():
   global _shared_memory, _shared_memory_devices_joined
   with _shared_memory_cleared:
     _shared_memory = None
-    _shared_memory_devices_joined = set()
+    _shared_memory_devices_joined = 0
     _shared_memory_cleared.notify_all()
 
 
@@ -95,7 +98,7 @@ def reset_gpu_interpret_mode_state():
   with _shared_memory_cleared:
     _shared_memory = None
     _races = None
-    _shared_memory_devices_joined = set()
+    _shared_memory_devices_joined = 0
     _shared_memory_cleared.notify_all()
 
 
@@ -170,36 +173,52 @@ def ordering_barrier(token):
 # on to the corresponding function (1).
 
 
+def _execution_ticket(token):
+  """A number no other device's call returns: an execution's devices take the
+  greatest of theirs as its identity (`call_execution_id`)."""
+  del token
+  return np.int32(next(_execution_tickets) % np.iinfo(np.int32).max)
+
+
+def call_execution_id(token, axis_names):
+  """The identity of the execution interpreting this kernel: the same on each of
+  its devices (`axis_names`' collective), another for every other execution."""
+  ticket = callback.io_callback_numpy_inputs(
+      _execution_ticket, TOKEN_SHAPE_DTYPE, token)
+  return jax.lax.pmax(ticket, tuple(axis_names)) if axis_names else ticket
+
+
 def _initialize_shared_memory(
     *,
     token: jax.Array,
-    device_id: jax.Array,
+    execution_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
     interpret_params: InterpretGPUParams,
 ):
-  global _shared_memory, _races, _shared_memory_devices_joined
+  global _shared_memory, _races, _shared_memory_devices_joined, _live_execution
 
-  device = int(device_id)
+  execution = int(execution_id)
   num_gpus_as_int = int(num_gpus)
   num_threads_per_block_as_int = int(num_threads_per_block)
   num_blocks_per_cluster_as_int = int(num_blocks_per_cluster)
-  del device_id, num_gpus, num_threads_per_block, num_blocks_per_cluster
+  del execution_id, num_gpus, num_threads_per_block, num_blocks_per_cluster
 
   with _shared_memory_cleared:
-    # Every device of the live kernel has joined its memory, or this device
-    # already has: this initialization is another kernel's, which waits for
-    # the live one's clean-up. A count of joins alone admitted another
-    # execution's first device into the live kernel's place, and the live
-    # kernel's own next device then waited forever for its clean-up.
+    # The live kernel's memory and barriers are its execution's alone: another
+    # execution's device waits for its clean-up, as does any once every device
+    # of the live kernel has joined. Counting joins alone admitted another
+    # execution's devices beside the live one's, which then shared its memory
+    # and barriers, or deadlocked waiting for each other's.
     while _shared_memory is not None and (
-        len(_shared_memory_devices_joined) >= _shared_memory.num_devices
-        or device in _shared_memory_devices_joined
+        execution != _live_execution
+        or _shared_memory_devices_joined >= _shared_memory.num_devices
     ):
       _shared_memory_cleared.wait()
-    _shared_memory_devices_joined.add(device)
+    _shared_memory_devices_joined += 1
     if _shared_memory is None:
+      _live_execution = execution
       _races = GPURaceDetectionState(on_race=interpret_params.on_race)
       _shared_memory = memory.GPUSharedMemory(
           num_devices=num_gpus_as_int,
@@ -223,7 +242,7 @@ def _initialize_shared_memory(
 def call_initialize_shared_memory(
     *,
     token: jax.Array,
-    device_id: jax.Array,
+    execution_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
@@ -236,7 +255,7 @@ def call_initialize_shared_memory(
       ),
       TOKEN_SHAPE_DTYPE,
       token=token,
-      device_id=device_id,
+      execution_id=execution_id,
       num_gpus=num_gpus,
       num_threads_per_block=num_threads_per_block,
       num_blocks_per_cluster=num_blocks_per_cluster,

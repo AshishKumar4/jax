@@ -47,11 +47,16 @@ def _maybe_reverse(arg: tuple[Any], reverse: bool) -> tuple[Any]:
 class InterpretExecutionGateTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
-      ("single_execution", False), ("overlapping_executions", True)
+      ("single_execution", "none"),
+      # B's device asks for admission between A's two devices: B's first
+      # (A0, B0, A1 deadlocked on a count of joins) or B's second (A0, B1, both
+      # new devices, paired into one memory by a gate keyed on devices).
+      ("overlapping_execution", "overlap"),
   )
-  def test_two_device_execution_can_finish(self, overlap):
-    # Exercise the actual host callbacks in a child: a broken admission gate
-    # leaves A0 in cleanup and A1 in initialization indefinitely.
+  def test_an_execution_owns_the_shared_memory_until_its_clean_up(self, overlap):
+    # The real host callbacks in a child: another execution's device joins
+    # nothing of the live kernel's (its memory, its barriers) until the live
+    # one has cleaned up, and both executions finish.
     program = textwrap.dedent("""
         import faulthandler
         import sys
@@ -60,18 +65,17 @@ class InterpretExecutionGateTest(jtu.JaxTestCase):
         from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks as cb
         from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
 
-        overlap = bool(int(sys.argv[1]))
+        overlap = sys.argv[1]
         params = InterpretGPUParams()
         token = np.int32(0)
         errors = []
-        b_entered = threading.Event()
         b_admitted = threading.Event()
-        a_done = threading.Event()
+        a_cleaned = threading.Event()
 
-        def initialize(threads, device):
+        def initialize(execution, threads):
           return cb._initialize_shared_memory(
-              token=token, device_id=np.int32(device), num_gpus=np.int32(2),
-              num_threads_per_block=np.int32(threads),
+              token=token, execution_id=np.int32(execution),
+              num_gpus=np.int32(2), num_threads_per_block=np.int32(threads),
               num_blocks_per_cluster=np.int32(1), interpret_params=params)
 
         def run(fn):
@@ -84,43 +88,41 @@ class InterpretExecutionGateTest(jtu.JaxTestCase):
           thread.start()
           return thread
 
-        # A0 is the first device of execution A (one warpgroup per block).
-        initialize(1, 0)
+        # Execution A (1): its first device joins.
+        initialize(1, 1)
+        b = None
+        if overlap != "none":
+          def b_device():
+            initialize(2, 2)
+            b_admitted.set()
+            # B was admitted only once A's memory was gone.
+            assert a_cleaned.is_set(), "B joined A's live shared memory"
+          b = run(b_device)
+          # B asks for admission while A is live: it must wait.
+          assert not b_admitted.wait(0.25), "B joined A's live shared memory"
 
-        def b0():
-          # B is a distinct execution (two warpgroups per block). Its first
-          # device attempts admission before A's second device.
-          b_entered.set()
-          initialize(2, 0)
-          b_admitted.set()
-          a_done.wait()
+        def a_device_0():
+          cb._clean_up_shared_memory(token)
 
-        if overlap:
-          run(b0)
-          assert b_entered.wait(2)
-          # Give the gate an opportunity to admit or park B0.
-          b_admitted.wait(0.25)
-
-        a0 = run(lambda: cb._clean_up_shared_memory(token))
-
-        def a1():
+        def a_device_1():
           initialize(1, 1)
           cb._clean_up_shared_memory(token)
 
-        second = run(a1)
-        a0.join(2)
-        second.join(0.1)
-        assert not errors, errors
-        if a0.is_alive() or second.is_alive():
+        a0, a1 = run(a_device_0), run(a_device_1)
+        a0.join(5)
+        a1.join(5)
+        if a0.is_alive() or a1.is_alive():
           faulthandler.dump_traceback()
-        assert not a0.is_alive() and not second.is_alive(), (
-            "A0 waits at its two-device cleanup barrier while A1 is blocked "
-            "in initialization; B0 was admitted=" + str(b_admitted.is_set()))
-        a_done.set()
+        assert not a0.is_alive() and not a1.is_alive(), "A's devices hung"
+        a_cleaned.set()
+        if b is not None:
+          b.join(5)
+          assert b_admitted.is_set(), "B was never admitted after A's clean-up"
+        assert not errors, errors
     """)
     result = subprocess.run(
-        [sys.executable, "-c", program, str(int(overlap))],
-        capture_output=True, text=True, timeout=20,
+        [sys.executable, "-c", program, overlap],
+        capture_output=True, text=True, timeout=30,
     )
     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
