@@ -87,6 +87,9 @@ archive_override(
         # fused into a nested GEMM took r as the accumulator's start and rounded 1.7 times as far from float64
         # as the add kept apart (row 6759).
         "//third_party:xla/triton_dot_add_kept.patch",
+        # HloEvaluator's float32 dot over an empty contraction is zeros, where its Eigen contraction divided by
+        # the depth: XLA:CPU's constant folding died of SIGFPE on one with the algebraic simplifier off (row 6942).
+        "//third_party:xla/evaluator_empty_contraction.patch",
     ],
     strip_prefix = "xla-4bd1084be692fed10e9b829fdbb469cd359621e4",
     urls = ["https://github.com/openxla/xla/archive/4bd1084be692fed10e9b829fdbb469cd359621e4.tar.gz"],
