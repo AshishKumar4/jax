@@ -240,6 +240,23 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     missing = dict(declared, JAX_PALLAS_LOWERING_CACHE_SOURCES="no_such_package")
     self.assertEqual(self.lower(env=missing)["events"], ["unsealed"])
 
+  def test_a_disappeared_source_bypasses_optional_caching(self):
+    package = self.tmp / "boundary_package"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "unrelated.py").symlink_to("disappeared.py")
+    declared = {
+        "PYTHONPATH": os.pathsep.join([str(self._site), str(self.tmp)]),
+        "JAX_PALLAS_LOWERING_CACHE_SOURCES": "boundary_package",
+    }
+    # The unreadable file is unrelated to the kernel: fresh lowering works.
+    fresh = self.lower(cache=False, env=declared)
+    self.assertNotIn("error", fresh, fresh)
+    cached = self.lower(env=declared)
+    self.assertNotIn("error", cached, cached)
+    self.assertEqual(cached["events"], ["unsealed"], cached)
+    self.assertEqual(cached["normalized"], fresh["normalized"])
+
   def test_what_no_lowering_reads_is_no_input_of_the_key(self):
     # A process's own settings: its compilation cache, its client's
     # allocations, XLA's dumps, a profiler's injection and the devices it sees.

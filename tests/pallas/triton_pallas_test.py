@@ -83,8 +83,15 @@ DTYPE_LIST = [jnp.float32, jnp.float16, jnp.bfloat16,
 
 class TritonSliceBoundaryTest(jtu.JaxTestCase):
 
-  @parameterized.parameters(((1, 16),), ((16, 1),))
-  def test_full_slice_of_an_already_unit_axis_lowers(self, shape):
+  @parameterized.named_parameters(
+      ("axis0", (1, 16), (1, 16)), ("axis1", (16, 1), (16, 1)),
+      ("axis0_control", (2, 16), (1, 16)),
+      ("axis1_control", (16, 2), (16, 1)))
+  def test_full_slice_of_an_already_unit_axis_lowers(self, input_shape, shape):
+    self.enter_context(jtu.ignore_warning(
+        category=DeprecationWarning,
+        message="The Pallas Triton backend is deprecated"))
+
     def kernel(x_ref, out_ref):
       out_ref[...] = lax.slice(x_ref[...], (0, 0), shape)
 
@@ -97,7 +104,8 @@ class TritonSliceBoundaryTest(jtu.JaxTestCase):
         compute_capability="8.0")
     mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
     with jax.sharding.use_abstract_mesh(mesh):
-      lowered = jax.jit(call).trace(descriptor).lower(
+      lowered = jax.jit(call).trace(
+          jax.ShapeDtypeStruct(input_shape, jnp.float32)).lower(
           lowering_platforms=("cuda",))
     self.assertEqual(lowered.out_info.shape, shape)
     self.assertEqual(lowered.out_info.dtype, np.dtype(np.float32))

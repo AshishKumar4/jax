@@ -169,11 +169,14 @@ def run_on_sm80(method):
 
 class BoundedAccuracyBoundaryTest(jtu.JaxTestCase):
 
-  @parameterized.named_parameters(("tanh", lax.tanh), ("logistic", lax.logistic))
-  def test_absolute_tolerance_lowers_for_a_bounded_result(self, operation):
+  @parameterized.named_parameters(
+      ("tanh", lax.tanh, 0.), ("logistic", lax.logistic, 0.),
+      ("tanh_control", lax.tanh, 1e-3),
+      ("logistic_control", lax.logistic, 1e-3))
+  def test_absolute_tolerance_lowers_for_a_bounded_result(self, operation, rtol):
     def kernel(x_ref, out_ref):
       out_ref[...] = operation(
-          x_ref[...], accuracy=lax.Tolerance(atol=1e-3))
+          x_ref[...], accuracy=lax.Tolerance(atol=1e-3, rtol=rtol))
 
     descriptor = jax.ShapeDtypeStruct((128,), jnp.float32)
     call = _kernel(kernel, out_type=descriptor, num_threads=1, thread_name="wg")
