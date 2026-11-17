@@ -670,10 +670,11 @@ def emit_pipeline[T](
     )
     if is_cp_async and copies_per_step > 0:
       if has_dynamic_grid:
-        # A literal, not `zeros_like(num_steps)`, which inherits the count's
-        # sharding where its operands sit on a concrete mesh and binds a
-        # reshard of the literal inside the kernel.
-        steady_steps = lax.max(
+        # A weakly typed literal (the count's dtype under x64 too), not
+        # `zeros_like(num_steps)`, which inherits the count's sharding where its
+        # operands sit on a concrete mesh and binds a reshard of the literal
+        # inside the kernel.
+        steady_steps = jnp.maximum(
             num_steps - (max_concurrent_steps - 1 - lead), 0
         )
       else:
