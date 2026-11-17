@@ -1744,6 +1744,16 @@ def _handle_transforms[T: (ir.Value, tcgen05.TMEMRef)](
       scratch_transforms if ref_aval.memory_space == gpu_core.TMEM else (),
   )
 
+  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    # A ref that states no transforms is already plain under lane semantics.
+    kept = [
+        (t_aval, t)
+        for t_aval, t in zip(transform_avals, transforms)
+        if not isinstance(t, gpu_core.PlainRef)
+    ]
+    transform_avals = [t_aval for t_aval, _ in kept]
+    transforms = [t for _, t in kept]
+
   if scratch_transforms:
     physical_ref_aval = cast(
         state_types.AbstractRef,
