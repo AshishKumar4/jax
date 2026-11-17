@@ -825,6 +825,41 @@ class TritonPallasTest(PallasBaseTest):
     )
     self.assertArraysEqual(scalar_ops(x_float), expected_scalar_out)
 
+  def test_a_tile_loaded_once_and_used_twice_is_the_same_pipelined(self):
+    # An attention backward's dK: each step loads a query tile once, scales it
+    # in registers for the scores and feeds it raw to the warpgroup MMA summing
+    # into dK. Pipelined at two stages, the next step's copy must not overwrite
+    # the tile that MMA still reads asynchronously, so the kernel computes at
+    # two stages exactly what it computes at one, every run.
+    self._require_compute_capability("9.0")
+    block, steps, width = 64, 16, 64
+
+    def kernel(q_ref, k_ref, dk_ref):
+      k = k_ref[...]
+
+      def step(i, dk):
+        q = q_ref[pl.ds(i * block, block), :]
+        scores = plgpu.dot((q * 0.5).astype(q.dtype), k, trans_b=True)
+        return dk + plgpu.dot(scores.astype(q.dtype), q, trans_a=True)
+
+      dk_ref[...] = lax.fori_loop(
+          0, steps, step, jnp.zeros((block, width), jnp.float32))
+
+    q = jax.random.normal(jax.random.key(0), (steps * block, width), jnp.bfloat16)
+    k = jax.random.normal(jax.random.key(1), (block, width), jnp.bfloat16)
+
+    def call(stages):
+      return self.pallas_call(
+          kernel,
+          out_shape=jax.ShapeDtypeStruct((block, width), jnp.float32),
+          grid=(1,),
+          compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=stages),
+      )(q, k)
+
+    unpipelined = call(1)
+    for _ in range(8):
+      self.assertArraysEqual(call(2), unpipelined)
+
 
 @functools.partial(
     jax.jit, static_argnames=["bm", "bn", "gm", "bk", "interpret", "debug"]
