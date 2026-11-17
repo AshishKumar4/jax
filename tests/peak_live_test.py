@@ -65,6 +65,13 @@ class PeakLiveTest(jtu.JaxTestCase):
     self.assertEqual(self._names_of_lowered_results(f, "sine", [(8,)]),
                      [("left,right",)])
 
+  def test_checkpoint_name_without_comma_is_one_name(self):
+    def f(x):
+      return ad_checkpoint.checkpoint_name(jnp.sin(x), "left")
+
+    self.assertEqual(self._names_of_lowered_results(f, "sine", [(8,)]),
+                     [("left",)])
+
   def test_checkpoint_names_belong_to_individual_sort_results(self):
     def f(keys, values):
       keys, values = jax.lax.sort_key_val(keys, values)
@@ -73,6 +80,17 @@ class PeakLiveTest(jtu.JaxTestCase):
 
     self.assertEqual(self._names_of_lowered_results(f, "sort", [(8,), (8,)]),
                      [("keys",), ("values",)])
+
+  def test_checkpoint_names_on_separate_result_operations_stay_separate(self):
+    def f(keys, values):
+      keys, values = jax.lax.sort_key_val(keys, values)
+      return (ad_checkpoint.checkpoint_name(jnp.sin(keys), "keys"),
+              ad_checkpoint.checkpoint_name(jnp.cos(values), "values"))
+
+    self.assertEqual(self._names_of_lowered_results(f, "sine", [(8,), (8,)]),
+                     [("keys",)])
+    self.assertEqual(self._names_of_lowered_results(f, "cosine", [(8,), (8,)]),
+                     [("values",)])
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_compiles_peak_holds_its_parameters_and_the_temporaries_it_reads_at_once(self):
