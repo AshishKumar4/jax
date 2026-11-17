@@ -1,4 +1,4 @@
-From aa2965ebf40e7b4eee19b73dcabc425b08e92aaa Mon Sep 17 00:00:00 2001
+From e9245cd990448a4e716b620d5c57f1e003a49334 Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 01:52:08 -0600
 Subject: [PATCH] [PJRT:GPU] The CUDA plugin serves its executables' metadata,
@@ -10,17 +10,17 @@ serving PjRtExecutableMetadata with the executable's compiled memory stats, the 
 compile's or one stopped after buffer assignment), and PjRtCApiExecutable::GetCompiledMemoryStats fills the
 assignment from it where the plugin serves the extension.
 ---
- xla/pjrt/c/BUILD                              | 23 ++++++
+ xla/pjrt/c/BUILD                              | 26 +++++++
  ...pjrt_c_api_gpu_executable_metadata_test.cc | 77 +++++++++++++++++++
  xla/pjrt/c/pjrt_c_api_gpu_internal.cc         | 26 ++++++-
  xla/pjrt/c_api_client/BUILD                   |  1 +
  xla/pjrt/c_api_client/pjrt_c_api_client.cc    | 21 +++++
  xla/pjrt/c_api_client/pjrt_c_api_client.h     |  7 +-
- 6 files changed, 151 insertions(+), 4 deletions(-)
+ 6 files changed, 154 insertions(+), 4 deletions(-)
  create mode 100644 xla/pjrt/c/pjrt_c_api_gpu_executable_metadata_test.cc
 
 diff --git a/xla/pjrt/c/BUILD b/xla/pjrt/c/BUILD
-index 514cb384a9..9817f1233b 100644
+index 514cb384a9..3893f12c2f 100644
 --- a/xla/pjrt/c/BUILD
 +++ b/xla/pjrt/c/BUILD
 @@ -667,12 +667,14 @@ cc_library(
@@ -38,13 +38,16 @@ index 514cb384a9..9817f1233b 100644
          "//xla/python:custom_call_batch_partitioner",
          "//xla/python:custom_partition_callback",
          "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
-@@ -772,6 +774,27 @@ cc_library(
+@@ -772,6 +774,30 @@ cc_library(
      ],
  )
  
 +xla_test(
 +    name = "pjrt_c_api_gpu_executable_metadata_test",
 +    srcs = ["pjrt_c_api_gpu_executable_metadata_test.cc"],
++    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against its
++    # libraries' shared objects finds none of their functions.
++    linkstatic = True,
 +    backends = ["gpu"],
 +    tags = if_google([
 +        "config-cuda-only",
