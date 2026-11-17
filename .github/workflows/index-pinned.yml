@@ -40,33 +40,28 @@ jobs:
           for project in $(python3 -c 'import json; print(" ".join(sorted({pin.split("==")[0] for pin in json.load(open("pins.json"))})))'); do
             curl -fsS "https://pypi.dewml.dev/simple/$project/" -o "pages/$project.html" || rm -f "pages/$project.html"
           done
-          # The writers of the index's queue (one concurrency group, `patch-stack`), whose one pending place a
-          # dispatch would take from another's: none is asked while any of their runs, queued or running, is under way
-          # (review).
-          for workflow in patch-stack.yml publish-package.yml unlist-package.yml; do
-            for status in queued in_progress waiting pending requested; do
-              under_way=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?status=$status" \
-                            --jq '.total_count')
-              if [ "$under_way" != 0 ]; then
-                echo "$workflow has a run $status: what main pins is asked once it ends"
-                exit 0
-              fi
-            done
-          done
           # Every index run dispatched, all of its history read (paginated, filtered here: the API caps a filtered
           # listing at 1,000 runs), so a stop cannot age out.
           dispatched=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/patch-stack.yml/runs?per_page=100" \
                          --jq '.workflow_runs[] | select(.event == "workflow_dispatch")
-                               | [.display_title, .conclusion] | @tsv')
+                               | [.display_title, .status, .conclusion] | @tsv')
           for version in $(python3 dew/dew/patch_stack.py unindexed pins.json pages); do
             if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
               echo "::warning::main pins jax $version, which no release of the fork holds"
               continue
             fi
+            # Its own index run under way (titled by its version, `token`), queued or running: asked again, it would
+            # index the version twice; no other run of the workflow holds it (2026-11-17: a run of 11-06 GitHub still
+            # lists as queued read as under way, and nothing was asked while main pinned post108 unindexed).
+            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 != "completed" { found = 1 }
+                                                                    END { exit !found }' <<< "$dispatched"; then
+              echo "jax $version: its index run is under way"
+              continue
+            fi
             # One automatic attempt a version: one that failed or was cancelled waits for a hand to repair and run
             # it again (patch-stack's index), never asked every ten minutes (review).
-            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 != "success" { found = 1 }
-                                                                    END { exit !found }' <<< "$dispatched"; then
+            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 == "completed" && $3 != "success"
+                                                                    { found = 1 } END { exit !found }' <<< "$dispatched"; then
               echo "::warning::jax $version's automatic index did not succeed: index it by hand once repaired"
               continue
             fi
