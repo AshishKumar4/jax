@@ -8110,9 +8110,12 @@ def _ragged_dot_general_batch_rule(
     out_sharding,
     reduction_order=None,
 ):
-  if not all(dim == 0 for dim in batch_dims):
-    raise NotImplementedError('ragged_dot vmap over any dim but 0 - NYI')
-  lhs, rhs, gs = batched_args
+  # Each operand's mapped dimension moved to its front, an unmapped one (a
+  # shared right operand, group sizes closed over) broadcast there, so the rule
+  # for operands batched along their leading dimension applies.
+  lhs, rhs, gs = (
+      batching.bdim_at_front(x, d, axis_data.size, axis_data.explicit_mesh_axis)
+      for x, d in zip(batched_args, batch_dims))
   invoke = lambda l, r, d, **kw: _ragged_dot_general_bound(l, r, gs, d, **kw)
   batched_out, result_batch_dim = _dot_batch_rule(
       lambda xs: xs, lambda ds: ds, invoke, axis_data, (lhs, rhs), (0, 0),
