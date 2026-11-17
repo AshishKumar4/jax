@@ -397,6 +397,9 @@ def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_pat
     commit({"jax/version.py": unset.replace("0.12.0", "0.12.1"), "jax/b.py": "b fixed\n"}, "jax 0.12.1: b fixed")
     run("tag", "jax-v0.12.1")
     monkeypatch.chdir(tmp_path)
+    # A committer, as the workflow's runner configures one: a machine with no git identity (an armada vessel) has none.
+    for who, value in (("NAME", "t"), ("EMAIL", "t@t")):
+        monkeypatch.setenv(f"GIT_COMMITTER_{who}", value)
     assert patch_stack.rebase("0.12.0", "0.12.1") == 0
     subjects = run("log", "--format=%s", "jax-v0.12.1..v0.12.1-cache-key-pool-fingerprints").splitlines()
     assert subjects == ["Release 0.12.1.post1: the stack carried from 0.12.0 onto jax-v0.12.1, a commit a family",
