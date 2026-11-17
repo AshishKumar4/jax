@@ -42,6 +42,7 @@ pytype_strict_library(
         "interpret_pallas_call.py",
     ],
     deps = [
+        ":functional",
         ":gpu_callbacks",
         ":jaxpr_interpret",
         ":params",
@@ -58,6 +59,29 @@ pytype_strict_library(
         "//jax/_src/pallas/mosaic/interpret:utils",
         "//jax/_src/pallas/mosaic_gpu:core",
     ],
+)
+
+pytype_strict_library(
+    name = "functional",
+    srcs = ["functional.py"],
+    deps = [
+        ":jaxpr_interpret",
+        ":params",
+        ":shared_memory",
+        "//jax",
+        "//jax/_src:callback",
+        "//jax/_src:core",
+        "//jax/_src:lax",
+        "//jax/_src:source_info_util",
+        "//jax/_src:state_types",
+        "//jax/_src:util",
+        "//jax/_src/pallas",
+        "//jax/_src/pallas/mosaic/interpret:utils",
+        "//jax/_src/pallas/mosaic_gpu:core",
+        "//jax/_src/pallas/mosaic_gpu:primitives",
+    ] + py_deps([
+        "numpy",
+    ]),
 )
 
 pytype_strict_library(
