@@ -536,9 +536,7 @@ def emit_pipeline[T](
       # reads and 60% tensor-pipe activity; the carried slot, with outputs
       # bitwise identical, at 9.1 ms, 2.5 GB and 87%.
       wrapped = slot + 1
-      return lax.select(
-          wrapped == max_concurrent_steps, jnp.zeros_like(wrapped), wrapped
-      )
+      return jnp.where(wrapped == max_concurrent_steps, 0, wrapped)
 
     def fetch(step, fetch_index_levels, fetch_slots):
       for delay_release, fetch_indices, fetch_slot in zip(
@@ -672,9 +670,11 @@ def emit_pipeline[T](
     )
     if is_cp_async and copies_per_step > 0:
       if has_dynamic_grid:
+        # A literal, not `zeros_like(num_steps)`, which inherits the count's
+        # sharding where its operands sit on a concrete mesh and binds a
+        # reshard of the literal inside the kernel.
         steady_steps = lax.max(
-            jnp.zeros_like(num_steps),
-            num_steps - (max_concurrent_steps - 1 - lead),
+            num_steps - (max_concurrent_steps - 1 - lead), 0
         )
       else:
         steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
