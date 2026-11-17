@@ -737,6 +737,25 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "tpu_flash_attention_delta_test",
+    srcs = [
+        "tpu_flash_attention_delta_test.py",
+    ],
+    enable_backends = [
+        "cpu",
+        "tpu",
+    ],
+    deps = [
+        "//jax/experimental:pallas",
+        "//jax/experimental:pallas_tpu",
+        "//jax/experimental:pallas_tpu_ops",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "tpu_pallas_interpret_thread_map_test",
     srcs = [
         "tpu_pallas_interpret_thread_map_test.py",
