@@ -289,6 +289,17 @@ def _wgmma_m64(
   return to_acc_vec_regs(acc_regs)
 
 
+def _at_use(base: ir.Value) -> ir.Value:
+  """`base`, a descriptor's 32-bit encoded shared memory base, copied where it
+  is read: an opaque, side-effecting copy no compiler pass moves out of an
+  enclosing loop, so the descriptors derived from it are formed at their
+  instructions."""
+  return llvm.inline_asm(
+      ir.IntegerType.get_signless(32), [base], "mov.b32 $0, $1;", "=r,r",
+      asm_dialect=0, has_side_effects=True,
+  )
+
+
 def wgmma(
     acc: WGMMAAccumulator,
     a: fa.FragmentedArray | ir.Value,
@@ -428,6 +439,19 @@ def wgmma(
   )
 
   # Step 4. Issue the instructions.
+  # Each shared operand's descriptors are formed from its base at the
+  # instructions that read them. Where the operand's address is fixed across a
+  # loop (a block staged once and read every step), the compiler would
+  # otherwise hoist every slice's descriptor (`SmemDescriptor.slice_i64`) out of
+  # the loop and hold them all, two registers each, across it: 64 registers for
+  # two operands of 16 groups. An opaque copy of the base at the product keeps
+  # the slice descriptors at their instructions, one base an operand live
+  # instead.
+  if not isinstance(a_operand, fa.FragmentedArray):
+    a_operand = dataclasses.replace(
+        a_operand, addr_base=_at_use(a_operand.addr_base)
+    )
+  b_desc = dataclasses.replace(b_desc, addr_base=_at_use(b_desc.addr_base))
   new_acc_regs = acc._value.registers.copy()
   for mi in range(m_groups):
     new_acc_regs[mi : mi + 1] = _wgmma_m64(
