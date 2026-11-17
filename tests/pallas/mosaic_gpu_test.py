@@ -521,6 +521,18 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       x = x / 2
     np.testing.assert_array_equal(kernel(x), (x != 0).astype(jnp.int32))
 
+  def test_a_booleans_negation_is_its_complement(self):
+    # Under both semantics; the warpgroup's negated ~int(x), -1 or -2, which
+    # converted back to a boolean is true either way.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.int32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = jnp.logical_not(x_ref[...] > 1).astype(jnp.int32)
+
+    x = jnp.arange(256, dtype=jnp.int32) % 4
+    np.testing.assert_array_equal(kernel(x), (x <= 1).astype(jnp.int32))
+
   @parameterized.product(
       op=["exp", "exp2", "logistic", "tanh"],
       asked=["highest", "approximate", "default", "unmet"],
