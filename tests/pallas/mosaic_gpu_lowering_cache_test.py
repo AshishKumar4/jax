@@ -246,7 +246,8 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     (package / "__init__.py").write_text("")
     (package / "unrelated.py").symlink_to("disappeared.py")
     declared = {
-        "PYTHONPATH": os.pathsep.join([str(self._site), str(self.tmp)]),
+        "PYTHONPATH": os.pathsep.join(
+            [str(self._site), str(harness.TESTS_PALLAS), str(self.tmp)]),
         "JAX_PALLAS_LOWERING_CACHE_SOURCES": "boundary_package",
     }
     # The unreadable file is unrelated to the kernel: fresh lowering works.

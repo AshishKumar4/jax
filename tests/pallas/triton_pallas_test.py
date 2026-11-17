@@ -100,7 +100,7 @@ class TritonSliceBoundaryTest(jtu.JaxTestCase):
         kernel, out_shape=descriptor, grid=(1,),
         compiler_params=plgpu.CompilerParams())
     device = jax.sharding.AbstractDevice(
-        device_kind="GPU", platform="cuda", num_cores=None,
+        device_kind="NVIDIA A100-SXM4-40GB", platform="gpu", num_cores=108,
         compute_capability="8.0")
     mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
     with jax.sharding.use_abstract_mesh(mesh):
