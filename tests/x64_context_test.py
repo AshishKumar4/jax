@@ -16,6 +16,7 @@
 import concurrent.futures
 from functools import partial
 import time
+import warnings
 
 from absl.testing import absltest
 import numpy as np
@@ -26,6 +27,7 @@ from jax import lax
 from jax import random
 import jax.numpy as jnp
 from jax._src import config
+from jax._src import core
 import jax._src.test_util as jtu
 
 
@@ -298,6 +300,197 @@ class X64ContextTests(jtu.JaxTestCase):
         res = compiled(x)
         self.assertEqual(res.dtype, jnp.int64)
         self.assertEqual(int(res), 43)
+
+  def test_a_wide_trace_keeps_its_dtypes_under_later_transformations(self):
+    # A float64 product traced in an x64 scope, staged (as a cond's branch, as
+    # `lax.platform_dependent` stages one) and later batched, differentiated in
+    # reverse mode and transposed outside that scope keeps float64: the rules
+    # re-invoke dot_general and convert_element_type with the jaxpr's dtypes,
+    # which canonicalization must not narrow, and no truncation warning fires.
+    rng = np.random.RandomState(0)
+    a = rng.standard_normal((3, 4, 5)).astype(np.float32)
+    b = rng.standard_normal((5, 6)).astype(np.float32)
+
+    def wide(x, y):
+      with jax.enable_x64(True):
+        product = jnp.einsum('ij,jk->ik', x.astype(jnp.float64), y.astype(jnp.float64),
+                             precision=lax.Precision.HIGHEST)
+        return product.astype(jnp.float32)
+
+    def staged(x, y):
+      return lax.cond(True, wide, lambda x, y: jnp.zeros((x.shape[0], y.shape[1]), jnp.float32), x, y)
+
+    expected = np.einsum('bij,jk->bik', a.astype(np.float64), b.astype(np.float64)).astype(np.float32)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      batched = jax.jit(jax.vmap(staged, in_axes=(0, None)))(a, b)
+      gradient = jax.jit(jax.grad(lambda x, y: jnp.sum(jax.vmap(staged, in_axes=(0, None))(x, y)),
+                                  argnums=1))(a, b)
+    np.testing.assert_array_equal(batched, expected)
+    self.assertEqual(batched.dtype, np.float32)
+    expected_gradient = np.einsum('bij,bik->jk', a.astype(np.float64),
+                                  np.ones((3, 4, 6))).astype(np.float32)
+    np.testing.assert_array_equal(gradient, expected_gradient)
+
+  def test_a_wide_max_and_pad_keep_their_dtypes_under_later_derivatives(self):
+    # A float64 maximum, row maximum and pad traced in an x64 scope, staged (as
+    # `lax.platform_dependent` stages one) and differentiated outside that scope, forward and in
+    # reverse twice: max's and reduce_max's derivative weights and pad's transposed zero keep float64,
+    # and no truncation warning fires.
+    a = np.array([1., 2., 3.], np.float32)
+    b = np.array([3., 2., 1.], np.float32)
+
+    def wide(x, y):
+      with jax.enable_x64(True):
+        larger = jnp.maximum(x.astype(jnp.float64), y.astype(jnp.float64))
+        larger = larger + jnp.max(larger) - jnp.max(larger)
+        return lax.pad(larger, jnp.zeros((), jnp.float64), [(1, 1, 0)]).astype(jnp.float32)
+
+    def staged(x):
+      return lax.cond(True, wide, lambda x, y: jnp.zeros((x.shape[0] + 2,), jnp.float32), x, b)
+
+    def squares(x):
+      return jnp.sum(staged(x) ** 2)
+
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      tangent = jax.jvp(staged, (a,), (np.ones(3, np.float32),))[1]
+      gradient = jax.grad(squares)(a)
+      second = jax.grad(lambda x: jnp.sum(jax.grad(squares)(x)))(a)
+    # x wins the last entry, ties the middle one (half its weight) and loses the first.
+    np.testing.assert_array_equal(tangent, [0., 0., 0.5, 1., 0.])
+    np.testing.assert_array_equal(gradient, [0., 2., 6.])
+    np.testing.assert_array_equal(second, [0., 0.5, 2.])
+
+  def test_a_narrow_product_stated_wide_keeps_its_accumulation_when_batched(self):
+    # A float32 product traced in an x64 scope with a float64 accumulator
+    # (preferred_element_type), staged and batched outside that scope: the
+    # batching rule binds the jaxpr's float64 as recorded, where canonicalizing
+    # it again would accumulate in float32 and lose the 1 between the 1e8s.
+    x = np.array([[1e8, 1., -1e8]], np.float32)
+    y = np.ones((3, 1), np.float32)
+
+    def wide(a, b):
+      with jax.enable_x64(True):
+        return lax.dot_general(a, b, (((1,), (0,)), ((), ())),
+                               preferred_element_type=jnp.float64).astype(jnp.float32)
+
+    def staged(a, b):
+      return lax.cond(True, wide, lambda a, b: jnp.zeros((1, 1), jnp.float32), a, b)
+
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      batched = jax.jit(jax.vmap(staged, in_axes=(0, None)))(x[None], y)
+    np.testing.assert_array_equal(batched, [[[1.]]])
+
+  def test_a_complex_abs_staged_wide_differentiates_outside_its_scope(self):
+    # abs of a complex128 traced in an x64 scope, its JVP taken outside it:
+    # the float64 magnitude goes back to complex128 as recorded, never to the
+    # complex64 a request would canonicalize it to.
+    def wide(z):
+      with jax.enable_x64(True):
+        return jnp.abs(z.astype(jnp.complex128)).astype(jnp.float32)
+
+    def staged(z):
+      return lax.cond(True, wide, lambda z: jnp.float32(0), z)
+
+    # Staged once in the scope, differentiated outside it: the JVP of the
+    # staged abs runs with x64 off.
+    with jax.enable_x64(True):
+      jaxpr = jax.make_jaxpr(staged)(jnp.complex64(3 + 4j))
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      grad = jax.grad(lambda z: core.jaxpr_as_fun(jaxpr)(z)[0])(
+          jnp.complex64(3 + 4j))
+    np.testing.assert_allclose(grad, np.complex64(0.6 - 0.8j), rtol=1e-6)
+
+  def test_a_wide_power_staged_in_scope_differentiates_outside_it(self):
+    # x ** y of float64 operands staged inside an x64 scope, differentiated
+    # outside it: both partials stay float64, as recorded.
+    def wide(x, y):
+      return lax.pow(x, y)
+
+    with jax.enable_x64(True):
+      x, y = jnp.float64(2.0), jnp.float64(3.0)
+      jaxpr = jax.make_jaxpr(wide)(x, y)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      gx, gy = jax.grad(lambda x, y: core.jaxpr_as_fun(jaxpr)(x, y)[0],
+                        argnums=(0, 1))(x, y)
+    self.assertEqual((gx.dtype, gy.dtype), (np.float64, np.float64))
+    np.testing.assert_allclose([gx, gy], [12.0, 8.0 * np.log(2.0)], rtol=1e-12)
+
+  def test_a_wide_complex_convolution_lowers_outside_its_scope(self):
+    # A complex128 convolution staged inside an x64 scope and lowered outside
+    # it through the real-convolution decomposition keeps its real float64
+    # parts as recorded.
+    def wide(x, w):
+      return lax.conv_general_dilated(
+          x, w, (1,), 'VALID', preferred_element_type=jnp.complex128)
+
+    with jax.enable_x64(True):
+      x = jnp.ones((1, 1, 4), jnp.complex128)
+      w = jnp.ones((1, 1, 2), jnp.complex128)
+      jaxpr = jax.make_jaxpr(wide)(x, w)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      text = jax.jit(core.jaxpr_as_fun(jaxpr)).trace(x, w).lower(
+          lowering_platforms=('cuda',)).as_text()
+    self.assertNotIn('f32', text)
+
+  def test_a_wide_convolution_s_vjp_keeps_its_dtypes_outside_its_scope(self):
+    # A float64 convolution of float32 operands traced in an x64 scope, its
+    # VJP taken outside it: each cotangent comes back in its primal's dtype.
+    x = np.ones((1, 1, 4), np.float32)
+    w = np.ones((1, 1, 2), np.float32)
+
+    def wide(x, w):
+      with jax.enable_x64(True):
+        return lax.conv_general_dilated(
+            x, w, (1,), 'VALID',
+            preferred_element_type=jnp.float64).astype(jnp.float32).sum()
+
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      gx, gw = jax.grad(wide, argnums=(0, 1))(x, w)
+    self.assertEqual((gx.dtype, gw.dtype), (np.float32, np.float32))
+    np.testing.assert_array_equal(gx, [[[1., 2., 2., 1.]]])
+    np.testing.assert_array_equal(gw, [[[3., 3.]]])
+
+  def test_a_user_request_for_a_wide_dtype_on_a_wide_value_still_narrows(self):
+    # A user's float64 request canonicalizes with x64 off whatever its operand
+    # holds: only a transformation rule binds a jaxpr's dtype as recorded.
+    with jax.enable_x64(True):
+      wide = jnp.ones(3, jnp.float64)
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      self.assertEqual(lax.convert_element_type(wide, np.float64).dtype, np.float32)
+
+  def test_a_user_request_for_a_wide_dtype_still_narrows(self):
+    # A NumPy float64 operand is a user's value, not a wide trace's: with x64
+    # off, converting it or asking a product for float64 still narrows.
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      converted = lax.convert_element_type(np.ones(3, np.float64), np.float64)
+      product = lax.dot_general(np.ones((2, 2), np.float64), np.ones((2, 2), np.float64),
+                                (((1,), (0,)), ((), ())), preferred_element_type=np.float64)
+    self.assertEqual(converted.dtype, np.float32)
+    self.assertEqual(product.dtype, np.float32)
+
+  def test_a_default_dtype_request_on_a_wide_value_still_narrows(self):
+    # Python's float, int and complex ask for the default dtype of their kind,
+    # which with x64 off is the 32-bit one, whatever the operand holds: only a
+    # dtype the trace itself states (a NumPy dtype, as a jaxpr's params hold
+    # one) is kept for a wide operand.
+    with jax.enable_x64(True):
+      wide = {float: jnp.ones(3, jnp.float64), int: jnp.ones(3, jnp.int64),
+              complex: jnp.ones(3, jnp.complex128)}
+    expected = {float: np.float32, int: np.int32, complex: np.complex64}
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter('ignore', UserWarning)
+      for kind, operand in wide.items():
+        self.assertEqual(lax.convert_element_type(operand, kind).dtype, expected[kind])
+        self.assertEqual(operand.astype(kind).dtype, expected[kind])
 
 
 if __name__ == "__main__":
