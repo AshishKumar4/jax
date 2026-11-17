@@ -199,6 +199,19 @@ class DimensionProvenanceTest(jtu.JaxTestCase):
       }""")
     self.assertEqual(descended["called"], [[(_of((0, 0)), _of((0, 1)))]])
 
+  def test_custom_call_alias_resolves_operand_shape_index(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        x = f32[8,16] parameter(0)
+        arg = (f32[8,16]) tuple(x)
+        ROOT called = (f32[8,16]) custom-call(arg),
+            custom_call_target="kernel",
+            output_to_operand_aliasing={{0}: (0, {0})},
+            frontend_attributes={output_dims="[null]"}
+      }""")
+    self.assertEqual(descended["called"], [(_of((0, 0)), _of((0, 1)))])
+
   def test_custom_call_tuple_alias_does_not_require_output_dims(self):
     descended = _descended("""
       HloModule m

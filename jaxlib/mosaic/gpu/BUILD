@@ -94,6 +94,7 @@ cc_test(
     deps = [
         ":dump",
         "@com_google_googletest//:gtest_main",
+        "@llvm-project//mlir:GPUDialect",
         "@llvm-project//mlir:IR",
     ],
 )
