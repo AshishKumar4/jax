@@ -1859,8 +1859,12 @@ def jaxpr_subcomp(
         rule_context = None
 
         # TODO(phawkins): allow KeyScalarBundle/AccRef here as well as ir.Value.
-        can_cache = _is_cacheable_eqn(eqn) and all(
-            isinstance(x, ir.Value) for x in invals
+        # A call primitive's body is inlined where it is, as its own function it
+        # would read no grid (`program_id`).
+        can_cache = (
+            _is_cacheable_eqn(eqn)
+            and eqn.primitive not in eval_jaxpr_lib.call_primitives
+            and all(isinstance(x, ir.Value) for x in invals)
         )
         if can_cache:
           grid_arity = (
