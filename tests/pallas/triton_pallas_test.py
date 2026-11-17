@@ -107,6 +107,72 @@ class TritonPallasTest(PallasBaseTest):
     self.assertEqual(y.dtype, dst_dtype)
     self.assertArraysEqual(y, x.astype(dst_dtype))
 
+  @parameterized.parameters(
+      (jnp.float32, 0), (jnp.float32, 1), (jnp.int32, 1), (jnp.bool_, 0)
+  )
+  def test_a_unit_slice_of_a_value_is_its_element(self, dtype, axis):
+    # One element along one axis, exactly: a NaN and a negative zero among a
+    # float's, a boolean's own value.
+    x = jax.random.normal(jax.random.key(0), (16, 16), jnp.float32)
+    x = x.at[3, 5].set(jnp.nan).at[5, 3].set(-0.0)
+    x = (x > 0) if dtype == jnp.bool_ else x.astype(dtype)
+    index = 5
+
+    def kernel(x_ref, out_ref):
+      value = x_ref[...]
+      out_ref[...] = (
+          lax.slice_in_dim(value, index, index + 1, axis=axis)
+      )
+
+    shape = (1, 16) if axis == 0 else (16, 1)
+    out = self.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct(shape, dtype), grid=(1,)
+    )(x)
+    expected = lax.slice_in_dim(x, index, index + 1, axis=axis)
+    np.testing.assert_array_equal(
+        np.asarray(out).view(np.uint8), np.asarray(expected).view(np.uint8)
+    )
+
+  def test_a_booleans_any_and_all_reduce(self):
+    x = jax.random.normal(jax.random.key(0), (16, 16), jnp.float32) > 1.5
+
+    def kernel(x_ref, any_ref, all_ref):
+      value = x_ref[...]
+      any_ref[...] = jnp.any(value, axis=1)
+      all_ref[...] = jnp.all(value, axis=0)
+
+    vector = jax.ShapeDtypeStruct((16,), jnp.bool_)
+    found_any, found_all = self.pallas_call(
+        kernel, out_shape=(vector, vector), grid=(1,)
+    )(x)
+    np.testing.assert_array_equal(found_any, np.any(np.asarray(x), axis=1))
+    np.testing.assert_array_equal(found_all, np.all(np.asarray(x), axis=0))
+
+  def test_a_hijax_primitive_lowers_as_its_expansion(self):
+    from jax._src import hijax
+
+    class Square(hijax.HiPrim):
+
+      def __init__(self, in_aval):
+        self.in_avals = (in_aval,)
+        self.out_aval = in_aval
+        self.params = {}
+        super().__init__()
+
+      def expand(self, x):
+        return x * x
+
+    x = jax.random.normal(jax.random.key(0), (16, 16), jnp.float32)
+
+    def kernel(x_ref, out_ref):
+      value = x_ref[...]
+      out_ref[...] = Square(jax.typeof(value))(value)
+
+    out = self.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype), grid=(1,)
+    )(x)
+    np.testing.assert_array_equal(out, x * x)
+
   def test_a_product_beside_its_barriered_self_rounds_on_its_own(self):
     # x * y - barrier(x * y): each product rounds on its own, so the difference
     # is zero; contracted into an FMA it would be the product's rounding error.
