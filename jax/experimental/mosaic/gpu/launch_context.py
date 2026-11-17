@@ -1868,14 +1868,18 @@ class LaunchContext:
         # contiguous dimensions folded), every other dimension's GMEM stride,
         # and the slice's base offset.
         shape = tuple(smem_ref.type.shape)
-        _, ref_offset = ir.MemRefType(untransformed_gmem_ref.type).get_strides_and_offset()
+        _, ref_offset = ir.MemRefType(
+            untransformed_gmem_ref.type
+        ).get_strides_and_offset()
         if ref_offset == ir.ShapedType.get_dynamic_stride_or_offset():
           base_parts.append(1)
         else:
           base_constant += ref_offset
         suffix, folding = 1, True
         multiple = functools.reduce(math.gcd, base_parts, base_constant)
-        for size, stride in reversed(list(zip(shape, untransformed_gmem_strides))):
+        for size, stride in reversed(
+            list(zip(shape, untransformed_gmem_strides))
+        ):
           if size == 1:
             continue
           if folding and stride == suffix:
