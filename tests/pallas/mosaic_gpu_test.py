@@ -204,7 +204,7 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
       jax.make_jaxpr(trace)()
     [actual] = scoped
     [allocation] = declared
-    self.assertEqual(actual["meet_ref"].num_barriers, 2)
+    self.assertEqual(actual["meet_ref"].num_barriers, (2,))
     self.assertEqual(actual["meet_ref"].num_arrivals, 2)
     self.assertEqual(allocation.get("meet_ref"), actual["meet_ref"])
 
