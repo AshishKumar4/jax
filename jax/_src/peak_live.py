@@ -42,6 +42,9 @@ class LiveBuffer:
     instruction: the name of the instruction defining it.
     op_name: that instruction's ``op_name`` (jax's name stack).
     source: that instruction's source, ``file:line``.
+    names: the ``jax.ad_checkpoint.checkpoint_name`` names of the value that
+      instruction defines, where it carries them (a fusion its named root's).
+    parameter: the entry parameter's number, for a ``parameter`` buffer.
   """
   bytes: int
   shape: tuple[int, ...]
@@ -50,6 +53,8 @@ class LiveBuffer:
   instruction: str
   op_name: str
   source: str
+  names: tuple[str, ...] = ()
+  parameter: int | None = None
 
 
 def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
@@ -68,6 +73,9 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
   buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
   kinds = {allocation.index: _kind(allocation)
            for allocation in proto.buffer_allocations}
+  parameters = {allocation.index: allocation.parameter_number
+                for allocation in proto.buffer_allocations
+                if allocation.is_entry_computation_parameter}
   found = []
   for peak in proto.peak_buffers:
     kind = kinds[peak.index]
@@ -82,13 +90,16 @@ def live(assignment: bytes, module: bytes) -> tuple[LiveBuffer, ...]:
       if shape.tuple_shapes:
         continue  # A tuple's index table, no array.
       metadata = instruction.metadata
+      named = instruction.frontend_attributes.map.get("checkpoint_name")
       found.append(LiveBuffer(
           bytes=buffer.size, shape=tuple(shape.dimensions),
           dtype=primitive_type.values_by_number[shape.element_type]
           .name.lower(),
           kind=kind, instruction=instruction.name,
           op_name=metadata.op_name,
-          source=f"{metadata.source_file}:{metadata.source_line}"))
+          source=f"{metadata.source_file}:{metadata.source_line}",
+          names=tuple(named.split(",")) if named else (),
+          parameter=parameters.get(peak.index)))
   return tuple(found)
 
 
