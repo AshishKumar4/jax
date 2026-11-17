@@ -257,22 +257,35 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         lambda: jax.lax.dynamic_update_slice(x, x[:1, :1, :1] * 0 + x[1, 2, 3], (0, 0, 0)),
         lambda: x[:, jnp.array([2, 0])], lambda: jnp.concatenate([x, x], 1),
         lambda: jax.lax.pad(x, np.float32(-7.0), [(1, 0, 0), (0, 1, 1), (0, 0, 0)]),
-        lambda: jnp.split(x, 2, 2)[1],
+        lambda: jax.lax.split(x, (2, 2), 2)[1],
     ]
     allowed = set(np.asarray(x).ravel().tolist()) | {-7.0}
+
+    def primitives(program):
+      found = []
+      def walk(jaxpr):
+        for e in jaxpr.eqns:
+          found.append(e.primitive)
+          for inner in core.jaxprs_in_params(e.params):
+            walk(inner)
+      walk(jax.make_jaxpr(program)().jaxpr)
+      return found
+
     seen = set()
     for program in programs:
-      rearranging = [e.primitive for e in jax.make_jaxpr(program)().eqns if e.primitive.rearranges]
+      rearranging = [p for p in primitives(program) if p.rearranges]
       with self.subTest(primitives=[p.name for p in rearranging]):
         self.assertTrue(rearranging)
         self.assertLessEqual(set(np.asarray(jax.jit(program)()).ravel().tolist()), allowed)
         seen |= set(rearranging)
-    self.assertGreaterEqual(len(seen), 12)
+    self.assertEqual({p.name for p in seen},
+                     {"reshape", "squeeze", "broadcast_in_dim", "transpose", "rev", "slice", "dynamic_slice",
+                      "dynamic_update_slice", "gather", "concatenate", "pad", "split"})
     # Arithmetic and rounding are not rearrangements: an add, a convert, a dot.
     for program in (lambda: x + 1, lambda: x.astype(jnp.bfloat16), lambda: x.reshape(6, 4) @ x.reshape(4, 6)):
-      for e in jax.make_jaxpr(program)().eqns:
-        if e.primitive.name in ("add", "convert_element_type", "dot_general"):
-          self.assertFalse(e.primitive.rearranges, e.primitive.name)
+      for primitive in primitives(program):
+        if primitive.name in ("add", "convert_element_type", "dot_general"):
+          self.assertFalse(primitive.rearranges, primitive.name)
 
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.lax.fori_loop(0, 3, lambda _, y: y * 2, x))(1.0)
