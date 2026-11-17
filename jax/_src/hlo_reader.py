@@ -60,6 +60,13 @@ def _module_class() -> Any:
   return message_factory.GetMessageClass(pool.FindMessageTypeByName("xla.HloModuleProto"))
 
 
+def module_from_text(text: str) -> Any:
+  """The HLO module `text` writes (an XLA dump file, a test's module), parsed by XLA's own HLO parser, which
+  `instructions` reads as it reads a compiled one."""
+  from jax._src.lib import hlo
+  return hlo.hlo_module_from_text(text)
+
+
 def instructions(module: Any) -> Iterator[Instruction]:
   """Each instruction of `module`, computation by computation in the module's order: an HLO module (a
   compiled executable's `hlo_modules()`, a lowering's `compiler_ir("hlo")`) or its serialized

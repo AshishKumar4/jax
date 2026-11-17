@@ -63,6 +63,10 @@ class HloReaderTest(jtu.JaxTestCase):
       self.assertIn(instruction.name, text)
       for called in instruction.called:
         self.assertIn(called, text)
+    # Its text, parsed back, reads as the module does (XLA's parser names what it printed).
+    from_text = list(jex_xla.instructions(jex_xla.module_from_text(text)))
+    self.assertEqual([(i.computation, i.name, i.opcode, i.called, i.root, i.entry) for i in from_text],
+                     [(i.computation, i.name, i.opcode, i.called, i.root, i.entry) for i in from_module])
 
 
 if __name__ == "__main__":
