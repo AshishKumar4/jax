@@ -230,11 +230,10 @@ auto AppendDiagnosticTo(std::string* diagnostic) {
 absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     mlir::MLIRContext* ctx,
     const se::cuda::CompilationProvider* compilation_provider,
-    const se::CudaComputeCapability& cc, const std::string& sm,
-    const std::string& ptx_isa, const std::string& nvshmem_path,
-    bool verify_target) {
+    const std::string& sm, const std::string& ptx_isa,
+    const std::string& nvshmem_path, bool verify_target) {
   static absl::once_flag register_passes_flag;
-  absl::call_once(register_passes_flag, [&compilation_provider, &cc]() {
+  absl::call_once(register_passes_flag, [&compilation_provider]() {
     mosaic::gpu::EnsureLLVMNVPTXTargetIsRegistered();
     EnsureLLVMisInitialized();
     mlir::registerCanonicalizerPass();
@@ -258,7 +257,7 @@ absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     mlir::registerGPUNVVMPasses();
     mlir::registerGpuLaunchSinkIndexComputationsPass();
     mosaic::gpu::registerGpuModuleToAssemblyPass();
-    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider, cc);
+    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider);
     mosaic::gpu::registerGpuLaunchLoweringPass();
     mosaic::gpu::registerConvertGpuToLLVMPass();
     mosaic::gpu::registerByvalInsertionPass();
@@ -616,7 +615,7 @@ absl::Status RunMlirPasses(mlir::ModuleOp module, se::CudaComputeCapability cc,
   bool verify_target = !((cc.major == 10 && cc.minor > 0) || cc.major == 11);
   ASSIGN_OR_RETURN(
       auto passes,
-      GetPassPipeline(module.getContext(), compilation_provider, cc, sm,
+      GetPassPipeline(module.getContext(), compilation_provider, sm,
                       llvm_ptx_isa, nvshmem_path, verify_target));
   return RunPasses(std::move(passes), module, dump_opts);
 }
