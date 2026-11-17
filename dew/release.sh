@@ -21,6 +21,7 @@
 # commit it gains is a carried patch family's (its subject "[stack] NAME: ...") or a repair of one (a
 # `git commit --fixup` of it, kept as its own commit), and its release commit sets the version, last.
 set -euo pipefail
+shopt -s extglob
 
 checkout=$1 base=$2 new=$3 message=$4
 shift 4
@@ -94,12 +95,24 @@ for _ in $(seq 60); do
 done
 [[ -n $run ]] || failed "no run of patch-stack.yml named $token in 5 minutes"
 gh run watch "$run" -R AshishKumar4/jax > /dev/null || true
-conclusion=$(gh run view "$run" -R AshishKumar4/jax --json conclusion --jq .conclusion) || {
-  echo "release.sh: run $run's end could not be read; release/$new is at $composed, the stack branch at" \
-    "release/$base" >&2
+unread() {
+  echo "release.sh: $1; release/$new is at $composed, the stack branch at release/$base, both left as they are" >&2
   exit 1
 }
-[[ $conclusion == success ]] || failed "run $run ended $conclusion"
+ended=$(gh run view "$run" -R AshishKumar4/jax --json status,conclusion --jq '.status + " " + .conclusion') ||
+  unread "run $run's end could not be read"
+# Ended, and how: a run still going (a watch that stopped early) or a conclusion not known here touches nothing.
+case $ended in
+  "completed success") ;;
+  "completed "@(failure|cancelled|timed_out|action_required|neutral|skipped|stale|startup_failure))
+    # A run that staged its wheels before it ended (jax-NEW holds them, which are never replaced) is resumed, not
+    # composed again: its release branch stays for its jobs run again (review, 2026-11-17).
+    if gh release view "jax-$new" -R AshishKumar4/jax > /dev/null 2>&1; then
+      unread "run $run ended ${ended#completed } after staging jax-$new: run its failed jobs again (gh run rerun $run --failed), then push $composed to $stack"
+    fi
+    failed "run $run ended ${ended#completed }" ;;
+  *) unread "run $run has not ended as known ($ended)" ;;
+esac
 # Staged: the stack branch forward to it, a fast-forward from the published release it was checked at.
 git -C "$work" push -q origin "$composed:refs/heads/$stack"
 echo "$new published from $composed (run $run)"

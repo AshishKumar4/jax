@@ -253,7 +253,9 @@ if sys.argv[1:3] == ["run", "list"] and not os.environ.get("RUNS_NEVER_APPEAR"):
     if dispatched and listings >= 2 and token.removeprefix("token=") in query:
         print(7)
 if sys.argv[1:3] == ["run", "view"]:
-    print("failure" if os.environ.get("STAGE_RED") else "success")
+    print(os.environ.get("RUN_ENDED") or ("completed failure" if os.environ.get("STAGE_RED") else "completed success"))
+if sys.argv[1:3] == ["release", "view"]:
+    sys.exit(0 if os.environ.get("STAGED") else 1)
 """
 
 
@@ -356,6 +358,13 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
                                *picked], env={**environment, **extra}, capture_output=True, text=True,
                               check=False)
 
+    # A run whose watch stopped before its end, and a red one that staged its wheels first: each left as it is,
+    # its release branch kept for the run to go on or be run again, the stack branch where it was.
+    for how in ({"RUN_ENDED": "in_progress "}, {"STAGE_RED": "1", "STAGED": "1"}):
+        assert again("0.12.0.1.post41", commits["other"], **how).returncode != 0
+        assert run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints") == stack
+        assert "release/0.12.0.1.post41" in branches() and not run(origin, "tag", "--list", "failed/*")
+        run(origin, "update-ref", "-d", "refs/heads/release/0.12.0.1.post41")
     for how in ({"STAGE_RED": "1"}, {"RUNS_NEVER_APPEAR": "1"}):
         assert again("0.12.0.1.post41", commits["other"], **how).returncode != 0
         assert run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints") == stack
