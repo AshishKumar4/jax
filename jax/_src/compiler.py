@@ -474,10 +474,16 @@ def compile_or_get_cached(
 
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
+  # A compile-only client reads nothing back: an entry deserializes only as a
+  # loaded executable, which needs a client with devices. It writes its entry
+  # as any compile does, for a process of the target's devices to read.
   cache_retrieval_start = time.monotonic()
-  retrieved_executable, retrieved_compile_time = _cache_read(
-      module_name, cache_key, compile_options, backend, executable_devices,
-      host_callbacks)
+  if isinstance(backend, _jax.CompileOnlyPyClient):
+    retrieved_executable, retrieved_compile_time = None, None
+  else:
+    retrieved_executable, retrieved_compile_time = _cache_read(
+        module_name, cache_key, compile_options, backend, executable_devices,
+        host_callbacks)
   cache_retrieval_time = time.monotonic() - cache_retrieval_start
 
   if retrieved_executable is not None:
