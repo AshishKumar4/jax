@@ -446,6 +446,15 @@ cc_library(
 )
 
 cc_test(
+    name = "assembly_to_binary_test",
+    srcs = ["assembly_to_binary_test.cc"],
+    deps = [
+        ":passes",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "custom_call_test",
     srcs = ["custom_call_test.cc"],
     args = ["--heap_check="],  # TODO(b/452513034): Enable heapcheck once the bug is fixed.
