@@ -551,8 +551,9 @@ def _sources(declared: str) -> tuple[dict[str, tuple[str, str]], dict[str, bytes
 
   Each package is found where an import would find it; its every Python file is
   hashed, and its digest is the hash of its files' names and hashes in order. A
-  package that is declared and not found, or a namespace package (no one tree),
-  is a declaration the process cannot keep, and unseals it.
+  package that is declared and not found, a namespace package (no one tree), or
+  one holding a file that cannot be read, is a declaration the process cannot
+  keep, and unseals it.
   """
   files: dict[str, tuple[str, str]] = {}
   digests: dict[str, bytes] = {}
@@ -571,8 +572,16 @@ def _sources(declared: str) -> tuple[dict[str, tuple[str, str]], dict[str, bytes
           continue
         path = os.path.join(directory, name)
         relative = os.path.relpath(path, root).replace(os.sep, "/")
-        with open(path, "rb") as f:
-          digest = hashlib.sha256(f.read()).digest()
+        try:
+          with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).digest()
+        except OSError as error:
+          # A file of the package that cannot be read (unreadable, gone, a
+          # dangling link) states no code: the declaration cannot be kept, and
+          # the process lowers uncached, as for a package no import finds.
+          return {}, {}, (
+              f"the declared source package {package!r} holds {relative!r},"
+              f" which cannot be read: {error}")
         tree.update(_framed(relative.encode(), digest))
         files[os.path.normpath(path)] = (package, relative)
         files[os.path.realpath(path)] = (package, relative)
