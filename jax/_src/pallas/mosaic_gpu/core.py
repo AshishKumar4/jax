@@ -66,6 +66,8 @@ ScratchShapeTree = pallas_core.ScratchShapeTree
 # sensitive to alignment and while this is quite conservative, it gets the job
 # done. We should make this more refined in the future.
 SMEM_ALIGNMENT = 1024
+"""The bytes each shared-memory allocation of a kernel starts at a multiple of,
+so a model of a kernel's shared memory reads its allocator's rounding."""
 TMEM_COL_ALIGNMENT = 4
 
 
