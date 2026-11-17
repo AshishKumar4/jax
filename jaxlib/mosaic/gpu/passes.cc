@@ -192,7 +192,9 @@ class ByvalInsertionPass
 };
 
 // Insert the nvvm.minctasm attribute, which is sometimes required for ptxas
-// to recognize setmaxnreg instructions.
+// to recognize setmaxnreg instructions. Its value is the kernel module's
+// "mosaic_gpu.min_blocks_per_sm" attribute where it has one (Pallas's
+// CompilerParams.min_blocks_per_sm), else 1.
 class LLVMAttrInsertionPass
     : public jaxlib::mlir::Pass<LLVMAttrInsertionPass, mlir::gpu::GPUModuleOp> {
  public:
@@ -202,14 +204,22 @@ class LLVMAttrInsertionPass
   static constexpr llvm::StringLiteral kPassName = "LLVMAttrInsertionPass";
 
   void runOnOperation() override {
-    auto result = getOperation().walk([](mlir::LLVM::LLVMFuncOp op) {
+    int64_t min_blocks_per_sm = 1;
+    if (auto parent = getOperation()->getParentOfType<mlir::ModuleOp>()) {
+      if (auto attr = parent->getAttrOfType<mlir::IntegerAttr>(
+              "mosaic_gpu.min_blocks_per_sm")) {
+        min_blocks_per_sm = attr.getInt();
+      }
+    }
+    auto result = getOperation().walk([&](mlir::LLVM::LLVMFuncOp op) {
       // TODO(apaszke): op.isDeclaration() always returns false...
       if (op.getFunctionBody().empty()) {  // Skip over declarations.
         return mlir::WalkResult::advance();
       }
       op.getOperation()->setAttr(
-          "nvvm.minctasm", mlir::IntegerAttr::get(
-                               mlir::IntegerType::get(op.getContext(), 32), 1));
+          "nvvm.minctasm",
+          mlir::IntegerAttr::get(mlir::IntegerType::get(op.getContext(), 32),
+                                 min_blocks_per_sm));
       for (unsigned i = 0; i < op.getNumArguments(); ++i) {
         mlir::BlockArgument arg = op.getArgument(i);
         if (!mlir::isa<mlir::LLVM::LLVMPointerType>(arg.getType())) {

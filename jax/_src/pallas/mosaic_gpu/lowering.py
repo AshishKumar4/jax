@@ -996,6 +996,7 @@ def lower_jaxpr_to_module(
       uses_pdl=uses_pdl,
       is_multi_process=params.is_multi_process,
       use_barrier_semaphore=rs.use_barrier_semaphore,
+      min_blocks_per_sm=params.min_blocks_per_sm,
   )
 
   mgpu_core.lower_mgpu_module(
