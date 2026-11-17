@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from unittest import SkipTest
@@ -148,6 +149,66 @@ class CompilationCacheTest(CompilationCacheTestCase):
       raise SkipTest(
           "serialize executable only works on " + ",".join(supported_platforms)
       )
+
+  def test_reset_during_initialization_leaves_no_cache(self):
+    # A reset that runs while another thread builds the cache waits for the build and then clears it,
+    # so the next compile initializes the cache again rather than keep the one the reset was meant to
+    # drop.
+    timeout = 60
+    path = self.create_tempdir().full_path
+    entered, proceed, contending = threading.Event(), threading.Event(), threading.Event()
+    real_get_file_cache, real_mutex = cc.get_file_cache, cc._cache_initialized_mutex
+
+    class SignallingMutex:
+      """The initialization mutex, signalling just before the reset tries to take it."""
+
+      def __enter__(self):
+        if threading.current_thread().name == "reset":
+          contending.set()
+        return real_mutex.__enter__()
+
+      def __exit__(self, *exc_info):
+        return real_mutex.__exit__(*exc_info)
+
+    def slow(cache_path):
+      entered.set()
+      if not proceed.wait(timeout):
+        raise TimeoutError("the initialization was never let proceed")
+      return real_get_file_cache(cache_path)
+
+    def initialize():
+      # The cache directory is thread-local configuration: the initializing thread sets its own.
+      with config.compilation_cache_dir(path):
+        cc._initialize_cache()
+
+    cc.reset_cache()
+    initializing = threading.Thread(target=initialize)
+    resetting = threading.Thread(target=cc.reset_cache, name="reset")
+    try:
+      with (mock.patch.object(cc, "get_file_cache", side_effect=slow),
+            mock.patch.object(cc, "_cache_initialized_mutex", SignallingMutex())):
+        initializing.start()
+        self.assertTrue(entered.wait(timeout), "the initialization never built a cache")
+        resetting.start()
+        self.assertTrue(contending.wait(timeout), "the reset never reached the mutex")
+        proceed.set()
+        initializing.join(timeout)
+        resetting.join(timeout)
+        self.assertFalse(initializing.is_alive(), "the initialization never ended")
+        self.assertFalse(resetting.is_alive(), "the reset never ended")
+    finally:
+      proceed.set()
+      for thread in (initializing, resetting):
+        if thread.ident is not None:
+          thread.join(timeout)
+    self.assertIsNone(cc._cache)
+    self.assertFalse(cc._cache_initialized)
+    self.assertFalse(cc._cache_checked)
+    self.assertFalse(cc._cache_used)
+    with config.compilation_cache_dir(path):
+      cc._initialize_cache()
+    self.assertIsNotNone(cc._cache)
+    self.assertTrue(cc._cache_initialized)
 
   def test_get_no_executable(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
