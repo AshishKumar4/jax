@@ -25,16 +25,20 @@ from typing import Any, NamedTuple
 
 class Instruction(NamedTuple):
   """An instruction of a module (`instructions`): the computation holding it, its name and opcode, its
-  custom-call target (None where it is no custom call), the computations it calls (a fusion's, a while
-  loop's body and condition, a conditional's branches, a call's), by name, and the instruction as XLA's
-  schema holds it (`proto`, an `xla.HloInstructionProto`: its shape, operands, dimension numbers and
-  backend config, which the fields above do not name)."""
+  custom-call target (None where it is no custom call), its operands and the computations it calls (a
+  fusion's, a while loop's body and condition, a conditional's branches, a call's), each by name, whether
+  it is its computation's root and whether its computation is the module's entry, and the instruction as
+  XLA's schema holds it (`proto`, an `xla.HloInstructionProto`: its shape, dimension numbers and backend
+  config, which the fields above do not name)."""
 
   computation: str
   name: str
   opcode: str
   custom_call_target: str | None
+  operands: tuple[str, ...]
   called: tuple[str, ...]
+  root: bool
+  entry: bool
   proto: Any
 
 
@@ -67,8 +71,12 @@ def instructions(module: Any) -> Iterator[Instruction]:
   proto = _module_class().FromString(serialized)
   names = {computation.id: computation.name for computation in proto.computations}
   for computation in proto.computations:
+    operands = {instruction.id: instruction.name for instruction in computation.instructions}
+    entry = computation.id == proto.entry_computation_id
     for instruction in computation.instructions:
       yield Instruction(
           computation.name, instruction.name, instruction.opcode,
           instruction.custom_call_target if instruction.opcode == "custom-call" else None,
-          tuple(names[called] for called in instruction.called_computation_ids), instruction)
+          tuple(operands[operand] for operand in instruction.operand_ids),
+          tuple(names[called] for called in instruction.called_computation_ids),
+          instruction.id == computation.root_id, entry, instruction)
