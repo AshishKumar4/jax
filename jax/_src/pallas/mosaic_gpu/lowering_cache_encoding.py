@@ -189,6 +189,14 @@ class Encoder:
   def encode(self, x: Any) -> bytes:
     return self._e(x, 0)
 
+  def copy(self) -> Encoder:
+    """An encoder in this one's state: what it has met and numbered, so
+    encoding on from either gives the same bytes."""
+    other = object.__new__(Encoder)
+    for name, value in vars(self).items():
+      setattr(other, name, value.copy())
+    return other
+
   # -- the dispatch
 
   def _e(self, x: Any, depth: int) -> bytes:
