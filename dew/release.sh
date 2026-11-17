@@ -15,7 +15,8 @@
 # (0.12.0.1.post39), NEW the release it makes (0.12.0.1.post40), MESSAGE the release commit's message, and each
 # COMMIT a commit or a range (`A..B`) the fork holds, picked in order. RUNNER names run_hooked.sh, which makes every
 # commit on armada through the fork's own commit hook, taking RUNNER_LOCK, the lane's armada lock: the PC's clone
-# makes none. The stack branch must be at BASE's release branch, and NEW's must not exist yet.
+# makes none. The stack branch must be at BASE's release branch, and NEW's must not exist yet. BUILT_AT, where set,
+# the commit its native wheels were built at, which the composition must equal but for its version.
 #
 # Each release grows from the one before, which it holds whole, so neither branch moves but forward (owner,
 # 2026-10-31; Main, 2026-11-03: post46's composition, rebuilt under post45's release commit, was a force push): each
@@ -98,6 +99,21 @@ ran=$("$RUNNER" "--into=$checkout" "--lock=$RUNNER_LOCK" "rel-$new-$(date +%s)" 
 }
 composed=$(sed -n 's/^tip \([0-9a-f]\{40\}\)$/\1/p' <<< "$ran")
 [[ -n $composed ]] || { echo "release.sh: the runner named no tip: $ran" >&2; exit 1; }
+
+# BUILT_AT, where its native wheels (plugin-NEW) were built at a commit of the same picks before this one existed:
+# the composition is that commit's source but for the version (jax/version.py alone), and its message names it, or
+# nothing is pushed; so the plugins are the release's native code, proven, never assumed (FarSilverfish,
+# 2026-11-17: rebuilding at the release commit would cost three hours of capacity for the same .so files).
+if [[ -n ${BUILT_AT:-} ]]; then
+  git -C "$checkout" fetch -q origin "$BUILT_AT" 2> /dev/null || true
+  apart=$(git -C "$checkout" diff --name-only "$BUILT_AT" "$composed" | grep -vx 'jax/version.py' || true)
+  if [[ -n $apart ]]; then
+    echo "release.sh: $new's composition differs from BUILT_AT ${BUILT_AT:0:10} beyond its version: $apart" >&2
+    exit 1
+  fi
+  grep -Fq "${BUILT_AT:0:10}" <<< "$message" ||
+    { echo "release.sh: the release message names no BUILT_AT ${BUILT_AT:0:10}" >&2; exit 1; }
+fi
 
 # The release branch alone, only where none is: the stack branch moves once the stage has passed.
 git -C "$work" push -q "--force-with-lease=refs/heads/release/$new:" origin "$composed:refs/heads/release/$new"
