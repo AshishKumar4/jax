@@ -1358,7 +1358,9 @@ class LaxTest(jtu.JaxTestCase):
                       preferred_element_type=np.complex64)
       self.assertEqual(found.dtype, np.complex64)
       self.assertAllClose(found, expected, rtol=1e-5)
-      with jax.default_matmul_precision("F32_F32_F32"):
+      # jnp promotes a real operand to complex, as a user's matmul does.
+      with (jax.default_matmul_precision("F32_F32_F32"),
+            jax.numpy_dtype_promotion("standard")):
         self.assertAllClose(jax.jit(jnp.matmul)(left, right), expected,
                             rtol=1e-5)
 
