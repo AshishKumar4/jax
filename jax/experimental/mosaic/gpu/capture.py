@@ -71,7 +71,7 @@ def kernels(module: ir.Module) -> list[Kernel]:
           op = inner.operation
           if (op.name == "stablehlo.custom_call"
               and ir.StringAttr(op.attributes["call_target_name"]).value == custom_call_targets.MOSAIC_GPU):
-            config = ir.DictAttr(op.attributes["backend_config"])
+            config = ir.DictAttr(op.attributes["mhlo.backend_config"])
             found.append(Kernel(
                 module=ir.StringAttr(config["module"]).value_bytes,
                 operands=tuple(_shaped(operand.type) for operand in op.operands),
