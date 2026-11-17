@@ -21,7 +21,6 @@
 # commit it gains is a carried patch family's (its subject "[stack] NAME: ...") or a repair of one (a
 # `git commit --fixup` of it, kept as its own commit), and its release commit sets the version, last.
 set -euo pipefail
-shopt -s extglob
 
 checkout=$1 base=$2 new=$3 message=$4
 shift 4
@@ -104,7 +103,8 @@ ended=$(gh run view "$run" -R AshishKumar4/jax --json status,conclusion --jq '.s
 # Ended, and how: a run still going (a watch that stopped early) or a conclusion not known here touches nothing.
 case $ended in
   "completed success") ;;
-  "completed "@(failure|cancelled|timed_out|action_required|neutral|skipped|stale|startup_failure))
+  "completed failure" | "completed cancelled" | "completed timed_out" | "completed action_required" | \
+    "completed neutral" | "completed skipped" | "completed stale" | "completed startup_failure")
     # A run that staged its wheels before it ended (jax-NEW holds them, which are never replaced) is resumed, not
     # composed again: its release branch stays for its jobs run again (review, 2026-11-17).
     if gh release view "jax-$new" -R AshishKumar4/jax > /dev/null 2>&1; then
