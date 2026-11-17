@@ -144,7 +144,7 @@ def committed(message: str, author: str, date: str, taken: list[str]) -> str:
     with tempfile.TemporaryDirectory() as scratch:
         written = Path(scratch) / "message"
         written.write_text(f"{message.rstrip()}\n\n(cherry picked from commit {', '.join(taken)})\n")
-        git("commit", "-q", "--no-verify", "-F", str(written), f"--author={author}", f"--date={date}")
+        git("commit", "-q", "-F", str(written), f"--author={author}", f"--date={date}")
     return git("rev-parse", "--short=9", "HEAD").strip()
 
 
