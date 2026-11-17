@@ -1,0 +1,46 @@
+diff --git a/xla/backends/gpu/target_config/cudnn_device_props.cc b/xla/backends/gpu/target_config/cudnn_device_props.cc
+index d0c4f5d1fa..d21d499b2f 100644
+--- a/xla/backends/gpu/target_config/cudnn_device_props.cc
++++ b/xla/backends/gpu/target_config/cudnn_device_props.cc
+@@ -15,6 +15,7 @@ limitations under the License.
+ 
+ #include "xla/backends/gpu/target_config/cudnn_device_props.h"
+ 
++#include <cmath>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -40,6 +41,16 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+   const bool is_sm107 = cc && cc->major == 10 && cc->minor == 7;
+   const int64_t oversized_shared_memory =
+       is_sm107 ? desc.oversized_shared_memory_per_block() : 0;
++  // cuDNN (9.27 at least) requires the global memory bus width, in bits, of a
++  // deserialized description and refuses one without it ("!json_object
++  // .HasMember(key)"). The description keeps the bandwidth the executor
++  // derived from it (two transfers a memory clock over the bus,
++  // cuda_executor.cc), so the width is that derivation inverted.
++  const double mem_clock_hz = desc.mem_clock_ghz() * 1e9;
++  const int64_t memory_bus_width =
++      desc.memory_bandwidth() > 0 && mem_clock_hz > 0
++          ? std::llround(desc.memory_bandwidth() * 8.0 / (2.0 * mem_clock_hz))
++          : 0;
+   std::string json = absl::StrFormat(
+       R"json({
+   "deviceVer":%d,
+@@ -59,6 +70,7 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+   "l2CacheSize":%d,
+   "maxBlockSize":[%d,%d,%d],
+   "memClockRateKHz":%d,
++  "memoryBusWidth":%d,
+   "maxGridSize":[%d,%d,%d],
+   "supportCoopLaunch":%d,
+   "pciDeviceId":0,
+@@ -76,7 +88,7 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+       static_cast<int64_t>(desc.clock_rate_ghz() * 1e6), desc.l2_cache_size(),
+       desc.thread_dim_limit().x, desc.thread_dim_limit().y,
+       desc.thread_dim_limit().z,
+-      static_cast<int64_t>(desc.mem_clock_ghz() * 1e6),
++      static_cast<int64_t>(desc.mem_clock_ghz() * 1e6), memory_bus_width,
+       desc.block_dim_limit().x, desc.block_dim_limit().y,
+       desc.block_dim_limit().z,
+       /*desc.supports_coop_launch()*/ 1, driver_ver, desc.name());
