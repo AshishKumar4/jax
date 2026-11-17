@@ -260,8 +260,8 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
 
   def test_what_no_lowering_reads_is_no_input_of_the_key(self):
     # A process's own settings: its compilation cache, its client's
-    # allocations, XLA's dumps and a profiler's injection. Processes differing
-    # in them alone share their lowerings.
+    # allocations, XLA's dumps, a profiler's injection and the devices it sees.
+    # Processes differing in them alone share their lowerings.
     base = self.lower()
     self.assertEqual(base["events"], ["miss"])
     flags = os.environ.get("XLA_FLAGS", "")  # the children's own, kept
@@ -281,6 +281,9 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         "a profiler's injection": dict(env={
             "CUDA_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so",
             "NVTX_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so"}),
+        "the devices it sees": dict(env={
+            "JAX_PLATFORMS": "cuda,cpu", "CUDA_VISIBLE_DEVICES": "0",
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}),
     }
     for name, change in unread.items():
       with self.subTest(name):
