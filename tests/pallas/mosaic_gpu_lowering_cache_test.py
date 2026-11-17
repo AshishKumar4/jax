@@ -460,9 +460,15 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
       self.assertEqual(run["events"], ["uncacheable"], run)
     self.assertEmpty(self.entries())
 
-  def test_a_dumping_lowering_is_uncacheable(self):
-    run = self.lower(env={"MOSAIC_GPU_DUMP_PTX": "1"})
-    self.assertEqual(run["events"], ["uncacheable"], run)
+  def test_a_lowering_dumping_its_passes_is_uncacheable(self):
+    passes = self.tmp / "passes"
+    passes.mkdir()
+    for dumps in ({"MOSAIC_GPU_DUMP_MLIR_PASSES": "1"},
+                  {"MOSAIC_GPU_DUMP_CONSTRAINT_SYSTEM": "1"},
+                  {}):  # MOSAIC_GPU_DUMP_TO alone dumps every kind.
+      with self.subTest(str(dumps)):
+        run = self.lower(env={**dumps, "MOSAIC_GPU_DUMP_TO": str(passes)})
+        self.assertEqual(run["events"], ["uncacheable"], run)
     self.assertEmpty(self.entries())
 
   def test_a_hit_dumps_the_resource_estimate_a_dumping_miss_dumps(self):
