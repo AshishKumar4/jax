@@ -32,7 +32,12 @@ def _run(jaxpr, consts, *args):
 
 
 def _run_jaxpr(jaxpr, consts, *args):
-  traced = jax.jit(_run, static_argnums=(0,)).trace(jaxpr, consts, *args)
+  # Every argument kept: pruned unused ones beside committed ones (the consts
+  # and inputs placed on the device once) left the parameter tuple a leaf short
+  # of its shardings, which XLA's verifier refuses (a Blackwell causal forward's
+  # role thread: 9 leaves against 10 shardings, hlo_sharding.cc:819).
+  traced = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
+      jaxpr, consts, *args)
   traced.lower().compile()(consts, *args)
   return
 
