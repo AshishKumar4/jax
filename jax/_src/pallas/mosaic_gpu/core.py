@@ -1751,6 +1751,17 @@ class ClusterBarrierType(dtypes.ExtendedDType):
     return self.name
 
 
+@dataclasses.dataclass(frozen=True)
+class CtaBarrierType(dtypes.ExtendedDType):
+  type: ClassVar[Any] = barrier_dtype  # pyrefly: ignore[bad-override]
+  name: ClassVar[str] = "cta_barrier"
+
+  num_arrivals: int
+
+  def __str__(self):
+    return self.name
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Barrier:
   """Describes a barrier reference.
@@ -1783,6 +1794,41 @@ class Barrier:
 
   def get_ref_aval(self) -> state.AbstractRef:
     ty = BarrierType(self.num_arrivals, self.orders_tensor_core)
+    return state.AbstractRef(jax_core.ShapedArray(self.num_barriers, ty), SMEM)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CtaBarrier:
+  """Describes a named CTA barrier reference (`bar.arrive` and `bar.sync`).
+
+  A hardware barrier of the thread block, numbered past the ones Mosaic GPU
+  reserves for the block and its warpgroups (`mgpu.CtaBarrier`): arriving does
+  not wait, and arriving and waiting (`barrier_arrive_and_wait`) blocks until
+  `num_arrivals` warpgroups have arrived at it in this phase, without polling
+  shared memory as an mbarrier's wait does. It has no separate wait.
+
+  Attributes:
+    num_arrivals: The number of warpgroups that arrive at it in a phase.
+    num_barriers: The shape of the barrier array to create. By default a single
+      barrier is created, and the reference to it has an empty shape.
+  """
+  num_arrivals: int = 1
+  num_barriers: int | Sequence[int] = ()
+
+  def __post_init__(self):
+    if (n := self.num_arrivals) < 1:
+      raise ValueError(f"Num arrivals must be at least 1, but got {n}")
+
+    if isinstance(self.num_barriers, int):
+      object.__setattr__(self, "num_barriers", (self.num_barriers,))
+    else:
+      object.__setattr__(self, "num_barriers", tuple(self.num_barriers))
+
+  def get_array_aval(self) -> jax_core.ShapedArray:
+    raise ValueError("CTA barriers are not arrays")
+
+  def get_ref_aval(self) -> state.AbstractRef:
+    ty = CtaBarrierType(self.num_arrivals)
     return state.AbstractRef(jax_core.ShapedArray(self.num_barriers, ty), SMEM)
 
 
