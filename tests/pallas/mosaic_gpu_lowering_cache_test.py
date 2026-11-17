@@ -366,6 +366,17 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
       self.assertNotIn("error", run)
     self.assertEmpty(self.entries())
 
+  def test_a_param_class_of_an_installed_package_jax_does_not_require_is_uncacheable(self):
+    # The same layout_cast to a class a user's package defines, installed as a
+    # wheel installs it: its to_mgpu may read what no key holds, so it is no more
+    # cacheable than one of a source file.
+    self.kernel = "installed_layout"
+    for _ in range(2):
+      run = self.lower(size=128, rows=64)
+      self.assertEqual(run["events"], ["uncacheable"], run)
+      self.assertNotIn("error", run)
+    self.assertEmpty(self.entries())
+
   def test_a_profiling_lowering_is_uncacheable(self):
     params = dict(profile_space=8, profile_dir=str(self.tmp / "profile"))
     (self.tmp / "profile").mkdir()
