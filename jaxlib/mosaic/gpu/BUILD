@@ -446,6 +446,18 @@ cc_library(
 )
 
 cc_test(
+    name = "assembly_to_binary_test",
+    srcs = ["assembly_to_binary_test.cc"],
+    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against the
+    # library's shared object finds none of its functions.
+    linkstatic = True,
+    deps = [
+        ":passes",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "custom_call_test",
     srcs = ["custom_call_test.cc"],
     args = ["--heap_check="],  # TODO(b/452513034): Enable heapcheck once the bug is fixed.

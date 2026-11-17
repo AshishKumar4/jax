@@ -30,8 +30,11 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -57,6 +60,9 @@ namespace gpu {
 namespace {
 
 namespace se = ::stream_executor;
+
+// What precedes a performance-loss note's message, after its code.
+constexpr absl::string_view kLoss = ") Potential Performance Loss: ";
 
 absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
     const se::cuda::CompilationProvider& compilation_provider,
@@ -126,8 +132,10 @@ class AssemblyToBinaryPass
     DumpOptions dump_opts = GetOrSetDumpOptionsForModule(module);
 
     se::cuda::CompilationOptions compilation_options;
-    compilation_options.dump_compilation_log = dump_opts.ptxas;
+    // ptxas's report, whose notes of a loss of performance the module keeps.
+    compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
+    std::vector<mlir::Attribute> notes;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -175,14 +183,20 @@ class AssemblyToBinaryPass
         return mlir::WalkResult::interrupt();
       }
 
+      if (!sass_or->compilation_log.has_value()) {
+        binary.emitOpError("Expected a compilation log to be available.");
+        return mlir::WalkResult::interrupt();
+      }
       if (dump_opts.ptxas) {
-        if (!sass_or->compilation_log.has_value()) {
-          binary.emitOpError("Expected a compilation log to be available.");
-          return mlir::WalkResult::interrupt();
-        }
         DumpToFileOrStdout(*sass_or->compilation_log,
                            dump_opts.module_basename + ".ptxas",
                            dump_opts.dump_path);
+      }
+      for (const PtxasNote& note :
+           PtxasNotes(*sass_or->compilation_log)) {
+        notes.push_back(b.getDictionaryAttr(
+            {b.getNamedAttr("code", b.getStringAttr(note.code)),
+             b.getNamedAttr("message", b.getStringAttr(note.message))}));
       }
 
       mlir::StringAttr sass = mlir::StringAttr::get(
@@ -204,7 +218,9 @@ class AssemblyToBinaryPass
 
     if (result.wasInterrupted()) {
       signalPassFailure();
+      return;
     }
+    module->setAttr(kAssemblerNotesAttr, b.getArrayAttr(notes));
   }
 
  private:
@@ -212,6 +228,21 @@ class AssemblyToBinaryPass
 };
 
 }  // namespace
+
+std::vector<PtxasNote> PtxasNotes(absl::string_view log) {
+  std::vector<PtxasNote> notes;
+  for (absl::string_view line : absl::StrSplit(log, '\n')) {
+    size_t loss = line.find(kLoss);
+    size_t open = line.rfind("(C", loss);
+    if (loss == absl::string_view::npos || open == absl::string_view::npos) {
+      continue;
+    }
+    notes.push_back({std::string(line.substr(open + 1, loss - open - 1)),
+                     std::string(absl::StripTrailingAsciiWhitespace(
+                         line.substr(loss + kLoss.size())))});
+  }
+  return notes;
+}
 
 void registerAssemblyToBinaryPass(
     const se::cuda::CompilationProvider* compilation_provider) {
