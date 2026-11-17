@@ -233,7 +233,10 @@ def _gathered(value, indexer, fill):
     raise NotImplementedError(
         "The functional GPU interpreter reads past a buffer only through slices"
         " and scalar indices.")
-  return value.at[tuple(positions)].get(mode="fill", fill_value=fill)
+  # A position before the buffer (a window's negative start) lies past it too,
+  # not wrapped round to its end.
+  return value.at[tuple(positions)].get(
+      mode="fill", fill_value=fill, wrap_negative_indices=False)
 
 
 def _scattered(value, indexer, val):
@@ -243,7 +246,8 @@ def _scattered(value, indexer, val):
     raise NotImplementedError(
         "The functional GPU interpreter writes past a buffer only through slices"
         " and scalar indices.")
-  return value.at[tuple(positions)].set(val, mode="drop")
+  return value.at[tuple(positions)].set(
+      val, mode="drop", wrap_negative_indices=False)
 
 
 def _forward(x, transform):
@@ -390,7 +394,10 @@ class _Interpreter:
     if p is lax.while_p:
       return self.while_(eqn, invals)
     if p is gpu_primitives.copy_gmem_to_smem_p:
-      src, dst, _barrier, *flat = invals
+      src, dst, *flat = invals
+      if params["has_barrier"]:
+        flat = flat[1:]  # Its barrier: one program runs the copy at once.
+      predicate = flat.pop() if params["has_user_predicate"] else None
       src_t, dst_t, _ = jax.tree.unflatten(
           jax.tree_util.treedef_tuple((
               params["src_transforms_treedef"], params["dst_transforms_treedef"],
@@ -398,7 +405,10 @@ class _Interpreter:
       # A TMA load reads zeros past its GMEM source; its SMEM window must fit.
       # A fill is a constant (`.at[].get(mode="fill")`), never a traced zero.
       zero = np.zeros((), self.state[src.slots[0]].dtype)[()]
-      self.write(dst, dst_t, self.read(src, src_t, overhang=zero))
+      value = self.read(src, src_t, overhang=zero)
+      if predicate is not None:
+        value = jnp.where(predicate, value, self.read(dst, dst_t))
+      self.write(dst, dst_t, value)
       return []
     if p is gpu_primitives.copy_smem_to_gmem_p:
       src, dst, *flat = invals
@@ -495,19 +505,24 @@ class _Interpreter:
         invals, [params["cond_nconsts"], params["body_nconsts"]])
     cond_jaxpr, body_jaxpr = params["cond_jaxpr"].jaxpr, params["body_jaxpr"].jaxpr
 
-    def keep_going(loop):
-      state, oob, vals = loop
+    def tested(state, oob, vals):
+      # The condition runs as the kernel's code does, its writes and its
+      # out-of-bounds reads kept with the loop's state.
       operands = [*cond_consts, *vals]
-      _, _, (out,) = self._body(cond_jaxpr, operands)(state, oob, self._arrays(operands))
-      return out
+      state, oob, (going,) = self._body(cond_jaxpr, operands)(
+          state, oob, self._arrays(operands))
+      return state, oob, going
 
     def step(loop):
-      state, oob, vals = loop
+      state, oob, vals, _ = loop
       operands = [*body_consts, *vals]
       state, oob, out = self._body(body_jaxpr, operands)(state, oob, self._arrays(operands))
-      return state, oob, out
+      state, oob, going = tested(state, oob, out)
+      return state, oob, out, going
 
-    state, oob, out = lax.while_loop(keep_going, step, (tuple(self.state), self.oob, init))
+    state, oob, going = tested(tuple(self.state), self.oob, init)
+    state, oob, out, _ = lax.while_loop(
+        lambda loop: loop[3], step, (state, oob, init, going))
     self.state, self.oob = list(state), oob
     return out
 
