@@ -185,6 +185,7 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
 
   def test_the_primitives_an_analysis_dispatches_on_are_exported(self):
     from jax._src import callback, custom_batching, debugging, ffi, pjit, shard_map
+    from jax._src.lax import parallel
     from jax._src.lax.control_flow import conditionals
     from jax._src.pallas import primitives as pallas_primitives
     from jax._src.random import core as random_core, prng
@@ -200,7 +201,10 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         "pure_callback_p": callback.pure_callback_p, "io_callback_p": callback.io_callback_p,
         "debug_callback_p": debugging.debug_callback_p, "debug_print_p": debugging.debug_print_p,
         "ffi_call_p": ffi.ffi_call_p, "platform_index_p": conditionals.platform_index_p,
-        "reshard_p": pjit.reshard_p, "addupdate_p": state_primitives.addupdate_p}.items():
+        "reshard_p": pjit.reshard_p, "addupdate_p": state_primitives.addupdate_p,
+        "psum_invariant_p": parallel.psum_invariant_p, "reduce_scatter_p": parallel.reduce_scatter_p,
+        "all_gather_invariant_p": parallel.all_gather_invariant_p, "pbroadcast_p": parallel.pbroadcast_p,
+        "pvary_p": core.pvary_p}.items():
       with self.subTest(name):
         self.assertIs(getattr(exported, name), primitive)
     self.assertIs(pl.program_id_p, pallas_primitives.program_id_p)
