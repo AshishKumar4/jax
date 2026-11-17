@@ -22,7 +22,8 @@ version. The new branch holds one commit a family, then one release commit (row 
   as nothing; a family whose every commit is dropped leaves the stack;
 - each family's commits are applied in the order they came, each as a three-way merge, and committed as one under
   its first commit's message, author and date, naming every commit it was taken from; a commit named for no family
-  is a family of its own;
+  is a family of its own. Every commit is made on armada through the fork's own commit hook (RUNNER,
+  run_hooked.sh), never in this clone;
 - the release commit's version.py is jax-vNEW's with the newest release commit's lines in place of its
   `_release_version` line, the version NEW.post1, so the build sorts after the release it patches and satisfies
   `jax>=NEW`;
@@ -46,10 +47,12 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -138,14 +141,35 @@ def versioned(old: str, new: str, commit: str, post: int) -> str:
     return pristine.replace("\n_release_version: str | None = None\n", f"\n{lines}\n")
 
 
-def committed(message: str, author: str, date: str, taken: list[str]) -> str:
-    """The index committed under `message`, by `author` at `date`, naming the commits it was `taken` from; its
-    short sha."""
+def mailed(message: str, author: str, date: str, diff: str) -> str:
+    """One commit's patch as `git format-patch -k` writes it (its subject unprefixed, so `[stack]` and `fixup!`
+    survive): `diff` under `message`, by `author` at `date`."""
+    subject, _, body = message.strip().partition("\n")
+    return (f"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: {author}\nDate: {date}\n"
+            f"Subject: {subject}\n\n{body.strip()}\n---\n{diff}")
+
+
+def composed(base: str, label: str, patches: list[str]) -> str | None:
+    """`patches` (`mailed`) committed in order onto `base` on armada through the fork's own commit hook (RUNNER,
+    run_hooked.sh; RUNNER_LOCK, where set, the lane's armada lock), never here: the PC's clone makes no commit
+    (Main, 2026-11-17). The tip, fetched into this clone; None where the runner refused or did not run, its words
+    said."""
+    runner = os.environ.get("RUNNER")
+    if not runner:
+        raise SystemExit("patch_stack: RUNNER names run_hooked.sh, which commits through the fork's hooks on armada")
     with tempfile.TemporaryDirectory() as scratch:
-        written = Path(scratch) / "message"
-        written.write_text(f"{message.rstrip()}\n\n(cherry picked from commit {', '.join(taken)})\n")
-        git("commit", "-q", "-F", str(written), f"--author={author}", f"--date={date}")
-    return git("rev-parse", "--short=9", "HEAD").strip()
+        files = []
+        for index, patch in enumerate(patches):
+            files.append(Path(scratch) / f"{index:04}.patch")
+            files[-1].write_text(patch)
+        lock = [f"--lock={os.environ['RUNNER_LOCK']}"] if os.environ.get("RUNNER_LOCK") else []
+        ran = subprocess.run([runner, f"--into={git('rev-parse', '--show-toplevel').strip()}", *lock, label, base,
+                              *map(str, files)], capture_output=True, text=True, check=False)
+    tip = re.search(r"^tip ([0-9a-f]{40})$", ran.stdout, re.MULTILINE)
+    if ran.returncode != 0 or tip is None:
+        print(f"the runner did not compose {label} (exit {ran.returncode}):\n{ran.stdout}{ran.stderr}")
+        return None
+    return tip.group(1)
 
 
 def rebase(old: str, new: str) -> int:
@@ -153,6 +177,10 @@ def rebase(old: str, new: str) -> int:
     held = upstreamed(old, new)
     target = branch(new)
     git("checkout", "-q", "--detach", f"jax-v{new}")
+    # Each family's patch (`mailed`) the change its commits make, three-way, over the families before it: the index's
+    # tree after it against the tree before (`write-tree`, no commit), all committed at the end through the runner.
+    base = git("rev-parse", f"jax-v{new}^{{commit}}").strip()
+    before, patches = git("write-tree").strip(), []
     # Each family's commits in the order they came, the families in the order each began; the newest release
     # commit, whose version.py lines the new release keeps.
     families: dict[str, list[str]] = {}
@@ -191,7 +219,11 @@ def rebase(old: str, new: str) -> int:
         message = git("log", "-1", "--format=%B", first).replace(old, new)
         author = git("log", "-1", "--format=%an <%ae>", first).strip()
         date = git("log", "-1", "--format=%aD", first).strip()
-        print(f"{family} as {committed(message, author, date, taken)}")
+        after = git("write-tree").strip()
+        patches.append(mailed(f"{message.rstrip()}\n\n(cherry picked from commit {', '.join(taken)})", author, date,
+                              git("diff", "--binary", before, after)))
+        before = after
+        print(f"{family} composed")
         fixes += 1
     if fixes == 0 or release is None:
         print(f"jax-v{new} holds every fix: nothing left to carry" if fixes == 0 else
@@ -203,9 +235,14 @@ def rebase(old: str, new: str) -> int:
     author = git("log", "-1", "--format=%an <%ae>", release).strip()
     date = git("log", "-1", "--format=%aD", release).strip()
     message = f"Release {new}.post1: the stack carried from {old} onto jax-v{new}, a commit a family"
-    print(f"release as {committed(message, author, date, [release])}")
-    git("checkout", "-q", "-B", target)
-    print(f"{target} at {git('rev-parse', 'HEAD').strip()}, version {new}.post1")
+    patches.append(mailed(f"{message}\n\n(cherry picked from commit {release})", author, date,
+                          git("diff", "--binary", before, git("write-tree").strip())))
+    tip = composed(base, f"rebase-{new}-{int(time.time())}", patches)
+    if tip is None:
+        git("reset", "-q", "--hard")
+        return 4
+    git("checkout", "-q", "-f", "-B", target, tip)
+    print(f"{target} at {tip}, version {new}.post1")
     return 0
 
 
