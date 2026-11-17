@@ -16,8 +16,12 @@ import dataclasses
 import functools
 import threading
 import math
+import subprocess
+import sys
+import textwrap
 from typing import Any
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax._src import test_util as jtu
 from jax._src.pallas import mpmd
@@ -38,6 +42,87 @@ def _maybe_reverse(arg: tuple[Any], reverse: bool) -> tuple[Any]:
     return tuple(reversed(arg))
   else:
     return arg
+
+
+class InterpretExecutionGateTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      ("single_execution", "none"),
+      # B's device asks for admission between A's two devices: B's first
+      # (A0, B0, A1 deadlocked on a count of joins) or B's second (A0, B1, both
+      # new devices, paired into one memory by a gate keyed on devices).
+      ("overlapping_execution", "overlap"),
+  )
+  def test_an_execution_owns_the_shared_memory_until_its_clean_up(self, overlap):
+    # The real host callbacks in a child: another execution's device joins
+    # nothing of the live kernel's (its memory, its barriers) until the live
+    # one has cleaned up, and both executions finish.
+    program = textwrap.dedent("""
+        import faulthandler
+        import sys
+        import threading
+        import numpy as np
+        from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks as cb
+        from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
+
+        overlap = sys.argv[1]
+        params = InterpretGPUParams()
+        token = np.int32(0)
+        errors = []
+        b_admitted = threading.Event()
+
+        def initialize(execution, threads):
+          return cb._initialize_shared_memory(
+              token=token, execution_id=np.int32(execution),
+              num_gpus=np.int32(2), num_threads_per_block=np.int32(threads),
+              num_blocks_per_cluster=np.int32(1), interpret_params=params)
+
+        def run(fn):
+          def guarded():
+            try:
+              fn()
+            except BaseException as e:
+              errors.append(e)
+          thread = threading.Thread(target=guarded, daemon=True)
+          thread.start()
+          return thread
+
+        # Execution A (1): its first device joins.
+        initialize(1, 1)
+        b = None
+        if overlap != "none":
+          def b_device():
+            initialize(2, 2)
+            # Admitted into a memory of its own execution's, A's gone.
+            assert cb._live_execution == 2, "B joined A's live shared memory"
+            b_admitted.set()
+          b = run(b_device)
+          # B asks for admission while A is live: it must wait.
+          assert not b_admitted.wait(0.25), "B joined A's live shared memory"
+
+        def a_device_0():
+          cb._clean_up_shared_memory(token)
+
+        def a_device_1():
+          initialize(1, 1)
+          cb._clean_up_shared_memory(token)
+
+        a0, a1 = run(a_device_0), run(a_device_1)
+        a0.join(5)
+        a1.join(5)
+        if a0.is_alive() or a1.is_alive():
+          faulthandler.dump_traceback()
+        assert not a0.is_alive() and not a1.is_alive(), "A's devices hung"
+        if b is not None:
+          b.join(5)
+          assert b_admitted.is_set(), "B was never admitted after A's clean-up"
+        assert not errors, errors
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", program, overlap],
+        capture_output=True, text=True, timeout=30,
+    )
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 # TODO(nrink): Figure out how to safely run different instance of GPU
