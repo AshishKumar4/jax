@@ -53,10 +53,11 @@ jobs:
               fi
             done
           done
-          # Every index run dispatched, all of its history read (paginated), so a stop cannot age out.
-          dispatched=$(gh api --paginate \
-                         "repos/$GITHUB_REPOSITORY/actions/workflows/patch-stack.yml/runs?event=workflow_dispatch&per_page=100" \
-                         --jq '.workflow_runs[] | [.display_title, .conclusion] | @tsv')
+          # Every index run dispatched, all of its history read (paginated, filtered here: the API caps a filtered
+          # listing at 1,000 runs), so a stop cannot age out.
+          dispatched=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/patch-stack.yml/runs?per_page=100" \
+                         --jq '.workflow_runs[] | select(.event == "workflow_dispatch")
+                               | [.display_title, .conclusion] | @tsv')
           for version in $(python3 dew/dew/patch_stack.py unindexed pins.json pages); do
             if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
               echo "::warning::main pins jax $version, which no release of the fork holds"
