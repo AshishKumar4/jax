@@ -54,8 +54,45 @@ def _b64(digest: bytes) -> str:
   return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+# A package installed beside jax that JAX does not require (a user's, as a wheel
+# installs it): its module and its dist-info, whose RECORD lists it.
+_USER_PACKAGE = "user_layouts"
+_USER_SOURCE = '''"""A user's layout, in a package installed as a wheel installs it."""
+import dataclasses
+
+from jax._src.pallas.mosaic_gpu import core as gpu_core
+from jax.experimental.pallas import mosaic_gpu as plgpu
+
+
+@dataclasses.dataclass(frozen=True)
+class InstalledLayout(gpu_core.SomeLayout):
+  tag: int = 0
+
+  def to_mgpu(self, *args, **kwargs):
+    return plgpu.Layout.WGMMA.to_mgpu()
+'''
+
+
+def _install_user_package(dest: pathlib.Path) -> None:
+  source = _USER_SOURCE.encode()
+  (dest / f"{_USER_PACKAGE}.py").write_bytes(source)
+  info = dest / f"{_USER_PACKAGE}-1.0.dist-info"
+  info.mkdir()
+  metadata = f"Metadata-Version: 2.1\nName: {_USER_PACKAGE}\nVersion: 1.0\n".encode()
+  (info / "METADATA").write_bytes(metadata)
+  (info / "top_level.txt").write_text(f"{_USER_PACKAGE}\n")
+  rows = [
+      f"{_USER_PACKAGE}.py,sha256={_b64(hashlib.sha256(source).digest())},{len(source)}",
+      f"{info.name}/METADATA,sha256={_b64(hashlib.sha256(metadata).digest())},{len(metadata)}",
+      f"{info.name}/top_level.txt,,",
+      f"{info.name}/RECORD,,",
+  ]
+  (info / "RECORD").write_text("\n".join(rows) + "\n")
+
+
 def make_site(dest: pathlib.Path, *, with_record: bool = True) -> None:
-  """A site directory holding the jax under test, with a RECORD made for it."""
+  """A site directory holding the jax under test, with a RECORD made for it, and a
+  user's package installed beside it (`user_layouts`)."""
   shutil.copytree(
       ROOT / "jax", dest / "jax",
       ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -77,6 +114,7 @@ def make_site(dest: pathlib.Path, *, with_record: bool = True) -> None:
       f"{info}/METADATA,sha256={_b64(hashlib.sha256(metadata).digest())},{len(metadata)}")
   rows.append(f"{info}/RECORD,,")
   (dest / info / "RECORD").write_text("\n".join(rows) + "\n")
+  _install_user_package(dest)
 
 
 def split_entry(data: bytes) -> tuple[int, dict[str, Any], bytes]:

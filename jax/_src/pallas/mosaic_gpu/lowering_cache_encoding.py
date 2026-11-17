@@ -47,10 +47,15 @@ from jax._src import named_sharding
 from jax._src import partition_spec
 from jax._src import tree_util
 from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
+from jax._src.lib import _jax
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing
 from jax._src.state import types as state_types
 import numpy as np
+
+_NB_FUNCTION = type(_jax.add_exclude_path)
+"""nanobind's function type, every function jaxlib's extension exports: a value is
+one by its exact type, never by its class's name, which any class can take."""
 
 _LEN = struct.Struct("<Q")
 _MAX_DEPTH = 400
@@ -281,9 +286,9 @@ class Encoder:
       if not sealing.seal().holds(getattr(x, "__file__", None)):
         raise Uncacheable(f"module {x.__name__} is not a sealed file")
       return frame(b"V", x.__name__.encode())
-    if t.__module__ == "nanobind" and t.__name__ == "nb_func":
+    if t is _NB_FUNCTION:
       return self._extension_function(x)
-    if t.__name__ == "PjitFunction":
+    if t is _jax.PjitFunction:
       wrapped = getattr(x, "__wrapped__", None)
       if not isinstance(wrapped, types.FunctionType):
         raise Uncacheable("a jitted function that wraps no Python function")
