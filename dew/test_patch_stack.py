@@ -491,6 +491,13 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
         patch_stack.indexable(pins, [jax, changed], "0.12.0.1.post101")
     with pytest.raises(SystemExit):
         patch_stack.indexable(pins, [jax], "0.12.0.1.post102")
+    # Indexed as it lands: the version main pins that the index lists no jax wheel of, read from the index's page;
+    # one it lists is not asked again, nor a version only a longer one's prefix matches.
+    page = ('<a href="https://x/jax-0.12.0.1.post10-py3-none-any.whl#sha256=0">jax-0.12.0.1.post10-py3-none-any.whl'
+            '</a><br>\n')
+    assert patch_stack.unindexed(pins, page) == ["0.12.0.1.post101"]
+    page += page.replace("post10-", "post101-")
+    assert patch_stack.unindexed(pins, page) == []
 
 
 

@@ -1,0 +1,54 @@
+# What Dew's main pins of the fork's releases, indexed as it lands: every few minutes, Dew's main's locks
+# (`patch_stack.py pinned`) against the index's jax page (`unindexed`); a pinned release the index lists no jax of,
+# staged and passed by its pin head's train, is indexed by patch-stack's `index` with those pins. A hand indexing it
+# once the site failed to resolve was the step before (2026-11-17: post104 and post106).
+name: index what main pins
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: index-pinned
+  cancel-in-progress: false
+
+jobs:
+  pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dew
+          persist-credentials: false
+      - name: Index each release main pins that the index lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir locks
+          for url in $(gh api "repos/AshishKumar4/dew/contents/locks?ref=main" \
+                         --jq '.[] | select(.name | endswith(".txt")) | .download_url'); do
+            curl -fsSL "$url" -o "locks/$(basename "$url")"
+          done
+          python3 dew/dew/patch_stack.py pinned locks/*.txt > pins.json
+          curl -fsSL https://pypi.dewml.dev/simple/jax/ -o listed.html
+          for version in $(python3 dew/dew/patch_stack.py unindexed pins.json listed.html); do
+            if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "::warning::main pins jax $version, which no release of the fork holds"
+              continue
+            fi
+            # One index run a version at a time: one still queued or running is not asked again.
+            if gh run list --repo "$GITHUB_REPOSITORY" --workflow patch-stack.yml --limit 20 \
+                 --json status,displayTitle --jq '.[] | select(.status != "completed") | .displayTitle' \
+                 | grep -qx "patch stack index-$version"; then
+              echo "jax $version: its index run is under way"
+              continue
+            fi
+            gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
+              -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
+            echo "jax $version: indexed as main pins it"
+          done

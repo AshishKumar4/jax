@@ -357,6 +357,16 @@ def pinned(locks: list[str]) -> dict[str, set[str]]:
     return pins
 
 
+def unindexed(pins: dict[str, set[str]], listed: str) -> list[str]:
+    """The jax versions Dew's main pins (`pinned`) that the index's jax page (`listed`, its HTML) lists no wheel of:
+    a release whose pin head has passed its train, to be indexed (`indexable`) as it lands, never by a hand that
+    remembers (2026-11-17: main pinned post104, then post106, and the site's build failed to resolve each until a
+    hand indexed it)."""
+    files = set(re.findall(r">(jax-[^<]+\.whl)<", listed))
+    versions = [pin.partition("==")[2] for pin in pins if pin.startswith("jax==")]
+    return sorted(version for version in versions if not any(name.startswith(f"jax-{version}-") for name in files))
+
+
 def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> list[Path]:
     """Of a release's staged `wheels`, those Dew's main pins (`pinned`), byte for byte, to be indexed: a wheel of a
     pinned project and version whose sha256 the pin does not allow is refused (the bytes differ from what main's train
@@ -453,6 +463,9 @@ def main() -> int:
     indexing.add_argument("--projects", nargs="*", default=[], help="the index's other packages, for its root")
     pinning = commands.add_parser("pinned", help="what Dew's locks pin of the staged projects, for `indexable`")
     pinning.add_argument("locks", type=Path, nargs="+")
+    missing = commands.add_parser("unindexed", help="the jax versions main pins that the index lists none of")
+    missing.add_argument("pins", type=Path, help="`pinned`'s output")
+    missing.add_argument("listed", type=Path, help="the index's jax page")
     choosing = commands.add_parser("indexable", help="the staged wheels main pins, byte for byte")
     choosing.add_argument("pins", type=Path, help="`pinned`'s output")
     choosing.add_argument("version", help="the release's jax version, e.g. 0.12.0.1.post101")
@@ -482,6 +495,10 @@ def main() -> int:
     if args.command == "pinned":
         print(json.dumps({pin: sorted(digests) for pin, digests in sorted(pinned([lock.read_text() for lock in
                                                                                   args.locks]).items())}))
+        return 0
+    if args.command == "unindexed":
+        pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}
+        print("\n".join(unindexed(pins, args.listed.read_text())))
         return 0
     if args.command == "indexable":
         pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}
