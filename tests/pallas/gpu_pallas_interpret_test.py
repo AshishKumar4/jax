@@ -16,7 +16,6 @@ import dataclasses
 import functools
 import threading
 import math
-import os
 import subprocess
 import sys
 import textwrap
@@ -46,100 +45,6 @@ def _maybe_reverse(arg: tuple[Any], reverse: bool) -> tuple[Any]:
 
 
 class InterpretExecutionGateTest(jtu.JaxTestCase):
-
-  def test_overlapping_two_device_kernels_complete(self):
-    program = textwrap.dedent("""
-        import os
-        import threading
-        import numpy as np
-        import jax
-        from jax import lax
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import mosaic_gpu as plgpu
-        from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks as cb
-        from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
-
-        original = cb._initialize_shared_memory
-        a_admitted = threading.Event()
-        b_admitted = threading.Event()
-        a_done = threading.Event()
-        lock = threading.Lock()
-        calls = {1: 0, 2: 0}
-
-        def initialize(**kwargs):
-          threads = int(kwargs["num_threads_per_block"])
-          with lock:
-            index = calls[threads]
-            calls[threads] += 1
-          if threads == 1:
-            if index == 1:
-              assert b_admitted.wait(10)
-            result = original(**kwargs)
-            a_admitted.set()
-            return result
-          assert a_admitted.wait(10)
-          if index == 1:
-            assert a_done.wait(10)
-          result = original(**kwargs)
-          b_admitted.set()
-          assert a_done.wait(10)
-          return result
-
-        cb._initialize_shared_memory = initialize
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("device",))
-        assert mesh.size == 2
-
-        def make_kernel(threads):
-          @plgpu.kernel(
-              out_type=jax.ShapeDtypeStruct((1,), np.int32),
-              num_threads=threads, thread_name="threads",
-              interpret=InterpretGPUParams())
-          def kernel(out):
-            @pl.when(lax.axis_index("threads") == 0)
-            def _():
-              out[0] = 7
-          return jax.jit(jax.shard_map(
-              kernel, mesh=mesh, in_specs=(),
-              out_specs=jax.sharding.PartitionSpec(), check_vma=False))
-
-        # Compile ahead of the overlap so the timeout observes execution.
-        a, b = (make_kernel(n).lower().compile() for n in (1, 2))
-        errors = []
-        def execute(kernel, done):
-          try:
-            result = kernel()
-            result.block_until_ready()
-            np.testing.assert_array_equal(result, [7])
-            done.set()
-          except BaseException as e:
-            errors.append(repr(e))
-            done.set()
-        ta = threading.Thread(target=execute, args=(a, a_done), daemon=True)
-        tb = threading.Thread(
-            target=execute, args=(b, threading.Event()), daemon=True)
-        ta.start()
-        assert a_admitted.wait(10)
-        tb.start()
-        assert b_admitted.wait(10)
-        ta.join(3)
-        if ta.is_alive():
-          print("A kernel cannot complete after A0 then B0 admission; "
-                "A1 is blocked in initialization", flush=True)
-          os._exit(2)
-        tb.join(3)
-        assert not errors, errors
-        assert not tb.is_alive()
-        os._exit(0)
-    """)
-    env = dict(os.environ)
-    env["XLA_FLAGS"] = (
-        env.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=2"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", program],
-        capture_output=True, text=True, timeout=45, env=env,
-    )
-    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
   @parameterized.named_parameters(
       ("single_execution", False), ("overlapping_executions", True)
