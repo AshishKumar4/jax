@@ -137,12 +137,21 @@ _UNREAD_FLAGS = frozenset({
     "jax_persistent_cache_enable_xla_caches",
     "jax_raise_persistent_cache_errors",
     "jax_explain_cache_misses",
+    # Which devices a process sees: a lowering is for the target it is given
+    # (a compile-only GPU's capability among them), whichever devices exist.
+    "jax_platforms",
+    "jax_platform_name",
+    "jax_cuda_visible_devices",
 })
 _UNREAD_VARIABLES = re.compile(
     r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_"
     # A profiler's injection libraries (Nsight Systems', CUPTI's), which observe
     # a run and change no lowering: a profiled process shares its lowerings.
-    r"|CUDA_INJECTION64_PATH$|NVTX_INJECTION64_PATH$)")
+    r"|CUDA_INJECTION64_PATH$|NVTX_INJECTION64_PATH$"
+    # Which devices a process sees (`_UNREAD_FLAGS`'): a build on a host with
+    # none hidden (CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS=cpu) lowers for its
+    # compile-only GPU as the run on that GPU does.
+    r"|JAX_PLATFORMS$|JAX_PLATFORM_NAME$|CUDA_VISIBLE_DEVICES$|CUDA_DEVICE_ORDER$)")
 # What a lowering dumps and where: none changes the lowering, and one that
 # dumps as it runs is not cached (`_eligible`).
 _DUMP_VARIABLES = re.compile(r"^MOSAIC_GPU_DUMP")
