@@ -7492,6 +7492,12 @@ def _handle_dot_precision(ctx, lhs, rhs, precision, platform):
     def maybe_convert_dtype(operand, operand_aval, target_dtype):
       if target_dtype is None or operand_aval.dtype == target_dtype:
         return operand
+      if (dtypes.issubdtype(operand_aval.dtype, np.complexfloating) and
+          not dtypes.issubdtype(target_dtype, np.complexfloating)):
+        # A cast to the algorithm's real type would drop the imaginary part.
+        raise ValueError(
+            f"The dot algorithm '{precision}' takes {np.dtype(target_dtype)} "
+            f"operands, not {operand_aval.dtype}.")
       aval = core.ShapedArray(operand_aval.shape, target_dtype)
       return mlir.convert_hlo(ctx, operand, operand_aval, aval)
 
@@ -7624,6 +7630,28 @@ def _linear_dot(out_dtype, lhs, rhs, *, dimension_numbers):
   prod = lambda i: optimization_barrier(mul(la_at(i), ra_at(i)))
   return control_flow.fori_loop(1, k, lambda i, acc: add(acc, prod(i)), prod(0))
 
+def _complex_dot_by_parts(lhs, rhs, *, dimension_numbers, precision,
+                          out_dtype, out_sharding):
+  """A dot of complex operands under an algorithm, whose operand types are real,
+  as its real products each at the algorithm:
+  (a + bi)(c + di) = (ac - bd) + (ad + bc)i."""
+  def parts(x):
+    if dtypes.issubdtype(x.dtype, np.complexfloating):
+      return real(x), imag(x)
+    return x, None
+
+  def dot(x, y):
+    return dot_general(x, y, dimension_numbers, precision=precision,
+                       preferred_element_type=np.finfo(out_dtype).dtype,
+                       out_sharding=out_sharding)
+
+  (a, b), (c, d) = parts(lhs), parts(rhs)
+  re = dot(a, c) if b is None or d is None else sub(dot(a, c), dot(b, d))
+  ims = [dot(x, y) for x, y in ((a, d), (b, c))
+         if x is not None and y is not None]
+  return complex(re, ims[0] if len(ims) == 1 else add(*ims))
+
+
 def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
                        precision, preferred_element_type: np.dtype | None,
                        out_sharding, reduction_order=None, platform: str = "default"):
@@ -7635,6 +7663,17 @@ def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
         dict(dimension_numbers=dimension_numbers, preferred_element_type=dt),
         lhs, rhs)
   del preferred_element_type  # Implied by the output aval
+  if (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
+      precision != DotAlgorithmPreset.DEFAULT and
+      any(dtypes.issubdtype(aval.dtype, np.complexfloating)
+          for aval in ctx.avals_in)):
+    # An algorithm's operand types are real: a complex operand cast to them
+    # would lose its imaginary part, so its real products are taken at it.
+    return mlir.lower_fun(
+        partial(_complex_dot_by_parts, dimension_numbers=dimension_numbers,
+                precision=precision, out_dtype=ctx.avals_out[0].dtype,
+                out_sharding=out_sharding),
+        multiple_results=False)(ctx, lhs, rhs)
   lhs, rhs, accumulation_aval, algorithm_kwarg = _handle_dot_precision(
       ctx, lhs, rhs, precision, platform
   )
