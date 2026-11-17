@@ -86,11 +86,15 @@ jobs:
                              --bazel_options=--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc//:cc-toolchain-x64_windows-clang-cl
                              --bazel_options=--extra_execution_platforms=//jax/tools/toolchains:x64_windows-clang-cl
                              --bazel_options=--copt=-Werror=mismatched-tags
+                             --bazel_options=--copt=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+                             --bazel_options=--host_copt=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
                              --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
                      # Upstream's Windows toolchain's LLVM, 19.1.7 (XLA's tools/toolchains/win2022/t20260812,
                      # C:/tools/LLVM-19.1.7): the runner's LLVM 20 declares _m_prefetchw static where the Windows
-                     # SDK's winnt.h declares it extern, which clang-cl refuses (43940037469, grpc's tsi).
+                     # SDK's winnt.h declares it extern, which clang-cl refuses (43940037469, grpc's tsi). The
+                     # runner's STL (VS 18) asks Clang 20 of a compiler (STL1000, 43952144318); its documented
+                     # escape, _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH, takes 19 as Google's VS 2022 STL does.
                      choco install llvm --version=19.1.7 --allow-downgrade -y --no-progress > "$RUNNER_TEMP/llvm.log"
                      BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
                      export BAZEL_LLVM
