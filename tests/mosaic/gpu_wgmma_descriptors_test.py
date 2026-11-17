@@ -104,13 +104,22 @@ def _launch(moving: bool):
   return call, operands
 
 
+def _lowered_for_h100(call, *operands):
+  """`call` lowered for a compile-only H100: no GPU in the process."""
+  device = jax.sharding.AbstractDevice(
+      device_kind="GPU", platform="gpu", num_cores=132, compute_capability="9.0")
+  with jax.sharding.use_abstract_mesh(
+      jax.sharding.AbstractMesh((), (), abstract_device=device)):
+    return jax.jit(call).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 class WgmmaDescriptorsTest(jtu.JaxTestCase):
 
   def _registers(self, moving: bool) -> int:
     from jax.experimental.mosaic.gpu import capture
 
     call, operands = _launch(moving)
-    lowered = jax.jit(call).trace(*operands).lower(lowering_platforms=("cuda",))
+    lowered = _lowered_for_h100(call, *operands)
     (kernel,) = capture.kernels(lowered.compiler_ir("stablehlo"))
     directory = capture.capture_deviceless(
         kernel, "9.0", list(operands), tempfile.mkdtemp())
