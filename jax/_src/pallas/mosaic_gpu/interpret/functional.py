@@ -35,10 +35,11 @@ with `detect_races`, which needs the host memory's vector clocks.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
 import math
+import operator
 from typing import Any
 
 import jax
@@ -181,6 +182,17 @@ class _Barrier:
   """A barrier: nothing to keep, in one thread."""
 
 
+def _allocated(
+    aval: state_types.AbstractRef, transforms
+) -> jax_core.ShapedArray:
+  """The array a ref of `aval` allocates: its inner aval, `transforms` applied."""
+  inner = aval.inner_aval
+  if transforms:
+    inner = state_types.TransformedRef(inner, transforms).type
+  assert isinstance(inner, jax_core.ShapedArray), inner
+  return inner
+
+
 def _fill(shape, dtype, params: InterpretGPUParams, space=None):
   how = "zero" if space == mosaic_gpu_core.MemorySpace.REGS else params.uninitialized_memory
   return interpret_utils.get_uninitialized_array(shape, dtype, how)
@@ -218,7 +230,7 @@ def _positions(indexer: indexing.NDIndexer):
   axis, found = 0, []
   for index in indexer.indices:
     if isinstance(index, indexing.Slice):
-      position = index.start + index.stride * lax.iota(jnp.int32, index.size)
+      position = index.start + index.stride * lax.iota(jnp.int32, operator.index(index.size))
       found.append(position.reshape((1,) * axis + (-1,) + (1,) * (len(sliced) - axis - 1)))
       axis += 1
     else:
@@ -266,7 +278,7 @@ def _backward(seen, transform, x):
   """What `x` holds once `seen` (it through `transform`) is written."""
   match transform:
     case state_types.TransposeTransform():
-      return jnp.transpose(seen, np.argsort(transform.permutation))
+      return jnp.transpose(seen, np.argsort(transform.permutation).tolist())
     case state_types.BitcastTransform():
       return state_utils.bitcast(seen, x.dtype)
     case state_types.ReshapeTransform():
@@ -439,7 +451,7 @@ class _Interpreter:
   def run_scoped(self, eqn, invals):
     jaxpr = eqn.params["jaxpr"]
     depth = len(self.state)
-    allocs = []
+    allocs: list[_Ref | _Barrier] = []
     for var, transforms in safe_zip(jaxpr.invars, eqn.params["ref_transforms"]):
       aval = var.aval
       if isinstance(aval, mosaic_gpu_core.AbstractRefUnion):
@@ -452,9 +464,7 @@ class _Interpreter:
           slots.append(self.allocate(_fill(inner.shape, inner.dtype, self.params, aval.memory_space)))
         allocs.append(_Ref(tuple(slots), union=tuple(m.transforms[0] for m in members)))
         continue
-      inner = aval.inner_aval
-      if transforms:
-        inner = state_types.TransformedRef(inner, transforms).type
+      inner = _allocated(aval, transforms)
       if isinstance(
           inner.dtype,
           (
@@ -552,7 +562,7 @@ def interpret(
     input_output_aliases: tuple[tuple[int, int], ...],
     interpret_params: InterpretGPUParams,
     grid_dims: tuple[int, ...],
-    device_axes: dict[Any, int],
+    device_axes: Mapping[Any, int],
     kernel_arg_transforms: tuple[tuple[state_types.Transform, ...], ...] = (),
 ) -> Sequence[jax.Array]:
   """The kernel `jaxpr` over `args`, interpreted as one program (`eligible`)."""
@@ -571,11 +581,11 @@ def interpret(
   transforms_of = kernel_arg_transforms or ((),) * len(jaxpr.invars)
   scratch_refs = []
   for var, transforms in list(safe_zip(jaxpr.invars, transforms_of))[num_inputs + num_outputs:]:
-    inner = var.aval.inner_aval
-    if transforms:
-      inner = state_types.TransformedRef(inner, transforms).type
+    aval = var.aval
+    assert isinstance(aval, state_types.AbstractRef), aval
+    inner = _allocated(aval, transforms)
     scratch_refs.append(_Ref((interpreter.allocate(
-        _fill(inner.shape, inner.dtype, interpret_params, var.aval.memory_space)),)))
+        _fill(inner.shape, inner.dtype, interpret_params, aval.memory_space)),)))
   kernel_refs = [*input_refs, *output_refs, *scratch_refs]
 
   # The axes an `axis_index` names, as the GPU interpreter reads them: the

@@ -316,10 +316,12 @@ def _at_use(base: ir.Value) -> ir.Value:
   """`base`, a 64-bit descriptor base, copied where it is read: an opaque,
   side-effecting copy no compiler pass moves out of an enclosing loop, so the
   descriptors derived from it are formed at their instructions."""
-  return llvm.inline_asm(
+  copy = llvm.inline_asm(
       ir.IntegerType.get_signless(64), [base], "mov.b64 $0, $1;", "=l,l",
       asm_dialect=0, has_side_effects=True,
   )
+  assert isinstance(copy, ir.Value)
+  return copy
 
 
 def wgmma(
@@ -492,6 +494,7 @@ def wgmma(
   # An opaque copy of the base at the product keeps the group descriptors at
   # their instructions, one base a operand live instead.
   if not a_in_regs:
+    assert a_desc_base is not None
     a_desc_base = _at_use(a_desc_base)
   b_desc_base = _at_use(b_desc_base)
   new_acc_regs = acc._value.registers.copy()

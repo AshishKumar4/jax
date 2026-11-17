@@ -423,7 +423,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     # kernel_hash is that serialization's digest: the same kernel compiled
     # from two checkouts must key alike.
     def program(path):
-      with mlir.make_ir_context() as ctx, ir.Location.unknown():
+      with mlir.make_ir_context(), ir.Location.unknown():
         kernel = ir.Module.parse(
             "module {\n"
             "  func.func @kernel() {\n"

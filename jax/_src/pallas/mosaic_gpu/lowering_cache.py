@@ -257,7 +257,7 @@ def _gather_inputs(jax_mesh: Any) -> mgpu_lowering_inputs.LoweringInputs:
   """What the lowering reads of the process, read once, outside the cache's context."""
   try:
     return mgpu_lowering_inputs.LoweringInputs(
-        arch=tuple(int(a) for a in mgpu_utils._infer_arch()),
+        arch=mgpu_utils._infer_arch(),
         max_smem_bytes=int(mgpu_core._max_smem_bytes()),
         single_process_multi_device_topology=bool(
             mgpu_core.is_single_process_multi_device_topology()

@@ -828,7 +828,8 @@ class Compiled(Stage):
     analysis = self.memory_analysis()
     if analysis is None or not analysis.serialized_buffer_assignment_proto:
       return None
-    module, = self.runtime_executable().hlo_modules()
+    # The executable whose memory analysis that is.
+    module, = self._executable.xla_extension_executable().hlo_modules()
     return peak_live.live(analysis.serialized_buffer_assignment_proto,
                           module.as_serialized_hlo_module_proto(),
                           self._parameter_arguments())
@@ -853,7 +854,7 @@ class Compiled(Stage):
     kept = sorted(unloaded.kept_var_idx)
     mutable = 0 if unloaded.mut is None else len(unloaded.mut.in_mut)
     consts = len(self._params.const_args)
-    module, = self.runtime_executable().hlo_modules()
+    module, = executable.xla_extension_executable().hlo_modules()
     proto = hlo_reader.message_class("xla.HloModuleProto").FromString(
         module.as_serialized_hlo_module_proto())
     entry, = (computation for computation in proto.computations

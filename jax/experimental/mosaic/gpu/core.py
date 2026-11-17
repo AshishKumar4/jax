@@ -211,6 +211,7 @@ def kernel_hash(module: ir.Module) -> bytes:
   kernel_text = module.operation.get_asm(
       binary=True, enable_debug_info=False, assume_verified=True
   )
+  assert isinstance(kernel_text, bytes)
   kernel_id = hashlib.sha256(kernel_text).digest()
   # Note that this is technically only a half measure. Someone might load a
   # compiled module with a hash collision from disk. But that's so unlikely with
