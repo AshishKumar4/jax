@@ -35,6 +35,7 @@ _PARAMS = {
     "integer_pow": {"y": 3},
     "convert_element_type": {"new_dtype": np.dtype(np.float32), "weak_type": False, "sharding": None},
     "reduce_precision": {"exponent_bits": 5, "mantissa_bits": 10},
+    "round": {"rounding_method": lax_internal.RoundingMethod.TO_NEAREST_EVEN},
 }
 
 _DTYPES = (np.float32, np.int32, np.uint32, np.bool_, np.complex64)
