@@ -72,6 +72,10 @@ archive_override(
         # FFI handlers that instantiate concurrently (Mosaic GPU's) are instantiated together on the compile
         # threads before thunk emission, a program's Mosaic kernels compiled in parallel.
         "//third_party:xla/instantiate_concurrently.patch",
+        # A compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment: its executable
+        # states its memory and buffer assignment and refuses to run; within the limit it finishes. A start
+        # compiles its step once whether it fits or not.
+        "//third_party:xla/memory_limit_early_exit.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],
