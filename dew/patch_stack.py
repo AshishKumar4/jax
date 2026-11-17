@@ -151,20 +151,20 @@ def mailed(message: str, author: str, date: str, diff: str) -> str:
 
 def composed(base: str, label: str, patches: list[str]) -> str | None:
     """`patches` (`mailed`) committed in order onto `base` on armada through the fork's own commit hook (RUNNER,
-    run_hooked.sh; RUNNER_LOCK, where set, the lane's armada lock), never here: the PC's clone makes no commit
-    (Main, 2026-11-17). The tip, fetched into this clone; None where the runner refused or did not run, its words
-    said."""
-    runner = os.environ.get("RUNNER")
-    if not runner:
-        raise SystemExit("patch_stack: RUNNER names run_hooked.sh, which commits through the fork's hooks on armada")
+    run_hooked.sh, taking RUNNER_LOCK, the lane's armada lock), never here: the PC's clone makes no commit (Main,
+    2026-11-17). The tip, fetched into this clone; None where the runner refused or did not run, its words said."""
+    runner, lock = os.environ.get("RUNNER"), os.environ.get("RUNNER_LOCK")
+    if not runner or not lock:
+        raise SystemExit("patch_stack: RUNNER names run_hooked.sh, which commits through the fork's hooks on armada, "
+                         "and RUNNER_LOCK the lane's armada lock it takes")
     with tempfile.TemporaryDirectory() as scratch:
         files = []
         for index, patch in enumerate(patches):
             files.append(Path(scratch) / f"{index:04}.patch")
             files[-1].write_text(patch)
-        lock = [f"--lock={os.environ['RUNNER_LOCK']}"] if os.environ.get("RUNNER_LOCK") else []
-        ran = subprocess.run([runner, f"--into={git('rev-parse', '--show-toplevel').strip()}", *lock, label, base,
-                              *map(str, files)], capture_output=True, text=True, check=False)
+        clone = git("rev-parse", "--show-toplevel").strip()
+        ran = subprocess.run([runner, f"--into={clone}", f"--lock={lock}", label, base, *map(str, files)],
+                             capture_output=True, text=True, check=False)
     tip = re.search(r"^tip ([0-9a-f]{40})$", ran.stdout, re.MULTILINE)
     if ran.returncode != 0 or tip is None:
         print(f"the runner did not compose {label} (exit {ran.returncode}):\n{ran.stdout}{ran.stderr}")
@@ -212,14 +212,14 @@ def rebase(old: str, new: str) -> int:
                 return 2
             print(f"kept {commit[:9]} into {family}: {title}")
             taken.append(commit)
-        if not git("diff", "--cached", "--name-only").strip():
+        after = git("write-tree").strip()
+        if after == before:
             print(f"dropped {family} (applies as nothing on jax-v{new})")
             continue
         first = members[0]
         message = git("log", "-1", "--format=%B", first).replace(old, new)
         author = git("log", "-1", "--format=%an <%ae>", first).strip()
         date = git("log", "-1", "--format=%aD", first).strip()
-        after = git("write-tree").strip()
         patches.append(mailed(f"{message.rstrip()}\n\n(cherry picked from commit {', '.join(taken)})", author, date,
                               git("diff", "--binary", before, after)))
         before = after

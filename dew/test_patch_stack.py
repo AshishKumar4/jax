@@ -350,7 +350,8 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     for name, text in (("gh", GH), ("sleep", "#!/bin/sh\n"), ("run_hooked.sh", RUNNER), ("as_patch.sh", AS_PATCH)):
         (tmp_path / "bin" / name).write_text(text)
         (tmp_path / "bin" / name).chmod(0o755)
-    environment = {**environment, "RUNNER": str(tmp_path / "bin" / "run_hooked.sh")}
+    environment = {**environment, "RUNNER": str(tmp_path / "bin" / "run_hooked.sh"),
+                   "RUNNER_LOCK": str(tmp_path / "armada.lock")}
     calls = tmp_path / "bin" / "gh.json"
     script = Path(patch_stack.__file__).with_name("release.sh")
 
@@ -449,6 +450,7 @@ def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_pat
     (tmp_path.parent / "run_hooked.sh").write_text(RUNNER)
     (tmp_path.parent / "run_hooked.sh").chmod(0o755)
     monkeypatch.setenv("RUNNER", str(tmp_path.parent / "run_hooked.sh"))
+    monkeypatch.setenv("RUNNER_LOCK", str(tmp_path.parent / "armada.lock"))
     assert patch_stack.rebase("0.12.0", "0.12.1") == 0
     subjects = run("log", "--format=%s", "jax-v0.12.1..v0.12.1-cache-key-pool-fingerprints").splitlines()
     assert subjects == ["Release 0.12.1.post1: the stack carried from 0.12.0 onto jax-v0.12.1, a commit a family",

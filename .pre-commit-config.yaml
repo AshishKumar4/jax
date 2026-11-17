@@ -1,0 +1,13 @@
+# The dew branch's own commit hooks, which run_hooked.sh runs on armada for every commit made on it (the PC's clone
+# makes none): its tooling's Python parsed and linted.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-ast
+        files: ^dew/.*\.py$
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        files: ^dew/.*\.py$

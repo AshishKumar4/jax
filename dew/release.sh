@@ -14,8 +14,8 @@
 # CHECKOUT is a clone of the fork with `origin` its remote; BASE the published release it grows from
 # (0.12.0.1.post39), NEW the release it makes (0.12.0.1.post40), MESSAGE the release commit's message, and each
 # COMMIT a commit or a range (`A..B`) the fork holds, picked in order. RUNNER names run_hooked.sh, which makes every
-# commit on armada through the fork's own commit hook (RUNNER_LOCK, where set, the lane's armada lock it takes): the
-# PC's clone makes none. The stack branch must be at BASE's release branch, and NEW's must not exist yet.
+# commit on armada through the fork's own commit hook, taking RUNNER_LOCK, the lane's armada lock: the PC's clone
+# makes none. The stack branch must be at BASE's release branch, and NEW's must not exist yet.
 #
 # Each release grows from the one before, which it holds whole, so neither branch moves but forward (owner,
 # 2026-10-31; Main, 2026-11-03: post46's composition, rebuilt under post45's release commit, was a force push): each
@@ -26,6 +26,7 @@ set -euo pipefail
 checkout=$1 base=$2 new=$3 message=$4
 shift 4
 : "${RUNNER:?release.sh: RUNNER names run_hooked.sh, which commits through the hooks of the fork on armada}"
+: "${RUNNER_LOCK:?release.sh: RUNNER_LOCK names this lane armada lock, which the runner takes}"
 if (( $# == 0 )); then
   echo "release.sh: name the commits $new gains" >&2
   exit 2
@@ -59,7 +60,14 @@ for commit in "$@"; do
     picks+=("$(git -C "$checkout" rev-parse --verify "$commit^{commit}")")
   fi
 done
+git -C "$checkout" fetch -q origin
 for pick in "${picks[@]}"; do
+  # The runner fetches each pick from the fork by its sha: one origin holds on no branch fails here, not minutes into
+  # its task (review).
+  if [[ -z $(git -C "$checkout" branch -r --contains "$pick") ]]; then
+    echo "release.sh: ${pick:0:10} is on no branch of origin: push it first" >&2
+    exit 1
+  fi
   subject=$(git -C "$checkout" log -1 --format=%s "$pick")
   if ! grep -Eq '^(fixup! )?\[stack\] ' <<< "$subject"; then
     echo "release.sh: a commit is neither a family's nor a fixup of one: ${pick:0:10} $subject" >&2
@@ -68,7 +76,8 @@ for pick in "${picks[@]}"; do
 done
 
 work=$(mktemp -d) said=$(mktemp)
-trap 'git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"; rm -f "$said"' EXIT
+cleaned() { git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"; rm -f "$said" "$work.patch"; }
+trap cleaned EXIT
 git -C "$checkout" worktree add -q --detach "$work" "$published"
 # The version a release commit of its own sets on top, as a patch: no commit is made here.
 # The versions as literal strings: a dot in one matches only a dot.
@@ -81,9 +90,12 @@ git -C "$work" diff | "$(dirname "$RUNNER")/as_patch.sh" "$said" > "$work.patch"
 # 2026-11-17, the PC's clone refuses every commit): the picks onto the published release, then the release commit,
 # fetched into the checkout as refs/hooked/LABEL. A refusal, a pick that does not apply, or a run that did not end
 # stops here, with nothing pushed.
-ran=$("$RUNNER" "--into=$checkout" ${RUNNER_LOCK:+"--lock=$RUNNER_LOCK"} "rel-$new-$(date +%s)" "$published" \
-  "${picks[@]/#/pick:}" "$work.patch") || { echo "release.sh: the runner did not compose $new" >&2; exit 1; }
-rm -f "$work.patch"
+ran=$("$RUNNER" "--into=$checkout" "--lock=$RUNNER_LOCK" "rel-$new-$(date +%s)" "$published" \
+  "${picks[@]/#/pick:}" "$work.patch") || {
+  echo "release.sh: the runner did not compose $new:" >&2
+  echo "$ran" >&2
+  exit 1
+}
 composed=$(sed -n 's/^tip \([0-9a-f]\{40\}\)$/\1/p' <<< "$ran")
 [[ -n $composed ]] || { echo "release.sh: the runner named no tip: $ran" >&2; exit 1; }
 
