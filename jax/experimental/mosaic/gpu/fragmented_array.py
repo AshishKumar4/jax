@@ -3551,6 +3551,35 @@ class FragmentedArray:
         _registers=new_registers, _layout=self.layout, _is_signed=is_signed
     )
 
+  def reduce_pred(self, op: Literal["or", "and"]) -> FragmentedArray:
+    """Whether any (`or`) or every (`and`) element of this boolean array is
+    true, a scalar every thread of the warpgroup holds: each thread's elements
+    combined in its registers, then the warpgroup's by one `bar.red.{op}.pred`
+    (`utils.warpgroup_reduce_pred`), which every thread of the warpgroup
+    reaches. An element several threads hold counts alike in each, so any
+    layout reduces so, a row's replicated across its lanes among them."""
+    if self.mlir_dtype != ir.IntegerType.get_signless(1):
+      raise NotImplementedError(
+          f"A predicate reduction takes booleans, not {self.mlir_dtype}"
+      )
+    if self.is_unreduced:
+      raise NotImplementedError("A predicate reduction of an unreduced array")
+    combine = arith.ori if op == "or" else arith.andi
+    own = functools.reduce(combine, self.registers.flat)
+    if isinstance(own.type, ir.VectorType):
+      own = functools.reduce(
+          combine,
+          (
+              vector.extract(
+                  own,
+                  dynamic_position=[],
+                  static_position=ir.DenseI64ArrayAttr.get([i]),
+              )
+              for i in range(ir.VectorType(own.type).shape[0])
+          ),
+      )
+    return FragmentedArray.splat(utils.warpgroup_reduce_pred(own, op), ())
+
   def reduce(
       self,
       op: str | Callable[[ir.Value, ir.Value], ir.Value],
