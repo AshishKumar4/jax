@@ -1842,6 +1842,12 @@ def _barrier_arrive_and_wait_lowering(
     transforms_treedef,
 ):
   if isinstance(barrier, mgpu.CtaBarrierRef):
+    # A named barrier counts its arriving warpgroups' threads: a warp's 32 can
+    # never meet it, and a warp waiting at it would hang the CTA.
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise NotImplementedError(
+          "Arriving on a CTA barrier is not supported in a warp context"
+      )
     # A named barrier arrives and waits in one instruction (`bar.sync`).
     base_index = _get_barrier_base_index(
         ctx.avals_in[0], transforms_treedef.unflatten(flat_transforms)

@@ -214,6 +214,51 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
     self.assertEqual(allocations["barrier_ref"] is None, capability == "8.0")
 
 
+class CtaBarrierLoweringTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      (f"{name}_{semantics.name.lower()}", arrive, semantics)
+      for name, arrive in (
+          ("arrive", plgpu.barrier_arrive),
+          ("arrive_and_wait", plgpu.barrier_arrive_and_wait),
+      )
+      for semantics in (
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      )
+  )
+  def test_conditional_warp_cannot_arrive_on_cta_barrier(
+      self, arrive, lowering_semantics
+  ):
+    # Lower for an abstract GPU on CPU; never execute the unsafe barrier.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[plgpu.CtaBarrier(num_arrivals=1)],
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(o_ref, barrier):
+      @plgpu.warp_map
+      def _(warp):
+        @pl.when(warp == 0)
+        def _():
+          arrive(barrier)
+      o_ref[...] = jnp.ones_like(o_ref)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA H100 80GB HBM3", platform="gpu", num_cores=132,
+        compute_capability="9.0",
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      with self.assertRaisesRegex(
+          NotImplementedError,
+          "Arriving on a CTA barrier is not supported in a warp context",
+      ):
+        jax.jit(kernel).trace().lower(lowering_platforms=("cuda",))
+
+
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
   LOWERING_SEMANTICS: ClassVar[plgpu.LoweringSemantics]
 
