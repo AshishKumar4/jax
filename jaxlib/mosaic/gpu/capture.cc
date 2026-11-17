@@ -56,7 +56,7 @@ absl::Status Cuda(CUresult result, std::string_view what) {
 // A buffer of the capture: a device range the launch can address.
 struct Buffer {
   std::string name;
-  CUdeviceptr base = 0;
+  uint64_t base = 0;  // A device address, or a host one deviceless.
   uint64_t bytes = 0;
 };
 
@@ -64,13 +64,20 @@ struct Buffer {
 constexpr size_t kWorkspaceBytes = size_t{1} << 30;
 
 // The buffer `address` falls in, finding the device allocation holding it
-// where no buffer does (a workspace, ws<i>).
+// where no buffer does (a workspace, ws<i>), on a device (`on_device`).
 absl::StatusOr<const Buffer*> Holding(std::vector<Buffer>& buffers,
-                                      uint64_t address) {
+                                      uint64_t address, bool on_device) {
   for (const Buffer& buffer : buffers) {
     if (address >= buffer.base && address < buffer.base + buffer.bytes) {
       return &buffer;
     }
+  }
+  if (!on_device) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "launch capture: 0x%x lies in no operand of the launch, and a "
+        "deviceless capture has no allocation beside them (a workspace, "
+        "collective metadata)",
+        address));
   }
   CUdeviceptr base = 0;
   size_t bytes = 0;
@@ -188,13 +195,14 @@ std::string List(const T* values, size_t count) {
 // A tensor map of the spec, `name` its name, located in `buffers`.
 absl::StatusOr<std::string> Map(const TensorMapEncoding& map,
                                 std::string_view name,
-                                std::vector<Buffer>& buffers) {
+                                std::vector<Buffer>& buffers, bool on_device) {
   if (DataType(map.data_type).empty()) {
     return absl::UnimplementedError(absl::StrCat(
         "launch capture: tensor map dtype ", map.data_type,
         " has no simulator name"));
   }
-  absl::StatusOr<const Buffer*> held = Holding(buffers, map.global_address);
+  absl::StatusOr<const Buffer*> held =
+      Holding(buffers, map.global_address, on_device);
   if (!held.ok()) return held.status();
   std::string spec = absl::StrCat(
       "{ \"name\": ", Quoted(name), ", \"buffer\": ", Quoted((*held)->name),
@@ -222,11 +230,12 @@ absl::StatusOr<std::string> Map(const TensorMapEncoding& map,
 // The parameter `index` of `spec`: a device pointer into a buffer, or a byval
 // payload of tensor maps (by name) and the bytes between them (hex).
 absl::StatusOr<std::string> Param(const MosaicKernelSpec& spec, int32_t index,
-                                  std::vector<Buffer>& buffers) {
+                                  std::vector<Buffer>& buffers,
+                                  bool on_device) {
   const MosaicKernelSpec::Arg& arg = spec.args[index];
   if (const auto* device = std::get_if<MosaicKernelSpec::DeviceArg>(&arg)) {
     uint64_t address = reinterpret_cast<uint64_t>(device->ptr);
-    absl::StatusOr<const Buffer*> held = Holding(buffers, address);
+    absl::StatusOr<const Buffer*> held = Holding(buffers, address, on_device);
     if (!held.ok()) return held.status();
     return absl::StrCat("{ \"ordinal\": ", index, ", \"ptr\": ",
                         Quoted((*held)->name), ", \"offset_in\": ",
@@ -290,6 +299,122 @@ const std::string& CaptureDirectory() {
   return *directory;
 }
 
+namespace {
+
+// The buffers of a launch's operands, those that alias (an output written in
+// place) one buffer, and each operand's shape as the spec's provenance.
+void Operands(const std::vector<CapturedBuffer>& operands,
+              std::vector<Buffer>& buffers, std::vector<std::string>& shapes) {
+  for (const CapturedBuffer& operand : operands) {
+    const auto base = reinterpret_cast<uint64_t>(operand.data);
+    bool aliased = false;
+    for (const Buffer& buffer : buffers) aliased |= buffer.base == base;
+    if (!aliased && operand.bytes > 0) {
+      buffers.push_back({operand.name, base, operand.bytes});
+    }
+    shapes.push_back(absl::StrCat(
+        Quoted(operand.name), ": { \"dtype\": ", Quoted(operand.dtype),
+        ", \"dims\": ", List(operand.dims.data(), operand.dims.size()), " }"));
+  }
+}
+
+// A launch's spec, but its buffers' contents: its tensor maps and parameters,
+// every pointer they hold landing in a buffer (`Holding`) before any is
+// written, and its kernel's binary written to `dir`.
+struct Launch {
+  std::string code;
+  std::vector<std::string> maps, params, unplaced;
+};
+
+absl::StatusOr<Launch> Described(std::string_view gpu_binary,
+                                 const MosaicKernelSpec& spec,
+                                 std::vector<Buffer>& buffers, bool on_device,
+                                 const std::string& dir) {
+  Launch launch;
+  for (size_t m = 0; m < spec.tensor_maps.size(); ++m) {
+    absl::StatusOr<std::string> map =
+        Map(spec.tensor_maps[m], absl::StrCat("map", m), buffers, on_device);
+    if (!map.ok()) return map.status();
+    launch.maps.push_back(*std::move(map));
+    if (spec.tensor_maps[m].arg < 0) {
+      launch.unplaced.push_back(absl::StrCat("\"map", m, "\""));
+    }
+  }
+  for (int32_t i = 0; i < static_cast<int32_t>(spec.args.size()); ++i) {
+    absl::StatusOr<std::string> param = Param(spec, i, buffers, on_device);
+    if (!param.ok()) return param.status();
+    launch.params.push_back(*std::move(param));
+  }
+  const bool elf = gpu_binary.substr(0, 4) == "\x7f" "ELF";
+  launch.code = elf ? "kernel.cubin" : "kernel.ptx";
+  if (absl::Status written = Write(absl::StrCat(dir, "/", launch.code),
+                                   gpu_binary.data(), gpu_binary.size());
+      !written.ok()) {
+    return written;
+  }
+  return launch;
+}
+
+// The spec's JSON: `launch` over `buffers`, each initialized from
+// <name>.bin, and where `expect`, each operand's bytes after the launch
+// (<name>.expected.bin), which a simulation is held to bit for bit (a
+// workspace's are the launch's own); `device` its provenance.
+std::string Json(std::string_view kernel_name, const MosaicKernelSpec& spec,
+                 const Launch& launch, const std::vector<Buffer>& buffers,
+                 const std::vector<std::string>& shapes, bool expect,
+                 std::string_view device) {
+  std::vector<std::string> declared, expected;
+  for (const Buffer& buffer : buffers) {
+    declared.push_back(absl::StrCat(
+        "{ \"name\": ", Quoted(buffer.name), ", \"bytes\": ", buffer.bytes,
+        ", \"init\": { \"gen\": \"file\", \"path\": \"", buffer.name,
+        ".bin\" } }"));
+    if (expect && buffer.name.substr(0, 2) != "ws") {
+      expected.push_back(absl::StrCat("{ \"buffer\": ", Quoted(buffer.name),
+                                      ", \"offset\": 0, \"file\": \"",
+                                      buffer.name, ".expected.bin\" }"));
+    }
+  }
+  std::string json = absl::StrCat(
+      "{ \"code\": ", Quoted(launch.code), ", \"function\": ",
+      Quoted(kernel_name), ",\n  \"grid\": [", spec.grid.x, ", ", spec.grid.y,
+      ", ", spec.grid.z, "], \"block\": [", spec.block.x, ", ", spec.block.y,
+      ", ", spec.block.z, "], \"cluster\": [",
+      std::max<uint32_t>(spec.cluster.x, 1), ", ",
+      std::max<uint32_t>(spec.cluster.y, 1), ", ",
+      std::max<uint32_t>(spec.cluster.z, 1), "]");
+  absl::StrAppend(
+      &json, ", \"dynamicShared\": ", spec.smem_bytes,
+      ",\n  \"buffers\": [\n    ", absl::StrJoin(declared, ",\n    "),
+      " ],\n  \"tensorMaps\": [\n    ", absl::StrJoin(launch.maps, ",\n    "),
+      " ],\n  \"params\": [\n    ", absl::StrJoin(launch.params, ",\n    "),
+      " ]");
+  if (expect) {
+    absl::StrAppend(&json, ",\n  \"expect\": [\n    ",
+                    absl::StrJoin(expected, ",\n    "), " ]");
+  }
+  absl::StrAppend(&json, ",\n  \"mosaic\": { ", device, ", \"usesPdl\": ",
+                  spec.uses_pdl ? "true" : "false",
+                  ", \"unplacedTensorMaps\": [",
+                  absl::StrJoin(launch.unplaced, ", "), "], \"operands\": { ",
+                  absl::StrJoin(shapes, ", "), " } } }\n");
+  return json;
+}
+
+absl::StatusOr<std::string> Directory(std::string_view root,
+                                      std::string_view kernel_name) {
+  static std::atomic<int64_t> launches = 0;
+  std::string dir = absl::StrFormat("%s/%d-%06d-%s", root, getpid(),
+                                    launches.fetch_add(1), kernel_name);
+  if (std::error_code error = llvm::sys::fs::create_directories(dir)) {
+    return absl::InternalError(
+        absl::StrCat("launch capture: creating ", dir, ": ", error.message()));
+  }
+  return dir;
+}
+
+}  // namespace
+
 absl::Status CaptureLaunch(std::string_view kernel_name,
                            std::string_view gpu_binary, CUstream stream,
                            const MosaicKernelSpec& spec,
@@ -306,97 +431,56 @@ absl::Status CaptureLaunch(std::string_view kernel_name,
     return pushed;
   }
   absl::Cleanup popped = [] { cuCtxPopCurrent(nullptr); };
-  static std::atomic<int64_t> launches = 0;
-  const std::string dir =
-      absl::StrFormat("%s/%d-%06d-%s", CaptureDirectory(), getpid(),
-                      launches.fetch_add(1), kernel_name);
-  if (std::error_code error = llvm::sys::fs::create_directories(dir)) {
-    return absl::InternalError(
-        absl::StrCat("launch capture: creating ", dir, ": ", error.message()));
-  }
-  // Operands that alias (an output written in place) are one buffer.
+  absl::StatusOr<std::string> dir = Directory(CaptureDirectory(), kernel_name);
+  if (!dir.ok()) return dir.status();
   std::vector<Buffer> buffers;
   std::vector<std::string> shapes;
-  for (const CapturedBuffer& operand : operands) {
-    CUdeviceptr base = reinterpret_cast<CUdeviceptr>(operand.data);
-    bool aliased = false;
-    for (const Buffer& buffer : buffers) aliased |= buffer.base == base;
-    if (!aliased && operand.bytes > 0) {
-      buffers.push_back({operand.name, base, operand.bytes});
-    }
-    shapes.push_back(absl::StrCat(
-        Quoted(operand.name), ": { \"dtype\": ", Quoted(operand.dtype),
-        ", \"dims\": ", List(operand.dims.data(), operand.dims.size()), " }"));
-  }
-  // Every pointer the launch holds lands in a buffer before any is written.
-  std::vector<std::string> maps, params;
-  for (size_t m = 0; m < spec.tensor_maps.size(); ++m) {
-    absl::StatusOr<std::string> map =
-        Map(spec.tensor_maps[m], absl::StrCat("map", m), buffers);
-    if (!map.ok()) return map.status();
-    maps.push_back(*std::move(map));
-  }
-  for (int32_t i = 0; i < static_cast<int32_t>(spec.args.size()); ++i) {
-    absl::StatusOr<std::string> param = Param(spec, i, buffers);
-    if (!param.ok()) return param.status();
-    params.push_back(*std::move(param));
-  }
-  std::vector<std::string> unplaced;
-  for (size_t m = 0; m < spec.tensor_maps.size(); ++m) {
-    if (spec.tensor_maps[m].arg < 0) {
-      unplaced.push_back(absl::StrCat("\"map", m, "\""));
-    }
-  }
-
-  const bool elf = gpu_binary.substr(0, 4) == "\x7f" "ELF";
-  const std::string code = elf ? "kernel.cubin" : "kernel.ptx";
-  if (absl::Status written = Write(absl::StrCat(dir, "/", code),
-                                   gpu_binary.data(), gpu_binary.size());
-      !written.ok()) {
-    return written;
-  }
-  if (absl::Status before = Contents(buffers, stream, dir, ""); !before.ok()) {
+  Operands(operands, buffers, shapes);
+  absl::StatusOr<Launch> described =
+      Described(gpu_binary, spec, buffers, /*on_device=*/true, *dir);
+  if (!described.ok()) return described.status();
+  if (absl::Status before = Contents(buffers, stream, *dir, ""); !before.ok()) {
     return before;
   }
   if (absl::Status launched = launch(); !launched.ok()) return launched;
-  if (absl::Status after = Contents(buffers, stream, dir, ".expected");
+  if (absl::Status after = Contents(buffers, stream, *dir, ".expected");
       !after.ok()) {
     return after;
   }
+  std::string json = Json(kernel_name, spec, *described, buffers, shapes,
+                          /*expect=*/true, Device());
+  return Write(absl::StrCat(*dir, "/spec.json"), json.data(), json.size());
+}
 
-  // Each buffer's bytes before the launch, and after it each operand's, which a
-  // simulation is held to bit for bit (a workspace's are the launch's own).
-  std::vector<std::string> declared, expected;
+absl::StatusOr<std::string> CaptureDeviceless(
+    std::string_view kernel_name, std::string_view gpu_binary,
+    std::string_view sm, const MosaicKernelSpec& spec,
+    const std::vector<CapturedBuffer>& operands, std::string_view root) {
+  absl::StatusOr<std::string> dir = Directory(root, kernel_name);
+  if (!dir.ok()) return dir.status();
+  std::vector<Buffer> buffers;
+  std::vector<std::string> shapes;
+  Operands(operands, buffers, shapes);
+  absl::StatusOr<Launch> described =
+      Described(gpu_binary, spec, buffers, /*on_device=*/false, *dir);
+  if (!described.ok()) return described.status();
   for (const Buffer& buffer : buffers) {
-    declared.push_back(absl::StrCat(
-        "{ \"name\": ", Quoted(buffer.name), ", \"bytes\": ", buffer.bytes,
-        ", \"init\": { \"gen\": \"file\", \"path\": \"", buffer.name,
-        ".bin\" } }"));
-    if (buffer.name.substr(0, 2) != "ws") {
-      expected.push_back(absl::StrCat("{ \"buffer\": ", Quoted(buffer.name),
-                                      ", \"offset\": 0, \"file\": \"",
-                                      buffer.name, ".expected.bin\" }"));
+    if (absl::Status written =
+            Write(absl::StrCat(*dir, "/", buffer.name, ".bin"),
+                  reinterpret_cast<const void*>(buffer.base), buffer.bytes);
+        !written.ok()) {
+      return written;
     }
   }
-  std::string json = absl::StrCat(
-      "{ \"code\": ", Quoted(code), ", \"function\": ", Quoted(kernel_name),
-      ",\n  \"grid\": [", spec.grid.x,
-      ", ", spec.grid.y, ", ", spec.grid.z, "], \"block\": [", spec.block.x,
-      ", ", spec.block.y, ", ", spec.block.z, "], \"cluster\": [",
-      std::max<uint32_t>(spec.cluster.x, 1), ", ",
-      std::max<uint32_t>(spec.cluster.y, 1), ", ",
-      std::max<uint32_t>(spec.cluster.z, 1), "]");
-  absl::StrAppend(
-      &json, ", \"dynamicShared\": ", spec.smem_bytes,
-      ",\n  \"buffers\": [\n    ",
-      absl::StrJoin(declared, ",\n    "), " ],\n  \"tensorMaps\": [\n    ",
-      absl::StrJoin(maps, ",\n    "), " ],\n  \"params\": [\n    ",
-      absl::StrJoin(params, ",\n    "), " ],\n  \"expect\": [\n    ",
-      absl::StrJoin(expected, ",\n    "), " ],\n  \"mosaic\": { ", Device(),
-      ", \"usesPdl\": ", spec.uses_pdl ? "true" : "false",
-      ", \"unplacedTensorMaps\": [", absl::StrJoin(unplaced, ", "),
-      "], \"operands\": { ", absl::StrJoin(shapes, ", "), " } } }\n");
-  return Write(absl::StrCat(dir, "/spec.json"), json.data(), json.size());
+  std::string json =
+      Json(kernel_name, spec, *described, buffers, shapes, /*expect=*/false,
+           absl::StrCat("\"device\": \"deviceless\", \"sm\": ", Quoted(sm)));
+  if (absl::Status written = Write(absl::StrCat(*dir, "/spec.json"),
+                                   json.data(), json.size());
+      !written.ok()) {
+    return written;
+  }
+  return *dir;
 }
 
 }  // namespace gpu
