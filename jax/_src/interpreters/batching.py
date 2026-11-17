@@ -392,7 +392,12 @@ def batch_subtrace_2(f, tag, axis_data, in_dims, in_vals):
                     if dim is not None else x for x, dim in zip(in_vals, in_dims)]  # pyrefly: ignore[bad-argument-type]  # pyrefly#2385
       outs = f(*in_tracers)
     out_vals, out_dims = outs.map(trace.to_batch_info).unzip2()
-  return out_vals, list(out_dims)
+    # Each output's staged custom_jvp, kept past the subtrace (shard_map's
+    # batching rebuilds its outputs' tracers from these dims).
+    origins = [x.staged_custom_jvp
+               if isinstance(x, BatchTracer) and x._trace.tag is tag else None
+               for x in outs.vals]
+  return out_vals, _BatchDims(list(out_dims), origins)
 
 @lu.transformation_with_aux2
 def batch_subtrace(f, store, tag, axis_data, in_dims, *in_vals):
