@@ -1,5 +1,6 @@
 # How long the fork's jaxlib takes to build on one of GitHub's hosted runners, by jax's own CI configuration of that
-# machine (.bazelrc ci_darwin_arm64 without its push to Google's cache; ci_windows_amd64), measured and published
+# machine (.bazelrc ci_darwin_arm64 without its push to Google's cache; win_clang, ci_windows_amd64's toolchain on
+# this runner's own MSVC and LLVM), measured and published
 # nowhere: one Python's build cold (as Dew's remote cache stands), then again from a fresh output base (what that cache
 # then serves). Each build's seconds and exit in the run's summary and its builds.tsv artifact (Main, 2026-11-14:
 # whether macOS arm64 and Windows jaxlib builds are cheap enough to keep those platforms).
@@ -75,8 +76,29 @@ jobs:
           case "$RUNNER_OS" in
             macOS) config=(--bazel_options=--config=clang_local --bazel_options=--macos_minimum_os=11.0)
                    base="$RUNNER_TEMP/base" ;;
-            Windows) config=(--bazel_options=--config=ci_windows_amd64
+            # ci_windows_amd64's clang-cl toolchain names the paths of Google's image (C:/tools/LLVM-19.1.7, VS 2022
+            # BuildTools); on this runner none is there and Bazel resolved MSVC's cl, which refused clang's flags
+            # (43927868094: D8021 '/Wno-gnu-offsetof-extensions'). win_clang's is Bazel's own, configured from the
+            # runner's MSVC and the LLVM build.py compiles with (BAZEL_LLVM), with ci_windows_amd64's links; its
+            # repository by its canonical name, rules_cc's extension's, which the main repository does not import
+            # (43934254468: "No repository visible as '@local_config_cc'"), win_clang's other flags as it states them.
+            Windows) config=(--bazel_options=--config=clang_local --bazel_options=--compiler=clang-cl
+                             --bazel_options=--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc//:cc-toolchain-x64_windows-clang-cl
+                             --bazel_options=--extra_execution_platforms=//jax/tools/toolchains:x64_windows-clang-cl
+                             --bazel_options=--copt=-Werror=mismatched-tags
+                             --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
+                     # LLVM 21: the runner's Windows SDK (10.0.26100, the only one it holds) declares
+                     # _m_prefetchw in winnt.h with C linkage, which clang-cl 19 and 20 refuse beside their own
+                     # inline prfchwintrin.h in grpc's tsi (43940037469, 44051681881); LLVM 21 makes it a builtin
+                     # (llvm-project ee92122, #115099). Its STL (VS 18) asks Clang 20 or newer (STL1000), which
+                     # 21 is. The LLVM the build compiles with is that release, or the step stops.
+                     choco install llvm --version=21.1.8 --allow-downgrade -y --no-progress > "$RUNNER_TEMP/llvm.log"
+                     llvm=$(clang --version)
+                     echo "$llvm"
+                     [[ $llvm == *"clang version 21.1.8"* ]] || { echo "::error::clang is not LLVM 21.1.8"; exit 1; }
+                     BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
+                     export BAZEL_LLVM
                      base="C:/b" ;;
             *) echo "a runner of macOS or Windows" >&2; exit 2 ;;
           esac
@@ -211,3 +233,10 @@ jobs:
         with:
           name: measure-${{ inputs.runner }}-${{ matrix.attempt }}-log
           path: ${{ runner.temp }}/build.log
+      - name: The build's exit
+        # Last, past the diagnostics and the log: a run is green only where its build was.
+        if: always()
+        env:
+          CODE: ${{ steps.build.outputs.code }}
+        run: |
+          [[ "$CODE" == 0 ]] || { echo "::error::the build exited ${CODE:-without a code}"; exit 1; }
