@@ -52,18 +52,20 @@ class PeakLiveTest(jtu.JaxTestCase):
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
-    # tanh(x @ w) @ w's gradient under a policy saving the residual named
-    # "hidden" alone: at the backward's peak the saved tanh is live, its
-    # buffer named as jax.ad_checkpoint.checkpoint_name named it; each
-    # parameter's buffer states its entry parameter's number.
+    # sin(tanh(x @ w))'s gradient in w under a policy saving the residual
+    # named "hidden" alone: the backward reads the saved tanh beside the
+    # cotangent it forms from it, the rows' widest buffers, so at its peak the
+    # residual is live, its buffer named as jax.ad_checkpoint.checkpoint_name
+    # named it; each parameter's buffer states its entry parameter's number.
     def step(x, w):
       hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
-      return jnp.sum(jnp.sin(hidden @ w))
+      return jnp.sum(jnp.sin(hidden))
 
     saved = jax.checkpoint(
         step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
-    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
-    live = jax.jit(jax.grad(saved, argnums=1)).lower(tile, tile).compile().peak_live()
+    rows = jax.ShapeDtypeStruct((2048, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    live = jax.jit(jax.grad(saved, argnums=1)).lower(rows, weight).compile().peak_live()
     self.assertIsNotNone(live)
     named = [buffer for buffer in live if buffer.names]
     self.assertTrue(named, live)
