@@ -280,6 +280,10 @@ _backend_errors : dict[str, str] = {}
 _backend_lock = threading.Lock()
 _plugins_registered: bool = False
 _plugin_lock = threading.Lock()
+plugin_builds: dict[str, str] = {}
+"""Each PJRT plugin's own build by the name it registered under, where it states one
+(`register_plugin`'s `build`): the persistent compilation cache keys an executable by it
+(`cache_key`), since a plugin rebuilt under one jax and jaxlib compiles with its own XLA."""
 _topology_factories: dict[str, TopologyFactory] = {}
 _plugin_callbacks: list[Any] = []
 _plugin_callback_lock = threading.Lock()
@@ -614,6 +618,7 @@ def register_plugin(
     c_api: Any | None = None,
     factory: BackendFactory | None = None,
     make_topology: TopologyFactory | None = None,
+    build: str | None = None,
 ) -> Any:
   """Registers a backend factory for the PJRT plugin.
 
@@ -629,7 +634,11 @@ def register_plugin(
     c_api: Optional. The plugin can provide a PJRT C API to be registered.
     factory: Optional. A factory function that creates a PJRT client. If not
       provided, a default factory will be used.
+    build: Optional. The plugin's own build (its package's version), which the
+      persistent compilation cache keys an executable by (`plugin_builds`).
   """
+  if build:
+    plugin_builds[plugin_name] = build
 
   if library_path and c_api:
     logger.error(

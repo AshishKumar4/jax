@@ -27,6 +27,7 @@ from typing import cast as type_cast
 
 from jax import version as jax_version_module
 from jax._src import config
+from jax._src import xla_bridge
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
 from jax._src.lib import xla_client
@@ -474,6 +475,20 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
   _hash_string(hash_obj, backend.platform_version)
+  _hash_string(hash_obj, _plugin_build(backend))
+
+
+def _plugin_build(backend) -> str:
+  """The build of the PJRT plugin that compiles for `backend` ("" where none is
+  stated): a plugin rebuilt under one jax and jaxlib compiles with its own XLA,
+  which the platform version (the CUDA runtime it loads) does not tell apart, so
+  a cache keyed without it served the executables an earlier build compiled, a
+  miscompile the rebuild fixed included. The plugin is the one registered under
+  the platform version's runtime ("cuda 12090": 'cuda'), a live client's and a
+  compile-only one's alike: XLA states a compile-only topology's platform
+  version as its live client does (openxla/xla#50858)."""
+  runtime = backend.platform_version.split(" ", 1)[0]
+  return xla_bridge.plugin_builds.get(runtime, "")
 
 
 def jax_version() -> str:
