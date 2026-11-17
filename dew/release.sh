@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # A post release of the stack, composed and published in one run: the newest published release branch, the
-# reviewed and green commits it gains in their order on top of it, the version bumped, both branches pushed at once,
-# each only forward, and
-# patch-stack.yml asked to publish, its own run (by the token its name carries) watched to its end. Any step
-# that fails ends the run there: one before the push leaves the fork as it was, so no push or publish follows
-# a broken step (Main, 2026-10-30: a typed chain pushed a half-composed post40 and began its publish); one
-# after it leaves both branches at the composed release, unpublished, and says how to publish it again.
+# reviewed and green commits it gains in their order on top of it, the version bumped, its release branch pushed,
+# patch-stack.yml asked to publish it from there (`from`), its own run (by the token its name carries) watched to
+# its end, and only then the stack branch moved forward to it. Any step that fails ends the run there: one before
+# the push leaves the fork as it was, so no push or publish follows a broken step (Main, 2026-10-30: a typed chain
+# pushed a half-composed post40 and began its publish); a red stage leaves the stack branch where it was and the
+# release branch at the composition, which a tag keeps (failed/NEW-SHA) while the branch goes, so NEW is composed
+# again from the fixed commits with nothing moved back (2026-11-17: post105's red stage left the stack branch at it,
+# and moving it back was a rewrite of pushed history). No push here is a force or passes over a hook.
 #
 #   dew/release.sh CHECKOUT BASE NEW MESSAGE COMMIT...
 #
@@ -65,18 +67,24 @@ grep -Fqx "_release_version: str | None = \"$new\"" "$work/jax/version.py"
 git -C "$work" commit -q -am "$message"
 composed=$(git -C "$work" rev-parse HEAD)
 
-# Both branches move together, or neither: the stack branch forward from the published release (a push that is
-# no fast-forward is refused), the release branch only where none is.
-git -C "$work" push -q --atomic "--force-with-lease=refs/heads/release/$new:" origin \
-  "$composed:refs/heads/release/$new" "$composed:refs/heads/$stack"
+# The release branch alone, only where none is: the stack branch moves once the stage has passed.
+git -C "$work" push -q "--force-with-lease=refs/heads/release/$new:" origin "$composed:refs/heads/release/$new"
 
-# From here a failure leaves both branches at the composed release, unpublished: its run's log says why, and
-# `gh workflow run patch-stack.yml -R AshishKumar4/jax --ref dew -f publish=RELEASE` publishes it again.
+# A run that fails from here (no run found, a red stage) leaves the stack branch at the published release: the
+# composition is kept by a tag, and its release branch removed, which the fork's hooks allow (a deletion), so
+# NEW is composed again. A run whose end was not read leaves both as they are, its state said.
+failed() {
+  echo "release.sh: $1; the stack branch stays at release/$base" >&2
+  git -C "$work" push -q origin "$composed:refs/tags/failed/$new-${composed:0:10}" &&
+    git -C "$work" push -q "--force-with-lease=refs/heads/release/$new:$composed" origin ":refs/heads/release/$new" &&
+    echo "release.sh: $new's composition kept as failed/$new-${composed:0:10}, release/$new removed" >&2
+  exit 1
+}
 token=release-$new-$(date +%s)-$$
 # MACHINES, where set, the machines whose plugins it ships so far (patch-stack.yml's `machines`): the rest keep their
 # earlier ones until the same release is published again with every machine.
 gh workflow run patch-stack.yml -R AshishKumar4/jax --ref dew -f "publish=$release" -f "token=$token" \
-  ${MACHINES:+-f "machines=$MACHINES"}
+  -f "from=release/$new" ${MACHINES:+-f "machines=$MACHINES"}
 run=
 for _ in $(seq 60); do
   run=$(gh run list -R AshishKumar4/jax --workflow patch-stack.yml -L 20 --json databaseId,displayTitle \
@@ -84,10 +92,14 @@ for _ in $(seq 60); do
   [[ -n $run ]] && break
   sleep 5
 done
-if [[ -z $run ]]; then
-  echo "release.sh: no run of patch-stack.yml named $token in 5 minutes; release/$new and $stack are at" \
-    "$composed, unpublished" >&2
+[[ -n $run ]] || failed "no run of patch-stack.yml named $token in 5 minutes"
+gh run watch "$run" -R AshishKumar4/jax > /dev/null || true
+conclusion=$(gh run view "$run" -R AshishKumar4/jax --json conclusion --jq .conclusion) || {
+  echo "release.sh: run $run's end could not be read; release/$new is at $composed, the stack branch at" \
+    "release/$base" >&2
   exit 1
-fi
-gh run watch "$run" -R AshishKumar4/jax --exit-status > /dev/null
+}
+[[ $conclusion == success ]] || failed "run $run ended $conclusion"
+# Staged: the stack branch forward to it, a fast-forward from the published release it was checked at.
+git -C "$work" push -q origin "$composed:refs/heads/$stack"
 echo "$new published from $composed (run $run)"
