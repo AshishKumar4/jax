@@ -1,6 +1,7 @@
 # What Dew's main pins of the fork's releases, indexed as it lands: every few minutes, Dew's main's locks
-# (`patch_stack.py pinned`) against the index's jax page (`unindexed`); a pinned release the index lists no jax of,
-# staged and passed by its pin head's train, is indexed by patch-stack's `index` with those pins. A hand indexing it
+# (`patch_stack.py pinned`) against the index's page of each project they pin (`unindexed`); a pinned release the
+# index holds not whole, staged and passed by its pin head's train, is indexed by patch-stack's `index` with those
+# pins, once a version, while no patch-stack run is under way. A hand indexing it
 # once the site failed to resolve was the step before (2026-11-17: post104 and post106).
 name: index what main pins
 
@@ -35,20 +36,31 @@ jobs:
             curl -fsSL "$url" -o "locks/$(basename "$url")"
           done
           python3 dew/dew/patch_stack.py pinned locks/*.txt > pins.json
-          curl -fsSL https://pypi.dewml.dev/simple/jax/ -o listed.html
-          for version in $(python3 dew/dew/patch_stack.py unindexed pins.json listed.html); do
-            if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-              echo "::warning::main pins jax $version, which no release of the fork holds"
-              continue
-            fi
-            # One index run a version at a time: one still queued or running is not asked again.
-            if gh run list --repo "$GITHUB_REPOSITORY" --workflow patch-stack.yml --limit 20 \
-                 --json status,displayTitle --jq '.[] | select(.status != "completed") | .displayTitle' \
-                 | grep -qx "patch stack index-$version"; then
-              echo "jax $version: its index run is under way"
-              continue
-            fi
-            gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
-              -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
-            echo "jax $version: indexed as main pins it"
+          mkdir pages
+          for project in $(python3 -c 'import json; print(" ".join(sorted({pin.split("==")[0] for pin in json.load(open("pins.json"))})))'); do
+            curl -fsS "https://pypi.dewml.dev/simple/$project/" -o "pages/$project.html" || rm -f "pages/$project.html"
           done
+          version=$(python3 dew/dew/patch_stack.py unindexed pins.json pages)
+          [ -n "$version" ] || exit 0
+          if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::warning::main pins jax $version, which no release of the fork holds"
+            exit 0
+          fi
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow patch-stack.yml --limit 200 \
+                   --json status,conclusion,displayTitle)
+          # Patch-stack's runs share one queue (its concurrency group), whose one pending place a dispatch would
+          # take from another's: none is asked while any of its runs is under way (review).
+          if jq -e 'any(.[]; .status != "completed")' <<< "$runs" > /dev/null; then
+            echo "a patch-stack run is under way: jax $version is asked once it ends"
+            exit 0
+          fi
+          # One automatic attempt a version: one that failed or was cancelled waits for a hand to repair and run it
+          # again (patch-stack's index), never asked every ten minutes (review).
+          if jq -e --arg title "patch stack index-$version" \
+               'any(.[]; .displayTitle == $title and .conclusion != "success")' <<< "$runs" > /dev/null; then
+            echo "::warning::jax $version's automatic index did not succeed: index it by hand once repaired"
+            exit 0
+          fi
+          gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
+            -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
+          echo "jax $version: indexed as main pins it"

@@ -357,14 +357,20 @@ def pinned(locks: list[str]) -> dict[str, set[str]]:
     return pins
 
 
-def unindexed(pins: dict[str, set[str]], listed: str) -> list[str]:
-    """The jax versions Dew's main pins (`pinned`) that the index's jax page (`listed`, its HTML) lists no wheel of:
-    a release whose pin head has passed its train, to be indexed (`indexable`) as it lands, never by a hand that
-    remembers (2026-11-17: main pinned post104, then post106, and the site's build failed to resolve each until a
-    hand indexed it)."""
-    files = set(re.findall(r">(jax-[^<]+\.whl)<", listed))
-    versions = [pin.partition("==")[2] for pin in pins if pin.startswith("jax==")]
-    return sorted(version for version in versions if not any(name.startswith(f"jax-{version}-") for name in files))
+def unindexed(pins: dict[str, set[str]], pages: dict[str, str]) -> list[str]:
+    """The jax versions Dew's main pins (`pinned`) whose release the index holds not whole: some project and version
+    main pins (jax, jaxlib or a CUDA plugin) of which its project's page (`pages`, each project's HTML, none where
+    the index has no page for it) lists no wheel. A release whose pin head has passed its train, to be indexed
+    (`indexable`) as it lands, never by a hand that remembers (2026-11-17: main pinned post104, then post106, and
+    the site's build failed to resolve each until a hand indexed it); one whose index stopped partway, its jax
+    listed and a plugin not, among them (review)."""
+    missing = False
+    for pin in pins:
+        project, _, version = pin.partition("==")
+        prefix = f"{project.replace('-', '_')}-{version}-"
+        listed = re.findall(r">([^<]+\.whl)<", pages.get(project, ""))
+        missing = missing or not any(name.startswith(prefix) for name in listed)
+    return sorted(pin.partition("==")[2] for pin in pins if pin.startswith("jax==")) if missing else []
 
 
 def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> list[Path]:
@@ -463,9 +469,9 @@ def main() -> int:
     indexing.add_argument("--projects", nargs="*", default=[], help="the index's other packages, for its root")
     pinning = commands.add_parser("pinned", help="what Dew's locks pin of the staged projects, for `indexable`")
     pinning.add_argument("locks", type=Path, nargs="+")
-    missing = commands.add_parser("unindexed", help="the jax versions main pins that the index lists none of")
+    missing = commands.add_parser("unindexed", help="the jax versions main pins whose release the index lacks")
     missing.add_argument("pins", type=Path, help="`pinned`'s output")
-    missing.add_argument("listed", type=Path, help="the index's jax page")
+    missing.add_argument("pages", type=Path, help="a directory of <project>.html, the index's page of each")
     choosing = commands.add_parser("indexable", help="the staged wheels main pins, byte for byte")
     choosing.add_argument("pins", type=Path, help="`pinned`'s output")
     choosing.add_argument("version", help="the release's jax version, e.g. 0.12.0.1.post101")
@@ -498,7 +504,8 @@ def main() -> int:
         return 0
     if args.command == "unindexed":
         pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}
-        print("\n".join(unindexed(pins, args.listed.read_text())))
+        pages = {path.stem: path.read_text() for path in sorted(args.pages.glob("*.html"))}
+        print("\n".join(unindexed(pins, pages)))
         return 0
     if args.command == "indexable":
         pins = {pin: set(digests) for pin, digests in json.loads(args.pins.read_text()).items()}

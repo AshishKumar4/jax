@@ -491,13 +491,18 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
         patch_stack.indexable(pins, [jax, changed], "0.12.0.1.post101")
     with pytest.raises(SystemExit):
         patch_stack.indexable(pins, [jax], "0.12.0.1.post102")
-    # Indexed as it lands: the version main pins that the index lists no jax wheel of, read from the index's page;
-    # one it lists is not asked again, nor a version only a longer one's prefix matches.
-    page = ('<a href="https://x/jax-0.12.0.1.post10-py3-none-any.whl#sha256=0">jax-0.12.0.1.post10-py3-none-any.whl'
-            '</a><br>\n')
-    assert patch_stack.unindexed(pins, page) == ["0.12.0.1.post101"]
-    page += page.replace("post10-", "post101-")
-    assert patch_stack.unindexed(pins, page) == []
+    # Indexed as it lands: the jax version main pins while any project and version it pins is on no page of the
+    # index (a version only a longer one's prefix matches is not one); its jax listed and its jaxlib not, a release
+    # indexed partway, still asked; all listed, not asked again.
+    def page(name: str) -> str:
+        return f'<a href="https://x/{name}#sha256=0">{name}</a><br>\n'
+
+    jaxed = page("jax-0.12.0.1.post10-py3-none-any.whl")
+    assert patch_stack.unindexed(pins, {"jax": jaxed}) == ["0.12.0.1.post101"]
+    jaxed += page("jax-0.12.0.1.post101-py3-none-any.whl")
+    assert patch_stack.unindexed(pins, {"jax": jaxed}) == ["0.12.0.1.post101"]
+    whole = {"jax": jaxed, "jaxlib": page("jaxlib-0.12.0.1.post101-cp312-cp312-manylinux_2_27_x86_64.whl")}
+    assert patch_stack.unindexed(pins, whole) == []
 
 
 
