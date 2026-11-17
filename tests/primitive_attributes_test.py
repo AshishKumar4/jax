@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Primitive.elementwise and Primitive.inlined_call hold of what they mark."""
+"""Primitive.elementwise, Primitive.inlined_call and Primitive.transparent_call hold of what they mark,
+and the primitives an analysis dispatches on are exported."""
 
 import itertools
 
@@ -20,6 +21,7 @@ from absl.testing import absltest
 import numpy as np
 
 import jax
+import jax.extend as jex
 from jax._src import ad_util
 from jax._src import core
 from jax._src import test_util as jtu
@@ -145,6 +147,64 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         self.assertTrue(called.primitive.inlined_call, called.primitive.name)
         compiled = jax.jit(outer).lower(jnp.ones(4)).compile().as_text()
         self.assertNotIn(" call(", compiled)
+
+  def test_a_transparent_calls_transformation_is_its_programs(self):
+    body = lambda x: jnp.sin(x) * x
+
+    @jax.custom_jvp
+    def custom_jvp(x):
+      return body(x)
+    custom_jvp.defjvp(lambda primals, tangents: (body(*primals), tangents[0]))
+
+    program = jax.make_jaxpr(body)(jnp.ones(4))
+    calls = {
+        "jit": (jax.jit(body), True),
+        "closed_call": (lambda x: core.closed_call_p.bind(x, call_jaxpr=program)[0], True),
+        "checkpoint": (jax.checkpoint(body), False),
+        "custom_jvp": (custom_jvp, False),
+    }
+    x, t = jnp.linspace(0.5, 2.0, 4), jnp.linspace(1.0, -1.0, 4)
+    expected = jax.jvp(body, (x,), (t,))
+    for name, (call, transparent) in calls.items():
+      with self.subTest(name):
+        (called,) = jax.make_jaxpr(call)(x).eqns
+        self.assertEqual(called.primitive.transparent_call, transparent)
+        self.assertTrue(called.primitive.inlined_call)
+        if transparent:
+          self.assertAllClose(jax.jvp(call, (x,), (t,)), expected)
+    # A rule of its own is what keeps a call from being transparent: here a tangent passed through.
+    self.assertAllClose(jax.jvp(custom_jvp, (x,), (t,))[1], t)
+
+  def test_a_made_call_primitive_is_inlined_and_not_transparent(self):
+    marked = jex.core.primitives.create_call_primitive("marked_call")
+    program = jax.make_jaxpr(lambda x: jnp.cos(x) + 1.0)(jnp.ones(4))
+    self.assertTrue(marked.inlined_call)
+    self.assertFalse(marked.transparent_call)
+    compiled = jax.jit(lambda x: marked.bind(x, call_jaxpr=program)[0]).lower(jnp.ones(4)).compile()
+    self.assertNotIn(" call(", compiled.as_text())
+
+  def test_the_primitives_an_analysis_dispatches_on_are_exported(self):
+    from jax._src import callback, custom_batching, debugging, ffi, pjit, shard_map
+    from jax._src.lax.control_flow import conditionals
+    from jax._src.pallas import primitives as pallas_primitives
+    from jax._src.random import core as random_core, prng
+    from jax._src.state import primitives as state_primitives
+    import jax.experimental.pallas as pl
+
+    exported = jex.core.primitives
+    for name, primitive in {
+        "custom_vmap_p": custom_batching.custom_vmap_p, "shard_map_p": shard_map.shard_map_p,
+        "random_wrap_p": prng.random_wrap_p, "random_unwrap_p": prng.random_unwrap_p,
+        "random_clone_p": random_core.random_clone_p,
+        "ragged_dot_general_p": lax_internal.ragged_dot_general_p,
+        "pure_callback_p": callback.pure_callback_p, "io_callback_p": callback.io_callback_p,
+        "debug_callback_p": debugging.debug_callback_p, "debug_print_p": debugging.debug_print_p,
+        "ffi_call_p": ffi.ffi_call_p, "platform_index_p": conditionals.platform_index_p,
+        "reshard_p": pjit.reshard_p, "addupdate_p": state_primitives.addupdate_p}.items():
+      with self.subTest(name):
+        self.assertIs(getattr(exported, name), primitive)
+    self.assertIs(pl.program_id_p, pallas_primitives.program_id_p)
+    self.assertIs(pl.num_programs_p, pallas_primitives.num_programs_p)
 
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.lax.fori_loop(0, 3, lambda _, y: y * 2, x))(1.0)
