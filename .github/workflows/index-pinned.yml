@@ -1,13 +1,11 @@
-# What Dew's main pins of the fork's releases, indexed as it lands: every few minutes, Dew's main's locks
-# (`patch_stack.py pinned`) against the index's page of each project they pin (`unindexed`); a pinned release the
-# index holds not whole, staged and passed by its pin head's train, is indexed by patch-stack's `index` with those
-# pins, once a version, while no patch-stack run is under way. A hand indexing it
-# once the site failed to resolve was the step before (2026-11-17: post104 and post106).
+# What Dew's main pins of the fork's releases, indexed as main comes to pin them: the land queue asks this workflow as
+# it publishes a train that changes main's locks (dew-ops queue/land_queue.py `indexed_pins`), nothing polling. It
+# reads main's locks (`patch_stack.py pinned`) against the index's page of each project they pin (`unindexed`); a
+# pinned release the index holds not whole is indexed by patch-stack's `index` with those pins, once a version, while
+# its own index run is not under way.
 name: index what main pins
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
