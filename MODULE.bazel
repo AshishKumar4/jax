@@ -43,8 +43,9 @@ archive_override(
         "//third_party:xla/xpu_triton_hook.patch",
         "//third_party:xla/nvptx_compiler_target.patch",
         "//third_party:xla/windows_cpp_gen_intrinsics.patch",
-        # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
-        # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
+        # Triton's pipeliner sizes a load's async-copy buffers by its earliest use, not the last wgmma reading
+        # the buffer forwarded to a local_alloc, which the next cp.async overwrites while that wgmma still reads
+        # it (Dew ledger 3521): triton-lang/triton PR 12738, open, carried as it stands.
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
         # A bitcast commuted across a layout-changing copy in GEMM fusion drops the copy's permutation, so a
         # Triton GEMM fusion reads its operand permuted (Dew ledger 5275; upstream a22dec8093, PR #51630).
