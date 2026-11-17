@@ -2744,6 +2744,14 @@ def _remat_lowering_rule(ctx: LoweringRuleContext, *args, jaxpr, **_):
 triton_lowering_rules[ad_util.stop_gradient_p] = lambda _, x: x
 
 
+@register_lowering(lax.optimization_barrier_p)
+def _optimization_barrier_lowering_rule(ctx: LoweringRuleContext, *args):
+  # The operands as they are: XLA compiles a Triton call with no floating-point
+  # contraction, so each operation stays its own and rounds on its own.
+  del ctx
+  return args
+
+
 @register_lowering(lax.axis_index_p)
 def _axis_index_rule(ctx: LoweringRuleContext, *, axis_name: Hashable):
   grid_names = ctx.context.grid_mapping.grid_names

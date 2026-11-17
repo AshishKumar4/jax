@@ -107,6 +107,21 @@ class TritonPallasTest(PallasBaseTest):
     self.assertEqual(y.dtype, dst_dtype)
     self.assertArraysEqual(y, x.astype(dst_dtype))
 
+  def test_a_product_beside_its_barriered_self_rounds_on_its_own(self):
+    # x * y - barrier(x * y): each product rounds on its own, so the difference
+    # is zero; contracted into an FMA it would be the product's rounding error.
+    def kernel(x_ref, y_ref, out_ref):
+      x, y = x_ref[...], y_ref[...]
+      (rounded,) = lax.optimization_barrier((x * y,))
+      out_ref[...] = x * y - rounded
+
+    x = jax.random.normal(jax.random.key(0), (64, 64), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (64, 64), dtype=jnp.float32)
+    out = self.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((64, 64), jnp.float32), grid=(1,)
+    )(x, y)
+    self.assertArraysEqual(out, jnp.zeros_like(out))
+
   def test_float32_stack(self):
     # Triton stack only supports 2 arguments and last dimension.
     x = jax.random.normal(jax.random.key(0), (64, 64), dtype=jnp.float32)
