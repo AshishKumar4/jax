@@ -116,6 +116,55 @@ _CONTROLS = frozenset({
 })
 
 _ENVIRONMENT_PATTERN = re.compile(r"^(JAX|XLA|MOSAIC|NVSHMEM|CUDA|TRITON)")
+
+# What no lowering reads: where a process keeps its compiled programs and
+# which it keeps, and how its client allocates device memory. Each is a
+# process's own (a test runner's share of one GPU, its job's cache
+# directory), so none is part of a key, and processes alike in every input
+# a lowering reads share their lowerings.
+_UNREAD_FLAGS = frozenset({
+    "jax_compilation_cache_dir",
+    "jax_compilation_cache_max_size",
+    "jax_compilation_cache_check_contents",
+    "jax_compilation_cache_expect_pgle",
+    "jax_compilation_cache_include_metadata_in_key",
+    "jax_persistent_cache_min_compile_time_secs",
+    "jax_persistent_cache_min_entry_size_bytes",
+    "jax_persistent_cache_enable_xla_caches",
+    "jax_raise_persistent_cache_errors",
+    "jax_explain_cache_misses",
+})
+_UNREAD_VARIABLES = re.compile(
+    r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_"
+    # A profiler's injection libraries (Nsight Systems', CUPTI's), which observe
+    # a run and change no lowering: a profiled process shares its lowerings.
+    r"|CUDA_INJECTION64_PATH$|NVTX_INJECTION64_PATH$)")
+# What a lowering dumps and where: none changes the lowering, and one that
+# dumps as it runs is not cached (`_eligible`).
+_DUMP_VARIABLES = re.compile(r"^MOSAIC_GPU_DUMP")
+# XLA_FLAGS' cache directories, each its job's own, and its dumps (where and
+# what XLA writes of a compile, which it compiles alike); every other flag a
+# lowering may read (NVSHMEM's, `is_nvshmem_available`) stays keyed.
+_UNREAD_XLA_FLAGS = re.compile(
+    r"--xla_gpu_per_fusion_autotune_cache_dir=\S*|--xla_gpu_kernel_cache_file=\S*"
+    r"|--xla_dump_\S*")
+
+
+def _keyed_environment() -> dict[str, str]:
+  """The environment variables a key holds: those naming a backend or a
+  compiler, but not the cache's own controls nor what no lowering reads."""
+  keyed = {}
+  for name, value in os.environ.items():
+    if (not _ENVIRONMENT_PATTERN.match(name) or name.lower() in _CONTROLS
+        or _UNREAD_VARIABLES.match(name)):
+      continue
+    if name == "XLA_FLAGS":
+      # Flags that are all unread are none: as if XLA_FLAGS were unset.
+      value = " ".join(_UNREAD_XLA_FLAGS.sub("", value).split())
+      if not value:
+        continue
+    keyed[name] = value
+  return keyed
 _DUMP_ENVIRONMENT_PREFIX = "MOSAIC_GPU_DUMP"
 _DUMP_BASENAME = "mosaic_gpu.dump_basename"
 
@@ -265,15 +314,13 @@ def _key(
           ml_dtypes.__version__,
       )),
       # Every jax.config value and the environment variables that name a
-      # backend or a compiler, but not the cache's own controls.
+      # backend or a compiler, but not the cache's own controls nor what no
+      # lowering reads (`_UNREAD_FLAGS`, `_keyed_environment`).
       "jax.config": enc.encode({
           name: value for name, value in config.config.values.items()
-          if name.lower() not in _CONTROLS
+          if name.lower() not in _CONTROLS and name not in _UNREAD_FLAGS
       }),
-      "environment": enc.encode({
-          name: value for name, value in os.environ.items()
-          if _ENVIRONMENT_PATTERN.match(name) and name.lower() not in _CONTROLS
-      }),
+      "environment": enc.encode(_keyed_environment()),
   }
   if logger.isEnabledFor(logging.DEBUG):
     logger.debug("the key's parts: %s", {
