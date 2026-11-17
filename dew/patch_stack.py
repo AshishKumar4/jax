@@ -65,11 +65,12 @@ STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints
 PLUGINS = re.compile(r"refs/tags/plugin-(\d+(?:\.\d+){2,3})\.post(\d+)$")
 FAMILY = re.compile(r"^(?:fixup! )?\[stack\] ([^:]+):")
 """A stack commit's family, from its subject: a family's patch, or a repair of it (`fixup!`)."""
-PYTHON_ONLY = ("jax/", "tests/", "docs/", "build/generate_xla_protos.py")
+PYTHON_ONLY = ("jax/", "tests/", "docs/", "build/generate_xla_protos.py", ".pre-commit-config.yaml")
 """What a post release changes and still ships plugins built from an earlier one's native code (`plugins`): jax's
-Python package, its tests, its docs, and build/generate_xla_protos.py, which is run by hand to write jax/_src's
+Python package, its tests, its docs, build/generate_xla_protos.py, which is run by hand to write jax/_src's
 schema modules (xla_protos.py, mosaic_gpu_protos.py) and which no Bazel target, build/build.py or
-dew/build_plugin.sh reads (post77's kernel-record schema)."""
+dew/build_plugin.sh reads (post77's kernel-record schema), and .pre-commit-config.yaml, the commit hooks, which
+no build reads (post108's typecheck-clean line, its hooks' config among its files, asked for plugins of its own)."""
 
 
 def git(*args: str, check: bool = True) -> str:

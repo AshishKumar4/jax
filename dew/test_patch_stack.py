@@ -169,7 +169,8 @@ def test_a_stacks_native_change_is_any_a_build_reads_an_xla_patch_among_them(tmp
     commit({"jax/core.py": "release", "MODULE.bazel": "release"})
     run("tag", "jax-v0.12.0.1")
     monkeypatch.chdir(clone)
-    commit({"jax/core.py": "a fix", "tests/core_test.py": "its test", "docs/notes.md": "its note"})
+    commit({"jax/core.py": "a fix", "tests/core_test.py": "its test", "docs/notes.md": "its note",
+            ".pre-commit-config.yaml": "its hooks"})
     assert patch_stack.native("jax-v0.12.0.1") == []
     commit({"third_party/xla/early_exit.patch": "the patch", "MODULE.bazel": "lists it"})
     assert sorted(patch_stack.native("jax-v0.12.0.1")) == ["MODULE.bazel", "third_party/xla/early_exit.patch"]
