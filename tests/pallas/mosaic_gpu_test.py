@@ -255,14 +255,26 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
 class CtaBarrierLoweringTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
-      ("arrive", plgpu.barrier_arrive),
-      ("arrive_and_wait", plgpu.barrier_arrive_and_wait),
+      (f"{name}_{semantics.name.lower()}", arrive, semantics)
+      for name, arrive in (
+          ("arrive", plgpu.barrier_arrive),
+          ("arrive_and_wait", plgpu.barrier_arrive_and_wait),
+      )
+      for semantics in (
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      )
   )
-  def test_conditional_warp_cannot_arrive_on_cta_barrier(self, arrive):
+  def test_conditional_warp_cannot_arrive_on_cta_barrier(
+      self, arrive, lowering_semantics
+  ):
     # Lower for an abstract GPU on CPU; never execute the unsafe barrier.
     @_kernel(
         out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
         scratch_types=[plgpu.CtaBarrier(num_arrivals=1)],
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
     )
     def kernel(o_ref, barrier):
       @plgpu.warp_map

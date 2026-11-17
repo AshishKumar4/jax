@@ -20,6 +20,27 @@ def load(name):
 
 class CauseControlsTest(absltest.TestCase):
 
+  def test_waiting_foreign_execution_restores_progress(self):
+    module = load('gpu_pallas_interpret_test')
+    run = module.subprocess.run
+
+    def session_gated(args, **kwargs):
+      args = list(args)
+      before = 'def initialize(threads):\n'
+      after = (
+          'def initialize(threads):\n'
+          '  if threads == 2:\n'
+          '    a_done.wait()\n'
+      )
+      self.assertEqual(args[2].count(before), 1)
+      args[2] = args[2].replace(before, after)
+      return run(args, **kwargs)
+
+    with mock.patch.object(module.subprocess, 'run', session_gated):
+      method = 'test_two_device_execution_can_finish_overlapping_executions'
+      case = module.InterpretExecutionGateTest(method)
+      getattr(case, method)()
+
   def test_cta_warp_context_guard_restores_refusal(self):
     module = load('mosaic_gpu_test')
     rule = primitives._barrier_arrive_and_wait_lowering
@@ -31,13 +52,19 @@ class CauseControlsTest(absltest.TestCase):
             'Arriving on a CTA barrier is not supported in a warp context')
       return rule(ctx, barrier, *args, **kwargs)
 
-    with mock.patch.dict(
-        lowering.mosaic_lowering_rules[gpu_core.LANExWARP_SEMANTICS],
-        {primitives.barrier_arrive_and_wait_p: guarded},
+    for semantics, suffix in (
+        (gpu_core.LANExWARP_SEMANTICS, 'lane'),
+        (gpu_core.WGxWARP_SEMANTICS, 'warpgroup'),
     ):
-      case = module.CtaBarrierLoweringTest(
-          'test_conditional_warp_cannot_arrive_on_cta_barrier_arrive_and_wait')
-      case.test_conditional_warp_cannot_arrive_on_cta_barrier_arrive_and_wait()
+      with mock.patch.dict(
+          lowering.mosaic_lowering_rules[semantics],
+          {primitives.barrier_arrive_and_wait_p: guarded},
+      ):
+        method = (
+            'test_conditional_warp_cannot_arrive_on_cta_barrier_arrive_and_wait_'
+            + suffix)
+        case = module.CtaBarrierLoweringTest(method)
+        getattr(case, method)()
 
   def test_declaring_meeting_barriers_restores_resource_equality(self):
     module = load('mosaic_gpu_test')
