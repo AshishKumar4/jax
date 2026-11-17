@@ -40,6 +40,9 @@ on:
       token:
         description: "a token the run's name carries, by which a dispatcher (dew/release.sh) finds its own run"
         required: false
+      from:
+        description: "with `publish`, the branch the stack's wheel is built from, e.g. release/0.12.0.1.post105 (default: its stack branch); dew/release.sh names the release it composed, so the stack branch moves only once the stage has passed"
+        required: false
       machines:
         description: "with `publish`, the machines whose native wheels it ships (default: every one, \"x86_64 aarch64\"); a machine left out keeps its earlier plugins, which a later publish of the same release adds beside"
         required: false
@@ -263,10 +266,13 @@ jobs:
       # same release again with every machine adds the rest.
       MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
       CUDAS: "12 13"
+      # The branch built from: a composed release dew/release.sh names (`from`), else the stack branch.
+      FROM: ${{ inputs.from }}
     steps:
       - name: The inputs are of their forms
         run: |
           [[ "$RELEASE" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::publish: a release"; exit 1; }
+          [ -z "$FROM" ] || [[ "$FROM" =~ ^release/${RELEASE//./\\.}\.post[0-9]+$ ]] || { echo "::error::from: release/$RELEASE.postN"; exit 1; }
           [[ "$MACHINES" =~ ^(x86_64|aarch64)( (x86_64|aarch64))*$ ]] || { echo "::error::machines"; exit 1; }
       - uses: actions/checkout@v4
         with:
@@ -275,7 +281,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Build the stack's wheel, and fetch the release's own
         run: |
-          git clone -q --filter=blob:none --branch "v$RELEASE-cache-key-pool-fingerprints" \
+          git clone -q --filter=blob:none --branch "${FROM:-v$RELEASE-cache-key-pool-fingerprints}" \
             "https://github.com/$GITHUB_REPOSITORY.git" jax
           git -C jax fetch -q --no-tags https://github.com/jax-ml/jax.git "refs/tags/jax-v$RELEASE:refs/tags/jax-v$RELEASE"
           uv build -q --wheel --out-dir dist jax

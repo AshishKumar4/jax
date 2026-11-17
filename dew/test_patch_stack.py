@@ -3,6 +3,7 @@ the test files it runs, over a repository of its own."""
 
 import hashlib
 import json
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -235,8 +236,9 @@ def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
 
 
 GH = """#!/usr/bin/env python3
-# gh as release.sh calls it: a dispatch recorded with its token, and the run named for it listed (gh having
-# applied the caller's --jq) from the second listing after it, unless the fork says its runs never appear.
+# gh as release.sh calls it: a dispatch recorded with its token, the run named for it listed (gh having applied
+# the caller's --jq) from the second listing after it, unless the fork says its runs never appear, and that run's
+# conclusion success, unless the fork says its stage goes red.
 import json, os, sys
 from pathlib import Path
 state = Path(__file__).with_name("gh.json")
@@ -247,16 +249,25 @@ if sys.argv[1:3] == ["run", "list"] and not os.environ.get("RUNS_NEVER_APPEAR"):
     query = sys.argv[sys.argv.index("--jq") + 1]
     dispatched = [call for call in calls if call[:2] == ["workflow", "run"]]
     listings = sum(call[:2] == ["run", "list"] for call in calls)
-    if dispatched and listings >= 2 and dispatched[-1][-1].removeprefix("token=") in query:
+    token = next(arg for arg in dispatched[-1] if arg.startswith("token=")) if dispatched else ""
+    if dispatched and listings >= 2 and token.removeprefix("token=") in query:
         print(7)
+if sys.argv[1:3] == ["run", "view"]:
+    print(os.environ.get("RUN_ENDED") or ("completed failure" if os.environ.get("STAGE_RED") else "completed success"))
+if sys.argv[1] == "api":
+    if os.environ.get("STAGED"):
+        sys.exit(0)
+    sys.exit(print("gh: Server Error (HTTP 502)" if os.environ.get("LOOKUP_FAILS") else "gh: Not Found (HTTP 404)",
+                   file=sys.stderr) or 1)
 """
 
 
 def isolated(tmp_path) -> dict:
     """An environment whose git reads no configuration but its own and installs no hooks or templates, and
-    finds gh and sleep in tmp_path/bin first."""
+    finds gh and sleep in tmp_path/bin first, then git where this machine has it."""
     (tmp_path / "templates").mkdir()
-    return {"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+    git = Path(shutil.which("git") or "/usr/bin/git").parent
+    return {"PATH": f"{tmp_path / 'bin'}:{git}:/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TEMPLATE_DIR": str(tmp_path / "templates"),
             **{f"GIT_{who}_{what}": value for who in ("AUTHOR", "COMMITTER")
                for what, value in (("NAME", "t"), ("EMAIL", "t@example.com"))}}
@@ -294,12 +305,14 @@ def fork(tmp_path, environment):
 
 
 def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_held(tmp_path):
-    """release.sh pushes the release branch and the stack branch together, the release grown on top of the one
-    before so both move only forward, asks patch-stack.yml to publish and watches the run its dispatch's token
-    names, only once every commit it carries has applied as a family's and the version reads exactly the new
-    release: a cherry-pick that conflicts, a commit of no family, or a stack branch moved off the release it
-    grows from, ends the run with nothing pushed and nothing asked; a dispatched run that never appears ends it
-    within its bound, the branches left at the composed release."""
+    """release.sh pushes the release branch, asks patch-stack.yml to publish from it and watches the run its
+    dispatch's token names, and moves the stack branch forward to it only once that run has passed, the release
+    grown on top of the one before so both move only forward, all only once every commit it carries has applied
+    as a family's and the version reads exactly the new release: a cherry-pick that conflicts, a commit of no
+    family, or a stack branch moved off the release it grows from, ends the run with nothing pushed and nothing
+    asked. A run that goes red or never appears leaves the stack branch where it was, the composition kept by a
+    tag and its release branch removed, so the release is composed again with nothing moved back (2026-11-17:
+    post105's red stage left the stack branch at it, and moving it back rewrote pushed history)."""
     environment = isolated(tmp_path)
     origin, checkout, commits, run = fork(tmp_path, environment)
     (tmp_path / "bin").mkdir()
@@ -335,19 +348,37 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     dispatch, = [call for call in asked if call[:2] == ["workflow", "run"]]
     assert dispatch[:9] == ["workflow", "run", "patch-stack.yml", "-R", "AshishKumar4/jax", "--ref", "dew", "-f",
                             "publish=0.12.0.1"]
-    assert ["run", "watch", "7", "-R", "AshishKumar4/jax", "--exit-status"] in asked
+    assert "from=release/0.12.0.1.post40" in dispatch
+    assert ["run", "watch", "7", "-R", "AshishKumar4/jax"] in asked
     # The stack branch has moved off post39: a release grown from post39 again is refused, unasked.
     before, count = branches(), len(asked)
     assert released("0.12.0.1.post41", commits["fix"]).returncode != 0
     assert branches() == before and len(json.loads(calls.read_text())) == count
-    # A run that never appears: the branches stay at the release they were pushed to, and the script ends.
-    run(origin, "update-ref", "refs/heads/v0.12.0.1-cache-key-pool-fingerprints",
-        run(origin, "rev-parse", "release/0.12.0.1.post39"))
-    lost = released("0.12.0.1.post41", commits["fix"], RUNS_NEVER_APPEAR="1")
-    assert lost.returncode != 0
-    assert run(origin, "rev-parse", "release/0.12.0.1.post41") == run(origin, "rev-parse",
-                                                                     "v0.12.0.1-cache-key-pool-fingerprints")
-    assert not any(call[:2] == ["run", "watch"] for call in json.loads(calls.read_text())[count:])
+    # A red stage, then a run that never appears: the stack branch stays at post40 each time, the composition kept
+    # by a tag and its release branch removed, and post41 is composed again over it, nothing moved back.
+    def again(new, *picked, **extra):
+        return subprocess.run(["bash", str(script), str(checkout), "0.12.0.1.post40", new, f"Release {new}",
+                               *picked], env={**environment, **extra}, capture_output=True, text=True,
+                              check=False)
+
+    # A run whose watch stopped before its end, a red one that staged its wheels first, and a red one whose staging
+    # could not be read (an error other than GitHub's 404): each left as it is,
+    # its release branch kept for the run to go on or be run again, the stack branch where it was.
+    for how in ({"RUN_ENDED": "in_progress "}, {"STAGE_RED": "1", "STAGED": "1"}, {"STAGE_RED": "1", "LOOKUP_FAILS": "1"}):
+        assert again("0.12.0.1.post41", commits["other"], **how).returncode != 0
+        assert run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints") == stack
+        assert "release/0.12.0.1.post41" in branches() and not run(origin, "tag", "--list", "failed/*")
+        run(origin, "update-ref", "-d", "refs/heads/release/0.12.0.1.post41")
+    for how in ({"STAGE_RED": "1"}, {"RUNS_NEVER_APPEAR": "1"}):
+        assert again("0.12.0.1.post41", commits["other"], **how).returncode != 0
+        assert run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints") == stack
+        assert "release/0.12.0.1.post41" not in branches()
+        kept = run(origin, "tag", "--list", "failed/0.12.0.1.post41-*").split()
+        assert kept and all(run(origin, "show", f"{tag}:lax.py") == "two" for tag in kept)
+    assert again("0.12.0.1.post41", commits["other"]).returncode == 0
+    grown = run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints")
+    assert run(origin, "rev-parse", "release/0.12.0.1.post41") == grown
+    assert run(origin, "rev-parse", f"{grown}^^") == stack
 
 
 def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_path, monkeypatch):
@@ -379,6 +410,9 @@ def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_pat
     commit({"jax/version.py": unset.replace("0.12.0", "0.12.1"), "jax/b.py": "b fixed\n"}, "jax 0.12.1: b fixed")
     run("tag", "jax-v0.12.1")
     monkeypatch.chdir(tmp_path)
+    # A committer, as the workflow's runner configures one: a machine with no git identity (an armada vessel) has none.
+    for who, value in (("NAME", "t"), ("EMAIL", "t@t")):
+        monkeypatch.setenv(f"GIT_COMMITTER_{who}", value)
     assert patch_stack.rebase("0.12.0", "0.12.1") == 0
     subjects = run("log", "--format=%s", "jax-v0.12.1..v0.12.1-cache-key-pool-fingerprints").splitlines()
     assert subjects == ["Release 0.12.1.post1: the stack carried from 0.12.0 onto jax-v0.12.1, a commit a family",
