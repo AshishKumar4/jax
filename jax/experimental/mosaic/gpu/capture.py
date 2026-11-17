@@ -27,11 +27,11 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from jax._src import custom_call_targets
 from jax._src import dtypes
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 
-_TARGET = "mosaic_gpu_v2"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,7 +70,7 @@ def kernels(module: ir.Module) -> list[Kernel]:
         for inner in block.operations:
           op = inner.operation
           if (op.name == "stablehlo.custom_call"
-              and ir.StringAttr(op.attributes["call_target_name"]).value == _TARGET):
+              and ir.StringAttr(op.attributes["call_target_name"]).value == custom_call_targets.MOSAIC_GPU):
             config = ir.DictAttr(op.attributes["backend_config"])
             found.append(Kernel(
                 module=ir.StringAttr(config["module"]).value_bytes,
