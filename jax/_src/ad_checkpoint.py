@@ -949,8 +949,11 @@ def _name_lowering(ctx, x, *, name):
   op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attributes)
   return [x]
 
+# Lowered in its caller's function, not a cached one of its own, where its
+# operand would be an argument with no defining op to tag (as
+# `xla_metadata_value_p`'s rule is).
 mlir.register_lowering(
-    name_p, _name_lowering,
+    name_p, _name_lowering, cacheable=False,
     shard_map_collective_rule=lambda *_, **__: None)
 
 def name_batcher(args, dims, *, name):
