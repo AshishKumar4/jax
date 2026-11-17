@@ -332,6 +332,8 @@ def fork(tmp_path, environment):
         run(checkout, "add", "-A")
         run(checkout, "commit", "-qm", name if name == "near" else f"[stack] {name}: {name}")
         commits[name] = run(checkout, "rev-parse", "HEAD")
+        # On the fork, as every commit a release picks is (the runner fetches it there).
+        run(checkout, "push", "-q", "origin", f"{name}:refs/heads/{name}")
     return origin, checkout, commits, run
 
 
@@ -468,7 +470,10 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
     jax = wheel(tmp_path, "jax", "0.12.0.1.post101")
     jaxlib = wheel(tmp_path, "jaxlib", "0.12.0.1.post101")
     unpinned = wheel(tmp_path, "jax_cuda13_plugin", "0.12.0.1.post101")
-    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
     lock = (f"jax[cuda12]==0.12.0.1.post101 ; sys_platform == 'linux' \\\n"
             f"    --hash=sha256:{digest(jax)}\n    # via dewml\n"
             f"jaxlib==0.12.0.1.post101 \\\n    --hash=sha256:{'0' * 64} \\\n    --hash=sha256:{digest(jaxlib)}\n"
