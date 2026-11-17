@@ -50,7 +50,9 @@ def _eval_jaxpr_jvp(prim, primals, tangents, *, call_jaxpr, **params):
 def _eval_jaxpr_batch(prim, axis_data, args, dims, *, call_jaxpr, **params):
   new_jaxpr, out_dims = batching.batch_jaxpr2(call_jaxpr, axis_data, tuple(dims))
   outs = prim.bind(*args, call_jaxpr=new_jaxpr, **params)
-  return outs, list(out_dims)
+  # The body's output axes as batching gave them, a staged custom_jvp output's
+  # marker with them (`batching._BatchDims`), which a shared read refuses.
+  return outs, out_dims
 
 def _eval_jaxpr_linearize(prim, is_vjp, nzs, *primals_in, call_jaxpr, **params):
   primal_jaxpr, out_tree, nzs_out, in_fwd_res, tangent_jaxpr = \
