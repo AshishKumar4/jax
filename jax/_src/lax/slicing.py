@@ -1506,6 +1506,7 @@ slice_p = standard_primitive(_slice_shape_rule, input_dtype, 'slice',
                              vma_rule=partial(core.standard_vma_rule, 'slice'),
                              ur_rule=_slice_ur_rule,
                              layout_rule=_slice_layout_rule)
+slice_p.rearranges = True
 ad.primitive_jvps[slice_p] = _slice_jvp_rule
 ad.fancy_transposes[slice_p] = _slice_transpose_fancy
 batching.primitive_batchers[slice_p] = _slice_batching_rule
@@ -1702,6 +1703,7 @@ dynamic_slice_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'dynamic_slice'),
     ur_rule=_dynamic_slice_ur_rule,
     layout_rule=_dynamic_slice_layout_rule)
+dynamic_slice_p.rearranges = True
 ad.primitive_jvps[dynamic_slice_p] = _dynamic_slice_jvp
 ad.fancy_transposes[dynamic_slice_p] = _dynamic_slice_transpose_fancy
 batching.fancy_primitive_batchers[dynamic_slice_p] = _dynamic_slice_batching_rule
@@ -1871,6 +1873,7 @@ dynamic_update_slice_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'dynamic_update_slice'),
     ur_rule=_dynamic_update_slice_ur_rule,
     layout_rule=_dynamic_update_slice_layout_rule)
+dynamic_update_slice_p.rearranges = True
 ad.primitive_jvps[dynamic_update_slice_p] = _dynamic_update_slice_jvp
 ad.primitive_transposes[dynamic_update_slice_p] = \
     _dynamic_update_slice_transpose_rule
@@ -2503,6 +2506,7 @@ gather_p = standard_primitive(
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_gather_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'gather'),
     ur_rule=_gather_ur_rule)
+gather_p.rearranges = True
 ad.defjvp(gather_p, _gather_jvp_rule, None)
 ad.fancy_transposes[gather_p] = _gather_transpose_fancy
 batching.fancy_primitive_batchers[gather_p] = _gather_batching_rule
