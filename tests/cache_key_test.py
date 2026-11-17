@@ -16,6 +16,8 @@ import hashlib
 import os
 import re
 import sys
+import io
+import types
 import unittest
 from typing import cast as type_cast
 
@@ -26,11 +28,13 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pl_triton
 from jax._src import cache_key
 from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
+from jax._src.interpreters import mlir
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.mesh import Mesh
@@ -267,22 +271,30 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(include_metadata, key1 != key2)
 
   @parameterized.parameters([False, True])
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="The Pallas Triton backend is deprecated")
   def test_identical_pallas_kernels_different_metadata(self, include_metadata):
-    if not jtu.test_device_matches(["tpu"]):
-      self.skipTest("Pallas TPU lowering requires TPU backend")
+    if jtu.test_device_matches(["tpu"]):
+      compiler_params = None
+    elif jtu.test_device_matches(["cuda"]):
+      compiler_params = pl_triton.CompilerParams()
+    else:
+      self.skipTest("Pallas lowers its kernels for TPU and CUDA")
 
     # Same kernel body at different source lines; same __name__ to avoid kernel_name diff
     def make_caller_a():
       def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
       return jax.jit(lambda x: pl.pallas_call(
-          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          compiler_params=compiler_params)(x))
 
     def make_caller_b():
       def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
       return jax.jit(lambda x: pl.pallas_call(
-          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          compiler_params=compiler_params)(x))
 
     x = np.ones((128,), dtype=np.float32)
     computation1 = make_caller_a().lower(x).compiler_ir()
@@ -296,6 +308,87 @@ class CacheKeyTest(jtu.JaxTestCase):
       key1 = cache_key.get(computation1, devices, compile_options, backend)
       key2 = cache_key.get(computation2, devices, compile_options, backend)
     self.assertEqual(include_metadata, key1 != key2)
+
+  @parameterized.parameters(("mosaic_gpu_v2", "module", "kernel_hash"),
+                            ("__gpu$xla.gpu.triton", "ir", None))
+  def test_identical_gpu_kernels_from_two_checkouts_key_alike(
+      self, target, field, digest):
+    # A Mosaic GPU or Pallas Triton kernel's module is serialized into its
+    # custom call with its source locations, and a Mosaic GPU kernel's
+    # kernel_hash is that serialization's digest: the same kernel compiled
+    # from two checkouts must key alike.
+    def program(path):
+      with mlir.make_ir_context() as ctx, ir.Location.unknown():
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  func.func @kernel() {\n"
+            f'    return loc("{path}/src/kernels.py":3:5)\n'
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        body = out.getvalue()
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            f"    %0 = stablehlo.custom_call @{target}(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        config = {field: ir.StringAttr.get(body)}
+        if digest is not None:
+          config[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(config)
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+
+  def test_triton_kernels_differing_in_a_property_key_apart(self):
+    # Pallas Triton writes its kernels at the default bytecode version, which
+    # keeps an operation's properties (a transpose's order) in a form only
+    # Triton's dialect reads: the key reads them through it, so kernels that
+    # differ only in one key apart, and one kernel from two checkouts alike.
+    try:
+      from jax._src.lib.triton import dialect as tt_dialect  # pytype: disable=import-error
+    except ImportError:
+      self.skipTest("this jaxlib has no Triton dialect")
+
+    def program(order, path):
+      with ir.Context() as kernel_ctx, ir.Location.unknown():
+        tt_dialect.register_dialect(kernel_ctx)
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  tt.func @kernel(%arg0: tensor<4x4x4xf32>) -> tensor<4x4x4xf32> {\n"
+            f"    %0 = tt.trans %arg0 {{order = array<i32: {order}>}} : "
+            "tensor<4x4x4xf32> -> tensor<4x4x4xf32> "
+            f'loc("{path}/src/kernels.py":3:5)\n'
+            "    tt.return %0 : tensor<4x4x4xf32>\n"
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out)
+        body = out.getvalue()
+      with mlir.make_ir_context(), ir.Location.unknown():
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(
+            {"ir": ir.StringAttr.get(body)})
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("1, 0, 2", "/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+    self.assertNotEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                        program("2, 1, 0", "/home/ubuntu/s/trees/caea5dc4fa46-1"))
 
   @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_xla_flags(self):
