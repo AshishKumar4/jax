@@ -16,8 +16,12 @@ import dataclasses
 import functools
 import threading
 import math
+import subprocess
+import sys
+import textwrap
 from typing import Any
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax._src import test_util as jtu
 from jax._src.pallas import mpmd
@@ -38,6 +42,84 @@ def _maybe_reverse(arg: tuple[Any], reverse: bool) -> tuple[Any]:
     return tuple(reversed(arg))
   else:
     return arg
+
+
+class InterpretExecutionGateTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      ("single_execution", False), ("overlapping_executions", True)
+  )
+  def test_two_device_execution_can_finish(self, overlap):
+    # Exercise the actual host callbacks in a child: a broken admission gate
+    # leaves A0 in cleanup and A1 in initialization indefinitely.
+    program = textwrap.dedent("""
+        import sys
+        import threading
+        import numpy as np
+        from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks as cb
+        from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
+
+        overlap = bool(int(sys.argv[1]))
+        params = InterpretGPUParams()
+        token = np.int32(0)
+        errors = []
+        b_entered = threading.Event()
+        b_admitted = threading.Event()
+        a_done = threading.Event()
+
+        def initialize(threads):
+          return cb._initialize_shared_memory(
+              token=token, num_gpus=np.int32(2),
+              num_threads_per_block=np.int32(threads),
+              num_blocks_per_cluster=np.int32(1), interpret_params=params)
+
+        def run(fn):
+          def guarded():
+            try:
+              fn()
+            except BaseException as e:
+              errors.append(e)
+          thread = threading.Thread(target=guarded, daemon=True)
+          thread.start()
+          return thread
+
+        # A0 is the first device of execution A (one warpgroup per block).
+        initialize(1)
+
+        def b0():
+          # B is a distinct execution (two warpgroups per block). Its first
+          # device attempts admission before A's second device.
+          b_entered.set()
+          initialize(2)
+          b_admitted.set()
+          a_done.wait()
+
+        if overlap:
+          run(b0)
+          assert b_entered.wait(2)
+          # Give the gate an opportunity to admit or park B0.
+          b_admitted.wait(0.25)
+
+        a0 = run(lambda: cb._clean_up_shared_memory(token))
+
+        def a1():
+          initialize(1)
+          cb._clean_up_shared_memory(token)
+
+        second = run(a1)
+        a0.join(2)
+        second.join(0.1)
+        assert not errors, errors
+        assert not a0.is_alive() and not second.is_alive(), (
+            "A0 waits at its two-device cleanup barrier while A1 is blocked "
+            "in initialization; B0 was admitted=" + str(b_admitted.is_set()))
+        a_done.set()
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(int(overlap))],
+        capture_output=True, text=True, timeout=20,
+    )
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 # TODO(nrink): Figure out how to safely run different instance of GPU

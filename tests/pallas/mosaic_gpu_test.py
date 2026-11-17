@@ -170,6 +170,44 @@ def run_on_sm80(method):
 class PipelineAllocationsTest(jtu.JaxTestCase):
   """A pipeline's scoped buffers stated before it runs (`get_allocations`)."""
 
+  @parameterized.parameters("8.0", "9.0")
+  def test_collective_pipeline_declares_its_meeting_barriers(self, capability):
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", num_cores=None, platform="cuda",
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    refs = [jax.ShapeDtypeStruct((256, 32), jnp.float16)]
+    declared, scoped = [], []
+
+    def capture_scope(body, **allocations):
+      del body
+      allocations.pop("collective_axes")
+      scoped.append(allocations)
+
+    def trace():
+      pipeline = plgpu.emit_pipeline(
+          lambda *_: None,
+          grid=(4,),
+          in_specs=[plgpu.BlockSpec((64, 32), lambda i: (i, 0))],
+          max_concurrent_steps=2,
+          thread_axis="threads",
+      )
+      declared.append(pipeline.get_allocations(*refs))
+      pipeline(*refs)
+
+    with (
+        jax.sharding.use_abstract_mesh(mesh),
+        jax_core.extend_axis_env_nd([("threads", 2)]),
+        mock.patch.object(pl, "run_scoped", capture_scope),
+    ):
+      jax.make_jaxpr(trace)()
+    [actual] = scoped
+    [allocation] = declared
+    self.assertEqual(actual["meet_ref"].num_barriers, 2)
+    self.assertEqual(actual["meet_ref"].num_arrivals, 2)
+    self.assertEqual(allocation.get("meet_ref"), actual["meet_ref"])
+
   @parameterized.parameters(("8.0", None, 3), ("9.0", None, 3), ("9.0", 2, 2))
   def test_emit_pipeline_states_its_scoped_allocations(
       self, capability, steps, slots
@@ -212,6 +250,39 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
     )
     self.assertEqual(allocations["out_smem_refs"], [])
     self.assertEqual(allocations["barrier_ref"] is None, capability == "8.0")
+
+
+class CtaBarrierLoweringTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      ("arrive", plgpu.barrier_arrive),
+      ("arrive_and_wait", plgpu.barrier_arrive_and_wait),
+  )
+  def test_conditional_warp_cannot_arrive_on_cta_barrier(self, arrive):
+    # Lower for an abstract GPU on CPU; never execute the unsafe barrier.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[plgpu.CtaBarrier(num_arrivals=1)],
+    )
+    def kernel(o_ref, barrier):
+      @plgpu.warp_map
+      def _(warp):
+        @pl.when(warp == 0)
+        def _():
+          arrive(barrier)
+      o_ref[...] = jnp.ones_like(o_ref)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA H100 80GB HBM3", platform="gpu", num_cores=132,
+        compute_capability="9.0",
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      with self.assertRaisesRegex(
+          NotImplementedError,
+          "Arriving on a CTA barrier is not supported in a warp context",
+      ):
+        jax.jit(kernel).trace().lower(lowering_platforms=("cuda",))
 
 
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
