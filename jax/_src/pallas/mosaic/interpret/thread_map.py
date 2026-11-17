@@ -13,15 +13,59 @@
 # limitations under the License.
 
 from concurrent import futures
+import contextlib
 import functools
+import threading
 
 import jax
 from jax._src import callback
+from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
+import numpy as np
+
 
 TOP_LEVEL_TOKEN_VALUE = 42
 NESTED_TOKEN_VALUE = 1337
+
+
+# The executions a CPU client's device holds in flight at once
+# (cpu_client.h's LocalDeviceState, max_inflight_computations default): a
+# leased client runs this many threads on each of its devices.
+_THREADS_PER_DEVICE = 32
+
+_free_clients: list[xla_client.Client] = []
+_clients_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _leased_devices(num_threads: int):
+  """The devices of a CPU client of the interpreter's own, held by this thread
+  map alone: one for every `_THREADS_PER_DEVICE` of its `num_threads` threads.
+
+  A thread map runs inside a host callback of the computation that calls it,
+  and runs its threads' programs from threads of its own: off the callback's
+  thread, each execution takes a unit of its client's in-flight semaphore,
+  which the callback's thread alone is exempt from (cpu_client.cc's
+  ThisThreadIsInsideHostCallback). On the caller's client, computations queued
+  behind the one running the callback can hold every unit, so the threads'
+  programs wait for units that free only when the callback returns: a
+  deadlock. On a client no other computation uses, the thread map's own
+  executions are all that hold its units, at most `_THREADS_PER_DEVICE` on each
+  of its devices (a cluster of blocks maps 36 threads, a test's six blocks of
+  six)."""
+  devices = -(-num_threads // _THREADS_PER_DEVICE)
+  with _clients_lock:
+    fitting = [i for i, held in enumerate(_free_clients)
+               if len(held.local_devices()) >= devices]
+    client = _free_clients.pop(fitting[0]) if fitting else None
+  if client is None:
+    client = xla_client.make_cpu_client(asynchronous=False, num_devices=devices)
+  try:
+    yield client.local_devices()[:devices]
+  finally:
+    with _clients_lock:
+      _free_clients.append(client)
 
 
 # top-level function so that caching works properly
@@ -50,21 +94,27 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
   threads = []
-  with futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-    # The constants and inputs go to the device once, on a worker as each
-    # thread's run would put them, and every thread reads those arrays rather
-    # than transferring them again (about 15% of an interpreted kernel's time
-    # in one measured test).
-    consts, invals = executor.submit(jax.device_put, (consts, invals)).result()
+  with _leased_devices(num_threads) as devices, futures.ThreadPoolExecutor(
+      max_workers=num_threads
+  ) as executor:
+    # The constants and inputs go to each leased device once, and every thread
+    # there reads those arrays rather than transferring them again (about 15%
+    # of an interpreted kernel's time in one measured test).
+    placed = [jax.device_put((consts, invals), d) for d in devices]
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
       #   - prepend the thread ID onto the `invals`; and
       #   - flatten the arguments that are to be passed through to the
       #     evaluation of `jaxpr`.
-      args = (jnp.int32(i), *invals)
+      # The thread ID is placed there too: a body with no other operand runs
+      # where its arguments are committed, which would otherwise be nowhere.
+      device = i // _THREADS_PER_DEVICE
+      thread_consts, thread_invals = placed[device]
+      args = (jax.device_put(np.int32(i), devices[device]), *thread_invals)
       flat_args, _ = jax.tree.flatten(args)
-      threads.append(executor.submit(_run_jaxpr, jaxpr, consts, *flat_args))
+      threads.append(
+          executor.submit(_run_jaxpr, jaxpr, thread_consts, *flat_args))
     exceptions = []
     for i in range(num_threads):
       try:
