@@ -561,21 +561,17 @@ class TiledLayout:
     )
     dims_strides = utils.get_contiguous_strides(dims_shape)
     if isinstance(idx, int):
-      dims_indices = tuple(
-          idx // stride % size for stride, size in zip(dims_strides, dims_shape)
-      )
-      full_indices = [0] * len(tiled_shape)
-    else:
-      i32 = ir.IntegerType.get_signless(32)
-      dims_indices = tuple(
-          arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
-          for stride, size in zip(dims_strides, dims_shape)
-      )
-      full_indices = [arith.constant(i32, 0)] * len(tiled_shape)
-    for d, i in zip(dims, dims_indices):
+      ints = [0] * len(tiled_shape)
+      for d, stride, size in zip(dims, dims_strides, dims_shape):
+        if isinstance(d, int):
+          ints[d] = idx // stride % size
+      return tuple(ints)
+    i32 = ir.IntegerType.get_signless(32)
+    values = [arith.constant(i32, 0)] * len(tiled_shape)
+    for d, stride, size in zip(dims, dims_strides, dims_shape):
       if isinstance(d, int):
-        full_indices[d] = i
-    return tuple(full_indices)
+        values[d] = arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
+    return tuple(values)
 
   def lane_indices(self, lane_idx: ir.Value | None = None) -> tuple[ir.Value, ...]:
     i32 = ir.IntegerType.get_signless(32)

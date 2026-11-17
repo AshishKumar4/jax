@@ -1962,7 +1962,7 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
     acc_range = self.acc_access
     acc_dtype = shared_memory.buffer_shape_and_dtype(self.acc_key).dtype
 
-    if self.a_scale_key is not None:
+    if self.a_scale_key is not None and self.b_scale_key is not None:
       # A block-scaled MMA: each operand's values times their blocks' scales
       # (`a_scale` one row of K scales for each of a's M rows, `b_scale` one for
       # each of b's N columns), multiplied exactly in float32.

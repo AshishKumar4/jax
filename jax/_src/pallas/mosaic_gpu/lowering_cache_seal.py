@@ -297,8 +297,11 @@ class Seal:
     if memo is not None and memo[0] is code:
       return memo[1]
     relative = self.relative(code.co_filename)
-    source = None if relative is not None else self.source(code.co_filename)
-    if relative is None and source is None:
+    if relative is not None:
+      where = relative.encode()
+    elif (source := self.source(code.co_filename)) is not None:
+      where = self.source_identity(source[0]) + source[1].encode()
+    else:
       raise NotSealed(
           f"{code.co_qualname} is defined in {code.co_filename}, which the"
           " sealed installation does not hold"
@@ -316,8 +319,6 @@ class Seal:
         code.co_exceptiontable,
         self._constant(code.co_consts),
     ))
-    where = (relative.encode() if source is None else
-             self.source_identity(source[0]) + source[1].encode())
     identity = _framed(
         where, str(code.co_firstlineno).encode(), code.co_name.encode(),
         body.digest(),

@@ -806,7 +806,8 @@ if sys.version_info >= (3, 12):
 
   ArrayImpl.__buffer__ = _guarded_buffer
 
-_cpp_replace_with = ArrayImpl._replace_with
+# The C++ ArrayImpl's own (py_array.cc), which the Python class does not declare.
+_cpp_replace_with = xc.ArrayImpl._replace_with
 
 
 def _replace_with(self, other):

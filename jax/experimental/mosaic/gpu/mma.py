@@ -162,6 +162,7 @@ def _rounded_to_tf32(x: fa.FragmentedArray) -> fa.FragmentedArray:
           i32, [element], "cvt.rna.tf32.f32 $0, $1;", "=r,f",
           has_side_effects=False,
       )
+      assert isinstance(bits, ir.Value)
       out = llvm.insertelement(out, utils.bitcast(bits, f32),
                                position=utils.c(i, i32))
     return out

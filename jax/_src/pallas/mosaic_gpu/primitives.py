@@ -4652,16 +4652,16 @@ def _async_load_tmem_lowering_rule_wg(
         reduce_attr = mgpu.dialect.TMEMLoadReduction.AbsMax  # pyrefly: ignore[missing-attribute]
       case _:
         raise ValueError(f"Unsupported load reduce operation: {orig_reduce}")
-    results = mgpu.dialect.async_load_tmem(x_tmem, reduce=reduce_attr)  # type: ignore
+    load = mgpu.dialect.AsyncLoadTmemOp(x_tmem, reduce=reduce_attr)
   else:
-    results = [mgpu.dialect.async_load_tmem(x_tmem)]
+    load = mgpu.dialect.AsyncLoadTmemOp(x_tmem)
   if max_registers != 32:
     # A discardable attribute, which the op's lowering reads (no field of the
     # dialect's own).
-    results[0].owner.attributes["max_registers"] = ir.IntegerAttr.get(
+    load.operation.attributes["max_registers"] = ir.IntegerAttr.get(
         ir.IntegerType.get_signless(32), max_registers
     )
-  return tuple(results)
+  return tuple(load.results)
 
 
 wait_load_tmem_p = jax_core.Primitive("wait_load_tmem")

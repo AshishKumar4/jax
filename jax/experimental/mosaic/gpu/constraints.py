@@ -32,7 +32,7 @@ from . import dialect_lowering as lowering
 from . import fragmented_array as fa
 from . import launch_context as lc
 from . import layouts as layouts_lib
-from . import mma
+from .mma import can_relayout_acc_to_lhs
 from . import tcgen05
 from . import utils
 
@@ -516,7 +516,7 @@ def _is_supported_tiled_relayout(
       src.vector_length
   ) and dst == fa.tmem_native_layout(dst.vector_length):
     return True
-  return mma.can_relayout_acc_to_lhs(src, dst, bitwidth)
+  return can_relayout_acc_to_lhs(src, dst, bitwidth)
 
 
 @dataclasses.dataclass(frozen=True)

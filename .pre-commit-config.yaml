@@ -52,10 +52,13 @@ repos:
         - opt-einsum~=3.4.0
         - tensorstore
         - scipy-stubs
-        - --pre
-        - --extra-index-url
-        - https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
-        - jaxlib
+        # The line's own jaxlib release, as upstream pinned it (ac5ac69d81): the
+        # nightly's bindings are a later jaxlib's, which this line's code does
+        # not target.
+        - jaxlib==0.12.0.1
+        # hlo_reader and mosaic_gpu_records read XLA's and Mosaic GPU's protos
+        # with it.
+        - protobuf==6.33.6
 
 - repo: https://github.com/mwouts/jupytext
   rev: 8ed836db64ad5d304f2315e6bfd9049c9142e190  # frozen: v1.16.4
