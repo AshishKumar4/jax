@@ -211,6 +211,17 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
   def test_a_primitive_states_the_class_its_batching_rule_serves(self):
     x = jnp.arange(12.0).reshape(3, 4)
     key = jax.random.key(0)
+
+    def primitives(program):
+      found = set()
+      def walk(jaxpr):
+        for e in jaxpr.eqns:
+          found.add(e.primitive)
+          for inner in core.jaxprs_in_params(e.params):
+            walk(inner)
+      walk(jax.make_jaxpr(program)().jaxpr)
+      return found
+
     programs = {
         "positionwise": [lambda: jnp.sin(x), lambda: x + x, lambda: jax.random.split(key),
                          lambda: jax.random.bits(key, (4,)), lambda: jax.lax.bitcast_convert_type(x, jnp.int32)],
@@ -222,18 +233,18 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
     classes = tuple(programs)
     for fact, made in programs.items():
       for program in made:
-        primitives = {e.primitive for e in jax.make_jaxpr(program)().eqns}
-        stated = [p for p in primitives if getattr(p, fact)]
-        with self.subTest(fact=fact, primitives=sorted(p.name for p in primitives)):
+        found = primitives(program)
+        stated = [p for p in found if getattr(p, fact)]
+        with self.subTest(fact=fact, primitives=sorted(p.name for p in found)):
           self.assertTrue(stated)
           # Each class is its rule's alone: no primitive states two.
           for primitive in stated:
             self.assertEqual([c for c in classes if getattr(primitive, c)], [fact])
-    # A primitive whose batching rule is its own states none of them (a dot, a gather).
-    for program in (lambda: x @ x.T, lambda: x[jnp.array([0, 2])]):
-      for e in jax.make_jaxpr(program)().eqns:
-        with self.subTest(primitive=e.primitive.name):
-          self.assertFalse(any(getattr(e.primitive, c) for c in classes))
+    # A primitive whose batching rule is its own states none of them: a dot, a gather.
+    for program, name in ((lambda: x @ x.T, "dot_general"), (lambda: x[jnp.array([0, 2])], "gather")):
+      (primitive,) = [p for p in primitives(program) if p.name == name]
+      with self.subTest(primitive=name):
+        self.assertFalse(any(getattr(primitive, c) for c in classes))
 
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
     jaxpr = jax.make_jaxpr(lambda x: jax.lax.fori_loop(0, 3, lambda _, y: y * 2, x))(1.0)
