@@ -1012,16 +1012,15 @@ def lower_jaxpr_to_module(
       auto_barriers=not params.unsafe_no_auto_barriers,
   )
 
-  dump_options = mgpu.dialect.get_or_set_dump_options(module)
-  if dump_options.resources:
-    if prof_spec is not None:
-      smem_scratch_bytes = rs.smem_scratch_bytes + prof_spec.smem_bytes(block)
-      rs = dataclasses.replace(rs, smem_scratch_bytes=smem_scratch_bytes)
-    # Dumped with the kernel's hash once the module is lowered to its custom
-    # call (`mosaic_gpu.core`), which names the estimate's kernel.
-    module.operation.attributes[mgpu_core.RESOURCES_ATTR] = ir.StringAttr.get(
-        str(rs)
-    )
+  if prof_spec is not None:
+    smem_scratch_bytes = rs.smem_scratch_bytes + prof_spec.smem_bytes(block)
+    rs = dataclasses.replace(rs, smem_scratch_bytes=smem_scratch_bytes)
+  # Carried by every module, a cached lowering's as a fresh one's, and dumped
+  # with the kernel's hash once the module is lowered to its custom call
+  # (`mosaic_gpu.core`) where MOSAIC_GPU_DUMP_RESOURCES asks.
+  module.operation.attributes[mgpu_core.RESOURCES_ATTR] = ir.StringAttr.get(
+      str(rs)
+  )
 
   return LoweringResult(
       module,
