@@ -86,8 +86,8 @@ jobs:
                              --bazel_options=--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc//:cc-toolchain-x64_windows-clang-cl
                              --bazel_options=--extra_execution_platforms=//jax/tools/toolchains:x64_windows-clang-cl
                              --bazel_options=--copt=-Werror=mismatched-tags
-                             --bazel_options=--copt=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
-                             --bazel_options=--host_copt=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+                             --bazel_options=--copt=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+                             --bazel_options=--host_copt=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
                              --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
                      # Upstream's Windows toolchain's LLVM, 19.1.7 (XLA's tools/toolchains/win2022/t20260812,
