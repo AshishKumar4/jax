@@ -8802,7 +8802,6 @@ clamp_p = standard_primitive(_clamp_shape_rule, _clamp_dtype_rule, 'clamp',
                              sharding_rule=_clamp_sharding_rule,
                              vma_rule=partial(core.standard_vma_rule, 'clamp'),
                              layout_rule=_clamp_layout_rule)
-                             vma_rule=partial(core.standard_vma_rule, 'clamp'))
 clamp_p.elementwise = True
 ad.defjvp(clamp_p,
           lambda g, min, operand, max:
@@ -10325,7 +10324,6 @@ select_n_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'select_n'),
     ur_rule=_select_ur_rule,
     layout_rule=_select_layout_rule)
-    ur_rule=_select_ur_rule)
 select_n_p.elementwise = True
 select_n_p.rearranges = True
 ad.primitive_jvps[select_n_p] = _select_jvp
@@ -11067,7 +11065,6 @@ reduce_precision_p = standard_primitive(
     ur_rule=_reduce_precision_ur_rule,
     memory_space_rule=_reduce_precision_memory_space_rule,
     layout_rule=_reduce_precision_layout_rule)
-    memory_space_rule=_reduce_precision_memory_space_rule)
 reduce_precision_p.elementwise = True
 ad.deflinear(reduce_precision_p, lambda t, **kwargs: [reduce_precision_p.bind(t, **kwargs)])
 batching.defvectorized(reduce_precision_p)
