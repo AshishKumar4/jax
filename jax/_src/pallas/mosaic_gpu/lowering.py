@@ -2712,10 +2712,12 @@ def _neg_lowering_rule_wg(ctx: LoweringRuleContext, x):
 
 mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS].update({
     lax.neg_p: _neg_lowering_rule_wg,
+    # A boolean's complement is its xor with true: through ~int(x), -1 or -2,
+    # it is nonzero either way, and converted back to a boolean it is true.
     lax.not_p: _lower_fun(
-        lambda x: jnp.astype(
-            jnp.bitwise_xor(jnp.astype(x, int), -1), jnp.dtype(x)
-        )
+        lambda x: jnp.bitwise_xor(x, True)
+        if jnp.dtype(x) == jnp.bool_
+        else jnp.astype(jnp.bitwise_xor(jnp.astype(x, int), -1), jnp.dtype(x))
     ),
 })
 
