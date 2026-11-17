@@ -83,7 +83,7 @@ DTYPE_LIST = [jnp.float32, jnp.float16, jnp.bfloat16,
 
 class TritonSliceBoundaryTest(jtu.JaxTestCase):
 
-  @parameterized.parameters((1, 16), (16, 1))
+  @parameterized.parameters(((1, 16),), ((16, 1),))
   def test_full_slice_of_an_already_unit_axis_lowers(self, shape):
     def kernel(x_ref, out_ref):
       out_ref[...] = lax.slice(x_ref[...], (0, 0), shape)

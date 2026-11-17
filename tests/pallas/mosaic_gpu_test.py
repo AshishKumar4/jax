@@ -176,9 +176,7 @@ class BoundedAccuracyBoundaryTest(jtu.JaxTestCase):
           x_ref[...], accuracy=lax.Tolerance(atol=1e-3))
 
     descriptor = jax.ShapeDtypeStruct((128,), jnp.float32)
-    call = pl.pallas_call(
-        kernel, out_shape=descriptor, grid=(1,),
-        compiler_params=plgpu.CompilerParams())
+    call = _kernel(kernel, out_type=descriptor, num_threads=1, thread_name="wg")
     device = jax.sharding.AbstractDevice(
         device_kind="GPU", platform="cuda", num_cores=None,
         compute_capability="9.0")

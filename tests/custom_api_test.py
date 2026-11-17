@@ -306,8 +306,9 @@ class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
         jax.vmap(f, in_axes=(None, 0), out_axes=None,
                  sum_match=sum_match)(x, ignored), 3.)
     with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
-      jax.vmap(staged, in_axes=(None, 0), out_axes=None,
-               sum_match=sum_match)(x, ignored)
+      result = jax.vmap(staged, in_axes=(None, 0), out_axes=None,
+                        sum_match=sum_match)(x, ignored)
+      self.assertAllClose(result, 3.)
 
   @parameterized.parameters("eval_jaxpr", "registered_call", "cond", "scan",
                             "while_loop")

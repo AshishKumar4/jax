@@ -432,7 +432,8 @@ class X64ContextTests(jtu.JaxTestCase):
       y = jnp.array([[5. - 6.j], [7. + 8.j]], dtype=jnp.complex128)
       jaxpr = jax.make_jaxpr(wide)(x, y)
       expected = np.asarray(x) @ np.asarray(y)
-    with jax.enable_x64(False):
+    with jax.enable_x64(False), warnings.catch_warnings():
+      warnings.simplefilter("ignore", UserWarning)
       [result] = jax.jit(core.jaxpr_as_fun(jaxpr))(x, y)
     self.assertEqual(result.dtype, np.complex128)
     np.testing.assert_allclose(result, expected, rtol=1e-12)
