@@ -23,6 +23,7 @@ children; the helpers below read and damage the cache's entries.
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -37,7 +38,9 @@ from absl.testing import absltest
 
 SUPPORT = pathlib.Path(__file__).resolve().parent
 TESTS_PALLAS = SUPPORT.parent
-ROOT = SUPPORT.parents[2]
+# The jax under test, where this process finds it: the checkout's, or the installed wheel's where its tests run
+# apart from the checkout (the fork's dew/test_wheel.sh).
+JAX = pathlib.Path(importlib.util.find_spec("jax").origin).parent
 VERSION = "0.12.0.1.post51"
 RESULT = "RESULT "
 SM90 = "9.0"
@@ -94,7 +97,7 @@ def make_site(dest: pathlib.Path, *, with_record: bool = True) -> None:
   """A site directory holding the jax under test, with a RECORD made for it, and a
   user's package installed beside it (`user_layouts`)."""
   shutil.copytree(
-      ROOT / "jax", dest / "jax",
+      JAX, dest / "jax",
       ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
   for source, name in _SITE_MODULES.items():
     shutil.copyfile(SUPPORT / source, dest / name)
@@ -166,6 +169,9 @@ class LoweringCacheTestCase(absltest.TestCase):
     cls._site = cls._site_root / "site"
     cls._site.mkdir()
     make_site(cls._site)
+    # The jax under test with no dist-info beside it, ahead of any installed one: as a source tree is.
+    cls._overlay = cls._site_root / "overlay"
+    shutil.copytree(JAX, cls._overlay / "jax", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
   @classmethod
   def tearDownClass(cls):
@@ -186,16 +192,14 @@ class LoweringCacheTestCase(absltest.TestCase):
     """Starts a case in a fresh process.
 
     `site` is "sealed" (the test's own site directory, whose RECORD is made for
-    it), "overlay" (the jax under test, which no RECORD lists), or a path.
+    it), "overlay" (a copy of the jax under test, which no RECORD lists), or a
+    path.
     """
-    sealed = site == "sealed"
-    site_dir = self._site if sealed else (None if site == "overlay" else site)
-    if site_dir is not None and not isinstance(site_dir, pathlib.Path):
-      site_dir = pathlib.Path(site_dir)
+    site_dir = pathlib.Path({"sealed": self._site, "overlay": self._overlay}.get(site, site))
     spec = {
         "capability": SM90, "size": 256, "power": 2, "scale": 2.0, "pad": 0,
         "workdir": str(self.tmp / "work"),
-        "site": str(site_dir) if site_dir is not None else None,
+        "site": str(site_dir),
     }
     spec.update(case)
     child_env = {
@@ -204,7 +208,7 @@ class LoweringCacheTestCase(absltest.TestCase):
     }
     child_env.update(
         PYTHONPATH=os.pathsep.join(
-            [str(site_dir if site_dir is not None else ROOT), str(TESTS_PALLAS)]),
+            [str(site_dir), str(TESTS_PALLAS)]),
         JAX_PLATFORMS="cpu",
         LOWERING_CACHE_CASE=json.dumps(spec),
     )
