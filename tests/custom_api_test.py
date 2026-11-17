@@ -286,6 +286,35 @@ class CustomJVPStagedBatchingTest(jtu.JaxTestCase):
     self.assertAllClose(api.grad(lambda x: jax.vmap(
         lambda _: staged(x, jnp.float32(2)), out_axes=None)(ignored))(x), 3.)
 
+  @parameterized.named_parameters(
+      ("shared_control", False, False), ("sum_control", True, False),
+      ("shared_shard_map", False, True), ("sum_shard_map", True, True))
+  def test_staged_shared_output_refused_through_shard_map(
+      self, sum_match, through_shard_map):
+    @jax.custom_jvp
+    def f(x, ignored):
+      return 3 * x
+
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      return 3 * primals[0], 3 * tangents[0]
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("device",))
+    spec = jax.sharding.PartitionSpec()
+    staged = jax.jit(f)
+    if through_shard_map:
+      staged = jax.shard_map(
+          staged, mesh=mesh, in_specs=(spec, spec), out_specs=spec,
+          check_vma=False)
+    x, ignored = jnp.float32(1), jnp.array([2., 6.])
+    self.assertAllClose(
+        jax.vmap(f, in_axes=(None, 0), out_axes=None,
+                 sum_match=sum_match)(x, ignored), 3.)
+    with self.assertRaisesRegex(ValueError, "custom_jvp 'f'.*staged application"):
+      result = jax.vmap(staged, in_axes=(None, 0), out_axes=None,
+                        sum_match=sum_match)(x, ignored)
+      self.assertAllClose(result, 3.)
+
   @parameterized.parameters("eval_jaxpr", "registered_call", "cond", "scan",
                             "while_loop")
   def test_staged_shared_output_refused_through_a_call_primitive(self, through):
