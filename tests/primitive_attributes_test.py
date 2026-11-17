@@ -262,6 +262,9 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         lambda: x[:, jnp.array([2, 0])], lambda: jnp.concatenate([x, x], 1),
         lambda: jax.lax.pad(x, np.float32(-7.0), [(1, 0, 0), (0, 1, 1), (0, 0, 0)]),
         lambda: jax.lax.split(x, (2, 2), 2)[1],
+        lambda: jax.lax.stack([x, x], 1), lambda: jax.lax.unstack(x, 2)[1],
+        lambda: jnp.where(x > 20.0, x, jnp.flip(x, 2)), lambda: jnp.array(x, copy=True),
+        lambda: jnp.sort(jnp.flip(x, 2), axis=2),
     ]
     allowed = set(np.asarray(x).ravel().tolist()) | {-7.0}
 
@@ -284,11 +287,15 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         seen |= set(rearranging)
     self.assertEqual({p.name for p in seen},
                      {"reshape", "squeeze", "broadcast_in_dim", "transpose", "rev", "slice", "dynamic_slice",
-                      "dynamic_update_slice", "gather", "concatenate", "pad", "split"})
-    # Arithmetic and rounding are not rearrangements: an add, a convert, a dot.
-    for program in (lambda: x + 1, lambda: x.astype(jnp.bfloat16), lambda: x.reshape(6, 4) @ x.reshape(4, 6)):
+                      "dynamic_update_slice", "gather", "concatenate", "pad", "split", "stack", "unstack",
+                      "select_n", "copy", "sort"})
+    # Arithmetic and rounding are not rearrangements: an add, a convert, a dot,
+    # an iota (its entries computed from their indices, rounded past a float's
+    # mantissa: 2^24 + 1 is no float32).
+    for program in (lambda: x + 1, lambda: x.astype(jnp.bfloat16), lambda: x.reshape(6, 4) @ x.reshape(4, 6),
+                    lambda: jax.lax.iota(jnp.float32, 4)):
       for primitive in primitives(program):
-        if primitive.name in ("add", "convert_element_type", "dot_general"):
+        if primitive.name in ("add", "convert_element_type", "dot_general", "iota"):
           self.assertFalse(primitive.rearranges, primitive.name)
 
   def test_a_loop_or_branch_is_not_an_inlined_call(self):
