@@ -38,6 +38,7 @@ from jax._src.sharding_impls import (
 from jax._src.sharding_impls import make_single_device_sharding
 from jax._src.xla_metadata import set_xla_metadata
 from jax._src.shard_map import shard_map
+from jax.experimental import io_callback
 from jax.experimental.compute_on import compute_on
 import jax.numpy as jnp
 import numpy as np
@@ -183,6 +184,21 @@ class ShardingMemoriesTest(jtu.JaxTestCase):
     cycle.append(cycle)
     del mem, cycle
     gc.collect()
+
+
+class OrderedEffectMemoriesTest(jtu.JaxTestCase):
+
+  def test_an_ordered_effect_beside_an_output_in_host_memory_lowers(self):
+    # The effect's token is a result of the lowered function beside the
+    # output, whose memory kind the jaxpr's transfer states.
+    @jax.jit
+    def f(x):
+      io_callback(lambda: None, None, ordered=True)
+      return jax.device_put(x * 2, jax.memory.Space.Host)
+
+    out = f(jnp.arange(4.0))
+    self.assertArraysEqual(out, jnp.arange(4.0) * 2)
+    self.assertEqual(out.sharding.memory_kind, "pinned_host")
 
 
 class DevicePutTest(jtu.JaxTestCase):
