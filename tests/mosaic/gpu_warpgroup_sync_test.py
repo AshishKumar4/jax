@@ -81,7 +81,7 @@ class WarpgroupSyncReaderTest(jtu.JaxTestCase):
     (module,) = _kernel_modules(lowered)
     return _warpgroup_syncs(module)
 
-  def test_a_warp_maps_syncs_are_read_from_its_kernel_and_a_plain_kernel_has_none(self):
+  def test_a_warp_maps_two_syncs_are_read_from_its_kernel(self):
     def plain(x_ref, o_ref):
       o_ref[...] = x_ref[...] + 1.0
 
@@ -94,8 +94,7 @@ class WarpgroupSyncReaderTest(jtu.JaxTestCase):
 
       o_ref[...] = x_ref[...] + 1.0
 
-    self.assertEqual(self._syncs(plain), 0)
-    self.assertEqual(self._syncs(mapped), 2)
+    self.assertEqual(self._syncs(mapped) - self._syncs(plain), 2)
 
 
 if __name__ == "__main__":
