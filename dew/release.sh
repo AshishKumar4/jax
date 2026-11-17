@@ -102,13 +102,17 @@ composed=$(sed -n 's/^tip \([0-9a-f]\{40\}\)$/\1/p' <<< "$ran")
 
 # BUILT_AT, where its native wheels (plugin-NEW) were built at a commit of the same picks before this one existed:
 # the composition is that commit's source but for the version (jax/version.py alone), and its message names it, or
-# nothing is pushed; so the plugins are the release's native code, proven, never assumed (FarSilverfish,
-# 2026-11-17: rebuilding at the release commit would cost three hours of capacity for the same .so files).
+# nothing of the release is pushed (the runner's own checkpoints, refs/heads/hooked/*, are its scratch); so the
+# plugins are the release's native code, proven, never assumed (FarSilverfish, 2026-11-17: rebuilding at the
+# release commit would cost three hours of capacity for the same .so files). A BUILT_AT that cannot be read or
+# compared is refused, never passed (review).
 if [[ -n ${BUILT_AT:-} ]]; then
   git -C "$checkout" fetch -q origin "$BUILT_AT" 2> /dev/null || true
-  apart=$(git -C "$checkout" diff --name-only "$BUILT_AT" "$composed" | grep -vx 'jax/version.py' || true)
-  if [[ -n $apart ]]; then
-    echo "release.sh: $new's composition differs from BUILT_AT ${BUILT_AT:0:10} beyond its version: $apart" >&2
+  built=$(git -C "$checkout" rev-parse -q --verify "$BUILT_AT^{commit}") ||
+    { echo "release.sh: BUILT_AT $BUILT_AT is no commit this checkout or origin holds" >&2; exit 1; }
+  if ! git -C "$checkout" diff --quiet "$built" "$composed" -- . ':(exclude)jax/version.py'; then
+    apart=$(git -C "$checkout" diff --name-only "$built" "$composed" -- . ':(exclude)jax/version.py' || true)
+    echo "release.sh: $new's composition differs from BUILT_AT ${built:0:10} beyond its version: ${apart:-unread}" >&2
     exit 1
   fi
   grep -Fq "${BUILT_AT:0:10}" <<< "$message" ||

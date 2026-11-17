@@ -375,7 +375,8 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     # message that names it not, push and ask nothing (FarSilverfish, 2026-11-17: a native release built ahead).
     base = run(origin, "rev-parse", "release/0.12.0.1.post39")
     for built, said in ((base, f"Release 0.12.0.1.post40, its plugins built at {base[:10]}"),
-                        (commits["fix"], "Release 0.12.0.1.post40")):
+                        (commits["fix"], "Release 0.12.0.1.post40"),
+                        ("0" * 40, f"Release 0.12.0.1.post40, its plugins built at {'0' * 10}")):
         refused = subprocess.run(["bash", str(script), str(checkout), "0.12.0.1.post39", "0.12.0.1.post40", said,
                                   commits["fix"]], env={**environment, "BUILT_AT": built}, capture_output=True,
                                  text=True, check=False)
