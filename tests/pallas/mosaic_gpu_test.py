@@ -4512,6 +4512,54 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     x, y = (jnp.arange(128).astype(jnp.float32) for _ in range(2))
     np.testing.assert_array_equal(kernel(x, y), x + y)
 
+  @parameterized.parameters((2, 3, 4), (2, 3, 4, 5))
+  def test_fresh_axis_index(self, *grid):
+    # A squashed grid (more than three axes) unravels its third block coordinate.
+    names = tuple("abcd"[: len(grid)])
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((*grid, len(grid), 128), jnp.int32),
+        grid=grid,
+        grid_names=names,
+    )
+    def kernel(o_ref):
+      place = tuple(lax.axis_index(name) for name in names)
+      for axis, name in enumerate(names):
+        o_ref[(*place, axis)] = lax.broadcast(
+            plgpu.fresh_axis_index(name), (128,)
+        )
+
+    coordinates = np.stack(
+        np.meshgrid(*map(np.arange, grid), indexing="ij"), axis=-1
+    )
+    np.testing.assert_array_equal(
+        kernel(), np.broadcast_to(coordinates[..., None], (*grid, len(grid), 128))
+    )
+
+  def test_fresh_axis_index_reads_at_each_use(self):
+    # Each fresh read is its own: none is merged with another, so the PTX reads
+    # the coordinate once more for each one more.
+    def reads(count):
+      @self.kernel(
+          out_type=jax.ShapeDtypeStruct((2, 3, 128), jnp.int32),
+          grid=(2, 3),
+          grid_names=("a", "b"),
+      )
+      def kernel(o_ref):
+        total = sum(plgpu.fresh_axis_index("b") for _ in range(count))
+        o_ref[lax.axis_index("a"), lax.axis_index("b")] = lax.broadcast(
+            total, (128,)
+        )
+
+      with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
+        np.testing.assert_array_equal(
+            kernel(),
+            np.broadcast_to(count * np.arange(3)[None, :, None], (2, 3, 128)),
+        )
+      return ptx().count("%ctaid")
+
+    self.assertEqual(reads(3) - reads(1), 2)
+
   @parameterized.product(
       sm_steps=(1, 2, 3),
       dynamic_sm_steps=(False, True),
