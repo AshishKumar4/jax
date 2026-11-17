@@ -1184,6 +1184,19 @@ def warpgroup_barrier():
   inline_ptx(WARPGROUP_BARRIER_PTX, wg_idx, convergent=True)
 
 
+def warpgroup_reduce_pred(pred: ir.Value, op: Literal["or", "and"]) -> ir.Value:
+  """`pred`, an i1, reduced by `op` over the warpgroup's threads, the result
+  every thread's: one `bar.red.{op}.pred` on the warpgroup's barrier, which
+  every thread of the warpgroup reaches."""
+  return inline_ptx(
+      f"bar.red.{op}.pred $0, $1, {WARPGROUP_SIZE}, $2;",
+      warpgroup_barrier_idx(sync=False),
+      pred,
+      result_types=ir.IntegerType.get_signless(1),
+      has_side_effects=True,
+  )
+
+
 def warp_barrier():
   nvvm.bar_warp_sync(c(0xFFFFFFFF, ir.IntegerType.get_signless(32)))
 

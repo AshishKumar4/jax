@@ -852,10 +852,15 @@ def _vector_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.ReductionOp
 ) -> Sequence[ir.Value]:
   [layout] = inference_utils.in_layouts(op)
+  op_kind = _combining_kind(op.kind)
+  if op_kind in (vector.CombiningKind.OR, vector.CombiningKind.AND):
+    # A boolean's, over the warpgroup's threads by a barrier: no scratch.
+    a = _fragmented_array_from_ir(op.vector, layout, None)
+    result = a.reduce_pred("or" if op_kind == vector.CombiningKind.OR else "and")
+    return [result.registers.item()]
   element_type = op.vector.type.element_type
   scratch = _reduction_scratch(op, element_type, 4, ctx.smem_requested_bytes)
   axes = range(op.vector.type.rank)
-  op_kind = _combining_kind(op.kind)
   is_signed = _is_reduction_signed(op_kind)
   a = _fragmented_array_from_ir(op.vector, layout, is_signed)
   acc_ilp_attr = op.attributes.get("acc_ilp")
