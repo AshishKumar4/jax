@@ -66,6 +66,9 @@ archive_override(
         # A compile stops after buffer assignment and states its memory (xla_gpu_experimental_early_exit's
         # EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT): a planner's probe at the cost of the HLO passes alone.
         "//third_party:xla/early_exit_buffer_assignment.patch",
+        # The CUDA plugin serves its executables' metadata (PJRT_ExecutableMetadata_Extension), and the C API
+        # client reads their buffer assignment from it into memory_analysis().
+        "//third_party:xla/executable_metadata_gpu.patch",
     ],
     strip_prefix = "xla-4bd1084be692fed10e9b829fdbb469cd359621e4",
     urls = ["https://github.com/openxla/xla/archive/4bd1084be692fed10e9b829fdbb469cd359621e4.tar.gz"],
