@@ -90,7 +90,8 @@ def live(assignment: bytes, module: bytes,
                 if allocation.is_entry_computation_parameter}
   found = []
   for peak in proto.peak_buffers:
-    if kinds[peak.index] is None:
+    kind = kinds[peak.index]
+    if kind is None:
       continue
     for buffer_id in peak.logical_buffer_ids:
       buffer = buffers[buffer_id]
@@ -107,7 +108,7 @@ def live(assignment: bytes, module: bytes,
           bytes=buffer.size, shape=tuple(shape.dimensions),
           dtype=primitive_type.values_by_number[shape.element_type]
           .name.lower(),
-          kind=kinds[peak.index], instruction=instruction.name,
+          kind=kind, instruction=instruction.name,
           op_name=metadata.op_name,
           source=f"{metadata.source_file}:{metadata.source_line}",
           names=tuple(named.split(",")) if named else (),

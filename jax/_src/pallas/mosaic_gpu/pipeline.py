@@ -35,6 +35,7 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import jax.numpy as jnp
@@ -197,7 +198,11 @@ class BufferedRef:
           f" {granule}-row chunks"
       )
     part = rows // threads
-    gmem = self.gmem_ref.at[self.compute_gmem_slice(grid_indices)]
+    # `.at`'s indexer, which the type checker cannot read through AbstractRef's
+    # `aval_property`.
+    gmem = state_types.RefIndexer(self.gmem_ref)[
+        self.compute_gmem_slice(grid_indices)
+    ]
     oob_mode = getattr(self.spec, "oob_fill_mode", None)
     for share in range(threads):
       @pl.when(thread == share)
@@ -605,6 +610,7 @@ def emit_pipeline[T](
         meet()
 
     def prefetched_at(indices, slot):
+      assert prefetch is not None
       return prefetch(
           indices, *(bref.get_ref_for_slot(slot) for bref in in_brefs)
       )
@@ -625,7 +631,7 @@ def emit_pipeline[T](
             max_concurrent_steps - 1, wait_read_only=True
         )
 
-      extra = ()
+      extra: tuple[Any, ...] = ()
       called = []
       # The body's own trace: a boundary called under a `lax.cond` branch or a
       # loop's body traces in another, so its wait would run on some paths or
@@ -673,6 +679,11 @@ def emit_pipeline[T](
               " not wait for its slots"
           )
         if init_carry is not None:
+          if not (isinstance(next_body_carry, tuple) and len(next_body_carry) == 2):
+            raise ValueError(
+                "a pipeline body with prefetch and a carry returns"
+                " (next_carry, next_prefetched)"
+            )
           next_body_carry, next_prefetched = next_body_carry
         else:
           next_body_carry, next_prefetched = None, next_body_carry

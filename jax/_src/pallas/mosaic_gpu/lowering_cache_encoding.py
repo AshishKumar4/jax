@@ -425,21 +425,22 @@ class Encoder:
     ])
 
   def _flat_tree(self, x: flattree.FlatTree, depth: int) -> bytes:
-    cls = type(x)
-    name = self._class(cls, "flat tree class")
-    if cls is flattree.FTTuple:
+    name = self._class(type(x), "flat tree class")
+    if type(x) is flattree.FTTuple:
       return seq(b"Ft", [name, self._e(tuple(x.elts), depth + 1)])
-    if cls is flattree.FTDict:
+    if type(x) is flattree.FTDict:
       return seq(b"Ft", [
           name, self._e(tuple(x.keys), depth + 1), self._e(tuple(x._vals), depth + 1)
       ])
-    if cls is flattree.FTPyTree:
+    if type(x) is flattree.FTPyTree:
       return seq(b"Ft", [
           name, self._e(tuple(x.xs), depth + 1), self._e(x._tree, depth + 1)
       ])
-    if cls in (flattree.FTSingleton, flattree.FTStatic):
+    if type(x) is flattree.FTSingleton or type(x) is flattree.FTStatic:
       return seq(b"Ft", [name, self._e(x.val, depth + 1)])
-    raise Uncacheable(f"the flat tree class {cls.__qualname__} has no encoding")
+    raise Uncacheable(
+        f"the flat tree class {type(x).__qualname__} has no encoding"
+    )
 
   def _treedef(self, treedef: tree_util.PyTreeDef, depth: int) -> bytes:
     if depth > _MAX_DEPTH:

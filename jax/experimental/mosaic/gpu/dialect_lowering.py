@@ -1278,7 +1278,7 @@ def _no_thread_smem_access(op: ir.Operation) -> bool:
   name = op.name
   if name.startswith(_STRUCTURED):
     return all(
-        _no_thread_smem_access(inner)
+        _no_thread_smem_access(inner.operation)
         for region in op.regions
         for block in region.blocks
         for inner in block.operations

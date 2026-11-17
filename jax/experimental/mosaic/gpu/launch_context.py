@@ -21,7 +21,7 @@ import dataclasses
 import enum
 import functools
 import math
-from typing import cast, Any, ClassVar, Literal
+from typing import cast, overload, Any, ClassVar, Literal
 
 from jax._src.lib import mosaic_gpu_dialect as mgpu_dialect
 from jax._src.lib import version as jaxlib_version
@@ -1064,6 +1064,26 @@ class LaunchContext:
       byte_offset = arith.muli(gmem_peer_id, c(TMA_DESCRIPTOR_BYTES, i32))
       return utils.getelementptr(tma_desc, [byte_offset], i8)
     return tma_desc
+
+  @overload
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: ir.Value,
+  ) -> tuple[tuple[MemRefTransform, ...], ir.Value]:
+    ...
+
+  @overload
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: None,
+  ) -> tuple[tuple[MemRefTransform, ...], None]:
+    ...
 
   def _untile_partial(
       self,

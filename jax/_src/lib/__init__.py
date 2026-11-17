@@ -174,8 +174,9 @@ def _cuda_path() -> str | None:
         nvcc_module = importlib.import_module(name)
       except ImportError:
         continue
-      if getattr(nvcc_module, '__file__', None) is not None:
-        paths = [pathlib.Path(nvcc_module.__file__).parent]
+      file = getattr(nvcc_module, '__file__', None)
+      if file is not None:
+        paths = [pathlib.Path(file).parent]
       else:
         paths = [pathlib.Path(path) for path in getattr(nvcc_module, '__path__', None) or ()]
       for path in paths:

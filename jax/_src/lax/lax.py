@@ -7605,7 +7605,10 @@ def _ragged_dot_general_lower(
       rhs,
       group_sizes,
       ragged_dot_dnums,
-      precision_config=chlo_precision_attr(precision),
+      # The DEFAULT preset names no algorithm: the operands' default precision.
+      precision_config=chlo_precision_attr(
+          Precision.DEFAULT if precision == DotAlgorithmPreset.DEFAULT
+          else precision),
   )
   if expanded_shape is not None:
     expanded_aval = core.ShapedArray(expanded_shape, accumulation_aval.dtype)

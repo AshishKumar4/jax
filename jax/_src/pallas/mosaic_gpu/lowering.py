@@ -3519,6 +3519,7 @@ def _reduce_lowering_rule(
           warpgroup = arith_dialect.index_cast(
               ir.IndexType.get(), mgpu.warpgroup_idx(sync=True)
           )
+          assert scratch is not None
           scratch = mgpu.memref_slice(scratch, warpgroup)
         return x.reduce(op, axes[0], scratch=scratch, acc_ilp=accumulator_ilp)
     case _:
@@ -3684,6 +3685,7 @@ def _block_id(
         "=r",
         has_side_effects=True,
     )
+    assert isinstance(read, ir.Value)
     result = arith_dialect.index_cast(ir.IndexType.get(), read)
   else:
     result = gpu_dialect.block_id(dim)
