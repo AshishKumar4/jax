@@ -32,16 +32,17 @@ NESTED_TOKEN_VALUE = 1337
 # top-level function so that caching works properly
 # The executions a CPU client's device holds in flight at once
 # (cpu_client.h's LocalDeviceState, max_inflight_computations default): a
-# leased client runs at most this many threads.
-_MAX_THREADS = 32
+# leased client runs this many threads on each of its devices.
+_THREADS_PER_DEVICE = 32
 
 _free_clients: list[xla_client.Client] = []
 _clients_lock = threading.Lock()
 
 
 @contextlib.contextmanager
-def _leased_client():
-  """A CPU client of the interpreter's own, held by this thread map alone.
+def _leased_client(num_threads: int):
+  """A CPU client of the interpreter's own, held by this thread map alone, with
+  a device for every `_THREADS_PER_DEVICE` of its `num_threads` threads.
 
   A thread map runs inside a host callback of the computation that calls it,
   and runs its threads' programs from threads of its own: off the callback's
@@ -51,11 +52,16 @@ def _leased_client():
   behind the one running the callback can hold every unit, so the threads'
   programs wait for units that free only when the callback returns: a
   deadlock. On a client no other computation uses, the thread map's own
-  executions are all that hold its units, at most `_MAX_THREADS`."""
+  executions are all that hold its units, at most `_THREADS_PER_DEVICE` on each
+  of its devices (a cluster of blocks maps 36 threads, a test's six blocks of
+  six)."""
+  devices = -(-num_threads // _THREADS_PER_DEVICE)
   with _clients_lock:
-    client = _free_clients.pop() if _free_clients else None
+    fitting = [i for i, held in enumerate(_free_clients)
+               if len(held.local_devices()) >= devices]
+    client = _free_clients.pop(fitting[0]) if fitting else None
   if client is None:
-    client = xla_client.make_cpu_client(asynchronous=False)
+    client = xla_client.make_cpu_client(asynchronous=False, num_devices=devices)
   try:
     yield client
   finally:
@@ -88,14 +94,16 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
   threads = []
-  with _leased_client() as client, futures.ThreadPoolExecutor(
+  with _leased_client(num_threads) as client, futures.ThreadPoolExecutor(
       max_workers=num_threads
   ) as executor:
-    # The constants and inputs go to the leased client's device once, and
-    # every thread reads those arrays rather than transferring them again
-    # (about 15% of an interpreted kernel's time in one measured test).
-    device = client.local_devices()[0]
-    consts, invals = jax.device_put((consts, invals), device)
+    # The constants and inputs go to each of the leased client's devices the
+    # threads run on once, and every thread there reads those arrays rather
+    # than transferring them again (about 15% of an interpreted kernel's time
+    # in one measured test).
+    devices = client.local_devices()
+    placed = [jax.device_put((consts, invals), devices[d])
+              for d in range(-(-num_threads // _THREADS_PER_DEVICE))]
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
@@ -104,9 +112,12 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
       #     evaluation of `jaxpr`.
       # The thread ID is placed there too: a body with no other operand runs
       # where its arguments are committed, which would otherwise be nowhere.
-      args = (jax.device_put(np.int32(i), device), *invals)
+      device = i // _THREADS_PER_DEVICE
+      thread_consts, thread_invals = placed[device]
+      args = (jax.device_put(np.int32(i), devices[device]), *thread_invals)
       flat_args, _ = jax.tree.flatten(args)
-      threads.append(executor.submit(_run_jaxpr, jaxpr, consts, *flat_args))
+      threads.append(
+          executor.submit(_run_jaxpr, jaxpr, thread_consts, *flat_args))
     exceptions = []
     for i in range(num_threads):
       try:
@@ -161,15 +172,6 @@ def thread_map(
     # We're running `f` in the same JAX computation as the caller, so we thread
     # the token through.
     return f(jnp.int32(0), token, *args)
-  if num_threads > _MAX_THREADS:
-    # Refused as the kernel is traced: a refusal inside the callback would leave
-    # the interpreter's shared state mid-kernel for the kernels after it. No
-    # kernel maps more: a GPU block holds at most 8 warpgroups (1,024 threads)
-    # and a TPU device at most 16 subcores.
-    raise ValueError(
-        f"a thread map runs at most {_MAX_THREADS} threads, the executions a"
-        f" CPU client holds in flight at once, not {num_threads}"
-    )
 
   def _f(core_or_thread_index, *args):
     # We are running `f` in sparate JAX computations on different threads from
