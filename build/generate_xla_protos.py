@@ -22,7 +22,6 @@ Rerun whenever MODULE.bazel's XLA commit moves; the module states the commit it 
 
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import textwrap
