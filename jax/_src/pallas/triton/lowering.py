@@ -35,6 +35,7 @@ from jax._src import core as jax_core
 from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import custom_derivatives
 from jax._src import debugging
+from jax._src import hijax
 from jax._src import literals
 from jax._src import pjit
 from jax._src import source_info_util
@@ -2654,6 +2655,64 @@ triton_lowering_rules[lax.reduce_min_p] = functools.partial(
 )
 triton_lowering_rules[lax.reduce_sum_p] = functools.partial(
     _reduce_lowering, jnp.add
+)
+triton_lowering_rules[lax.reduce_or_p] = functools.partial(
+    _reduce_lowering, jnp.bitwise_or
+)
+triton_lowering_rules[lax.reduce_and_p] = functools.partial(
+    _reduce_lowering, jnp.bitwise_and
+)
+
+
+def _unit_slice(x, *, start_indices, limit_indices, strides):
+  # A Triton tensor is no memory to index: a slice of one element along one
+  # axis is the masked maximum of that axis, over the value's bits, so a float
+  # (a NaN, a negative zero) and a boolean come back exactly.
+  sliced = [
+      axis
+      for axis, (start, limit) in enumerate(zip(start_indices, limit_indices))
+      if limit - start != x.shape[axis]
+  ]
+  if (
+      len(sliced) != 1
+      or limit_indices[sliced[0]] - start_indices[sliced[0]] != 1
+      or (strides is not None and any(stride != 1 for stride in strides))
+  ):
+    raise NotImplementedError(
+        f"Pallas Triton slices one element along one axis, not"
+        f" {start_indices}:{limit_indices} of {x.shape}"
+    )
+  (axis,) = sliced
+  dtype = jnp.dtype(x.dtype)
+  if dtype == jnp.bool_:
+    bits = x.astype(jnp.int32)
+  elif jnp.issubdtype(dtype, jnp.floating):
+    bits = lax.bitcast_convert_type(x, jnp.dtype(f"int{dtype.itemsize * 8}"))
+  else:
+    bits = x
+  least = jnp.iinfo(bits.dtype).min
+  picked = jnp.where(
+      lax.broadcasted_iota(jnp.int32, x.shape, axis) == start_indices[axis],
+      bits,
+      least,
+  )
+  found = jnp.max(picked, axis=axis, keepdims=True)
+  if dtype == jnp.bool_:
+    return found.astype(jnp.bool_)
+  if jnp.issubdtype(dtype, jnp.floating):
+    return lax.bitcast_convert_type(found, dtype)
+  return found
+
+
+triton_lowering_rules[lax.slice_p] = lower_fun(
+    _unit_slice, multiple_results=False
+)
+# A hijax primitive's call lowers as the lojax its primitive expands to.
+triton_lowering_rules[hijax.call_hi_primitive_p] = lower_fun(
+    lambda *args, _prim: hijax.call_hi_primitive_p.to_lojax(
+        *args, _prim=_prim
+    ),
+    multiple_results=True,
 )
 
 
