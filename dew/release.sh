@@ -13,8 +13,9 @@
 #
 # CHECKOUT is a clone of the fork with `origin` its remote; BASE the published release it grows from
 # (0.12.0.1.post39), NEW the release it makes (0.12.0.1.post40), MESSAGE the release commit's message, and each
-# COMMIT a commit or a range (`A..B`) cherry-picked in order. The stack branch must be at BASE's release branch,
-# and NEW's must not exist yet.
+# COMMIT a commit or a range (`A..B`) the fork holds, picked in order. RUNNER names run_hooked.sh, which makes every
+# commit on armada through the fork's own commit hook (RUNNER_LOCK, where set, the lane's armada lock it takes): the
+# PC's clone makes none. The stack branch must be at BASE's release branch, and NEW's must not exist yet.
 #
 # Each release grows from the one before, which it holds whole, so neither branch moves but forward (owner,
 # 2026-10-31; Main, 2026-11-03: post46's composition, rebuilt under post45's release commit, was a force push): each
@@ -24,6 +25,7 @@ set -euo pipefail
 
 checkout=$1 base=$2 new=$3 message=$4
 shift 4
+: "${RUNNER:?release.sh: RUNNER names run_hooked.sh, which commits through the hooks of the fork on armada}"
 if (( $# == 0 )); then
   echo "release.sh: name the commits $new gains" >&2
   exit 2
@@ -47,25 +49,43 @@ if (( status != 2 )); then
   exit 1
 fi
 
-work=$(mktemp -d)
-trap 'git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"' EXIT
-git -C "$checkout" worktree add -q --detach "$work" "$published"
-# The commits picked onto the published release, and the version set by a release commit of its own on top.
+# The commits it gains, in order, by full sha (a range its commits oldest first), each a family's or a fixup of one.
+picks=()
 for commit in "$@"; do
-  git -C "$work" cherry-pick "$commit" > /dev/null
+  if [[ $commit == *..* ]]; then
+    mapfile -t more < <(git -C "$checkout" rev-list --reverse "$commit")
+    picks+=("${more[@]}")
+  else
+    picks+=("$(git -C "$checkout" rev-parse --verify "$commit^{commit}")")
+  fi
 done
-if git -C "$work" log --format=%s "$published..HEAD" | grep -Ev '^(fixup! )?\[stack\] ' | grep -q .; then
-  echo "release.sh: a commit is neither a family's nor a fixup of one:" >&2
-  git -C "$work" log --format='%h %s' "$published..HEAD" | grep -Ev '^[0-9a-f]+ (fixup! )?\[stack\] ' >&2
-  exit 1
-fi
-git -C "$work" show "$published:jax/version.py" > "$work/jax/version.py"
+for pick in "${picks[@]}"; do
+  subject=$(git -C "$checkout" log -1 --format=%s "$pick")
+  if ! grep -Eq '^(fixup! )?\[stack\] ' <<< "$subject"; then
+    echo "release.sh: a commit is neither a family's nor a fixup of one: ${pick:0:10} $subject" >&2
+    exit 1
+  fi
+done
+
+work=$(mktemp -d) said=$(mktemp)
+trap 'git -C "$checkout" worktree remove --force "$work" 2> /dev/null || rm -rf "$work"; rm -f "$said"' EXIT
+git -C "$checkout" worktree add -q --detach "$work" "$published"
+# The version a release commit of its own sets on top, as a patch: no commit is made here.
 # The versions as literal strings: a dot in one matches only a dot.
 sed -i "s/^_release_version: str | None = \"${base//./\\.}\"\$/_release_version: str | None = \"$new\"/" \
   "$work/jax/version.py"
 grep -Fqx "_release_version: str | None = \"$new\"" "$work/jax/version.py"
-git -C "$work" commit -q -am "$message"
-composed=$(git -C "$work" rev-parse HEAD)
+printf '%s\n' "$message" > "$said"
+git -C "$work" diff | "$(dirname "$RUNNER")/as_patch.sh" "$said" > "$work.patch"
+# Composed on armada through the fork's own commit hook, never committed here (RUNNER, run_hooked.sh: Main,
+# 2026-11-17, the PC's clone refuses every commit): the picks onto the published release, then the release commit,
+# fetched into the checkout as refs/hooked/LABEL. A refusal, a pick that does not apply, or a run that did not end
+# stops here, with nothing pushed.
+ran=$("$RUNNER" "--into=$checkout" ${RUNNER_LOCK:+"--lock=$RUNNER_LOCK"} "rel-$new-$(date +%s)" "$published" \
+  "${picks[@]/#/pick:}" "$work.patch") || { echo "release.sh: the runner did not compose $new" >&2; exit 1; }
+rm -f "$work.patch"
+composed=$(sed -n 's/^tip \([0-9a-f]\{40\}\)$/\1/p' <<< "$ran")
+[[ -n $composed ]] || { echo "release.sh: the runner named no tip: $ran" >&2; exit 1; }
 
 # The release branch alone, only where none is: the stack branch moves once the stage has passed.
 git -C "$work" push -q "--force-with-lease=refs/heads/release/$new:" origin "$composed:refs/heads/release/$new"

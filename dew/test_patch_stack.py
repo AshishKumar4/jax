@@ -262,6 +262,37 @@ if sys.argv[1] == "api":
 """
 
 
+# run_hooked.sh as release.sh calls it, composing where armada would: BASE's tree, each `pick:SHA` cherry-picked and
+# each patch file applied as its commit (`git am -k`), the tip fetched into --into as refs/hooked/LABEL; a series
+# that does not apply exits 2, as the runner does, having fetched nothing.
+RUNNER = """#!/bin/bash
+set -euo pipefail
+into=${1#--into=}; shift
+[[ $1 == --lock=* ]] && shift
+label=$1 base=$2; shift 2
+work=$(mktemp -d)
+git -C "$into" worktree add -q --detach "$work" "$base"
+for entry in "$@"; do
+  case $entry in
+    pick:*) git -C "$work" cherry-pick "${entry#pick:}" > /dev/null 2>&1 || exit 2 ;;
+    *) git -C "$work" am -q -k "$entry" > /dev/null 2>&1 || exit 2 ;;
+  esac
+done
+tip=$(git -C "$work" rev-parse HEAD)
+git -C "$into" update-ref "refs/hooked/$label" "$tip"
+echo "tip $tip"
+"""
+# as_patch.sh beside the runner: a diff on stdin as one commit's patch under the message file's message.
+AS_PATCH = """#!/bin/bash
+set -euo pipefail
+printf 'From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\\nFrom: t <t@example.com>\\n'
+printf 'Date: %s\\nSubject: %s\\n\\n' "$(date -R)" "$(head -n 1 "$1")"
+tail -n +2 "$1" | sed '1{/^$/d;}'
+printf -- '---\\n'
+cat
+"""
+
+
 def isolated(tmp_path) -> dict:
     """An environment whose git reads no configuration but its own and installs no hooks or templates, and
     finds gh and sleep in tmp_path/bin first, then git where this machine has it."""
@@ -316,9 +347,10 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     environment = isolated(tmp_path)
     origin, checkout, commits, run = fork(tmp_path, environment)
     (tmp_path / "bin").mkdir()
-    for name, text in (("gh", GH), ("sleep", "#!/bin/sh\n")):
+    for name, text in (("gh", GH), ("sleep", "#!/bin/sh\n"), ("run_hooked.sh", RUNNER), ("as_patch.sh", AS_PATCH)):
         (tmp_path / "bin" / name).write_text(text)
         (tmp_path / "bin" / name).chmod(0o755)
+    environment = {**environment, "RUNNER": str(tmp_path / "bin" / "run_hooked.sh")}
     calls = tmp_path / "bin" / "gh.json"
     script = Path(patch_stack.__file__).with_name("release.sh")
 
