@@ -258,6 +258,49 @@ class CtaBarrierLoweringTest(jtu.JaxTestCase):
         jax.jit(kernel).trace().lower(lowering_platforms=("cuda",))
 
 
+class PredicateReductionLoweringTest(jtu.JaxTestCase):
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      capability=("9.0", "10.0"),
+      lowering_semantics=(
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      ),
+  )
+  def test_a_predicate_reduction_lowers_for_hopper_and_blackwell(
+      self, op, capability, lowering_semantics
+  ):
+    # Lowered for an abstract GPU on CPU: a row vector's any or all, reduced
+    # over the warpgroup to the scalar `pl.when` takes.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      rows = jnp.max(
+          plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False),
+          axis=-1,
+      )
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(rows > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
+
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
   LOWERING_SEMANTICS: ClassVar[plgpu.LoweringSemantics]
 
@@ -842,6 +885,44 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     if dtype != jnp.uint32:
       x = x - x.size // 2  # include negative values.
     np.testing.assert_array_equal(kernel(x), op(x))
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      layout=(None, plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+      marked=("none", "first", "last", "every", "every_but_first",
+              "every_but_last"),
+  )
+  def test_predicate_reduction_guards_a_branch(self, op, layout, marked):
+    # Whether any or every element holds, as the scalar `pl.when` takes: of a
+    # strided array's elements, or of a block's row maxima, a row vector whose
+    # rows a tiled layout spreads over threads (WGMMA's over four lanes each).
+    rows = {
+        "none": [], "first": [0], "last": [127], "every": range(128),
+        "every_but_first": range(1, 128), "every_but_last": range(127),
+    }[marked]
+    x = np.full((128, 128), -1.0, np.float32)
+    for r in rows:
+      if layout is None:
+        x[r] = 1.0
+      else:
+        x[r, (37 * r) % 128] = 1.0
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.int32))
+    def kernel(x_ref, o_ref):
+      if layout is None:
+        values = x_ref[...]
+      else:
+        values = jnp.max(
+            plgpu.load(x_ref, layout=layout, optimized=False), axis=-1
+        )
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(values > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    held = op(x > 0) if layout is None else op(x.max(axis=-1) > 0)
+    self.assertEqual(int(kernel(jnp.asarray(x))), int(held))
 
   def test_reshape(self):
     shape1, shape2 = (128,), (2, 16, 4)
