@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
+import threading
 import time
 
 from absl.testing import absltest
@@ -182,6 +184,44 @@ class LRUCacheTest(LRUCacheTestCase):
   # Check that we don't write access time file when the eviction policy is
   # disabled. Writing this file can be extremely unperformant and cause
   # problems on large-scale network storage.
+  def test_a_reader_beside_a_writer_sees_a_whole_entry_or_none(self):
+    # Readers of an unbounded cache take no lock: an entry another process is
+    # writing must never be read in part.
+    cache = LRUCache(self.name, max_size=-1)
+    value = bytes(range(256)) * (1 << 17)
+    seen = []
+    for index in range(16):
+      key = f"entry{index}"
+      writer = threading.Thread(target=cache.put, args=(key, value))
+      writer.start()
+      while writer.is_alive():
+        if (read := cache.get(key)) is not None:
+          seen.append(len(read))
+      writer.join()
+    self.assertEqual(set(seen) - {len(value)}, set())
+    self.assertEmpty([path for path in self.path.iterdir() if not path.name.endswith(_CACHE_SUFFIX)])
+
+  def test_an_entry_written_aside_takes_the_umask_s_permissions(self):
+    # Written as `write_bytes` writes, so another trusted user of a shared
+    # cache directory reads it where the umask lets them.
+    cache = LRUCache(self.name, max_size=-1)
+    previous = os.umask(0o022)
+    try:
+      cache.put("shared", b"value")
+    finally:
+      os.umask(previous)
+    mode = (self.path / f"shared{_CACHE_SUFFIX}").stat().st_mode & 0o777
+    self.assertEqual(mode, 0o644)
+
+  def test_a_key_as_long_as_its_entry_s_name_allows_is_written(self):
+    # The temporary name is short, whatever the key: a key whose entry's name
+    # is as long as the filesystem allows is still written.
+    cache = LRUCache(self.name, max_size=-1)
+    limit = os.pathconf(self.path, "PC_NAME_MAX")
+    key = "k" * (limit - len(_CACHE_SUFFIX))
+    cache.put(key, b"value")
+    self.assertEqual(cache.get(key), b"value")
+
   def test_no_atime_file(self):
     cache = LRUCache(self.name, max_size=-1)
 
