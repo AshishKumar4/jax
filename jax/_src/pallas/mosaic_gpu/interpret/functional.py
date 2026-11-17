@@ -454,7 +454,14 @@ class _Interpreter:
         allocs.append(_Ref(tuple(slots), union=tuple(m.transforms[0] for m in members)))
         continue
       inner = _allocated(aval, transforms)
-      if isinstance(inner.dtype, (mosaic_gpu_core.BarrierType, mosaic_gpu_core.ClusterBarrierType)):
+      if isinstance(
+          inner.dtype,
+          (
+              mosaic_gpu_core.BarrierType,
+              mosaic_gpu_core.ClusterBarrierType,
+              mosaic_gpu_core.CtaBarrierType,
+          ),
+      ):
         allocs.append(_Barrier())
         continue
       allocs.append(_Ref((self.allocate(
