@@ -459,7 +459,7 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     )
 
   @parameterized.product(
-      op=["exp", "exp2", "logistic"],
+      op=["exp", "exp2", "logistic", "tanh"],
       asked=["highest", "approximate", "default", "unmet"],
       approx_math=[False, True],
   )
@@ -478,11 +478,13 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     # quotient's rounding (2^-23), in ulps that times 2^24.
     logistic = lambda b: ((b[1] + 2.0**-23) * 2.0**24, b[1] + 2.0**-23)
     approximate = {"exp": fa.APPROX_EXP_BOUND, "exp2": fa.APPROX_EXP2_BOUND,
-                   "logistic": logistic(fa.APPROX_EXP_BOUND)}[op]
-    default = (logistic(fa.LIBDEVICE_EXP_BOUND) if op == "logistic"
-               else fa.LIBDEVICE_EXP_BOUND)
-    exact = (logistic(fa.EXACT_EXP_BOUND) if op == "logistic"
-             else fa.EXACT_EXP_BOUND)
+                   "logistic": logistic(fa.APPROX_EXP_BOUND),
+                   "tanh": fa.APPROX_TANH_BOUND}[op]
+    default = {"logistic": logistic(fa.LIBDEVICE_EXP_BOUND),
+               "tanh": fa.LIBDEVICE_TANH_BOUND}.get(op, fa.LIBDEVICE_EXP_BOUND)
+    # tanh's most accurate form is libdevice's.
+    exact = {"logistic": logistic(fa.EXACT_EXP_BOUND),
+             "tanh": fa.LIBDEVICE_TANH_BOUND}.get(op, fa.EXACT_EXP_BOUND)
     accuracy, bound = {
         "highest": (lax.AccuracyMode.HIGHEST, exact),
         "approximate": (lax.Tolerance(
@@ -494,16 +496,22 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         "unmet": (lax.Tolerance(rtol=2.0**-30), None),
     }[asked]
 
-    @functools.partial(
-        self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct([1024], jnp.float32),
-        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-    )
     def kernel(x_ref, o_ref):
       o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
 
-    reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0}[op]
-    x = np.random.default_rng(0).uniform(-reach, reach, 1024).astype(np.float32)
+    # A kernel of its own name a case, so each compiles, and dumps, its PTX:
+    # cases lowering to one module would share a compiled kernel.
+    kernel.__name__ = kernel.__qualname__ = (
+        f"accuracy_{op}_{asked}_{int(approx_math)}"
+    )
+    kernel = self.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+    )
+
+    reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0, "tanh": 10.0}[op]
+    x = np.random.default_rng(0).uniform(-reach, reach, 256).astype(np.float32)
     if asked == "unmet":
       with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
         kernel(x)
@@ -514,13 +522,15 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         "exp": np.exp,
         "exp2": np.exp2,
         "logistic": lambda v: 1 / (1 + np.exp(-v)),
+        "tanh": np.tanh,
     }[op](x.astype(np.float64))
     ulps = np.abs(y - truth) / np.spacing(truth.astype(np.float32))
     self.assertLessEqual(ulps.max(), bound[0])
-    if asked == "highest":
-      self.assertNotIn("ex2.approx", out())
+    fast = "tanh.approx" if op == "tanh" else "ex2.approx"
+    if asked == "highest" and op != "tanh":
+      self.assertNotIn(fast, out())
     elif asked == "approximate":
-      self.assertIn("ex2.approx", out())
+      self.assertIn(fast, out())
 
   @parameterized.parameters(False, True)
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
