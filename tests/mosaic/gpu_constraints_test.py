@@ -21,6 +21,7 @@ from jax._src import config
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import func
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
@@ -604,7 +605,9 @@ class ConstraintSystemTest(parameterized.TestCase):
     self.assertEqual(reg_to_smem.holds(), holds)
     self.assertEqual(smem_to_reg.holds(), holds)
 
-  @parameterized.parameters(((9, 0), (10, 0)), ((10, 0), (9, 0)), (None, (10, 0)))
+  @parameterized.parameters(
+      ((9, 0), (10, 0)), ((10, 0), (9, 0)), (None, (10, 0)), ("detached", (9, 0))
+  )
   def test_a_transfer_its_target_decides_is_read_for_each_target_in_one_process(
       self, first, second
   ):
@@ -623,6 +626,12 @@ class ConstraintSystemTest(parameterized.TestCase):
       if arch is None:
         # No module: the target is the device's (`utils.get_arch`).
         return constraint.holds()
+      if arch == "detached":
+        # Inside an op no module holds yet, as a kernel body layout inference
+        # reads before it is placed: the device's target too.
+        body = func.FuncOp("unplaced", ir.FunctionType.get([], [])).add_entry_block()
+        with ir.InsertionPoint(body):
+          return constraint.holds()
       module = ir.Module.create()
       i32 = ir.IntegerType.get_signless(32)
       module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch[0])
@@ -630,7 +639,9 @@ class ConstraintSystemTest(parameterized.TestCase):
       with ir.InsertionPoint(module.body):
         return constraint.holds()
 
-    blackwell = lambda arch: (arch or (mgpu_utils.get_arch().major,))[0] >= 10
+    blackwell = lambda arch: (
+        arch if isinstance(arch, tuple) else (mgpu_utils.get_arch().major,)
+    )[0] >= 10
     self.assertEqual(
         [holds(first), holds(second)], [blackwell(first), blackwell(second)]
     )
