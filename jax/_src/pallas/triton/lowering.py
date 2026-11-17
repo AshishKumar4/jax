@@ -32,6 +32,7 @@ from jax._src import ad_util
 from jax._src import api_util
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import custom_derivatives
 from jax._src import debugging
 from jax._src import literals
@@ -418,13 +419,16 @@ def lower_jaxpr_to_triton_ir(
 
   for eqn in jaxpr.eqns:
     invals = map(read_env, eqn.invars)
-    if eqn.primitive not in triton_lowering_rules:
+    # Any call primitive lowers as `eval_jaxpr_p`, its body inlined.
+    primitive = (pe.eval_jaxpr_p if eqn.primitive in eval_jaxpr_lib.call_primitives
+                 else eqn.primitive)
+    if primitive not in triton_lowering_rules:
       raise NotImplementedError(
           "Unimplemented primitive in Pallas Triton lowering:"
           f" {eqn.primitive.name}. Please file an issue at"
           " https://github.com/jax-ml/jax/issues/new/choose."
       )
-    rule = triton_lowering_rules[eqn.primitive]
+    rule = triton_lowering_rules[primitive]
     avals_in = [v.aval for v in eqn.invars]
     avals_out = [v.aval for v in eqn.outvars]
     eqn_block_infos = map(read_block_info_env, eqn.invars)
