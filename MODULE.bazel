@@ -69,6 +69,9 @@ archive_override(
         # The CUDA plugin serves its executables' metadata (PJRT_ExecutableMetadata_Extension), and the C API
         # client reads their buffer assignment from it into memory_analysis().
         "//third_party:xla/executable_metadata_gpu.patch",
+        # FFI handlers that instantiate concurrently (Mosaic GPU's) are instantiated together on the compile
+        # threads before thunk emission, a program's Mosaic kernels compiled in parallel.
+        "//third_party:xla/instantiate_concurrently.patch",
     ],
     strip_prefix = "xla-4bd1084be692fed10e9b829fdbb469cd359621e4",
     urls = ["https://github.com/openxla/xla/archive/4bd1084be692fed10e9b829fdbb469cd359621e4.tar.gz"],
