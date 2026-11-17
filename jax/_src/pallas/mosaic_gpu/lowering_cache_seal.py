@@ -146,6 +146,7 @@ class Seal:
     self._verified = set(verified_modules)
     self._verify_lock = threading.Lock()
     self._relative: dict[str, str | None] = {}
+    self._source_of: dict[str, tuple[str, str] | None] = {}
     # The declared source packages' files (`SOURCES_VARIABLE`), each by its path
     # to its package and its name in it, and each package's tree digest.
     self._sources = sources or {}
@@ -172,11 +173,18 @@ class Seal:
     return self.relative(file) is not None
 
   def source(self, file: str | None) -> tuple[str, str] | None:
-    """The declared source package `file` is of and its name in it, if any."""
+    """The declared source package `file` is of and its name in it, if any.
+
+    Read for every primitive a key's jaxpr binds, so it is answered once a
+    file: resolving a path's links was 0.15 of a 0.48 s key."""
     if not file:
       return None
-    return (self._sources.get(os.path.normpath(file))
-            or self._sources.get(os.path.realpath(file)))
+    if file not in self._source_of:
+      self._source_of[file] = (
+          self._sources.get(os.path.normpath(file))
+          or self._sources.get(os.path.realpath(file))
+      )
+    return self._source_of[file]
 
   def source_identity(self, package: str) -> bytes:
     """A declared source package's identity: its name and its tree's digest."""
