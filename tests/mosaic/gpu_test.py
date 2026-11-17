@@ -321,6 +321,20 @@ class Sm90ATestCase(TestCase, jtu.CudaArchSpecificTest):
 
 class TestUtilTest(TestCase):
 
+  def test_the_assembler_names_the_ptxas_it_runs(self):
+    # An open-source build links no libnvptxcompiler (XLA's
+    # enable_libnvptxcompiler_support), so a subprocess provider assembles a
+    # kernel's PTX, naming the ptxas it runs; a kernel assembled by it runs.
+    name = mosaic_gpu_lib._mosaic_gpu_ext._get_assembler()
+    named = re.search(r"ptxas: ([^,)]+)", name)
+    self.assertIsNotNone(named, name)
+    self.assertTrue(os.access(named.group(1), os.X_OK), name)
+    def kernel(ctx, src, dst, _):
+      copy(src, dst)
+    x = jnp.arange(128, dtype=jnp.float32)
+    y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, ())(x)
+    np.testing.assert_array_equal(y, x)
+
   def test_copy_basic(self):
     def kernel(ctx, src, dst, _):
       copy(src, dst)

@@ -423,6 +423,15 @@ NB_MODULE(_mosaic_gpu_ext, m) {
       },
       nb::arg("finalize") = true);
   m.def(
+      "_get_assembler",
+      []() -> std::string {
+        return jax::ValueOrThrow(
+                   mosaic::gpu::GetAssemblyToBinaryCompilationProvider())
+            ->name();
+      },
+      "Returns the compilation provider that assembles a kernel's PTX, as it "
+      "names itself: a subprocess provider names the `ptxas` it runs.");
+  m.def(
       "_get_ptxas_isa_version",
       []() -> int {
         return jax::ValueOrThrow(
