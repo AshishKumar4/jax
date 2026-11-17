@@ -30,7 +30,7 @@ executable protocols described above.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 from dataclasses import dataclass
 import enum
@@ -39,6 +39,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from jax._src import config
 from jax._src import core
+from jax._src import hlo_reader
 from jax._src import literals
 from jax._src import peak_live
 from jax._src import sharding as sharding_lib
@@ -870,7 +871,45 @@ class Compiled(Stage):
       return None
     module, = self.runtime_executable().hlo_modules()
     return peak_live.live(analysis.serialized_buffer_assignment_proto,
-                          module.as_serialized_hlo_module_proto())
+                          module.as_serialized_hlo_module_proto(),
+                          self._parameter_arguments())
+
+  def _parameter_arguments(self) -> Callable[[int], int | None] | None:
+    """The flat index among the call's arguments (``args_info``'s leaves) of
+    the compiled module's entry parameter numbered as given, None for one that
+    is no argument (a closed-over constant, an effect's token, a mutable
+    array's state); None for an executable that states no such map (not a
+    ``MeshExecutable`` holding its unloaded executable). Its entry parameters
+    are its ordered effects' tokens, then the arguments it keeps (its const
+    args first), then its mutable arrays'; refused (ValueError) where they do
+    not count the module's."""
+    from jax._src.interpreters import pxla  # pxla imports this module.
+
+    executable = self._executable
+    if not (isinstance(executable, pxla.MeshExecutable)
+            and executable._unloaded_executable is not None):
+      return None
+    unloaded = executable._unloaded_executable
+    tokens = len(unloaded.ordered_effects)
+    kept = sorted(unloaded.kept_var_idx)
+    mutable = 0 if unloaded.mut is None else len(unloaded.mut.in_mut)
+    consts = len(self._params.const_args)
+    module, = self.runtime_executable().hlo_modules()
+    proto = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module.as_serialized_hlo_module_proto())
+    entry, = (computation for computation in proto.computations
+              if computation.id == proto.entry_computation_id)
+    count = sum(instruction.opcode == "parameter"
+                for instruction in entry.instructions)
+    if tokens + len(kept) + mutable != count:
+      raise ValueError(
+          f"the module's entry takes {count} parameters, its executable "
+          f"{tokens} tokens, {len(kept)} kept arguments and {mutable} mutable "
+          "arrays")
+    arguments = [*(None,) * tokens,
+                 *(None if index < consts else index - consts for index in kept),
+                 *(None,) * mutable]
+    return arguments.__getitem__
 
   @property
   def in_avals(self):
