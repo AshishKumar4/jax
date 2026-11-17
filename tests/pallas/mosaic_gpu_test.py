@@ -167,6 +167,29 @@ def run_on_sm80(method):
   return method
 
 
+class BoundedAccuracyBoundaryTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(("tanh", lax.tanh), ("logistic", lax.logistic))
+  def test_absolute_tolerance_lowers_for_a_bounded_result(self, operation):
+    def kernel(x_ref, out_ref):
+      out_ref[...] = operation(
+          x_ref[...], accuracy=lax.Tolerance(atol=1e-3))
+
+    descriptor = jax.ShapeDtypeStruct((128,), jnp.float32)
+    call = pl.pallas_call(
+        kernel, out_shape=descriptor, grid=(1,),
+        compiler_params=plgpu.CompilerParams())
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="cuda", num_cores=None,
+        compute_capability="9.0")
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      lowered = jax.jit(call).trace(descriptor).lower(
+          lowering_platforms=("cuda",))
+    self.assertEqual(lowered.out_info.shape, descriptor.shape)
+    self.assertEqual(lowered.out_info.dtype, np.dtype(np.float32))
+
+
 class PipelineAllocationsTest(jtu.JaxTestCase):
   """A pipeline's scoped buffers stated before it runs (`get_allocations`)."""
 

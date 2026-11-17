@@ -81,6 +81,28 @@ DTYPE_LIST = [jnp.float32, jnp.float16, jnp.bfloat16,
               jnp.float8_e4m3fn, jnp.float8_e5m2]
 
 
+class TritonSliceBoundaryTest(jtu.JaxTestCase):
+
+  @parameterized.parameters((1, 16), (16, 1))
+  def test_full_slice_of_an_already_unit_axis_lowers(self, shape):
+    def kernel(x_ref, out_ref):
+      out_ref[...] = lax.slice(x_ref[...], (0, 0), shape)
+
+    descriptor = jax.ShapeDtypeStruct(shape, jnp.float32)
+    call = pl.pallas_call(
+        kernel, out_shape=descriptor, grid=(1,),
+        compiler_params=plgpu.CompilerParams())
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="cuda", num_cores=None,
+        compute_capability="8.0")
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      lowered = jax.jit(call).trace(descriptor).lower(
+          lowering_platforms=("cuda",))
+    self.assertEqual(lowered.out_info.shape, shape)
+    self.assertEqual(lowered.out_info.dtype, np.dtype(np.float32))
+
+
 class TritonPallasTest(PallasBaseTest):
   INTERPRET = False
 

@@ -420,6 +420,23 @@ class X64ContextTests(jtu.JaxTestCase):
     self.assertEqual((gx.dtype, gy.dtype), (np.float64, np.float64))
     np.testing.assert_allclose([gx, gy], [12.0, 8.0 * np.log(2.0)], rtol=1e-12)
 
+  def test_a_wide_complex_algorithmic_dot_lowers_outside_its_scope(self):
+    def wide(x, y):
+      return lax.dot_general(
+          x, y, (((1,), (0,)), ((), ())),
+          precision=lax.DotAlgorithmPreset.F64_F64_F64,
+          preferred_element_type=jnp.complex128)
+
+    with jax.enable_x64(True):
+      x = jnp.array([[1. + 2.j, 3. - 4.j]], dtype=jnp.complex128)
+      y = jnp.array([[5. - 6.j], [7. + 8.j]], dtype=jnp.complex128)
+      jaxpr = jax.make_jaxpr(wide)(x, y)
+      expected = np.asarray(x) @ np.asarray(y)
+    with jax.enable_x64(False):
+      [result] = jax.jit(core.jaxpr_as_fun(jaxpr))(x, y)
+    self.assertEqual(result.dtype, np.complex128)
+    np.testing.assert_allclose(result, expected, rtol=1e-12)
+
   def test_a_wide_complex_convolution_lowers_outside_its_scope(self):
     # A complex128 convolution staged inside an x64 scope and lowered outside
     # it through the real-convolution decomposition keeps its real float64

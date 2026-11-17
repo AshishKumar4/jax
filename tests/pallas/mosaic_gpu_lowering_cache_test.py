@@ -23,9 +23,12 @@ own cases are in `mosaic_gpu_lowering_cache_encoder_test`.
 """
 
 import os
+import pathlib
 import shutil
 
 import sys
+import types
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -33,6 +36,35 @@ from absl.testing import absltest
 # directory (and the support package in it) off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mosaic_gpu_lowering_cache_support import harness  # pylint: disable=g-import-not-at-top,g-bad-import-order  # noqa: E402
+
+
+class SourceSealingBoundaryTest(absltest.TestCase):
+
+  def test_unreadable_source_returns_an_unsealed_diagnostic(self):
+    from jax._src.pallas.mosaic_gpu import lowering_cache_seal
+
+    root = pathlib.Path(self.create_tempdir().full_path)
+    source = root / "__init__.py"
+    source.write_text("")
+    unrelated = root / "unrelated.py"
+    unrelated.write_text("VALUE = 1\n")
+    spec = types.SimpleNamespace(
+        origin=str(source), submodule_search_locations=[str(root)])
+    real_open = open
+
+    def unreadable(path, *args, **kwargs):
+      if pathlib.Path(path) == unrelated:
+        raise PermissionError("source is unreadable")
+      return real_open(path, *args, **kwargs)
+
+    with mock.patch.object(lowering_cache_seal.importlib.util, "find_spec",
+                           return_value=spec), mock.patch(
+                               "builtins.open", side_effect=unreadable):
+      files, digests, problem = lowering_cache_seal._sources("boundary_package")
+    self.assertIsNotNone(problem)
+    self.assertIn("boundary_package", problem)
+    self.assertEmpty(files)
+    self.assertEmpty(digests)
 
 
 class LoweringCacheTest(harness.LoweringCacheTestCase):
