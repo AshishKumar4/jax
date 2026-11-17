@@ -1,4 +1,4 @@
-From a27135d9a4409582db40e7207858370e12dbc77b Mon Sep 17 00:00:00 2001
+From b02acac1b4efc7c23ed882199689bc690d37d48b Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Sun, 15 Nov 2026 02:12:49 -0600
 Subject: [PATCH] [XLA:GPU] FFI handlers that instantiate concurrently are
@@ -22,11 +22,11 @@ execution_state, CustomCallThunk::Instantiated the one instantiate). An instanti
  xla/ffi/api/api.h                             |   6 +
  xla/ffi/api/c_api.h                           |   5 +
  xla/ffi/ffi_registry.h                        |   6 +
- xla/service/gpu/BUILD                         |  27 ++++
+ xla/service/gpu/BUILD                         |  30 ++++
  .../gpu/instantiate_concurrently_test.cc      | 133 ++++++++++++++++
  xla/service/gpu/thunk_emitter.cc              | 149 ++++++++++++++----
  xla/service/gpu/thunk_emitter.h               |  29 ++++
- 13 files changed, 431 insertions(+), 47 deletions(-)
+ 13 files changed, 434 insertions(+), 47 deletions(-)
  create mode 100644 xla/service/gpu/instantiate_concurrently_test.cc
 
 diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
@@ -320,7 +320,7 @@ index 517f6fd9c9..15fd9da67f 100644
  }
  
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 9127d9e185..e83c68dc44 100644
+index 9127d9e185..241ba0bc50 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -561,6 +561,8 @@ cc_library(
@@ -332,13 +332,16 @@ index 9127d9e185..e83c68dc44 100644
          "//xla/hlo/ir:hlo",
          "//xla/hlo/ir:hlo_instruction_utils",
          "//xla/mlir/utils:error_util",
-@@ -2185,6 +2187,31 @@ xla_test(
+@@ -2185,6 +2187,34 @@ xla_test(
      ],
  )
  
 +xla_test(
 +    name = "instantiate_concurrently_test",
 +    srcs = ["instantiate_concurrently_test.cc"],
++    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against its
++    # libraries' shared objects finds none of their functions.
++    linkstatic = True,
 +    backends = ["gpu"],
 +    deps = [
 +        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
