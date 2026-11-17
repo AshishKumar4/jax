@@ -109,6 +109,25 @@ def _xla_name(dtype: np.dtype) -> str:
   return _XLA_NAMES.get(np.dtype(dtype).name, np.dtype(dtype).name)
 
 
+def _buffers(kernel: Kernel, operands: Sequence[np.ndarray]) -> list[tuple[str, np.ndarray]]:
+  """Each operand and zeroed result of `kernel` by its capture's name, in C order and of the shape and
+  dtype the kernel reads. A sub-byte element type is refused: the kernel reads two elements a byte, a
+  host array holds one."""
+  buffers = []
+  for index, (array, (shape, dtype)) in enumerate(zip(operands, kernel.operands, strict=True)):
+    array = np.asarray(array, order="C")  # A scalar stays rank 0.
+    if array.shape != shape or array.dtype != dtype:
+      raise ValueError(f"operand {index} is {array.dtype}{list(array.shape)}, the kernel reads "
+                       f"{dtype}{list(shape)}")
+    buffers.append((f"in{index}", array))
+  buffers += [(f"out{index}", np.zeros(shape, dtype)) for index, (shape, dtype) in enumerate(kernel.results)]
+  for name, array in buffers:
+    if array.dtype.itemsize == 1 and dtypes.itemsize_bits(array.dtype) < 8:
+      raise ValueError(f"{name} is {array.dtype}, which the kernel reads packed two elements a byte; a "
+                       "deviceless capture takes whole bytes")
+  return buffers
+
+
 def capture_deviceless(kernel: Kernel, compute_capability: str, operands: Sequence[np.ndarray],
                        directory: str) -> str:
   """Writes `kernel`'s launch over `operands` (host arrays of its operands' shapes and dtypes; its results
@@ -118,14 +137,7 @@ def capture_deviceless(kernel: Kernel, compute_capability: str, operands: Sequen
     raise ValueError("a deviceless capture holds no collective metadata: the kernel reads XLA's")
   if len(operands) != len(kernel.operands):
     raise ValueError(f"the kernel reads {len(kernel.operands)} operands, not {len(operands)}")
-  buffers = []
-  for index, (array, (shape, dtype)) in enumerate(zip(operands, kernel.operands, strict=True)):
-    array = np.ascontiguousarray(array)
-    if array.shape != shape or array.dtype != dtype:
-      raise ValueError(f"operand {index} is {array.dtype}{list(array.shape)}, the kernel reads "
-                       f"{dtype}{list(shape)}")
-    buffers.append((f"in{index}", array))
-  buffers += [(f"out{index}", np.zeros(shape, dtype)) for index, (shape, dtype) in enumerate(kernel.results)]
+  buffers = _buffers(kernel, operands)
 
   major, minor = (int(part) for part in compute_capability.split("."))
   count = len(buffers)

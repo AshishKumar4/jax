@@ -25,6 +25,8 @@ import textwrap
 from absl.testing import absltest
 import jax
 from jax._src import test_util as jtu
+import jax.numpy as jnp
+import numpy as np
 
 # The kernel, run where a GPU captures it (MOSAIC_GPU_CAPTURE_LAUNCHES, read once a process) and lowered
 # here: a swizzled TMA load of a 64 x 64 half tile, stored back.
@@ -49,6 +51,31 @@ KERNEL = textwrap.dedent("""
       launch = mgpu.as_gpu_kernel(
           kernel, (1, 1, 1), (128, 1, 1), x, x, (x, mgpu.Barrier(1)))
 """)
+
+
+class DevicelessCaptureOperandsTest(jtu.JaxTestCase):
+  """The buffers a deviceless capture hands its library: no GPU needed."""
+
+  def _kernel(self, shape, dtype):
+    from jax.experimental.mosaic.gpu import capture
+
+    return capture.Kernel(module=b"", operands=((shape, np.dtype(dtype)),),
+                          results=((shape, np.dtype(dtype)),), collective=False)
+
+  def test_a_scalar_operand_stays_rank_zero(self):
+    from jax.experimental.mosaic.gpu import capture
+
+    buffers = capture._buffers(self._kernel((), np.float32), [np.float32(2)])
+    self.assertEqual([(name, array.shape) for name, array in buffers],
+                     [("in0", ()), ("out0", ())])
+
+  @jtu.parameterized.parameters("int4", "uint4", "float4_e2m1fn")
+  def test_a_sub_byte_operand_is_refused(self, dtype):
+    from jax.experimental.mosaic.gpu import capture
+
+    dtype = jnp.dtype(dtype)
+    with self.assertRaisesRegex(ValueError, "two elements a byte"):
+      capture._buffers(self._kernel((4,), dtype), [np.zeros((4,), dtype)])
 
 
 class DevicelessCaptureTest(jtu.JaxTestCase):
