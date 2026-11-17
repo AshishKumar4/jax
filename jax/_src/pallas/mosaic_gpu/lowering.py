@@ -24,7 +24,7 @@ import functools
 import itertools
 import math
 import operator
-from typing import Any, Protocol, assert_never, cast, overload
+from typing import Any, Literal, Protocol, assert_never, cast, overload
 
 import jax
 from jax import api_util
@@ -3539,6 +3539,38 @@ register_lowering_rule(lax.reduce_prod_p, mgpu.LoweringSemantics.Lane)(
 )
 
 
+def _check_reduce_pred(op: str, x_aval, axes) -> None:
+  """A predicate reduction lowers for a boolean array reduced whole: the
+  scalar `pl.when` takes (`jnp.any`, `jnp.all`)."""
+  if x_aval.dtype != jnp.bool_:
+    raise NotImplementedError(
+        f"reduce_{op} lowers for booleans alone, not {x_aval.dtype}"
+    )
+  if set(axes) != set(range(x_aval.ndim)):
+    raise NotImplementedError(
+        f"reduce_{op} lowers over every axis alone, not {tuple(axes)} of"
+        f" {x_aval.ndim}"
+    )
+
+
+def _reduce_pred_lowering_rule(
+    op: Literal["or", "and"], ctx: LoweringRuleContext, x, *, axes
+):
+  [x_aval] = ctx.avals_in
+  _check_reduce_pred(op, x_aval, axes)
+  if not axes:  # A scalar's: itself.
+    return x
+  return _ensure_fa(x, x_aval.dtype).reduce_pred(op)
+
+
+register_lowering_rule(lax.reduce_or_p, mgpu.LoweringSemantics.Lane)(
+    functools.partial(_reduce_pred_lowering_rule, "or")
+)
+register_lowering_rule(lax.reduce_and_p, mgpu.LoweringSemantics.Lane)(
+    functools.partial(_reduce_pred_lowering_rule, "and")
+)
+
+
 def _reduce_lowering_rule_wg(
     ctx: LoweringRuleContext,
     kind: vector_dialect.CombiningKind,
@@ -3669,6 +3701,28 @@ def _reduce_prod_lowering_rule_wg(
   kind = vector_dialect.CombiningKind.MUL
   return _reduce_lowering_rule_wg(
       ctx, kind, acc, x, axes, accumulator_ilp=accumulator_ilp
+  )
+
+
+@register_lowering_rule(lax.reduce_or_p, mgpu.LoweringSemantics.Warpgroup)
+def _reduce_or_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
+  [x_aval] = ctx.avals_in
+  _check_reduce_pred("or", x_aval, axes)
+  if not axes:  # A scalar's: itself.
+    return x
+  return _reduce_lowering_rule_wg(
+      ctx, vector_dialect.CombiningKind.OR, 0, x, axes
+  )
+
+
+@register_lowering_rule(lax.reduce_and_p, mgpu.LoweringSemantics.Warpgroup)
+def _reduce_and_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
+  [x_aval] = ctx.avals_in
+  _check_reduce_pred("and", x_aval, axes)
+  if not axes:  # A scalar's: itself.
+    return x
+  return _reduce_lowering_rule_wg(
+      ctx, vector_dialect.CombiningKind.AND, 1, x, axes
   )
 
 
