@@ -24,6 +24,7 @@ For more, see the `AOT walkthrough <https://docs.jax.dev/en/latest/201/aot.html>
 # Note: import <name> as <name> is required for names to be exported.
 # See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
+from jax._src.peak_live import LiveBuffer as LiveBuffer
 from jax._src.stages import (
   Compiled as Compiled,
   CompilerOptions as CompilerOptions,
