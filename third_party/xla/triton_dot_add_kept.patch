@@ -1,0 +1,179 @@
+From d02ae946acf7103c2046cc592aa2da5b412d6a47 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 23:57:31 -0600
+Subject: [PATCH] [XLA:GPU] Triton's combine keeps a float add of a dot's
+ result apart from its accumulator
+
+Triton's CombineOps folds add(dot(a, b, 0), d) into dot(a, b, d): the addend becomes the accumulator's initial
+value, every product added onto it and rounded at its magnitude, where the program adds it once to the
+products' sum. XLA's nested GEMM fusion of a residual add (r + x @ w in a while body, its K loop a single trip
+folded away) took the residual as its accumulator, 1.7 times the unfused program's float32 distance from
+float64 on an A100 and a GH200. The float patterns (a dot's and a scaled dot's) are dropped; an integer add,
+exact either way, is still combined. compilation_pipeline_test holds both.
+---
+ .../triton/common/dot_add_float_kept.patch    | 29 ++++++++++
+ third_party/triton/common/series              |  1 +
+ xla/backends/gpu/codegen/triton/BUILD         |  6 +++
+ .../triton/compilation_pipeline_test.cc       | 54 +++++++++++++++++++
+ 4 files changed, 90 insertions(+)
+ create mode 100644 third_party/triton/common/dot_add_float_kept.patch
+
+diff --git a/third_party/triton/common/dot_add_float_kept.patch b/third_party/triton/common/dot_add_float_kept.patch
+new file mode 100644
+index 0000000000..ea8751b5cb
+--- /dev/null
++++ b/third_party/triton/common/dot_add_float_kept.patch
+@@ -0,0 +1,29 @@
++--- a/lib/Dialect/Triton/Transforms/Combine.cpp
+++++ b/lib/Dialect/Triton/Transforms/Combine.cpp
++@@ -262,13 +262,12 @@
++ };
++ 
++ // AddIOp(DotOp(a, b, c), d) and c==0 => DotOp(a, b, d)
++-// AddFOp(DotOp(a, b, c), d) and c==0 => DotOp(a, b, d)
++ // AddIOp(d, DotOp(a, b, c)) and c==0 => DotOp(a, b, d)
++-// AddFOp(d, DotOp(a, b, c)) and c==0 => DotOp(a, b, d)
+++// A float add is not combined: d as the accumulator's initial value adds every
+++// product onto it, each rounded at d's magnitude, where the program adds d once
+++// to the products' sum (XLA: a scanned residual r + x @ w rounded 1.7 times as
+++// far from float64 as the add kept apart).
++ using CombineDotAddIPattern = CombineDotAddPattern<DotOp, arith::AddIOp>;
++-using CombineDotAddFPattern = CombineDotAddPattern<DotOp, arith::AddFOp>;
++-using CombineDotScaledAddFPattern =
++-    CombineDotAddPattern<DotScaledOp, arith::AddFOp>;
++ 
++ } // anonymous namespace
++ 
++@@ -280,8 +279,6 @@
++     ModuleOp m = getOperation();
++ 
++     patterns.add<CombineDotAddIPattern>(context);
++-    patterns.add<CombineDotAddFPattern>(context);
++-    patterns.add<CombineDotScaledAddFPattern>(context);
++     patterns.add<CombineSelectMaskedLoadPattern>(context);
++     patterns.add<CombineAddPtrPattern>(context);
++     patterns.add<CombineBroadcastMulReducePattern>(context);
+diff --git a/third_party/triton/common/series b/third_party/triton/common/series
+index ed0db60c2e..89f87aa9ae 100644
+--- a/third_party/triton/common/series
++++ b/third_party/triton/common/series
+@@ -39,3 +39,4 @@ cxx17_support.patch
+ llvm_cl996124567.patch
+ llvm_cl998243985.patch
+ pipeliner_multiuse_load.patch
++dot_add_float_kept.patch
+diff --git a/xla/backends/gpu/codegen/triton/BUILD b/xla/backends/gpu/codegen/triton/BUILD
+index bd13299ce6..ac0a1c7504 100644
+--- a/xla/backends/gpu/codegen/triton/BUILD
++++ b/xla/backends/gpu/codegen/triton/BUILD
+@@ -232,10 +232,16 @@ xla_cc_test(
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/stream_executor/sycl:oneapi_compute_capability",
+         "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/strings:string_view",
+         "@com_google_googletest//:gtest_main",
+         "@llvm-project//llvm:Support",
++        "@llvm-project//mlir:ArithDialect",
+         "@llvm-project//mlir:IR",
++        "@llvm-project//mlir:Parser",
+         "@llvm-project//mlir:Pass",
++        "@llvm-project//mlir:Support",
++        "@triton//:TritonDialects",
++        "@triton//:TritonTransforms",
+     ],
+ )
+ 
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc b/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
+index 49105fa163..85bde89d05 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
+@@ -22,18 +22,28 @@ limitations under the License.
+ #include <vector>
+ 
+ #include "absl/strings/ascii.h"
++#include "absl/strings/string_view.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/MLIRContext.h"
++#include "mlir/IR/OwningOpRef.h"
++#include "mlir/Parser/Parser.h"
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Pass/PassManager.h"
++#include "mlir/Support/LLVM.h"
+ #include "xla/service/platform_util.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+ #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++#include "triton/Dialect/Triton/Transforms/Passes.h"
+ 
+ namespace xla {
+ namespace gpu {
+ 
+ using ::testing::Contains;
++using ::testing::HasSubstr;
++using ::testing::Not;
+ 
+ namespace {
+ 
+@@ -45,6 +55,22 @@ std::vector<std::string> GetPassNames(const mlir::PassManager& pm) {
+   return pass_names;
+ }
+ 
++// `module` after Triton's combine, as the CUDA pipeline runs it, printed.
++std::string Combined(absl::string_view module) {
++  mlir::MLIRContext ctx;
++  ctx.loadDialect<mlir::triton::TritonDialect, mlir::arith::ArithDialect>();
++  mlir::OwningOpRef<mlir::ModuleOp> parsed =
++      mlir::parseSourceString<mlir::ModuleOp>(module, &ctx);
++  EXPECT_TRUE(parsed);
++  mlir::PassManager pm(&ctx);
++  pm.addPass(mlir::triton::createTritonCombineOps());
++  EXPECT_TRUE(mlir::succeeded(pm.run(*parsed)));
++  std::string printed;
++  llvm::raw_string_ostream os(printed);
++  parsed->print(os);
++  return printed;
++}
++
+ }  // namespace
+ 
+ TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
+@@ -67,6 +93,34 @@ TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
+   EXPECT_THAT(pipeline_str, ::testing::HasSubstr("xla-simplify-arith"));
+ }
+ 
++// A float add of a dot's result stays an add: the addend as the dot's
++// accumulator adds every product onto it, each rounded at its magnitude, where
++// the program adds it once to the products' sum (a scanned residual r + x @ w
++// rounded 1.7 times as far from float64 as the add kept apart). An integer
++// add, exact either way, still becomes the accumulator.
++TEST(CompilationPipelineTest, CombineKeepsAFloatAddOfADotApart) {
++  std::string floats = Combined(R"(
++    tt.func @residual(%x: tensor<16x16xf32>, %w: tensor<16x16xf32>,
++                      %r: tensor<16x16xf32>) -> tensor<16x16xf32> {
++      %zero = arith.constant dense<0.0> : tensor<16x16xf32>
++      %dot = tt.dot %x, %w, %zero : tensor<16x16xf32> * tensor<16x16xf32> -> tensor<16x16xf32>
++      %sum = arith.addf %r, %dot : tensor<16x16xf32>
++      tt.return %sum : tensor<16x16xf32>
++    })");
++  EXPECT_THAT(floats, HasSubstr("arith.addf"));
++  EXPECT_THAT(floats, Not(HasSubstr("tt.dot %arg0, %arg1, %arg2")));
++  std::string integers = Combined(R"(
++    tt.func @residual(%x: tensor<16x16xi8>, %w: tensor<16x16xi8>,
++                      %r: tensor<16x16xi32>) -> tensor<16x16xi32> {
++      %zero = arith.constant dense<0> : tensor<16x16xi32>
++      %dot = tt.dot %x, %w, %zero : tensor<16x16xi8> * tensor<16x16xi8> -> tensor<16x16xi32>
++      %sum = arith.addi %r, %dot : tensor<16x16xi32>
++      tt.return %sum : tensor<16x16xi32>
++    })");
++  EXPECT_THAT(integers, HasSubstr("tt.dot %arg0, %arg1, %arg2"));
++  EXPECT_THAT(integers, Not(HasSubstr("arith.addi")));
++}
++
+ TEST(CompilationPipelineTest, OneApiPipelineDispatchesCorrectly) {
+   mlir::MLIRContext ctx;
+   mlir::PassManager pm(&ctx);
+-- 
+2.53.0
+
