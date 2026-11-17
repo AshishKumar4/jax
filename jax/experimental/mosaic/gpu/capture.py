@@ -80,7 +80,9 @@ def kernels(module: ir.Module) -> list[Kernel]:
                             and ir.BoolAttr(config["uses_xla_collective_metadata"]).value)))
           walk(op)
 
-  walk(module.operation)
+  # The dtypes' IR types (`_dtype`) are built in the module's own context.
+  with module.context:
+    walk(module.operation)
   return found
 
 
