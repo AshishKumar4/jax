@@ -1,0 +1,415 @@
+From 80c0c707b26ea3a53f2632abf43b0bd4f94d36a6 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 23:57:31 -0600
+Subject: [PATCH] [XLA:GPU] An XLA fusion's Triton pipeline keeps a float add
+ of a dot's result apart from its accumulator
+
+Triton's CombineOps folds add(dot(a, b, 0), d) into dot(a, b, d): the addend becomes the accumulator's initial
+value, every product added onto it and rounded at its magnitude, where the HLO adds it once to the products'
+sum. XLA's nested GEMM fusion of a residual add (r + x @ w in a while body, its K loop a single trip folded
+away) took the residual as its accumulator, 1.7 times the unfused program's float32 distance from float64 on
+an A100 and a GH200.
+
+Triton's combine pass takes an option, fold-float-dot-add (default true, Triton's own rule), and
+CreateTritonPipeline takes is_xla_fusion: an XLA fusion's pipeline keeps the float add apart, as the HLO
+states it, while a Triton call's (a kernel written in Triton or Pallas, an online softmax's
+acc * alpha + dot(p, v) among them) folds it, as Triton's compiler does. An integer add, exact either way, is
+folded in both. compilation_pipeline_test holds the option's rule on IR and each pipeline's choice.
+---
+ .../common/combine_float_dot_add_option.patch | 44 +++++++++
+ third_party/triton/common/series              |  1 +
+ xla/backends/gpu/codegen/triton/BUILD         |  6 ++
+ .../codegen/triton/compilation_pipeline.cc    | 11 ++-
+ .../gpu/codegen/triton/compilation_pipeline.h |  8 +-
+ .../triton/compilation_pipeline_cuda.cc       | 13 ++-
+ .../triton/compilation_pipeline_rocm.cc       | 12 ++-
+ .../triton/compilation_pipeline_test.cc       | 94 ++++++++++++++++++-
+ .../gpu/codegen/triton/xtile_compiler.cc      |  3 +-
+ xla/backends/gpu/tests/xla-opt.cc             |  3 +-
+ 10 files changed, 177 insertions(+), 18 deletions(-)
+ create mode 100644 third_party/triton/common/combine_float_dot_add_option.patch
+
+diff --git a/third_party/triton/common/combine_float_dot_add_option.patch b/third_party/triton/common/combine_float_dot_add_option.patch
+new file mode 100644
+index 0000000000..2bd32e8da9
+--- /dev/null
++++ b/third_party/triton/common/combine_float_dot_add_option.patch
+@@ -0,0 +1,44 @@
++diff --git a/include/triton/Dialect/Triton/Transforms/Passes.td b/include/triton/Dialect/Triton/Transforms/Passes.td
++--- a/include/triton/Dialect/Triton/Transforms/Passes.td
+++++ b/include/triton/Dialect/Triton/Transforms/Passes.td
++@@ -20,6 +20,14 @@
++   }];
++ 
++   let dependentDialects = ["mlir::arith::ArithDialect"];
+++
+++  let options = [
+++    Option<"foldFloatDotAdd", "fold-float-dot-add",
+++           "bool", /*default*/"true",
+++           "Fold a float add of a dot's result into its accumulator: the addend as "
+++           "the accumulator's initial value, each product added onto it, where the "
+++           "program adds it once to the products' sum">
+++  ];
++ }
++ 
++ def TritonReorderBroadcast : Pass</*cli-arg*/"triton-reorder-broadcast", /*Op*/"mlir::ModuleOp"> {
++diff --git a/lib/Dialect/Triton/Transforms/Combine.cpp b/lib/Dialect/Triton/Transforms/Combine.cpp
++--- a/lib/Dialect/Triton/Transforms/Combine.cpp
+++++ b/lib/Dialect/Triton/Transforms/Combine.cpp
++@@ -274,14 +274,20 @@
++ 
++ class CombineOpsPass : public impl::TritonCombineOpsBase<CombineOpsPass> {
++ public:
+++  using impl::TritonCombineOpsBase<CombineOpsPass>::TritonCombineOpsBase;
+++
++   void runOnOperation() override {
++     MLIRContext *context = &getContext();
++     RewritePatternSet patterns(context);
++     ModuleOp m = getOperation();
++ 
++     patterns.add<CombineDotAddIPattern>(context);
++-    patterns.add<CombineDotAddFPattern>(context);
++-    patterns.add<CombineDotScaledAddFPattern>(context);
+++    // A float add folded into the accumulator rounds each product at the
+++    // addend's magnitude; an integer add is exact either way.
+++    if (foldFloatDotAdd) {
+++      patterns.add<CombineDotAddFPattern>(context);
+++      patterns.add<CombineDotScaledAddFPattern>(context);
+++    }
++     patterns.add<CombineSelectMaskedLoadPattern>(context);
++     patterns.add<CombineAddPtrPattern>(context);
++     patterns.add<CombineBroadcastMulReducePattern>(context);
+diff --git a/third_party/triton/common/series b/third_party/triton/common/series
+index ed0db60c2e..ee4aefa730 100644
+--- a/third_party/triton/common/series
++++ b/third_party/triton/common/series
+@@ -39,3 +39,4 @@ cxx17_support.patch
+ llvm_cl996124567.patch
+ llvm_cl998243985.patch
+ pipeliner_multiuse_load.patch
++combine_float_dot_add_option.patch
+diff --git a/xla/backends/gpu/codegen/triton/BUILD b/xla/backends/gpu/codegen/triton/BUILD
+index bd13299ce6..ac0a1c7504 100644
+--- a/xla/backends/gpu/codegen/triton/BUILD
++++ b/xla/backends/gpu/codegen/triton/BUILD
+@@ -232,10 +232,16 @@ xla_cc_test(
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/stream_executor/sycl:oneapi_compute_capability",
+         "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/strings:string_view",
+         "@com_google_googletest//:gtest_main",
+         "@llvm-project//llvm:Support",
++        "@llvm-project//mlir:ArithDialect",
+         "@llvm-project//mlir:IR",
++        "@llvm-project//mlir:Parser",
+         "@llvm-project//mlir:Pass",
++        "@llvm-project//mlir:Support",
++        "@triton//:TritonDialects",
++        "@triton//:TritonTransforms",
+     ],
+ )
+ 
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline.cc b/xla/backends/gpu/codegen/triton/compilation_pipeline.cc
+index ddd8599bd8..bb246c77b3 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline.cc
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline.cc
+@@ -99,12 +99,12 @@ void CreateTritonXlaPipeline(
+ void CreateTritonCudaPipeline(
+     mlir::OpPassManager* pm,
+     const stream_executor::CudaComputeCapability& cuda_cc, int num_warps,
+-    int num_ctas, int num_stages);
++    int num_ctas, int num_stages, bool is_xla_fusion);
+ 
+ void CreateTritonRocmPipeline(
+     mlir::OpPassManager* pm,
+     const stream_executor::RocmComputeCapability& rocm_cc, int num_warps,
+-    int num_ctas, int num_stages);
++    int num_ctas, int num_stages, bool is_xla_fusion);
+ 
+ void CreateTritonOneAPIPipeline(
+     mlir::OpPassManager* pm,
+@@ -113,10 +113,11 @@ void CreateTritonOneAPIPipeline(
+ 
+ void CreateTritonPipeline(mlir::OpPassManager* pm,
+                           const stream_executor::GpuComputeCapability& gpu_cc,
+-                          int num_warps, int num_ctas, int num_stages) {
++                          int num_warps, int num_ctas, int num_stages,
++                          bool is_xla_fusion) {
+   if (auto* cuda_cc = gpu_cc.cuda_compute_capability()) {
+     return CreateTritonCudaPipeline(pm, *cuda_cc, num_warps, num_ctas,
+-                                    num_stages);
++                                    num_stages, is_xla_fusion);
+   }
+   if (auto* oneapi_cc = gpu_cc.oneapi_compute_capability()) {
+     return CreateTritonOneAPIPipeline(pm, *oneapi_cc, num_warps, num_ctas,
+@@ -124,7 +125,7 @@ void CreateTritonPipeline(mlir::OpPassManager* pm,
+   }
+ 
+   CreateTritonRocmPipeline(pm, *gpu_cc.rocm_compute_capability(), num_warps,
+-                           num_ctas, num_stages);
++                           num_ctas, num_stages, is_xla_fusion);
+ }
+ 
+ }  // namespace xla::gpu
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline.h b/xla/backends/gpu/codegen/triton/compilation_pipeline.h
+index 66d1e475a8..5ab21a120d 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline.h
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline.h
+@@ -28,10 +28,14 @@ void CreateTritonXlaPipeline(
+     bool allow_tma, int num_stages, bool warp_specialization_allowed,
+     bool enable_pdl);
+ 
+-// Creates a Triton compilation pipeline.
++// Creates a Triton compilation pipeline. An XLA fusion's (`is_xla_fusion`)
++// keeps a float add of a dot's result apart from the dot's accumulator, as the
++// HLO adds it once to the products' sum; a Triton call's (a kernel written in
++// Triton or Pallas) folds it, as Triton's own compiler does.
+ void CreateTritonPipeline(mlir::OpPassManager* pm,
+                           const stream_executor::GpuComputeCapability& gpu_cc,
+-                          int num_warps, int num_ctas, int num_stages);
++                          int num_warps, int num_ctas, int num_stages,
++                          bool is_xla_fusion);
+ 
+ // Returns the default PTX version for a given CUDA compute capability.
+ int GetDefaultPtxVersion(const stream_executor::CudaComputeCapability& cuda_cc);
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline_cuda.cc b/xla/backends/gpu/codegen/triton/compilation_pipeline_cuda.cc
+index e5a6a756dd..925b8c1e24 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline_cuda.cc
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline_cuda.cc
+@@ -42,14 +42,19 @@ namespace ttng = mlir::triton::nvidia_gpu;
+ // Based on make_ttir() in
+ // @triton//:third_party/nvidia/backend/compiler.py
+ static void MakeTTIR(mlir::OpPassManager* pm,
+-                     const stream_executor::CudaComputeCapability& cuda_cc) {
++                     const stream_executor::CudaComputeCapability& cuda_cc,
++                     bool is_xla_fusion) {
+   pm->addPass(mt_xla::createRoundF32ToTF32ForTf32DotRewritePass());
+   pm->addPass(mlir::createInlinerPass());
+   if (!cuda_cc.IsAtLeastHopper()) {
+     pm->addPass(mt::createTritonRewriteTensorDescriptorToPointer());
+   }
+   pm->addPass(mlir::createCanonicalizerPass());
+-  pm->addPass(mt::createTritonCombineOps());
++  // An XLA fusion's float add of a dot's result is the HLO's add, once to the
++  // products' sum: folded into the accumulator, each product would be added
++  // onto it (a scanned residual r + x @ w, 1.7 times as far from float64).
++  pm->addPass(
++      mt::createTritonCombineOps({/*foldFloatDotAdd=*/!is_xla_fusion}));
+   pm->addPass(mt::createTritonReorderBroadcast());
+   pm->addPass(mlir::createCSEPass());
+   pm->addPass(mlir::createSymbolDCEPass());
+@@ -206,8 +211,8 @@ static void MakeLLIR(mlir::OpPassManager* pm,
+ void CreateTritonCudaPipeline(
+     mlir::OpPassManager* pm,
+     const stream_executor::CudaComputeCapability& cuda_cc, int num_warps,
+-    int num_ctas, int num_stages) {
+-  MakeTTIR(pm, cuda_cc);
++    int num_ctas, int num_stages, bool is_xla_fusion) {
++  MakeTTIR(pm, cuda_cc, is_xla_fusion);
+   MakeTTGIR(pm, cuda_cc, num_warps, num_ctas, num_stages);
+   MakeLLIR(pm, cuda_cc);
+ }
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline_rocm.cc b/xla/backends/gpu/codegen/triton/compilation_pipeline_rocm.cc
+index b433713c9c..22af2fe164 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline_rocm.cc
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline_rocm.cc
+@@ -43,13 +43,17 @@ namespace mt = ::mlir::triton;
+ // Based on make_ttir() in
+ // @triton//:third_party/amd/backend/compiler.py
+ static void MakeTTIR(mlir::OpPassManager* pm,
+-                     const stream_executor::RocmComputeCapability& rocm_cc) {
++                     const stream_executor::RocmComputeCapability& rocm_cc,
++                     bool is_xla_fusion) {
+   pm->addPass(mlir::createInlinerPass());
+   if (!rocm_cc.has_tdm_support()) {
+     pm->addPass(mt::createTritonRewriteTensorDescriptorToPointer());
+   }
+   pm->addPass(mlir::createCanonicalizerPass());
+-  pm->addPass(mt::createTritonCombineOps());
++  // An XLA fusion's float add of a dot's result is the HLO's add, once to the
++  // products' sum (the CUDA pipeline's MakeTTIR).
++  pm->addPass(
++      mt::createTritonCombineOps({/*foldFloatDotAdd=*/!is_xla_fusion}));
+   pm->addPass(mt::createTritonReorderBroadcast());
+   pm->addPass(mlir::createCSEPass());
+   pm->addPass(mlir::createLoopInvariantCodeMotionPass());
+@@ -190,8 +194,8 @@ static void MakeLLIR(mlir::OpPassManager* pm,
+ void CreateTritonRocmPipeline(
+     mlir::OpPassManager* pm,
+     const stream_executor::RocmComputeCapability& rocm_cc, int num_warps,
+-    int num_ctas, int num_stages) {
+-  MakeTTIR(pm, rocm_cc);
++    int num_ctas, int num_stages, bool is_xla_fusion) {
++  MakeTTIR(pm, rocm_cc, is_xla_fusion);
+   MakeTTGIR(pm, rocm_cc, num_warps, num_ctas, num_stages);
+   MakeLLIR(pm, rocm_cc, num_stages);
+ }
+diff --git a/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc b/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
+index 49105fa163..79c14e962e 100644
+--- a/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
++++ b/xla/backends/gpu/codegen/triton/compilation_pipeline_test.cc
+@@ -22,18 +22,28 @@ limitations under the License.
+ #include <vector>
+ 
+ #include "absl/strings/ascii.h"
++#include "absl/strings/string_view.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/MLIRContext.h"
++#include "mlir/IR/OwningOpRef.h"
++#include "mlir/Parser/Parser.h"
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Pass/PassManager.h"
++#include "mlir/Support/LLVM.h"
+ #include "xla/service/platform_util.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+ #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
++#include "triton/Dialect/Triton/IR/Dialect.h"
++#include "triton/Dialect/Triton/Transforms/Passes.h"
+ 
+ namespace xla {
+ namespace gpu {
+ 
+ using ::testing::Contains;
++using ::testing::HasSubstr;
++using ::testing::Not;
+ 
+ namespace {
+ 
+@@ -45,6 +55,37 @@ std::vector<std::string> GetPassNames(const mlir::PassManager& pm) {
+   return pass_names;
+ }
+ 
++// `module` after Triton's combine, its float fold as asked, printed.
++std::string Combined(absl::string_view module, bool fold_float_dot_add) {
++  mlir::MLIRContext ctx;
++  ctx.loadDialect<mlir::triton::TritonDialect, mlir::arith::ArithDialect>();
++  mlir::OwningOpRef<mlir::ModuleOp> parsed =
++      mlir::parseSourceString<mlir::ModuleOp>(module, &ctx);
++  EXPECT_TRUE(parsed);
++  mlir::PassManager pm(&ctx);
++  pm.addPass(mlir::triton::createTritonCombineOps(
++      {/*foldFloatDotAdd=*/fold_float_dot_add}));
++  EXPECT_TRUE(mlir::succeeded(pm.run(*parsed)));
++  std::string printed;
++  llvm::raw_string_ostream os(printed);
++  parsed->print(os);
++  return printed;
++}
++
++// The textual pipeline `CreateTritonPipeline` builds for a fusion of XLA's own
++// or for a Triton call.
++std::string Pipeline(bool is_xla_fusion) {
++  mlir::MLIRContext ctx;
++  mlir::PassManager pm(&ctx);
++  CreateTritonPipeline(&pm, stream_executor::CudaComputeCapability(8, 0),
++                       /*num_warps=*/4, /*num_ctas=*/1, /*num_stages=*/3,
++                       is_xla_fusion);
++  std::string pipeline;
++  llvm::raw_string_ostream os(pipeline);
++  pm.printAsTextualPipeline(os);
++  return pipeline;
++}
++
+ }  // namespace
+ 
+ TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
+@@ -67,6 +108,56 @@ TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
+   EXPECT_THAT(pipeline_str, ::testing::HasSubstr("xla-simplify-arith"));
+ }
+ 
++constexpr absl::string_view kFloatResidual = R"(
++    tt.func @residual(%x: tensor<16x16xf32>, %w: tensor<16x16xf32>,
++                      %r: tensor<16x16xf32>) -> tensor<16x16xf32> {
++      %zero = arith.constant dense<0.0> : tensor<16x16xf32>
++      %dot = tt.dot %x, %w, %zero
++          : tensor<16x16xf32> * tensor<16x16xf32> -> tensor<16x16xf32>
++      %sum = arith.addf %r, %dot : tensor<16x16xf32>
++      tt.return %sum : tensor<16x16xf32>
++    })";
++
++constexpr absl::string_view kIntegerResidual = R"(
++    tt.func @residual(%x: tensor<16x16xi8>, %w: tensor<16x16xi8>,
++                      %r: tensor<16x16xi32>) -> tensor<16x16xi32> {
++      %zero = arith.constant dense<0> : tensor<16x16xi32>
++      %dot = tt.dot %x, %w, %zero
++          : tensor<16x16xi8> * tensor<16x16xi8> -> tensor<16x16xi32>
++      %sum = arith.addi %r, %dot : tensor<16x16xi32>
++      tt.return %sum : tensor<16x16xi32>
++    })";
++
++// Without the float fold, a float add of a dot's result stays an add: the
++// addend as the dot's accumulator adds every product onto it, each rounded at
++// its magnitude, where the program adds it once to the products' sum (a scanned
++// residual r + x @ w rounded 1.7 times as far from float64 as the add kept
++// apart). With it, Triton's own rule, the addend is the accumulator. An integer
++// add, exact either way, is the accumulator in both.
++TEST(CompilationPipelineTest, CombineFoldsAFloatAddOfADotOnlyWhereAsked) {
++  std::string kept = Combined(kFloatResidual, /*fold_float_dot_add=*/false);
++  EXPECT_THAT(kept, HasSubstr("arith.addf"));
++  EXPECT_THAT(kept, Not(HasSubstr("tt.dot %arg0, %arg1, %arg2")));
++  std::string folded = Combined(kFloatResidual, /*fold_float_dot_add=*/true);
++  EXPECT_THAT(folded, HasSubstr("tt.dot %arg0, %arg1, %arg2"));
++  EXPECT_THAT(folded, Not(HasSubstr("arith.addf")));
++  for (bool fold : {false, true}) {
++    std::string integers = Combined(kIntegerResidual, fold);
++    EXPECT_THAT(integers, HasSubstr("tt.dot %arg0, %arg1, %arg2"));
++    EXPECT_THAT(integers, Not(HasSubstr("arith.addi")));
++  }
++}
++
++// XLA's own fusions keep a float add of a dot apart, as the HLO adds it; a
++// Triton call (a kernel written in Triton or Pallas, an online softmax's
++// acc * alpha + dot(p, v) among them) folds it, as Triton's compiler does.
++TEST(CompilationPipelineTest, OnlyAnXlaFusionKeepsAFloatAddOfADotApart) {
++  EXPECT_THAT(Pipeline(/*is_xla_fusion=*/true),
++              HasSubstr("triton-combine{fold-float-dot-add=false}"));
++  EXPECT_THAT(Pipeline(/*is_xla_fusion=*/false),
++              HasSubstr("triton-combine{fold-float-dot-add=true}"));
++}
++
+ TEST(CompilationPipelineTest, OneApiPipelineDispatchesCorrectly) {
+   mlir::MLIRContext ctx;
+   mlir::PassManager pm(&ctx);
+@@ -74,7 +165,8 @@ TEST(CompilationPipelineTest, OneApiPipelineDispatchesCorrectly) {
+   CreateTritonPipeline(&pm,
+                        stream_executor::GpuComputeCapability(
+                            stream_executor::OneAPIComputeCapability::BMG()),
+-                       /*num_warps=*/4, /*num_ctas=*/1, /*num_stages=*/2);
++                       /*num_warps=*/4, /*num_ctas=*/1, /*num_stages=*/2,
++                       /*is_xla_fusion=*/true);
+ 
+   std::vector<std::string> pass_names = GetPassNames(pm);
+   if (absl::AsciiStrToUpper(
+diff --git a/xla/backends/gpu/codegen/triton/xtile_compiler.cc b/xla/backends/gpu/codegen/triton/xtile_compiler.cc
+index 17122a6cd2..334e44ab20 100644
+--- a/xla/backends/gpu/codegen/triton/xtile_compiler.cc
++++ b/xla/backends/gpu/codegen/triton/xtile_compiler.cc
+@@ -560,7 +560,8 @@ absl::StatusOr<TritonWrapperResult> CompileTritonToLLVM(
+                           block_level_parameters.is_warp_specialization_allowed,
+                           enable_pdl);
+ 
+-  CreateTritonPipeline(&pm, gpu_cc, num_warps, num_ctas, num_stages);
++  CreateTritonPipeline(&pm, gpu_cc, num_warps, num_ctas, num_stages,
++                       is_xla_fusion);
+ 
+   // Triton generates pointers to the global address space, while XLA needs a
+   // kernel signature with pointers to the generic address space.
+diff --git a/xla/backends/gpu/tests/xla-opt.cc b/xla/backends/gpu/tests/xla-opt.cc
+index 74b3358a09..1b4ef115ad 100644
+--- a/xla/backends/gpu/tests/xla-opt.cc
++++ b/xla/backends/gpu/tests/xla-opt.cc
+@@ -81,7 +81,8 @@ mlir::PassPipelineRegistration<TritonPipelineOptions>
+               options.enable_pdl);
+ 
+           xla::gpu::CreateTritonPipeline(&pm, gpu_cc, options.num_warps,
+-                                         options.num_ctas, options.num_stages);
++                                         options.num_ctas, options.num_stages,
++                                         /*is_xla_fusion=*/true);
+         });
+ 
+ }  // namespace
+-- 
+2.53.0
+
