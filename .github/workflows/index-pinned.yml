@@ -40,27 +40,37 @@ jobs:
           for project in $(python3 -c 'import json; print(" ".join(sorted({pin.split("==")[0] for pin in json.load(open("pins.json"))})))'); do
             curl -fsS "https://pypi.dewml.dev/simple/$project/" -o "pages/$project.html" || rm -f "pages/$project.html"
           done
-          version=$(python3 dew/dew/patch_stack.py unindexed pins.json pages)
-          [ -n "$version" ] || exit 0
-          if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::warning::main pins jax $version, which no release of the fork holds"
+          # The writers of the index's queue (one concurrency group, `patch-stack`), whose one pending place a
+          # dispatch would take from another's: none is asked while any of their runs, queued or running, is under way
+          # (review).
+          for workflow in patch-stack.yml publish-package.yml unlist-package.yml; do
+            for status in queued in_progress waiting pending requested; do
+              under_way=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?status=$status" \
+                            --jq '.total_count')
+              if [ "$under_way" != 0 ]; then
+                echo "$workflow has a run $status: what main pins is asked once it ends"
+                exit 0
+              fi
+            done
+          done
+          # Every index run dispatched, all of its history read (paginated), so a stop cannot age out.
+          dispatched=$(gh api --paginate \
+                         "repos/$GITHUB_REPOSITORY/actions/workflows/patch-stack.yml/runs?event=workflow_dispatch&per_page=100" \
+                         --jq '.workflow_runs[] | [.display_title, .conclusion] | @tsv')
+          for version in $(python3 dew/dew/patch_stack.py unindexed pins.json pages); do
+            if ! gh release view "jax-$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "::warning::main pins jax $version, which no release of the fork holds"
+              continue
+            fi
+            # One automatic attempt a version: one that failed or was cancelled waits for a hand to repair and run
+            # it again (patch-stack's index), never asked every ten minutes (review).
+            if awk -F'\t' -v title="patch stack index-$version" '$1 == title && $2 != "success" { found = 1 }
+                                                                    END { exit !found }' <<< "$dispatched"; then
+              echo "::warning::jax $version's automatic index did not succeed: index it by hand once repaired"
+              continue
+            fi
+            gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
+              -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
+            echo "jax $version: indexed as main pins it; any other is asked at a later poll"
             exit 0
-          fi
-          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow patch-stack.yml --limit 200 \
-                   --json status,conclusion,displayTitle)
-          # Patch-stack's runs share one queue (its concurrency group), whose one pending place a dispatch would
-          # take from another's: none is asked while any of its runs is under way (review).
-          if jq -e 'any(.[]; .status != "completed")' <<< "$runs" > /dev/null; then
-            echo "a patch-stack run is under way: jax $version is asked once it ends"
-            exit 0
-          fi
-          # One automatic attempt a version: one that failed or was cancelled waits for a hand to repair and run it
-          # again (patch-stack's index), never asked every ten minutes (review).
-          if jq -e --arg title "patch stack index-$version" \
-               'any(.[]; .displayTitle == $title and .conclusion != "success")' <<< "$runs" > /dev/null; then
-            echo "::warning::jax $version's automatic index did not succeed: index it by hand once repaired"
-            exit 0
-          fi
-          gh workflow run patch-stack.yml --repo "$GITHUB_REPOSITORY" --ref dew \
-            -f index="$version" -f pins="$(cat pins.json)" -f token="index-$version"
-          echo "jax $version: indexed as main pins it"
+          done
