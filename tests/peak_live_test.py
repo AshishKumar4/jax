@@ -34,6 +34,46 @@ def _step(x, w):
 
 class PeakLiveTest(jtu.JaxTestCase):
 
+  def _names_of_lowered_results(self, fun, opcode, shapes):
+    lowered = jax.jit(fun).lower(
+        *[jax.ShapeDtypeStruct(shape, jnp.float32) for shape in shapes])
+    serialized = lowered.compiler_ir("hlo").as_serialized_hlo_module_proto()
+    module = hlo_reader.message_class("xla.HloModuleProto").FromString(serialized)
+    instruction, = [instruction
+                    for computation in module.computations
+                    for instruction in computation.instructions
+                    if instruction.opcode == opcode]
+    # Give each array result a logical buffer at the peak. This isolates name
+    # transport from backend scheduling and allocation choices.
+    assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+    allocation = assignment.buffer_allocations.add(index=0, maybe_live_out=True)
+    peak = assignment.peak_buffers.add(index=allocation.index)
+    indices = ([(i,) for i in range(len(instruction.shape.tuple_shapes))]
+               if instruction.shape.tuple_shapes else [()])
+    for number, index in enumerate(indices):
+      buffer = assignment.logical_buffers.add(id=number, size=4)
+      buffer.defined_at.instruction_id = instruction.id
+      buffer.defined_at.shape_index.extend(index)
+      peak.logical_buffer_ids.append(number)
+    return [buffer.names for buffer in peak_live.live(
+        assignment.SerializeToString(), serialized)]
+
+  def test_checkpoint_name_with_comma_is_one_name(self):
+    def f(x):
+      return ad_checkpoint.checkpoint_name(jnp.sin(x), "left,right")
+
+    self.assertEqual(self._names_of_lowered_results(f, "sine", [(8,)]),
+                     [("left,right",)])
+
+  def test_checkpoint_names_belong_to_individual_sort_results(self):
+    def f(keys, values):
+      keys, values = jax.lax.sort_key_val(keys, values)
+      return (ad_checkpoint.checkpoint_name(keys, "keys"),
+              ad_checkpoint.checkpoint_name(values, "values"))
+
+    self.assertEqual(self._names_of_lowered_results(f, "sort", [(8,), (8,)]),
+                     [("keys",), ("values",)])
+
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_compiles_peak_holds_its_parameters_and_the_temporaries_it_reads_at_once(self):
     # tanh(x @ w) @ w: at the second product's peak, x's and w's buffers and
@@ -124,6 +164,62 @@ def _of(*pairs: tuple[int, int]) -> frozenset[tuple[int, int]]:
 
 
 class DimensionProvenanceTest(jtu.JaxTestCase):
+
+  def test_custom_call_root_alias_does_not_require_output_dims(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        x = f32[8,16] parameter(0)
+        ROOT called = f32[8,16] custom-call(x), custom_call_target="kernel",
+            output_to_operand_aliasing={{}: (0, {})}
+      }""")
+    self.assertEqual(descended["called"], (_of((0, 0)), _of((0, 1))))
+
+  def test_custom_call_root_alias_overrides_unknown_output_dims(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        x = f32[8,16] parameter(0)
+        ROOT called = f32[8,16] custom-call(x), custom_call_target="kernel",
+            output_to_operand_aliasing={{}: (0, {})},
+            frontend_attributes={output_dims="[null]"}
+      }""")
+    self.assertEqual(descended["called"], (_of((0, 0)), _of((0, 1))))
+
+  def test_custom_call_nested_alias_resolves_both_shape_indices(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        x = f32[8,16] parameter(0)
+        arg = (f32[8,16]) tuple(x)
+        ROOT called = ((f32[8,16])) custom-call(arg),
+            custom_call_target="kernel",
+            output_to_operand_aliasing={{0,0}: (0, {0})},
+            frontend_attributes={output_dims="[null]"}
+      }""")
+    self.assertEqual(descended["called"], [[(_of((0, 0)), _of((0, 1)))]])
+
+  def test_custom_call_tuple_alias_does_not_require_output_dims(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        x = f32[8,16] parameter(0)
+        ROOT called = (f32[8,16]) custom-call(x),
+            custom_call_target="kernel",
+            output_to_operand_aliasing={{0}: (0, {})}
+      }""")
+    self.assertEqual(descended["called"], [(_of((0, 0)), _of((0, 1)))])
+
+  def test_triangular_solve_free_dimension_does_not_descend_from_matrix(self):
+    descended = _descended("""
+      HloModule m
+      ENTRY e {
+        a = f32[8,8] parameter(0)
+        b = f32[8,3] parameter(1)
+        ROOT solved = f32[8,3] triangular-solve(a, b), left_side=true,
+            lower=true, unit_diagonal=false, transpose_a=NO_TRANSPOSE
+      }""")
+    self.assertEqual(descended["solved"][1], _of((1, 1)))
 
   def test_a_dot_keeps_its_batch_and_free_dimensions_and_drops_the_contracted(self):
     descended = _descended("""
