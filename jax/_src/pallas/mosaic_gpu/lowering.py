@@ -2984,16 +2984,15 @@ def _tanh_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
 
 def _logistic(x, accuracy):
   """The logistic as `select(x >= 0, 1, e) / (1 + e)` with `e = e^-|x|`, its
-  exponential the form that meets `accuracy`.
+  exponential the cheapest form that meets `accuracy`.
 
   The sum and the quotient each round once (half an ulp, a relative 2^-24
   each), and the exponential's relative error reaches the result at most
   whole (scaled by `1 / (1 + e)` or `e / (1 + e)`), so the logistic's
   relative bound is its exponential's plus 2^-23, and its ulps that times
   2^24 (an ulp is at least 2^-24 of a float). A result under 2^-126 (x past
-  -87.3) is the exponential's subnormal, which the exact form keeps and the
-  approximate one flushes, so a tolerance of the approximate asks an `atol`
-  of 2^-126.
+  -87.3) is the exponential's subnormal, which a form that flushes loses, so
+  a tolerance asks an `atol` of 2^-126 of every form.
   """
   if accuracy is not None and accuracy != lax.AccuracyMode.DEFAULT:
     if x.dtype != jnp.float32:
@@ -3003,18 +3002,22 @@ def _logistic(x, accuracy):
       composed = lambda bound: (
           (bound[1] + 2.0**-23) * 2.0**24, bound[1] + 2.0**-23
       )
-      if _meets(accuracy, composed(fa.APPROX_EXP_BOUND), flushed):
-        accuracy = lax.Tolerance(
-            atol=flushed, ulps=math.ceil(fa.APPROX_EXP_BOUND[0])
-        )
-      elif _meets(accuracy, composed(fa.EXACT_EXP_BOUND), flushed):
-        accuracy = lax.AccuracyMode.HIGHEST
+      for bound, asked in (
+          (fa.APPROX_EXP_BOUND, lax.Tolerance(
+              atol=flushed, ulps=math.ceil(fa.APPROX_EXP_BOUND[0]))),
+          (fa.LIBDEVICE_EXP_BOUND, lax.Tolerance(
+              ulps=math.ceil(fa.LIBDEVICE_EXP_BOUND[0]))),
+          (fa.EXACT_EXP_BOUND, lax.AccuracyMode.HIGHEST),
+      ):
+        if _meets(accuracy, composed(bound), flushed):
+          accuracy = asked
+          break
       else:
         raise ValueError(
             "No f32 logistic meets the tolerance"
             f" (atol={accuracy.atol}, rtol={accuracy.rtol},"
-            f" ulps={accuracy.ulps}): the exact exponential's is within 4 ulps"
-            " and 2^-126"
+            f" ulps={accuracy.ulps}): the exact exponential's is within 4"
+            " ulps and 2^-126"
         )
   one = lax.full_like(x, 1)
   e = lax.exp(-lax.abs(x), accuracy=accuracy)
@@ -3047,23 +3050,28 @@ def _meets(
   return normal and subnormal
 
 
-def _approximate_exp(accuracy, approx_math: bool, bound) -> bool:
-  """Whether an f32 exponential takes the hardware's approximate form.
+def _exp_form(accuracy, approx_math: bool, approx_bound) -> str:
+  """The form an f32 exponential takes: "approx" (the hardware's), "default"
+  (libdevice's) or "exact" (`FragmentedArray.exp`'s and `exp2`'s).
 
   `accuracy` is lax's: none, or `AccuracyMode.DEFAULT`, takes the kernel's
-  `approx_math`; `AccuracyMode.HIGHEST` the exact form; a `lax.Tolerance`
-  the approximate form where its `bound` (and its flushed subnormals) meets
-  it, else the exact form where that one's does, else an error, as lax's
-  contract asks of a tolerance no form meets.
+  `approx_math` (the hardware's form, else libdevice's, as before any stated
+  accuracy); `AccuracyMode.HIGHEST` the exact form; a `lax.Tolerance` the
+  cheapest form whose bound meets it (`approx_bound`'s, libdevice's, the
+  exact one's), else an error, as lax's contract asks of a tolerance no form
+  meets.
   """
   if accuracy is None or accuracy == lax.AccuracyMode.DEFAULT:
-    return approx_math
+    return "approx" if approx_math else "default"
   if accuracy == lax.AccuracyMode.HIGHEST:
-    return False
-  if _meets(accuracy, bound, fa.APPROX_FLUSHED_ATOL):
-    return True
-  if _meets(accuracy, fa.EXACT_EXP_BOUND, fa.EXACT_EXP_ATOL):
-    return False
+    return "exact"
+  for form, bound, atol in (
+      ("approx", approx_bound, fa.APPROX_FLUSHED_ATOL),
+      ("default", fa.LIBDEVICE_EXP_BOUND, fa.LIBDEVICE_EXP_ATOL),
+      ("exact", fa.EXACT_EXP_BOUND, fa.EXACT_EXP_ATOL),
+  ):
+    if _meets(accuracy, bound, atol):
+      return form
   raise ValueError(
       "No f32 exponential meets the tolerance"
       f" (atol={accuracy.atol}, rtol={accuracy.rtol}, ulps={accuracy.ulps}):"
@@ -3075,13 +3083,20 @@ def _exp_like(ctx: LoweringRuleContext, x, accuracy, name: str, bound):
   [x_aval] = ctx.avals_in
   if accuracy is not None and x_aval.dtype != jnp.float32:
     raise NotImplementedError(f"accuracy for {name} of {x_aval.dtype}")
-  approx = _approximate_exp(accuracy, ctx.module_ctx.approx_math, bound)
+  form = _exp_form(accuracy, ctx.module_ctx.approx_math, bound)
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    return getattr(_ensure_fa(x, x_aval.dtype), name)(approx=approx)
-  fastmath = arith_dialect.FastMathFlags.afn if approx else None
-  return getattr(math_dialect, name)(
+    return getattr(_ensure_fa(x, x_aval.dtype), name)(
+        approx=form == "approx", exact=form == "exact"
+    )
+  fastmath = arith_dialect.FastMathFlags.afn if form == "approx" else None
+  result = getattr(math_dialect, name)(
       _ensure_ir_value(x, x_aval.dtype), fastmath=fastmath
   )
+  if form == "exact":
+    result.owner.attributes[mgpu.dialect_lowering.EXACT_ATTR] = (
+        ir.UnitAttr.get()
+    )
+  return result
 
 
 @register_lowering_rule(lax.exp_p, mgpu.LoweringSemantics.Lane)
