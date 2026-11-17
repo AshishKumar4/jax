@@ -214,3 +214,23 @@ def alias_unsealed(size, power, params, scale):
   _sealed_rules()  # So the registries are `alias_a`'s.
   return _lane_add(lambda x, y: _unsealed_add_p.bind(x, y))(
       size, power, params, scale)
+
+
+def declared_source(size, power, params, scale, *, package):
+  """`plain`, past an `inline_mgpu` body the module `package` defines: a
+  function of the process's own (not of the installation), which only a
+  declared source package gives an identity."""
+  kwargs = {} if params is None else {"compiler_params": params}
+  body = importlib.import_module(package).body
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+      **kwargs,
+  )
+  def kernel(x_ref, o_ref):
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(body)(o_ref)
+    o_ref[...] = x_ref[...] ** power * scale + 1.0
+
+  return kernel
