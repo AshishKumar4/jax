@@ -43,18 +43,25 @@ class Instruction(NamedTuple):
 
 
 @functools.cache
-def _module_class() -> Any:
+def pool() -> Any:
+  """XLA's protos (`xla_protos`) in a descriptor pool of their own: another library's copy of these
+  files (xla/xla_data.proto) in the default pool does not meet it."""
   from google.protobuf import descriptor_pb2
   from google.protobuf import descriptor_pool
-  from google.protobuf import message_factory
   from jax._src import xla_protos
 
-  # A pool of its own: another library's copy of these files (xla/xla_data.proto) in the default pool
-  # does not meet it.
-  pool = descriptor_pool.DescriptorPool()
+  held = descriptor_pool.DescriptorPool()
   for file in descriptor_pb2.FileDescriptorSet.FromString(xla_protos.FILE_DESCRIPTOR_SET).file:
-    pool.Add(file)
-  return message_factory.GetMessageClass(pool.FindMessageTypeByName("xla.HloModuleProto"))
+    held.Add(file)
+  return held
+
+
+@functools.cache
+def message_class(name: str) -> Any:
+  """The message class of XLA's message `name` (`xla.BufferAssignmentProto`), from `pool`."""
+  from google.protobuf import message_factory
+
+  return message_factory.GetMessageClass(pool().FindMessageTypeByName(name))
 
 
 def module_from_text(text: str) -> Any:
@@ -72,7 +79,7 @@ def instructions(module: Any) -> Iterator[Instruction]:
     serialized = bytes(module)
   else:
     serialized = module.as_serialized_hlo_module_proto()
-  proto = _module_class().FromString(serialized)
+  proto = message_class("xla.HloModuleProto").FromString(serialized)
   names = {computation.id: computation.name for computation in proto.computations}
   for computation in proto.computations:
     operands = {instruction.id: instruction.name for instruction in computation.instructions}
