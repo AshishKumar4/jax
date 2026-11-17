@@ -3,6 +3,7 @@ the test files it runs, over a repository of its own."""
 
 import hashlib
 import json
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -258,9 +259,10 @@ if sys.argv[1:3] == ["run", "view"]:
 
 def isolated(tmp_path) -> dict:
     """An environment whose git reads no configuration but its own and installs no hooks or templates, and
-    finds gh and sleep in tmp_path/bin first."""
+    finds gh and sleep in tmp_path/bin first, then git where this machine has it."""
     (tmp_path / "templates").mkdir()
-    return {"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+    git = Path(shutil.which("git") or "/usr/bin/git").parent
+    return {"PATH": f"{tmp_path / 'bin'}:{git}:/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TEMPLATE_DIR": str(tmp_path / "templates"),
             **{f"GIT_{who}_{what}": value for who in ("AUTHOR", "COMMITTER")
                for what, value in (("NAME", "t"), ("EMAIL", "t@example.com"))}}
