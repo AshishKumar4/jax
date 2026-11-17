@@ -1121,7 +1121,8 @@ _NON_DECREASING_DISTRIBUTES_OVER = ("max", "min")
 
 
 # 2^f for f in [-1/2, 1/2]: the Taylor series of exp(f ln 2) to degree 7,
-# whose truncation is under 2^-30 there, highest degree first (Horner's form).
+# whose truncation is under 2^-27 of 2^f there (about 0.06 ulp), highest
+# degree first (Horner's form).
 _EXP2_TERMS = tuple(math.log(2.0) ** k / math.factorial(k) for k in range(7, -1, -1))
 
 
