@@ -46,7 +46,8 @@ def _registers(cubin: bytes) -> int:
   found = []
   for name, _, _, _, offset, size, *_ in headers:
     title = cubin[names_at + name:cubin.index(b"\0", names_at + name)]
-    if not title.startswith(b".nv.info."):
+    # The attributes' own section (`.nv.info`) or a function's (`.nv.info.<f>`).
+    if title != b".nv.info" and not title.startswith(b".nv.info."):
       continue
     at = offset
     while at + 4 <= offset + size:
