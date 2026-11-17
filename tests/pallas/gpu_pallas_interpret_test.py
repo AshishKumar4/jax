@@ -53,6 +53,7 @@ class InterpretExecutionGateTest(jtu.JaxTestCase):
     # Exercise the actual host callbacks in a child: a broken admission gate
     # leaves A0 in cleanup and A1 in initialization indefinitely.
     program = textwrap.dedent("""
+        import faulthandler
         import sys
         import threading
         import numpy as np
@@ -110,6 +111,8 @@ class InterpretExecutionGateTest(jtu.JaxTestCase):
         a0.join(2)
         second.join(0.1)
         assert not errors, errors
+        if a0.is_alive() or second.is_alive():
+          faulthandler.dump_traceback()
         assert not a0.is_alive() and not second.is_alive(), (
             "A0 waits at its two-device cleanup barrier while A1 is blocked "
             "in initialization; B0 was admitted=" + str(b_admitted.is_set()))
