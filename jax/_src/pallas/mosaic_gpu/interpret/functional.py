@@ -405,10 +405,20 @@ class _Interpreter:
       # A TMA load reads zeros past its GMEM source; its SMEM window must fit.
       # A fill is a constant (`.at[].get(mode="fill")`), never a traced zero.
       zero = np.zeros((), self.state[src.slots[0]].dtype)[()]
-      value = self.read(src, src_t, overhang=zero)
-      if predicate is not None:
-        value = jnp.where(predicate, value, self.read(dst, dst_t))
-      self.write(dst, dst_t, value)
+
+      def copied(state, oob):
+        inner = _Interpreter(self.params, self.axes)
+        inner.state, inner.oob = list(state), oob
+        inner.write(dst, dst_t, inner.read(src, src_t, overhang=zero))
+        return tuple(inner.state), inner.oob
+
+      if predicate is None:
+        state, oob = copied(tuple(self.state), self.oob)
+      else:
+        # A copy its predicate disables touches no memory, in bounds or not.
+        state, oob = lax.cond(predicate, copied, lambda state, oob: (state, oob),
+                              tuple(self.state), self.oob)
+      self.state, self.oob = list(state), oob
       return []
     if p is gpu_primitives.copy_smem_to_gmem_p:
       src, dst, *flat = invals
