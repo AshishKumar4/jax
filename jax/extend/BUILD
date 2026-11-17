@@ -29,6 +29,7 @@ pytype_strict_library(
     deps = [
         ":backend",
         ":core",
+        ":custom_call_targets",
         ":linear_util",
         ":lowering",
         ":pallas",
@@ -55,6 +56,12 @@ py_library_providing_imports_info(
         "//jax/_src:lax",
         "//jax/_src:random",
     ],
+)
+
+pytype_strict_library(
+    name = "custom_call_targets",
+    srcs = ["custom_call_targets.py"],
+    deps = ["//jax/_src:custom_call_targets"],
 )
 
 pytype_strict_library(
