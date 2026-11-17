@@ -96,6 +96,14 @@ jobs:
                      # runner's STL (VS 18) asks Clang 20 of a compiler (STL1000, 43952144318); its documented
                      # escape, _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH, takes 19 as Google's VS 2022 STL does.
                      choco install llvm --version=19.1.7 --allow-downgrade -y --no-progress > "$RUNNER_TEMP/llvm.log"
+                     # The Windows SDK 10.0.26100's winnt.h declares _m_prefetchw with C linkage where clang's
+                     # prfchwintrin.h (19 and 20 alike) declares it inline, which clang-cl refuses in grpc's tsi
+                     # (44040550510): Bazel's toolchain takes the newest SDK before it the runner holds.
+                     ls "/c/Program Files (x86)/Windows Kits/10/include"
+                     BAZEL_WINSDK_FULL_VERSION=$(ls "/c/Program Files (x86)/Windows Kits/10/include" \
+                       | grep -E '^10\.0\.[0-9]+\.0$' | sort -V | awk -F. '$3 < 26100' | tail -1)
+                     echo "BAZEL_WINSDK_FULL_VERSION=$BAZEL_WINSDK_FULL_VERSION"
+                     export BAZEL_WINSDK_FULL_VERSION
                      BAZEL_LLVM=$(cygpath -w "$(dirname "$(dirname "$(command -v clang)")")")
                      export BAZEL_LLVM
                      base="C:/b" ;;
