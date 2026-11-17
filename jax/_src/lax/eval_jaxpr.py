@@ -127,9 +127,15 @@ def _eval_jaxpr_remat(prim, trace, *args, call_jaxpr, **params):
   return primals_out, res_full, rem
 
 
+call_primitives: set[core.Primitive] = set()
+"""Every primitive with `eval_jaxpr_p`'s rules (`register_call_primitive_rules`): a call of its body's
+jaxpr (`call_jaxpr`), which a backend that lowers `eval_jaxpr_p` lowers alike."""
+
+
 def register_call_primitive_rules(
     prim: core.Primitive, name: str | None = None, transpose_rule=None,
     inline_jax_late: bool = True):
+  call_primitives.add(prim)
   prim.multiple_results = True
   prim.def_impl(eval_jaxpr_p.impl)
   prim.def_effectful_abstract_eval(eval_jaxpr_p.abstract_eval)
