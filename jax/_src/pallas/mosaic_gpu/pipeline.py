@@ -396,25 +396,6 @@ def emit_pipeline[T](
               " provably in bounds, or oob_fill_mode="
               "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
           )
-    in_smem_refs, out_smem_refs = util.split_list(
-        [
-            gpu_core.SMEM(
-                (max_concurrent_steps, *_get_block_shape(spec, ref.shape)),
-                ref.dtype,
-                transforms=tuple(
-                    gpu_core.batch_transform(t, 1)
-                    for t in getattr(spec, "transforms", ())
-                ),
-            )
-            if _in_smem(spec)
-            else None
-            for spec, ref in zip(
-                it.chain(effective_in_specs, out_specs), gmem_refs
-            )
-        ],
-        [len(in_specs)],
-    )
-    copies_per_step = sum(map(_in_smem, in_specs))
     threads = (
         1 if thread_axis is None
         else core.get_axis_env().axis_size(thread_axis)
@@ -427,6 +408,40 @@ def emit_pipeline[T](
             out_gmem_refs=out_gmem_refs,
             threads=threads,
         ),
+        **get_allocations(*gmem_refs),
+        # Two barriers the threads meet at in turn, so that no thread arrives
+        # at a barrier's next phase before every thread has seen its last.
+        meet_ref=None
+        if threads == 1
+        else gpu_core.Barrier(num_arrivals=threads, num_barriers=2),
+        collective_axes=() if thread_axis is None else thread_axis,
+    )
+
+  def get_allocations(*gmem_refs: Any) -> dict[str, Any]:
+    """The buffers and barriers the pipeline scopes for ``gmem_refs``: its
+    SMEM slots, ``max_concurrent_steps`` of each block (fewer where a static
+    grid has fewer steps), and its TMA barriers. ``gmem_refs`` need only
+    their shapes and dtypes, so a caller can size the pipeline's shared
+    memory before it runs (as the warp-specialized pipeline's
+    ``get_allocations`` gives its own)."""
+    in_smem_refs, out_smem_refs = util.split_list(
+        [
+            gpu_core.SMEM(
+                (max_concurrent_steps, *_get_block_shape(spec, ref.shape)),
+                ref.dtype,
+                transforms=tuple(
+                    gpu_core.batch_transform(t, 1)
+                    for t in getattr(spec, "transforms", ())
+                ),
+            )
+            if _in_smem(spec)
+            else None
+            for spec, ref in zip(it.chain(in_specs, out_specs), gmem_refs)
+        ],
+        [len(in_specs)],
+    )
+    copies_per_step = sum(map(_in_smem, in_specs))
+    return dict(
         in_smem_refs=in_smem_refs,
         out_smem_refs=out_smem_refs,
         barrier_ref=None
@@ -437,13 +452,9 @@ def emit_pipeline[T](
             num_arrivals=copies_per_step,
             num_barriers=max_concurrent_steps,
         ),
-        # Two barriers the threads meet at in turn, so that no thread arrives
-        # at a barrier's next phase before every thread has seen its last.
-        meet_ref=None
-        if threads == 1
-        else gpu_core.Barrier(num_arrivals=threads, num_barriers=2),
-        collective_axes=() if thread_axis is None else thread_axis,
     )
+
+  pipeline.get_allocations = get_allocations  # pyrefly: ignore[missing-attribute]
 
   def scoped_pipeline(
       *,
