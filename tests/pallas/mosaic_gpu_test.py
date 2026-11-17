@@ -458,6 +458,70 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(x), op(x), rtol=1e-5 if approx_math else 3e-7
     )
 
+  @parameterized.product(
+      op=["exp", "exp2", "logistic"],
+      asked=["highest", "approximate", "default", "unmet"],
+      approx_math=[False, True],
+  )
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_an_exponential_takes_the_accuracy_it_states(
+      self, op, asked, approx_math
+  ):
+    # Over f32 inputs whose results span the normal floats, whatever the
+    # kernel's approx_math: HIGHEST takes the exact form, within an ulp, with
+    # no approximate instruction; a tolerance the hardware's form meets takes
+    # it (ex2.approx), within its bound; one only libdevice's meets (no flushed
+    # subnormals) takes that, within its bound; one no form meets is refused.
+    lax_op = getattr(lax, op)
+    fa = mgpu.fragmented_array
+    # The logistic's relative bound is its exponential's plus its sum's and
+    # quotient's rounding (2^-23), in ulps that times 2^24.
+    logistic = lambda b: ((b[1] + 2.0**-23) * 2.0**24, b[1] + 2.0**-23)
+    approximate = {"exp": fa.APPROX_EXP_BOUND, "exp2": fa.APPROX_EXP2_BOUND,
+                   "logistic": logistic(fa.APPROX_EXP_BOUND)}[op]
+    default = (logistic(fa.LIBDEVICE_EXP_BOUND) if op == "logistic"
+               else fa.LIBDEVICE_EXP_BOUND)
+    exact = (logistic(fa.EXACT_EXP_BOUND) if op == "logistic"
+             else fa.EXACT_EXP_BOUND)
+    accuracy, bound = {
+        "highest": (lax.AccuracyMode.HIGHEST, exact),
+        "approximate": (lax.Tolerance(
+            atol=2.0**-126, ulps=math.ceil(approximate[0])), approximate),
+        # A logistic's tiny results ask an atol of every form (`_logistic`).
+        "default": (lax.Tolerance(
+            atol=2.0**-126 if op == "logistic" else 0.0,
+            ulps=math.ceil(default[0])), default),
+        "unmet": (lax.Tolerance(rtol=2.0**-30), None),
+    }[asked]
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct([1024], jnp.float32),
+        compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = lax_op(x_ref[...], accuracy=accuracy)
+
+    reach = {"exp": 87.0, "exp2": 125.0, "logistic": 80.0}[op]
+    x = np.random.default_rng(0).uniform(-reach, reach, 1024).astype(np.float32)
+    if asked == "unmet":
+      with self.assertRaisesRegex(ValueError, "No f32 .* meets"):
+        kernel(x)
+      return
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
+      y = np.asarray(jax.block_until_ready(kernel(x)), np.float64)
+    truth = {
+        "exp": np.exp,
+        "exp2": np.exp2,
+        "logistic": lambda v: 1 / (1 + np.exp(-v)),
+    }[op](x.astype(np.float64))
+    ulps = np.abs(y - truth) / np.spacing(truth.astype(np.float32))
+    self.assertLessEqual(ulps.max(), bound[0])
+    if asked == "highest":
+      self.assertNotIn("ex2.approx", out())
+    elif asked == "approximate":
+      self.assertIn("ex2.approx", out())
+
   @parameterized.parameters(False, True)
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_sqrt(self, approx_math):

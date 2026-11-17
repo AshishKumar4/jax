@@ -1590,6 +1590,11 @@ for _op, _source_is_signed, _target_is_signed in [
   )
 
 
+EXACT_ATTR = "mosaic_gpu.exact"
+"""A math op's request for its exact form (`FragmentedArray.exp`'s and
+`exp2`'s `exact`), beside its fastmath flags, which name the approximate one."""
+
+
 def _unary_op_lowering_rule(
     _: LoweringContext,
     op: Any,
@@ -1604,6 +1609,8 @@ def _unary_op_lowering_rule(
   if hasattr(op, "fastmath"):
     if op.fastmath == ir.Attribute.parse("#arith.fastmath<afn>"):
       result_fa = impl(a, approx=True)
+    elif EXACT_ATTR in op.attributes:
+      result_fa = impl(a, exact=True)
     else:
       result_fa = impl(a)
   else:
