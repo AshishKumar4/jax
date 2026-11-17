@@ -362,7 +362,8 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
         assert kept and all(run(origin, "show", f"{tag}:lax.py") == "two" for tag in kept)
     assert again("0.12.0.1.post41", commits["other"]).returncode == 0
     grown = run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints")
-    assert run(origin, "rev-parse", "release/0.12.0.1.post41") == grown and run(origin, "rev-parse", f"{grown}^^") == stack
+    assert run(origin, "rev-parse", "release/0.12.0.1.post41") == grown
+    assert run(origin, "rev-parse", f"{grown}^^") == stack
 
 
 def test_a_rebase_folds_the_stack_into_a_commit_a_family_and_one_release(tmp_path, monkeypatch):
