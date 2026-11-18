@@ -1,39 +1,8 @@
-From 096b4836478bfcea49e6ff9d3f31304fbb93a73d Mon Sep 17 00:00:00 2001
-From: Ashish Kumar Singh <ashishkmr472@gmail.com>
-Date: Sun, 15 Nov 2026 01:49:25 -0600
-Subject: [PATCH] [XLA:GPU] A compile can stop after buffer assignment and
- state its memory
-
-EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT (xla_gpu_experimental_early_exit) maps to the AOT
-kAfterBufferAssignment, which no compiler implemented: the GPU compiler runs the HLO passes, cuDNN's compiler
-passes (their workspaces are buffers), scheduling and the post-scheduling pipelines (ScheduleForBackend, shared
-with CompileToBackendResult), then buffer assignment, and returns an EarlyExitCompilationResult holding the
-assignment, whose GetCompiledMemoryStats states the compile's memory (CompiledMemoryStats::FromBufferAssignment,
-the one owner GpuAotCompilationResult reads too), no code emitted. A planner reads an executable's memory at the
-cost of its HLO passes alone.
----
- xla/debug_options_flags.cc                    |  3 +-
- xla/pjrt/BUILD                                |  3 +
- xla/pjrt/compiled_memory_stats.cc             | 30 +++++++
- xla/pjrt/compiled_memory_stats.h              |  8 ++
- xla/pjrt/gpu/se_gpu_pjrt_compiler.cc          |  4 +
- xla/service/gpu/BUILD                         | 24 ++++-
- xla/service/gpu/compile_module_to_llvm_ir.h   |  6 ++
- .../gpu/early_exit_compilation_result.cc      | 10 ++-
- .../gpu/early_exit_compilation_result.h       |  9 ++
- xla/service/gpu/gpu_aot_compilation_result.cc | 34 +------
- xla/service/gpu/gpu_compiler.cc               | 85 ++++++++++++++----
- xla/service/gpu/gpu_compiler.h                | 13 +++
- .../gpu/gpu_compiler_early_exit_test.cc       | 88 +++++++++++++++++++
- xla/xla.proto                                 |  2 +
- 14 files changed, 265 insertions(+), 54 deletions(-)
- create mode 100644 xla/service/gpu/gpu_compiler_early_exit_test.cc
-
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index 81bc1bbf2a..f2d6329c44 100644
+index 29cda46ec8..0ffc4ba458 100644
 --- a/xla/debug_options_flags.cc
 +++ b/xla/debug_options_flags.cc
-@@ -3961,7 +3961,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+@@ -4215,7 +4215,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
        DebugOptions::EarlyExitPoint_Name(
            debug_options->xla_gpu_experimental_early_exit()),
        "Exits compilation early at the specified point. Available options: "
@@ -44,15 +13,16 @@ index 81bc1bbf2a..f2d6329c44 100644
        "xla_gpu_print_compilation_stats",
        bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
 diff --git a/xla/pjrt/BUILD b/xla/pjrt/BUILD
-index 2c8cb2366e..024481fe28 100644
+index 374377c75c..473a9815a0 100644
 --- a/xla/pjrt/BUILD
 +++ b/xla/pjrt/BUILD
-@@ -1501,8 +1501,11 @@ cc_library(
+@@ -1888,9 +1888,12 @@ cc_library(
          "//xla:shape_util",
          "//xla/pjrt/proto:executable_metadata_proto_cc",
          "//xla/service:buffer_assignment",
 +        "//xla/service:hlo_proto_cc",
          "//xla/service:hlo_value",
+         "@com_google_absl//absl/base:nullability",
          "@com_google_absl//absl/log:check",
 +        "@com_google_absl//absl/status:status_macros",
 +        "@com_google_absl//absl/status:statusor",
@@ -60,27 +30,29 @@ index 2c8cb2366e..024481fe28 100644
      ],
  )
 diff --git a/xla/pjrt/compiled_memory_stats.cc b/xla/pjrt/compiled_memory_stats.cc
-index 23e9e13234..27fc192e0c 100644
+index 19fed20463..e3d869d59c 100644
 --- a/xla/pjrt/compiled_memory_stats.cc
 +++ b/xla/pjrt/compiled_memory_stats.cc
-@@ -16,8 +16,11 @@ limitations under the License.
+@@ -16,9 +16,12 @@ limitations under the License.
  #include "xla/pjrt/compiled_memory_stats.h"
  
  #include <cstdint>
 +#include <vector>
  
+ #include "absl/base/nullability.h"
  #include "absl/log/check.h"
 +#include "absl/status/status_macros.h"
 +#include "absl/status/statusor.h"
  #include "absl/types/span.h"
  #include "xla/layout.h"
  #include "xla/service/buffer_assignment.h"
-@@ -25,6 +28,33 @@ limitations under the License.
+@@ -26,6 +29,42 @@ limitations under the License.
  
  namespace xla {
  
 +absl::StatusOr<CompiledMemoryStats> CompiledMemoryStats::FromBufferAssignment(
-+    const BufferAssignmentProto& assignment, const HloModuleProto& module) {
++    const BufferAssignmentProto& assignment,
++    const HloModuleProto* absl_nullable module) {
 +  CompiledMemoryStats stats;
 +  stats.serialized_buffer_assignment = assignment.SerializeAsString();
 +  std::vector<BufferAllocation> allocations;
@@ -94,11 +66,19 @@ index 23e9e13234..27fc192e0c 100644
 +  for (const BufferAllocation& allocation : allocations) {
 +    pointers.push_back(&allocation);
 +  }
-+  stats.PopulateBufferStatsFromAllocations(pointers);
-+  ABSL_ASSIGN_OR_RETURN(PeakMemorySizes peak,
-+                        ComputePeakMemorySizes(assignment, module));
-+  stats.peak_memory_in_bytes = peak.padded;
-+  stats.peak_unpadded_heap_bytes = peak.unpadded;
++  stats.PopulateBufferStatsFromAllocations(pointers, /*assignment=*/nullptr);
++  if (module != nullptr) {
++    ABSL_ASSIGN_OR_RETURN(PeakMemorySizes peak,
++                          ComputePeakMemorySizes(assignment, *module));
++    stats.peak_memory_in_bytes = peak.padded;
++    stats.peak_unpadded_heap_bytes = peak.unpadded;
++  } else {
++    // The unpadded sizes can only be derived from the HLO module, so without a
++    // module only the padded peak is computed and `peak_unpadded_heap_bytes`
++    // stays 0, which means unknown.
++    ABSL_ASSIGN_OR_RETURN(stats.peak_memory_in_bytes,
++                          ComputePeakMemory(assignment));
++  }
 +  stats.total_allocation_bytes =
 +      ComputeTotalAllocationBytes(assignment, /*memory_color=*/0);
 +  stats.indefinite_allocations =
@@ -110,13 +90,13 @@ index 23e9e13234..27fc192e0c 100644
  // Firstly, there are cases in which gpu::Executable inherits its allocations
  // from elsewhere, and no buffer assignment is available.
 diff --git a/xla/pjrt/compiled_memory_stats.h b/xla/pjrt/compiled_memory_stats.h
-index 9b4c149cbc..1b715c0567 100644
+index fb1f76ff44..3fecb9f440 100644
 --- a/xla/pjrt/compiled_memory_stats.h
 +++ b/xla/pjrt/compiled_memory_stats.h
-@@ -19,9 +19,11 @@ limitations under the License.
- #include <cstdint>
+@@ -20,9 +20,11 @@ limitations under the License.
  #include <string>
  
+ #include "absl/base/nullability.h"
 +#include "absl/status/statusor.h"
  #include "absl/types/span.h"
  #include "xla/pjrt/proto/executable_metadata.pb.h"
@@ -125,24 +105,25 @@ index 9b4c149cbc..1b715c0567 100644
  
  namespace xla {
  
-@@ -61,6 +63,12 @@ struct CompiledMemoryStats {
- 
+@@ -67,6 +69,13 @@ struct CompiledMemoryStats {
    void PopulateBufferStatsFromAllocations(
-       absl::Span<const BufferAllocation* const> allocs);
+       absl::Span<const BufferAllocation* const> allocs,
+       const BufferAssignment* absl_nullable assignment);
 +
-+  // The stats of `module` compiled under `assignment`, its serialized form
-+  // among them: an executable's, or a compile's that stopped after buffer
-+  // assignment.
++  // The stats of a compile's buffer assignment, its serialized form among them:
++  // an executable's, or a compile's that stopped after buffer assignment. With
++  // the compiled `module`, its peak's unpadded bytes too.
 +  static absl::StatusOr<CompiledMemoryStats> FromBufferAssignment(
-+      const BufferAssignmentProto& assignment, const HloModuleProto& module);
++      const BufferAssignmentProto& assignment,
++      const HloModuleProto* absl_nullable module);
  };
  
  }  // namespace xla
 diff --git a/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc b/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
-index 25576bb3a2..693c2f214a 100644
+index 4e0dcd88ec..657d054268 100644
 --- a/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
 +++ b/xla/pjrt/gpu/se_gpu_pjrt_compiler.cc
-@@ -362,6 +362,10 @@ StreamExecutorGpuCompiler::Compile(
+@@ -360,6 +360,10 @@ StreamExecutorGpuCompiler::Compile(
                 DebugOptions::EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT) {
        aot_options.set_early_exit_point(
            AotCompilationOptions::EarlyExitPoint::kAfterConfigAssignment);
@@ -154,10 +135,10 @@ index 25576bb3a2..693c2f214a 100644
    }
    const int num_replicas = hlo_module->config().replica_count();
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 8785c0c2d4..daf95fd535 100644
+index 5d3dbb4a79..2379daef91 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -2166,6 +2166,28 @@ cc_library(
+@@ -2220,6 +2220,28 @@ cc_library(
      ] + xla_internal(["//xla/service/gpu/google:export_hlo"]),
  )
  
@@ -186,7 +167,7 @@ index 8785c0c2d4..daf95fd535 100644
  xla_test(
      name = "gpu_compiler_test",
      srcs = ["gpu_compiler_test.cc"],
-@@ -2313,6 +2335,7 @@ cc_library(
+@@ -2381,6 +2403,7 @@ cc_library(
          "//xla/pjrt:compiled_memory_stats",
          "//xla/service:compiled_module",
          "//xla/service:executable",
@@ -194,7 +175,7 @@ index 8785c0c2d4..daf95fd535 100644
          "//xla/stream_executor:device_description",
          "//xla/stream_executor:platform",
          "@com_google_absl//absl/status",
-@@ -2331,7 +2354,6 @@ cc_library(
+@@ -2399,7 +2422,6 @@ cc_library(
          "//xla:xla_proto_cc",
          "//xla/hlo/ir:hlo",
          "//xla/pjrt:compiled_memory_stats",
@@ -203,7 +184,7 @@ index 8785c0c2d4..daf95fd535 100644
          "//xla/service:executable",
          "//xla/stream_executor:device_description",
 diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compile_module_to_llvm_ir.h
-index 2c6c78da23..f024b7cdc9 100644
+index f0048ca152..9fe68605c0 100644
 --- a/xla/service/gpu/compile_module_to_llvm_ir.h
 +++ b/xla/service/gpu/compile_module_to_llvm_ir.h
 @@ -63,6 +63,12 @@ struct CompileModuleResults {
@@ -220,10 +201,10 @@ index 2c6c78da23..f024b7cdc9 100644
      const HloModule* hlo_module, llvm::LLVMContext* llvm_context,
      const std::string& target_triple, const std::string& data_layout,
 diff --git a/xla/service/gpu/early_exit_compilation_result.cc b/xla/service/gpu/early_exit_compilation_result.cc
-index 7ece24b05d..c7cc8e1a74 100644
+index 7ece24b05d..cfa8561638 100644
 --- a/xla/service/gpu/early_exit_compilation_result.cc
 +++ b/xla/service/gpu/early_exit_compilation_result.cc
-@@ -47,9 +47,13 @@ EarlyExitCompilationResult::LoadExecutable(
+@@ -47,9 +47,14 @@ EarlyExitCompilationResult::LoadExecutable(
  
  absl::StatusOr<CompiledMemoryStats>
  EarlyExitCompilationResult::GetCompiledMemoryStats() const {
@@ -235,8 +216,9 @@ index 7ece24b05d..c7cc8e1a74 100644
 +        "GetCompiledMemoryStats() needs a compile that stopped after buffer "
 +        "assignment.");
 +  }
++  const HloModuleProto module = module_->ToProto();
 +  return CompiledMemoryStats::FromBufferAssignment(*buffer_assignment_,
-+                                                   module_->ToProto());
++                                                   &module);
  }
  
  }  // namespace gpu
@@ -282,7 +264,7 @@ index bea538c253..224c3c88c6 100644
  
  }  // namespace gpu
 diff --git a/xla/service/gpu/gpu_aot_compilation_result.cc b/xla/service/gpu/gpu_aot_compilation_result.cc
-index 880c9cfbea..9462e41347 100644
+index a97cc01a72..7498f1351d 100644
 --- a/xla/service/gpu/gpu_aot_compilation_result.cc
 +++ b/xla/service/gpu/gpu_aot_compilation_result.cc
 @@ -19,7 +19,6 @@ limitations under the License.
@@ -301,7 +283,7 @@ index 880c9cfbea..9462e41347 100644
  #include "xla/service/executable.h"
  #include "xla/service/gpu/gpu_executable.h"
  #include "xla/service/gpu/gpu_executable.pb.h"
-@@ -145,35 +143,9 @@ const GpuExecutableProto& GpuAotCompilationResult::GetExecutableProto() const {
+@@ -169,45 +167,11 @@ const GpuExecutableProto& GpuAotCompilationResult::GetExecutableProto() const {
  
  absl::StatusOr<CompiledMemoryStats>
  GpuAotCompilationResult::GetCompiledMemoryStats() const {
@@ -321,14 +303,24 @@ index 880c9cfbea..9462e41347 100644
 -  for (const BufferAllocation& alloc : allocations) {
 -    alloc_ptrs.push_back(&alloc);
 -  }
--  memory_stats.PopulateBufferStatsFromAllocations(alloc_ptrs);
--  ABSL_ASSIGN_OR_RETURN(
--      auto peak_memories,
--      ComputePeakMemorySizes(
--          GetExecutableProto().buffer_assignment(),
--          GetExecutableProto().hlo_module_with_config().hlo_module()));
--  memory_stats.peak_memory_in_bytes = peak_memories.padded;
--  memory_stats.peak_unpadded_heap_bytes = peak_memories.unpadded;
+-  memory_stats.PopulateBufferStatsFromAllocations(alloc_ptrs,
+-                                                  /*assignment=*/nullptr);
+-  if (HasHloModule(GetExecutableProto())) {
+-    ABSL_ASSIGN_OR_RETURN(
+-        auto peak_memories,
+-        ComputePeakMemorySizes(
+-            GetExecutableProto().buffer_assignment(),
+-            GetExecutableProto().hlo_module_with_config().hlo_module()));
+-    memory_stats.peak_memory_in_bytes = peak_memories.padded;
+-    memory_stats.peak_unpadded_heap_bytes = peak_memories.unpadded;
+-  } else {
+-    // The unpadded sizes can only be derived from the HLO module, so without a
+-    // module we only compute the padded peak and leave
+-    // `peak_unpadded_heap_bytes` at 0, which means unknown.
+-    ABSL_ASSIGN_OR_RETURN(
+-        memory_stats.peak_memory_in_bytes,
+-        ComputePeakMemory(GetExecutableProto().buffer_assignment()));
+-  }
 -  memory_stats.total_allocation_bytes = ComputeTotalAllocationBytes(
 -      GetExecutableProto().buffer_assignment(), /*memory_color=*/0);
 -  memory_stats.indefinite_allocations = ComputeIndefiniteAllocationsInBytes(
@@ -336,21 +328,23 @@ index 880c9cfbea..9462e41347 100644
 -  return memory_stats;
 +  return CompiledMemoryStats::FromBufferAssignment(
 +      GetExecutableProto().buffer_assignment(),
-+      GetExecutableProto().hlo_module_with_config().hlo_module());
++      HasHloModule(GetExecutableProto())
++          ? &GetExecutableProto().hlo_module_with_config().hlo_module()
++          : nullptr);
  }
  
  }  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
-index d438020ba2..9025596b36 100644
+index f2368312d5..69983b65ad 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -2747,6 +2747,61 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
+@@ -2784,6 +2784,54 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
  }
  }  // namespace
  
 +absl::StatusOr<std::unique_ptr<GpuAliasInfo>> GpuCompiler::ScheduleForBackend(
 +    HloModule* module, const GpuTopology& gpu_topology,
-+    mlir::MLIRContext* mlir_context, tsl::thread::ThreadPool* thread_pool) {
++    mlir::MLIRContext* mlir_context) {
 +  const se::DeviceDescription& device_description =
 +      gpu_topology.gpu_target_config().device_description;
 +  std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(device_description);
@@ -363,9 +357,9 @@ index d438020ba2..9025596b36 100644
 +  HloPassPipeline pipeline("scheduled-gpu-module");
 +  AddHloVerifier(&pipeline);
 +  ABSL_RETURN_IF_ERROR(pipeline.Run(module).status());
-+  ABSL_RETURN_IF_ERROR(RunPostSchedulingPipelines(
-+      module, schedule_metadata.scheduler_mem_limit, gpu_topology,
-+      alias_info.get(), mlir_context, thread_pool));
++  ABSL_RETURN_IF_ERROR(
++      RunPostSchedulingPipelines(module, schedule_metadata.scheduler_mem_limit,
++                                 gpu_topology, alias_info.get()));
 +  return alias_info;
 +}
 +
@@ -385,16 +379,9 @@ index d438020ba2..9025596b36 100644
 +                                              &dnn_compiled_graphs));
 +  ABSL_ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
 +                        mlir_context_pool_.GetOrCreate());
-+  MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
-+      /*parallelism=*/module->config()
-+          .debug_options()
-+          .xla_gpu_force_compilation_parallelism(),
-+      /*default_thread_pool=*/options.thread_pool,
-+      /*default_parallelism=*/tsl::port::MaxParallelism());
 +  ABSL_ASSIGN_OR_RETURN(
 +      std::unique_ptr<GpuAliasInfo> alias_info,
-+      ScheduleForBackend(module.get(), gpu_topology, borrowed_context->get(),
-+                         thread_pool.get_mutable()));
++      ScheduleForBackend(module.get(), gpu_topology, borrowed_context->get()));
 +  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> assignment,
 +                        RunBufferAssignment(module.get(), alias_info.get(),
 +                                            BufferSizeBytesFunction()));
@@ -406,7 +393,7 @@ index d438020ba2..9025596b36 100644
  absl::StatusOr<GpuCompiler::CompileResultWithMetadata>
  GpuCompiler::CompileToBackendResult(
      HloModule* module, llvm::LLVMContext* llvm_context,
-@@ -2759,30 +2814,15 @@ GpuCompiler::CompileToBackendResult(
+@@ -2796,20 +2844,6 @@ GpuCompiler::CompileToBackendResult(
        module->config().debug_options().xla_gpu_kernel_cache_file();
    const bool use_cache = !cache_path.empty();
  
@@ -427,20 +414,19 @@ index d438020ba2..9025596b36 100644
    MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
        /*parallelism=*/module->config()
            .debug_options()
-           .xla_gpu_force_compilation_parallelism(),
+@@ -2817,9 +2851,8 @@ GpuCompiler::CompileToBackendResult(
        /*default_thread_pool=*/options.thread_pool,
        /*default_parallelism=*/tsl::port::MaxParallelism());
--
--  ABSL_RETURN_IF_ERROR(RunPostSchedulingPipelines(
--      module, schedule_metadata.scheduler_mem_limit, gpu_topology,
--      alias_info.get(), mlir_context, thread_pool.get_mutable()));
+ 
+-  ABSL_RETURN_IF_ERROR(
+-      RunPostSchedulingPipelines(module, schedule_metadata.scheduler_mem_limit,
+-                                 gpu_topology, alias_info.get()));
 +  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<GpuAliasInfo> alias_info,
-+                        ScheduleForBackend(module, gpu_topology, mlir_context,
-+                                           thread_pool.get_mutable()));
++                        ScheduleForBackend(module, gpu_topology, mlir_context));
  
    absl::Mutex module_stats_m_;
    ModuleStats module_stats;
-@@ -3061,6 +3101,15 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
+@@ -3123,6 +3156,15 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
        RunHloPassesIfNeeded(std::move(hlo_module), options.executor(),
                             compile_options));
  
@@ -457,10 +443,10 @@ index d438020ba2..9025596b36 100644
        AotCompilationOptions::EarlyExitPoint::kNone) {
      std::vector<std::unique_ptr<CompiledModule>> results;
 diff --git a/xla/service/gpu/gpu_compiler.h b/xla/service/gpu/gpu_compiler.h
-index fae1025645..a3cfac8746 100644
+index 057c82b673..7ed8ee0a09 100644
 --- a/xla/service/gpu/gpu_compiler.h
 +++ b/xla/service/gpu/gpu_compiler.h
-@@ -215,6 +215,19 @@ class GpuCompiler : public LLVMCompiler {
+@@ -207,6 +207,19 @@ class GpuCompiler : public LLVMCompiler {
      CompileModuleResults compile_module_results;
    };
  
@@ -469,7 +455,7 @@ index fae1025645..a3cfac8746 100644
 +  // read, under the alias info returned.
 +  absl::StatusOr<std::unique_ptr<GpuAliasInfo>> ScheduleForBackend(
 +      HloModule* module, const GpuTopology& gpu_topology,
-+      mlir::MLIRContext* mlir_context, tsl::thread::ThreadPool* thread_pool);
++      mlir::MLIRContext* mlir_context);
 +
 +  // `module`, optimized, compiled as far as its buffer assignment: its memory
 +  // stats, no code emitted (`kAfterBufferAssignment`).
@@ -575,7 +561,7 @@ index 0000000000..c35ec4b2b0
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/xla.proto b/xla/xla.proto
-index b0e6702981..ccdd1b9304 100644
+index 6cb420f86f..87170977dd 100644
 --- a/xla/xla.proto
 +++ b/xla/xla.proto
 @@ -538,6 +538,8 @@ message DebugOptions {
@@ -587,6 +573,3 @@ index b0e6702981..ccdd1b9304 100644
    }
  
    enum DeterministicOpsTritonMode {
--- 
-2.53.0
-
