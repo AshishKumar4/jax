@@ -86,14 +86,21 @@ def kernels(module: ir.Module) -> list[Kernel]:
   return found
 
 
+class NoCudaPlugin(ModuleNotFoundError):
+  """A deviceless capture asked of a process with no CUDA plugin installed: the
+  capture is the plugin's export (`MosaicGpuCaptureDeviceless`)."""
+
+
 def _library() -> ctypes.CDLL:
   try:
     try:
       import jax_plugins.xla_cuda13 as cuda_plugin  # pyrefly: ignore[missing-import]
     except ImportError:
       import jax_plugins.xla_cuda12 as cuda_plugin  # pyrefly: ignore[missing-import]
-  except ImportError:
-    return ctypes.CDLL(None)
+  except ImportError as missing:
+    raise NoCudaPlugin(
+        "a deviceless capture needs a CUDA plugin (jax-cuda13-plugin or"
+        " jax-cuda12-plugin), and none is installed") from missing
   return ctypes.CDLL(cuda_plugin._get_library_path())
 
 
