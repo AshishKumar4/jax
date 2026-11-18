@@ -3645,6 +3645,14 @@ def _fold_and_get_constant_value(x):
 def _stop_gradient_lowering_rule(_: LoweringRuleContext, x):
   return x
 
+
+@register_lowering_rule(lax.optimization_barrier_p)
+def _optimization_barrier_lowering_rule(_: LoweringRuleContext, *args):
+  # The operands as they are: Mosaic keeps a kernel's multiply and add apart,
+  # no fused multiply-add (a v5e's x * y + z, z the negated rounded product, is
+  # zero), so each operation keeps its own rounding.
+  return args
+
 @register_lowering_rule(
     lax.max_p, ensure_mlir_values=False, kernel_types=[*tpu_core.CoreType]
 )
