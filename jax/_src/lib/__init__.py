@@ -99,6 +99,11 @@ import jaxlib.lapack as lapack  # noqa: F401
 import jaxlib.utils as utils  # noqa: F401
 import jaxlib._jax as _jax  # noqa: F401
 
+# The frontend attribute a float add, subtract or multiply carries to round on
+# its own, never contracted into a fused multiply-add, where this jaxlib's
+# compilers honour it (its native build states it); None where they do not.
+no_contract_attribute: str | None = getattr(_jax, "XLA_NO_CONTRACT_ATTRIBUTE", None)
+
 import jaxlib._xla as _xla  # noqa: F401
 
 
