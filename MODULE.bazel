@@ -104,6 +104,11 @@ archive_override(
         # HloEvaluator's float32 dot over an empty contraction is zeros, where its Eigen contraction divided by
         # the depth: XLA:CPU's constant folding died of SIGFPE on one with the algebraic simplifier off (row 6942).
         "//third_party:xla/evaluator_empty_contraction.patch",
+        # A float add, subtract or multiply labeled xla_no_contract (jax.experimental.xla_metadata) rounds on its
+        # own on the CPU, fenced (llvm.arithmetic.fence) where XLA:CPU makes its arithmetic contractible, its
+        # unlabeled twins kept apart by CSE and contracted as before; LLVM widens the fence (row 7953: Dew's
+        # error-free transforms' products contracted into fused multiply-adds, their compensations lost).
+        "//third_party:xla/no_contract_mark.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
