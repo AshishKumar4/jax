@@ -4309,12 +4309,33 @@ class FragmentedArray:
           tuple(d for i, d in enumerate(source_dimensions) if i != axis),
           layout,
       )
-    if len(layout.base_tile_shape) != len(shape):
+    new_dimensions = sorted(set(range(len(shape))) - set(source_dimensions))
+    untiled_rank = len(shape) - len(layout.base_tile_shape)
+    if (
+        untiled_rank > 0
+        and layout == self.layout
+        and all(d < untiled_rank for d in new_dimensions)
+        and all(self.shape[i] == shape[d] for i, d in enumerate(source_dimensions))
+    ):
+      # New dimensions the layout leaves untiled, leading its tiled ones: a
+      # thread holds each of their elements, so its registers repeat along
+      # each (a row made a [1, n] one, as layout inference may lay it out).
+      pre_broadcast_registers_shape = list(layout.registers_shape(shape))
+      for new_dim in new_dimensions:
+        pre_broadcast_registers_shape[new_dim] = 1
+      return FragmentedArray(
+          _registers=np.broadcast_to(
+              self.registers.reshape(pre_broadcast_registers_shape),
+              layout.registers_shape(shape),
+          ),
+          _layout=layout,
+          _is_signed=self.is_signed,
+      )
+    if untiled_rank:
       raise NotImplementedError(
           "Tiling rank different than broadcast result rank, "
           f"{layout.base_tile_shape} vs {shape}"
       )
-    new_dimensions = sorted(set(range(len(shape))) - set(source_dimensions))
     expected_layout = layout.reduce(new_dimensions)
     if expected_layout != self.layout:
       raise ValueError(
