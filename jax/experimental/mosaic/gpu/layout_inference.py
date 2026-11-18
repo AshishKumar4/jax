@@ -1345,9 +1345,13 @@ def _multi_dim_reduction_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   source = ValueSite(op, VariableType.OPERAND, 0)
+  source_variable = cs.Variable(source)
+  if not isinstance(op.result.type, ir.VectorType):
+    # Every dimension reduced, to a scalar: its source in any layout, as
+    # vector.reduction's.
+    return cs.ConstraintSystem(), {source_variable: [source]}
   acc = ValueSite(op, VariableType.OPERAND, 1)
   out = ValueSite(op, VariableType.RESULT, 0)
-  source_variable = cs.Variable(source)
   out_variable = cs.Variable(out)
   constraints = [
       cs.NotOfType(source_variable, fa.WGStridedFragLayout),
