@@ -266,6 +266,80 @@ class InterpretTest(jtu.JaxTestCase):
         _kernel(jnp.int32(42)).block_until_ready()
 
 
+  def test_a_copy_overwrites_its_own_threads_earlier_read_without_a_fence(self):
+    # Only the generic proxy's writes need a proxy fence before the async
+    # proxy's: a read before the copy is ordered by program order alone.
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        scratch_types=dict(
+            smem_ref=plgpu.SMEM((), jnp.int32),
+            barrier_ref=plgpu.Barrier(num_arrivals=1),
+        ),
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(in_ref, out_ref, smem_ref, barrier_ref):
+      smem_ref[...] = 100
+      plgpu.commit_smem()
+      earlier = smem_ref[...]
+      plgpu.copy_gmem_to_smem(in_ref, smem_ref, barrier_ref)
+      plgpu.barrier_wait(barrier_ref)
+      out_ref[...] = earlier + smem_ref[...]
+
+    self.assertEqual(_kernel(jnp.int32(42)), 142)
+
+  @jtu.parameterized.product(
+      warp_specialize=[WarpSpecializeHelper(False), WarpSpecializeHelper(True)],
+      released=[False, True],
+  )
+  def test_a_copy_overwrites_another_threads_read_once_it_is_released(
+      self, warp_specialize, released
+  ):
+    # A ring's refill: its reader arrives at the slot's barrier, its producer
+    # waits there and copies into the slot, with no proxy fence.
+    @functools.partial(
+        plgpu.kernel,
+        out_type=(
+            jax.ShapeDtypeStruct((), jnp.int32),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        ),
+        scratch_types=dict(
+            smem_ref=plgpu.SMEM((), jnp.int32),
+            written=plgpu.Barrier(num_arrivals=1),
+            consumed=plgpu.Barrier(num_arrivals=1),
+            copied=plgpu.Barrier(num_arrivals=1),
+        ),
+        interpret=InterpretParams(detect_races=True),
+        num_threads=warp_specialize.thread_count(2),
+        thread_name='t',
+    )
+    def _kernel(in_ref, read_ref, out_ref, smem_ref, written, consumed, copied):
+      @warp_specialize.maybe_warp_specialize(thread_name='t')
+      def _(warp_id):
+        @pl.when(warp_id == 0)
+        def _():
+          plgpu.barrier_wait(written)
+          read_ref[...] = smem_ref[...]
+          if released:
+            plgpu.barrier_arrive(consumed)
+
+        @pl.when(warp_id == 1)
+        def _():
+          smem_ref[...] = 100
+          plgpu.commit_smem()
+          plgpu.barrier_arrive(written)
+          if released:
+            plgpu.barrier_wait(consumed)
+          plgpu.copy_gmem_to_smem(in_ref, smem_ref, copied)
+          plgpu.barrier_wait(copied)
+          out_ref[...] = smem_ref[...]
+
+    if released:
+      self.assertEqual(_kernel(jnp.int32(42)), (100, 42))
+    else:
+      with self.assertRaisesRegex(jax.errors.JaxRuntimeError, 'RACE DETECTED'):
+        jax.block_until_ready(_kernel(jnp.int32(42)))
+
   @jtu.parameterized.product(
       a=[False, True],
       b=[False, True],

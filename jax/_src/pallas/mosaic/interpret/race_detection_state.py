@@ -141,7 +141,15 @@ class RaceDetectionState[ThreadKey]:
       buffer_key,
       rnge,
       source_info=None,
+      reads_clock: vc.NpVectorClock | None = None,
   ):
+    """Records a write at `clock`, checking it against prior accesses.
+
+    `reads_clock`, where given, is the clock that orders the write after prior
+    reads, where that is not `clock`: a GPU async-proxy write's, ordered after
+    the generic proxy's reads by its thread's synchronization alone.
+    """
+    reads_clock = clock if reads_clock is None else reads_clock
     if source_info is not None:
       user_frame = source_info_util.summarize(source_info)
     else:
@@ -186,7 +194,7 @@ class RaceDetectionState[ThreadKey]:
       read_thread, read_clock, read_range, read_frame = (
           reads[i]
       )
-      if read_clock.ordered(clock):
+      if read_clock.ordered(reads_clock):
         continue
       if not _ranges_overlap(rnge, read_range):
         continue
