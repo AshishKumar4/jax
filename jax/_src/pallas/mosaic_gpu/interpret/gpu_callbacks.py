@@ -1531,12 +1531,17 @@ class AsyncCopyGmemToSmemTask(AsyncCopyTask):
       assert self.clock is not None
       self.clock.inc(tma_thread_id)
 
+      # The generic proxy's writes are ordered before the copy's by a proxy
+      # fence (`commit_smem`), its reads by the thread's synchronization alone:
+      # a ring's slot refilled once its readers arrive at its barrier, as
+      # Pallas's warp-specialized pipeline releases a slot.
       get_races().check_write(
           self.thread,
           self.clock.async_smem_clock.copy(),
           self.dst_allocation_key,
           self.dst_access,
           source_info=self.source_info,
+          reads_clock=self.clock.generic_clock.copy(),
       )
 
   def post_write(self, tma_thread_id: int, shared_memory: memory.GPUSharedMemory):
