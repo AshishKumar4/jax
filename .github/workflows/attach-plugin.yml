@@ -1,0 +1,60 @@
+# A build node's plugin wheels attached to plugin-VERSION from where the node left them, the GPU outputs bucket, each
+# by a presigned URL, so no byte of them passes through the machine that asks (dew-ops' dewops.node.attach): the
+# release made where there is none, then each file fetched, checked against its sha256, attached without replacing
+# an asset of other bytes and read back anonymously, by the one attach Dew's fixture store runs too
+# (AshishKumar4/dew-fixtures' .github/actions/attach, pinned by its commit). A machine's wheels a GitHub runner
+# builds attach through build-plugin.yml's own job.
+name: attach plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "the wheels' version, e.g. 0.12.0.1.post111; the release is plugin-VERSION"
+        required: true
+      assets:
+        description: 'a JSON list of {"url": presigned URL, "sha256": its SHA-256, "asset": the asset name}'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: The release, made where there is none
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::version"; exit 1; }
+          release="plugin-$VERSION"
+          gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$release" -R "$GITHUB_REPOSITORY" --title "$release" --notes \
+              "Dew's JAX $VERSION: its jaxlib, CUDA plugins and PJRT plugins for each machine, and their debug symbols."
+
+  attach:
+    needs: release
+    name: attach ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(inputs.assets) }}
+    steps:
+      - uses: AshishKumar4/dew-fixtures/.github/actions/attach@8e865e552d82dbf06fdad3d5d54f362b6fed3f62
+        with:
+          url: ${{ matrix.url }}
+          sha256: ${{ matrix.sha256 }}
+          asset: ${{ matrix.asset }}
+          release: plugin-${{ inputs.version }}
+          repository: ${{ github.repository }}
+          token: ${{ github.token }}
