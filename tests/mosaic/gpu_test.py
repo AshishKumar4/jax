@@ -8180,6 +8180,33 @@ class FragmentedArrayTest(TestCase, jtu.CudaArchSpecificTest):
     out_ref = jax.lax.broadcast_in_dim(inp, (m, n), (1,))
     np.testing.assert_array_equal(result, out_ref)
 
+  @parameterized.product(
+      layout=(mgpu.WGMMA_ROW_LAYOUT, mgpu.WGMMA_COL_LAYOUT),
+      leading=((1,), (3,), (2, 1)),
+  )
+  def test_broadcast_in_dim_into_untiled_leading_dims(self, layout, leading):
+    # A vector broadcast into new leading dimensions its own layout leaves
+    # untiled, the layout kept: each element repeated along them.
+    dtype = jnp.float32
+    shape = (*leading, 128)
+
+    def kernel(ctx, gmem_input, gmem_output, _):
+      t = mgpu.FragmentedArray.load_untiled(
+          gmem_input, layout=layout, optimized=False
+      )
+      t.broadcast_in_dim(shape, (len(leading),), layout).store_untiled(
+          gmem_output, optimized=False
+      )
+
+    inp = self.prng.uniform(-1, 1, (128,)).astype(dtype)
+    result = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (inp,),
+        jax.ShapeDtypeStruct(shape, dtype), inp,
+    )(inp)
+    np.testing.assert_array_equal(
+        result, jax.lax.broadcast_in_dim(inp, shape, (len(leading),))
+    )
+
   @parameterized.parameters(
       ((128), (4, 128)),
       ((1, 128), (2, 128)),

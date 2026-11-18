@@ -300,6 +300,43 @@ class PredicateReductionLoweringTest(jtu.JaxTestCase):
           jax.ShapeDtypeStruct((128, 128), jnp.float32)
       ).lower(lowering_platforms=("cuda",))
 
+  @parameterized.product(
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+          ("9.0", plgpu.Layout.WGMMA),
+          ("10.0", plgpu.Layout.TCGEN05),
+      ),
+  )
+  def test_a_barriered_row_beside_its_zeros_lowers(self, tile):
+    # Lowered for an abstract GPU on CPU: an accumulator tile's row maxima
+    # made a [1, n] row and held with zeros of its shape through an
+    # optimization barrier, as a compensated sum's TwoSum takes its operands,
+    # then added and stored. Layout inference lays the row's [1, n] out in the
+    # row's own layout, its new dimension untiled.
+    capability, layout = tile
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((1, 128), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      rows = jnp.max(tile, axis=-1)[None, :]
+      held, zeros = lax.optimization_barrier((rows, jnp.zeros_like(rows)))
+      o_ref[...] = held + zeros
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
 
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
   LOWERING_SEMANTICS: ClassVar[plgpu.LoweringSemantics]
