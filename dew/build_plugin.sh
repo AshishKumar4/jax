@@ -157,7 +157,9 @@ for python in $pythons; do
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
-    [ "$code" = 0 ] || { grep -m 60 -E "error:|ERROR:" "$out/plugin-cp${python/./}-cuda$cuda.log" || true
+    # Each error with the lines after it, where Bazel says why (an analysis failure's "Error in fail: ..." follows
+    # its "ERROR: ... in <rule> rule" line, 2026-11-18: two red builds said only that the rule failed).
+    [ "$code" = 0 ] || { grep -m 60 -A 6 -E "error:|ERROR:" "$out/plugin-cp${python/./}-cuda$cuda.log" || true
                          echo "build_plugin: a build of $python, CUDA $cuda failed ($code)" >&2; exit "$code"; }
   done
 done
