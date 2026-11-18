@@ -2107,10 +2107,23 @@ class LaunchContext:
         raise NotImplementedError("Gather/scatter unsupported when using integer indexing")
       if reduction_op is not None:
         raise ValueError("Gather/scatter TMA can't perform reductions")
-      if not isinstance(predicate, _DefaultPredicate):
-        raise ValueError("Gather/scatter TMA can't use a predicate")
       if gather_indices.layout not in (fa.TMA_INDICES_LAYOUT, fa.TMA_INDICES_4_LAYOUT):
         raise ValueError(f"Unsupported gather indices layout: {gather_indices.layout}")
+      if (not isinstance(predicate, _DefaultPredicate)
+          and gather_indices.layout != fa.TMA_INDICES_4_LAYOUT):
+        raise ValueError(
+            "Gather/scatter TMA can only use a predicate with indices in"
+            " TMA_INDICES_4_LAYOUT, which every thread holds"
+        )
+      # With indices every thread holds, the copies are issued by the thread
+      # the predicate selects (by default, the first of the warpgroup), which
+      # also arrives on the barrier.
+      if isinstance(predicate, _DefaultPredicate):
+        issuing = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
+      elif predicate is None:
+        issuing = c(1, ir.IntegerType.get_signless(1))
+      else:
+        issuing = predicate
       ROWS_PER_INSTR = 4
       # Make sure we'll always be accessing SMEM with sufficient alignment.
       single_tma_bits = ROWS_PER_INSTR * slice_shape[-1] * element_bitwidth
@@ -2122,11 +2135,10 @@ class LaunchContext:
 
       if untransformed_gmem_ref is src_ref and arrive:
         assert barrier is not None
-        arrive_predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
         nvvm.mbarrier_arrive_expect_tx(
             barrier.get_ptr(),
             transfer_bytes,
-            predicate=arrive_predicate,
+            predicate=issuing,
         )
 
       gmem_strides, _ = untransformed_gmem_ref_ty.get_strides_and_offset()
@@ -2163,7 +2175,7 @@ class LaunchContext:
       # TMA instructions are uniform, so we can't use multiple lanes.
       if gather_indices.layout == fa.TMA_INDICES_4_LAYOUT:
         gather_linear_idx_warp = arith.constant(i32, 0)
-        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
+        issuer = issuing
         indexing_stride = 1
         # Note: If we have several tiles here, we could still issue copies from
         # each warp to increase parallelism, though it's primarily useful for
@@ -2177,7 +2189,7 @@ class LaunchContext:
             arith.constant(i32, utils.WARPS_IN_WARPGROUP),
         )
         gather_linear_idx_warp = arith.muli(warp_idx, c(ROWS_PER_INSTR, i32))
-        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARP)
+        issuer = utils.single_thread_predicate(utils.ThreadSubset.WARP)
         indexing_stride = utils.WARPS_IN_WARPGROUP
 
       # Since the TMA instruction is limited to 2D gathers, we flatten all
@@ -2254,7 +2266,7 @@ class LaunchContext:
                 smem_ptr,
                 col_offset,
                 *gather_rows,
-                predicate=predicate,
+                predicate=issuer,
             )
           else:
             assert barrier is not None
@@ -2266,7 +2278,7 @@ class LaunchContext:
                 barrier.get_ptr(),
                 col_offset,
                 *gather_rows,
-                predicate=predicate,
+                predicate=issuer,
             )
       if untransformed_gmem_ref is dst_ref and arrive:
         nvvm.cp_async_bulk_commit_group()
