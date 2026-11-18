@@ -385,7 +385,7 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
     # Wheels built at a commit whose source differs from the composition only in what no native wheel is built from
     # (a test, the jax package's Python): the release goes on (2026-11-18: post111's test skip on its built source).
     run(checkout, "checkout", "-q", "-b", "built", base)
-    (checkout / "fix.py").write_text("fixed")
+    run(checkout, "cherry-pick", commits["fix"])
     (checkout / "tests").mkdir(exist_ok=True)
     (checkout / "tests" / "t.py").write_text("skipped before")
     run(checkout, "add", "-A")
