@@ -1,16 +1,16 @@
-diff --git a/xla/backends/gpu/target_config/cudnn_device_props.cc b/xla/backends/gpu/target_config/cudnn_device_props.cc
-index d0c4f5d1fa..d21d499b2f 100644
---- a/xla/backends/gpu/target_config/cudnn_device_props.cc
-+++ b/xla/backends/gpu/target_config/cudnn_device_props.cc
+diff --git a/xla/backends/gpu/target_config/cudnn_device_props_json.cc b/xla/backends/gpu/target_config/cudnn_device_props_json.cc
+index 975a04fb53..57723d0e89 100644
+--- a/xla/backends/gpu/target_config/cudnn_device_props_json.cc
++++ b/xla/backends/gpu/target_config/cudnn_device_props_json.cc
 @@ -15,6 +15,7 @@ limitations under the License.
  
- #include "xla/backends/gpu/target_config/cudnn_device_props.h"
+ #include "xla/backends/gpu/target_config/cudnn_device_props_json.h"
  
 +#include <cmath>
  #include <cstdint>
- #include <memory>
+ #include <optional>
  #include <string>
-@@ -40,6 +41,16 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+@@ -37,6 +38,16 @@ std::string FormatDevicePropertiesJson(
    const bool is_sm107 = cc && cc->major == 10 && cc->minor == 7;
    const int64_t oversized_shared_memory =
        is_sm107 ? desc.oversized_shared_memory_per_block() : 0;
@@ -24,10 +24,10 @@ index d0c4f5d1fa..d21d499b2f 100644
 +      desc.memory_bandwidth() > 0 && mem_clock_hz > 0
 +          ? std::llround(desc.memory_bandwidth() * 8.0 / (2.0 * mem_clock_hz))
 +          : 0;
-   std::string json = absl::StrFormat(
+   return absl::StrFormat(
        R"json({
    "deviceVer":%d,
-@@ -59,6 +70,7 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+@@ -56,6 +67,7 @@ std::string FormatDevicePropertiesJson(
    "l2CacheSize":%d,
    "maxBlockSize":[%d,%d,%d],
    "memClockRateKHz":%d,
@@ -35,7 +35,7 @@ index d0c4f5d1fa..d21d499b2f 100644
    "maxGridSize":[%d,%d,%d],
    "supportCoopLaunch":%d,
    "pciDeviceId":0,
-@@ -76,7 +88,7 @@ BuildDeviceProperties(const stream_executor::DeviceDescription& desc) {
+@@ -73,7 +85,7 @@ std::string FormatDevicePropertiesJson(
        static_cast<int64_t>(desc.clock_rate_ghz() * 1e6), desc.l2_cache_size(),
        desc.thread_dim_limit().x, desc.thread_dim_limit().y,
        desc.thread_dim_limit().z,
