@@ -1196,6 +1196,11 @@ NB_MODULE(_jax, m) {
 
   m.attr("ifrt_version_number") = JAX_IFRT_VERSION_NUMBER;
 
+  // The frontend attribute under which a float add, subtract or multiply rounds
+  // on its own, never contracted into a fused multiply-add: this build's
+  // compilers honour it (jax.extend.backend.no_contract_attribute).
+  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = "xla_no_contract";
+
   m.def("approx_top_k_reduction_output_size",
         xla::ValueOrThrowWrapper(xla::ApproxTopKReductionOutputSize),
         nb::arg("input_size"), nb::arg("rank"), nb::arg("top_k"),
