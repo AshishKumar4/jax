@@ -187,14 +187,15 @@ diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compi
 index f0048ca152..9fe68605c0 100644
 --- a/xla/service/gpu/compile_module_to_llvm_ir.h
 +++ b/xla/service/gpu/compile_module_to_llvm_ir.h
-@@ -63,6 +63,12 @@ struct CompileModuleResults {
+@@ -63,6 +63,13 @@ struct CompileModuleResults {
  absl::Status LoadCache(IrEmitterContext& ir_emitter_context,
                         absl::string_view cache_file_path);
  
 +// The buffer assignment of scheduled `module`, as its code emission assigns
 +// it.
 +absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
-+    const HloModule* module, const GpuAliasInfo* alias_info,
++    const HloModule* module, const GpuTopology& gpu_topology,
++    const GpuAliasInfo* alias_info,
 +    BufferValue::SizeFunction buffer_size_bytes_function);
 +
  absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
@@ -338,7 +339,7 @@ diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
 index f2368312d5..69983b65ad 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -2784,6 +2784,54 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
+@@ -2784,6 +2784,55 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
  }
  }  // namespace
  
@@ -383,7 +384,8 @@ index f2368312d5..69983b65ad 100644
 +      std::unique_ptr<GpuAliasInfo> alias_info,
 +      ScheduleForBackend(module.get(), gpu_topology, borrowed_context->get()));
 +  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> assignment,
-+                        RunBufferAssignment(module.get(), alias_info.get(),
++                        RunBufferAssignment(module.get(), gpu_topology,
++                                            alias_info.get(),
 +                                            BufferSizeBytesFunction()));
 +  BufferAssignmentProto assignment_proto = assignment->ToProto();
 +  return std::make_unique<EarlyExitCompilationResult>(
