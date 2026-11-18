@@ -4220,6 +4220,26 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         convert(x), jax.lax.bitcast_convert_type(x, out_dtype)
     )
 
+  def test_a_product_marked_uncontracted_rounds_before_its_sum(self):
+    # x * y + z, z the negation of XLA's rounded x * y, under the no-contract
+    # mark: zero at every element where the product rounds on its own, its
+    # rounding error where it fuses into the add.
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    x = jax.random.normal(jax.random.key(0), (128,), jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (128,), jnp.float32)
+    z = -jax.jit(jnp.multiply)(x, y)
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((128,), jnp.float32),
+    )
+    def kernel(x_ref, y_ref, z_ref, o_ref):
+      with set_xla_metadata(xla_no_contract=True):
+        o_ref[...] = x_ref[...] * y_ref[...] + z_ref[...]
+
+    np.testing.assert_array_equal(kernel(x, y, z), jnp.zeros_like(x))
+
   def test_optimization_barrier(self):
     @functools.partial(
         self.pallas_call,

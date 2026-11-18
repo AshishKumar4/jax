@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -6073,15 +6075,43 @@ def plan_tiled_transfer(
   )
 
 # We allow contractions, to potentially take advantage of FMA instructions.
-# They can change the results, but the precision should only increase.
+# They can change the results, but the precision should only increase, except
+# where an operation's own rounding is the result: an error-free transform's
+# product and the sums reading it (`contracting`).
+_CONTRACTS = contextvars.ContextVar("mosaic_gpu_contracts", default=True)
+
+
+@contextlib.contextmanager
+def contracting(allowed: bool) -> Iterator[None]:
+  """Within the block, the float adds, subtracts and multiplies emitted may be
+  contracted into fused multiply-adds where `allowed`, else each rounds on its
+  own."""
+  token = _CONTRACTS.set(allowed)
+  try:
+    yield
+  finally:
+    _CONTRACTS.reset(token)
+
+
+def contracts() -> bool:
+  """Whether the float arithmetic emitted here may be contracted (`contracting`)."""
+  return _CONTRACTS.get()
+
+
 def addf(a: ir.Value, b: ir.Value):
-  return arith.addf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.addf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.addf(a, b)
 
 def subf(a: ir.Value, b: ir.Value):
-  return arith.subf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.subf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.subf(a, b)
 
 def mulf(a: ir.Value, b: ir.Value):
-  return arith.mulf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.mulf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.mulf(a, b)
 
 
 @overload
