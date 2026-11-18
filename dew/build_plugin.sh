@@ -145,14 +145,16 @@ for python in $pythons; do
     wheels=jax-cuda-plugin
     [ "$python" != "${pythons%% *}" ] || wheels=$wheels,jax-cuda-pjrt
     [ "$cuda" != "${cudas%% *}" ] || wheels=jaxlib,$wheels
+    config=ci_linux_$(uname -m)_cuda$cuda
     # DEW_PLUGIN_WHEELS=jaxlib: jaxlib alone, a CPU change's wheel built without the CUDA plugins (an XLA CPU
-    # patch's proof, its first CUDA's config for the toolchain only).
+    # patch's proof), under JAX's CPU CI config: build.py adds the CUDA configs and hermetic versions the CUDA one
+    # assumes only for a CUDA wheel, so jaxlib alone under it failed analysis (2026-11-18, three builds).
     if [ "${DEW_PLUGIN_WHEELS:-}" = jaxlib ]; then
       [ "$cuda" = "${cudas%% *}" ] || continue
-      wheels=jaxlib
+      wheels=jaxlib config=ci_linux_$(uname -m)
     fi
     python3 build/build.py build --wheels="$wheels" --cuda_major_version="$cuda" --python_version="$python" \
-      --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
+      --bazel_options=--config="$config" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
