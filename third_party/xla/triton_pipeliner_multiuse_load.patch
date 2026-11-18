@@ -65,7 +65,7 @@ new file mode 100644
 ++  if (auto load = dyn_cast<tt::LoadOp>(loadOp)) {
 ++    // A non-zero "other" is applied to a local_load of the buffer, and nothing
 ++    // is forwarded (see createAsyncCopy).
-++    if (load.getOther() && !isZeroFillConst(load.getOther()))
+++    if (load.getOther() && !isZeroConst(load.getOther()))
 ++      return 0;
 ++  }
 ++  auto [defStage, defCluster] = schedule[loadOp];
