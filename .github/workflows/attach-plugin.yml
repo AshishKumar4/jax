@@ -5,6 +5,7 @@
 # (AshishKumar4/dew-fixtures' .github/actions/attach, pinned by its commit). A machine's wheels a GitHub runner
 # builds attach through build-plugin.yml's own job.
 name: attach plugin
+run-name: attach plugin ${{ inputs.version }} ${{ inputs.request }}
 
 on:
   workflow_dispatch:
@@ -14,6 +15,9 @@ on:
         required: true
       assets:
         description: 'a JSON list of {"url": presigned URL, "sha256": its SHA-256, "asset": the asset name}'
+        required: true
+      request:
+        description: "the asker's own name for this run, which its run name carries so the asker finds it"
         required: true
 
 permissions:
@@ -33,9 +37,11 @@ jobs:
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::version"; exit 1; }
           release="plugin-$VERSION"
+          # One that another attach made meanwhile stands: a create refused is read again, not a failure.
           gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create "$release" -R "$GITHUB_REPOSITORY" --title "$release" --notes \
-              "Dew's JAX $VERSION: its jaxlib, CUDA plugins and PJRT plugins for each machine, and their debug symbols."
+              "Dew's JAX $VERSION: its jaxlib, CUDA plugins and PJRT plugins for each machine, and their debug symbols." ||
+            gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null
 
   attach:
     needs: release
@@ -50,6 +56,10 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.assets) }}
     steps:
+      # Every URL masked before any step names one: a composite action's inputs are printed before its own steps
+      # run, its own mask among them. Read from the event's own file, never interpolated into this step.
+      - name: Mask the staged URLs
+        run: jq -r '.inputs.assets | fromjson | .[].url' "$GITHUB_EVENT_PATH" | while read -r url; do echo "::add-mask::$url"; done
       - uses: AshishKumar4/dew-fixtures/.github/actions/attach@8e865e552d82dbf06fdad3d5d54f362b6fed3f62
         with:
           url: ${{ matrix.url }}

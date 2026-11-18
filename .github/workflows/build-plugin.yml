@@ -1,7 +1,7 @@
 # Dew's JAX CUDA plugin wheels for one machine, built on GitHub's hosted runner of that machine (dew/build_plugin.sh)
-# and attached to the release `release`: an aarch64 build on the free arm64 runner, where no Dew node is one. Bazel
-# reads and writes Dew's remote cache (DEW_BAZEL_TOKEN), so a build cut off at the job's limit leaves what it built
-# there, and the next run of the same inputs carries on from it.
+# and attached to the release `release`: every release's aarch64 build, on the free arm64 runner, where no Dew node is
+# one. With `cache` on, Bazel reads and writes Dew's remote cache (DEW_BAZEL_TOKEN), so a build cut off at the job's
+# limit leaves what it built there; off, the default while row 6204 holds that token as leaked, the build is cold.
 #
 # The build runs the fork's code and Bazel's, so its job holds no write token and keeps no Git credential: what it
 # made goes to `attach`, a job that runs nothing built and alone may write the release (Dew ledger 6204). Inputs reach
@@ -30,6 +30,10 @@ on:
       cudas:
         required: true
         default: "12 13"
+      cache:
+        description: "on: Bazel reads and writes Dew's remote cache; off, the default while row 6204 holds its token as leaked: the build is cold and reads no result of it"
+        required: true
+        default: "off"
 
 permissions:
   contents: read
@@ -49,6 +53,7 @@ jobs:
       VERSION: ${{ inputs.version }}
       PYTHONS: ${{ inputs.pythons }}
       CUDAS: ${{ inputs.cudas }}
+      CACHE: ${{ inputs.cache }}
     steps:
       - name: The inputs are of their forms
         run: |
@@ -57,6 +62,7 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::version"; exit 1; }
           [[ "$PYTHONS" =~ ^(3\.1[0-9])( 3\.1[0-9])*$ ]] || { echo "::error::pythons"; exit 1; }
           [[ "$CUDAS" =~ ^(1[2-9])( 1[2-9])*$ ]] || { echo "::error::cudas"; exit 1; }
+          [[ "$CACHE" =~ ^(on|off)$ ]] || { echo "::error::cache: on or off"; exit 1; }
       - uses: actions/checkout@v4
         with:
           ref: dew
@@ -66,12 +72,19 @@ jobs:
         env:
           DEW_BAZEL_TOKEN: ${{ secrets.DEW_BAZEL_TOKEN }}
         run: |
-          (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token")
-          unset DEW_BAZEL_TOKEN
           code=0
-          DEW_BAZEL_TOKEN_FILE="$RUNNER_TEMP/bazel.token" bash dew/build_plugin.sh "$REF" "$VERSION" \
-            "$RUNNER_TEMP/out" "$PYTHONS" "$CUDAS" || code=$?
-          rm -f "$RUNNER_TEMP/bazel.token"
+          if [ "$CACHE" = on ]; then
+            (umask 077 && printf '%s' "$DEW_BAZEL_TOKEN" > "$RUNNER_TEMP/bazel.token")
+            unset DEW_BAZEL_TOKEN
+            DEW_BAZEL_TOKEN_FILE="$RUNNER_TEMP/bazel.token" bash dew/build_plugin.sh "$REF" "$VERSION" \
+              "$RUNNER_TEMP/out" "$PYTHONS" "$CUDAS" || code=$?
+            rm -f "$RUNNER_TEMP/bazel.token"
+          else
+            # Cold: no remote cache read or written, and no token of it in the job at all (row 6204).
+            unset DEW_BAZEL_TOKEN
+            DEW_BAZEL_CACHE=off bash dew/build_plugin.sh "$REF" "$VERSION" "$RUNNER_TEMP/out" "$PYTHONS" \
+              "$CUDAS" || code=$?
+          fi
           exit $code
       - name: What it made
         run: |
@@ -95,8 +108,15 @@ jobs:
       RELEASE: ${{ inputs.release }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: The release is of its form
-        run: '[[ "$RELEASE" =~ ^plugin-[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::release"; exit 1; }'
+      - name: The release, made where there is none
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^plugin-[0-9]+(\.[0-9]+)+(\.(post|dev)[0-9]+)?$ ]] || { echo "::error::release"; exit 1; }
+          # One that another attach made meanwhile stands: a create refused is read again, not a failure.
+          gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$RELEASE" -R "$GITHUB_REPOSITORY" --title "$RELEASE" --notes \
+              "Dew's JAX ${RELEASE#plugin-}: its jaxlib, CUDA plugins and PJRT plugins for each machine, and their debug symbols." ||
+            gh release view "$RELEASE" -R "$GITHUB_REPOSITORY" > /dev/null
       - uses: actions/download-artifact@v4
         with:
           name: made
