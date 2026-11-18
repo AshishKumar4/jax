@@ -122,8 +122,12 @@ class WgmmaDescriptorsTest(jtu.JaxTestCase):
     call, operands = _launch(moving)
     lowered = _lowered_for_h100(call, *operands)
     (kernel,) = capture.kernels(lowered.compiler_ir("stablehlo"))
-    directory = capture.capture_deviceless(
-        kernel, "9.0", list(operands), tempfile.mkdtemp())
+    try:
+      directory = capture.capture_deviceless(
+          kernel, "9.0", list(operands), tempfile.mkdtemp())
+    except capture.NoCudaPlugin as missing:
+      # A CPU wheel's test: the capture is the CUDA plugin's export.
+      self.skipTest(str(missing))
     return _registers((pathlib.Path(directory) / "kernel.cubin").read_bytes())
 
   def test_an_operand_at_one_address_holds_no_more_registers_than_a_moving_one(self):
