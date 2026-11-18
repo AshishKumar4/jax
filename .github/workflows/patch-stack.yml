@@ -289,7 +289,9 @@ jobs:
           git clone -q --filter=blob:none --branch "${FROM:-v$RELEASE-cache-key-pool-fingerprints}" \
             "https://github.com/$GITHUB_REPOSITORY.git" jax
           git -C jax fetch -q --no-tags https://github.com/jax-ml/jax.git "refs/tags/jax-v$RELEASE:refs/tags/jax-v$RELEASE"
-          uv build -q --wheel --out-dir dist jax
+          # Its zip's times its commit's, so a publish run again (another machine's plugins added beside) builds the
+          # same bytes the release staged (`staged`).
+          SOURCE_DATE_EPOCH=$(git -C jax log -1 --format=%ct) uv build -q --wheel --out-dir dist jax
           uv venv -q venv
           uv pip install -q --python venv/bin/python pip
           venv/bin/python -m pip download -q --no-deps --only-binary :all: --dest dist "jax==$RELEASE"
@@ -401,11 +403,26 @@ jobs:
               --notes "jax $version, staged: Dew's pin head locks it from here, and it is indexed once that head has passed Dew's train (patch-stack's index)."
           fi
           # Staged once: a publish run again (another machine's plugins added beside) finds its wheel there; the same
-          # bytes are kept, other bytes under the name refused, never replaced (a lock may hold their sha256).
+          # bytes are kept, other bytes under the name refused, never replaced (a lock may hold their sha256). A wheel
+          # staged before its build fixed its zip's times (SOURCE_DATE_EPOCH, above) is kept where only those differ:
+          # every member's name and bytes the same (2026-11-18: post111's aarch64 publish refused its own jax wheel,
+          # rebuilt at the same commit an hour on).
           name=$(basename "$wheel")
           if gh release download "jax-$version" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir staged 2> /dev/null; then
-            [ "$(sha256sum < "staged/$name")" = "$(sha256sum < "$wheel")" ] || { echo "::error::jax-$version holds another $name"; exit 1; }
-            echo "kept $name: staged already, the same bytes"
+            if [ "$(sha256sum < "staged/$name")" = "$(sha256sum < "$wheel")" ]; then
+              echo "kept $name: staged already, the same bytes"
+            elif python3 - "staged/$name" "$wheel" <<'PY'
+          import sys, zipfile
+          held, built = (zipfile.ZipFile(path) for path in sys.argv[1:])
+          names = sorted(held.namelist())
+          sys.exit(0 if names == sorted(built.namelist())
+                   and all(held.read(member) == built.read(member) for member in names) else 1)
+          PY
+            then
+              echo "kept $name: staged already, every member the same, the zip's times apart"
+            else
+              echo "::error::jax-$version holds another $name"; exit 1
+            fi
           else
             gh release upload "jax-$version" --repo "$GITHUB_REPOSITORY" "$wheel"
             echo "staged $name on jax-$version; its native wheels are on their plugin release"
