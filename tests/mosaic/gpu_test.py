@@ -5014,6 +5014,74 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     )(x, idx)
     np.testing.assert_array_equal(y, x[idx, slice(col_slice, 2 * col_slice)])
 
+  @parameterized.parameters(1, 2, 3)
+  def test_tma_gather_issued_by_a_later_warp(self, warp):
+    if not jtu.is_cuda_compute_capability_at_least("10.0"):
+      self.skipTest("TMA gather requires CUDA compute capability 10.0 or higher")
+    i1 = ir.IntegerType.get_signless(1)
+    i32 = ir.IntegerType.get_signless(32)
+    dtype, swizzle = jnp.int32, 128
+    col_slice = 8 * swizzle // bitwidth(dtype_to_ir_type(dtype))
+    shape = (64, 2 * col_slice)
+    def kernel(ctx, src, idx, dst, smem):
+      tmp, barrier = smem
+      idxs = mgpu.FragmentedArray.load_untiled(
+          idx, layout=fa.TMA_INDICES_4_LAYOUT, optimized=False, is_signed=False
+      )
+      # Every thread holds the indices: the first thread of a later warp
+      # issues the gather and arrives on its barrier.
+      in_warp = arith.cmpi(
+          arith.CmpIPredicate.eq,
+          arith.remui(warp_idx(sync=True), c(utils.WARPS_IN_WARPGROUP, i32)),
+          c(warp, i32),
+      )
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          swizzle=swizzle,
+          barrier=barrier,
+          gmem_slice=(idxs, mgpu.ds(col_slice, col_slice)),
+          predicate=arith.andi(
+              in_warp, single_thread_predicate(utils.ThreadSubset.WARP)
+          ),
+      )
+      barrier.wait_parity(c(0, i1))
+      copy(tmp, dst, swizzle=swizzle)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    idx = jax.random.permutation(jax.random.key(1234), 48).astype(jnp.int32)[:12]
+    out_type = jax.ShapeDtypeStruct((12, col_slice), dtype)
+    smem = (out_type, mgpu.Barrier(1))
+    y = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (x, idx), out_type, smem,
+    )(x, idx)
+    np.testing.assert_array_equal(y, x[idx, slice(col_slice, 2 * col_slice)])
+
+  def test_tma_gather_refuses_a_predicate_with_indices_split_over_warps(self):
+    dtype, swizzle = jnp.int32, 128
+    col_slice = 8 * swizzle // bitwidth(dtype_to_ir_type(dtype))
+    def kernel(ctx, src, idx, dst, smem):
+      tmp, barrier = smem
+      idxs = mgpu.FragmentedArray.load_untiled(
+          idx, layout=fa.TMA_INDICES_LAYOUT, optimized=False, is_signed=False
+      )
+      ctx.async_copy(
+          src_ref=src,
+          dst_ref=tmp,
+          swizzle=swizzle,
+          barrier=barrier,
+          gmem_slice=(idxs, mgpu.ds(0, col_slice)),
+          predicate=single_thread_predicate(utils.ThreadSubset.WARPGROUP),
+      )
+      del dst
+    x = jax.ShapeDtypeStruct((64, 2 * col_slice), dtype)
+    idx = jax.ShapeDtypeStruct((48,), jnp.int32)
+    out_type = jax.ShapeDtypeStruct((48, col_slice), dtype)
+    with self.assertRaisesRegex(ValueError, "TMA_INDICES_4_LAYOUT"):
+      mgpu.as_gpu_kernel(
+          kernel, (1, 1, 1), (128, 1, 1), (x, idx), out_type,
+          (out_type, mgpu.Barrier(1)),
+      )
+
   @parameterized.product(
       swizzle=(16, 32, 64, 128),
       shape=((64, None),),
