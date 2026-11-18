@@ -849,43 +849,67 @@ def _reduction_scratch(
   return utils.memref_slice(scratch, (warpgroup, slice(0, elements)))
 
 
+def _reduced_whole(
+    ctx: LoweringContext,
+    op: vector.ReductionOp | vector.MultiDimReductionOp,
+    source: ir.Value,
+    layout: ir.Attribute,
+    acc: ir.Value | None = None,
+) -> ir.Value:
+  """`source`, of any rank and layout, reduced over every axis to a scalar by
+  `op`'s kind, then combined with `acc` where given (a multi-reduction's)."""
+  op_kind = _combining_kind(op.kind)
+  if op_kind in (vector.CombiningKind.OR, vector.CombiningKind.AND):
+    # A boolean's, over the warpgroup's threads by a barrier: no scratch.
+    a = _fragmented_array_from_ir(source, layout, None)
+    if op_kind == vector.CombiningKind.OR:
+      result, combined = a.reduce_pred("or"), operator.or_
+    else:
+      result, combined = a.reduce_pred("and"), operator.and_
+  else:
+    element_type = ir.VectorType(source.type).element_type
+    scratch = _reduction_scratch(op, element_type, 4, ctx.smem_requested_bytes)
+    axes = range(ir.VectorType(source.type).rank)
+    is_signed = _is_reduction_signed(op_kind)
+    a = _fragmented_array_from_ir(source, layout, is_signed)
+    acc_ilp_attr = op.attributes.get("acc_ilp")
+    acc_ilp = None if acc_ilp_attr is None else ir.IntegerAttr(acc_ilp_attr).value
+    reduce = functools.partial(a.reduce, axis=axes, scratch=scratch, acc_ilp=acc_ilp)
+    match op_kind:
+      case vector.CombiningKind.ADD:
+        result, combined = reduce("add"), operator.add
+      case vector.CombiningKind.MUL:
+        result, combined = reduce("prod"), operator.mul
+      case vector.CombiningKind.MAXSI | vector.CombiningKind.MAXUI | vector.CombiningKind.MAXIMUMF:
+        result, combined = reduce("max"), fa.FragmentedArray.max
+      case vector.CombiningKind.MINUI | vector.CombiningKind.MINSI | vector.CombiningKind.MINIMUMF:
+        result, combined = reduce("min"), fa.FragmentedArray.min
+      case _:
+        raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
+  if acc is not None:
+    result = combined(
+        result, fa.FragmentedArray.splat(acc, (), is_signed=result.is_signed)
+    )
+  assert isinstance(result.layout, fa.WGSplatFragLayout)
+  return result.registers.item()
+
+
 @_register_lowering(vector.ReductionOp)
 def _vector_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.ReductionOp
 ) -> Sequence[ir.Value]:
   [layout] = inference_utils.in_layouts(op)
-  op_kind = _combining_kind(op.kind)
-  if op_kind in (vector.CombiningKind.OR, vector.CombiningKind.AND):
-    # A boolean's, over the warpgroup's threads by a barrier: no scratch.
-    a = _fragmented_array_from_ir(op.vector, layout, None)
-    result = a.reduce_pred("or" if op_kind == vector.CombiningKind.OR else "and")
-    return [result.registers.item()]
-  element_type = op.vector.type.element_type
-  scratch = _reduction_scratch(op, element_type, 4, ctx.smem_requested_bytes)
-  axes = range(op.vector.type.rank)
-  is_signed = _is_reduction_signed(op_kind)
-  a = _fragmented_array_from_ir(op.vector, layout, is_signed)
-  acc_ilp_attr = op.attributes.get("acc_ilp")
-  acc_ilp = None if acc_ilp_attr is None else ir.IntegerAttr(acc_ilp_attr).value
-  match op_kind:
-    case vector.CombiningKind.ADD:
-      result = a.reduce("add", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MUL:
-      result = a.reduce("prod", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MAXSI | vector.CombiningKind.MAXUI | vector.CombiningKind.MAXIMUMF:
-      result = a.reduce("max", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MINUI | vector.CombiningKind.MINSI | vector.CombiningKind.MINIMUMF:
-      result = a.reduce("min", axes, scratch, acc_ilp=acc_ilp)
-    case _:
-      raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
-  assert isinstance(result.layout, fa.WGSplatFragLayout)
-  return [result.registers.item()]
+  return [_reduced_whole(ctx, op, op.vector, layout)]
 
 
 @_register_lowering(vector.MultiDimReductionOp)
 def _vector_multi_dim_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.MultiDimReductionOp
 ) -> Sequence[ir.Value]:
+  if not isinstance(op.result.type, ir.VectorType):
+    # Every axis reduced, to a scalar: vector.reduction's, of any rank.
+    [in_layout] = inference_utils.in_layouts(op)
+    return [_reduced_whole(ctx, op, op.source, in_layout, op.acc)]
   [in_layout, acc_layout] = inference_utils.in_layouts(op)
   [out_layout] = inference_utils.out_layouts(op)
   if out_layout != acc_layout:

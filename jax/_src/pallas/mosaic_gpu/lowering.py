@@ -3486,7 +3486,11 @@ def _reduce_lowering_rule(
   del kwargs
   [x_aval] = ctx.avals_in
   match x.layout:
-    case mgpu.WGStridedFragLayout():
+    case mgpu.WGStridedFragLayout() | mgpu.TiledLayout() if (
+        isinstance(x.layout, mgpu.WGStridedFragLayout) or len(axes) > 1
+    ):
+      # Every axis at once, to a scalar: a strided array's, or a tiled one's
+      # (an accumulator's) reduced whole.
       if set(axes) != set(range(x_aval.ndim)):
         raise NotImplementedError("No support for axes yet")
       # To relax the restriction below, you need to ensure sufficient
@@ -3501,8 +3505,6 @@ def _reduce_lowering_rule(
       with ctx.module_ctx.scratch_view(scratch_ty) as scratch:
         return x.reduce(op, axes, scratch, acc_ilp=accumulator_ilp)
     case mgpu.TiledLayout():
-      if len(axes) != 1:
-        raise NotImplementedError("Multi-axis reductions not supported")
       reduced_dim = x.layout.tiling.tile_dimension(axes[0])
       if any(reduced_dim[d] for d in x.layout.partitioned_warp_dims):
         dtype_bitwidth = dtypes.itemsize_bits(x_aval.dtype)
@@ -3592,14 +3594,15 @@ def _reduce_lowering_rule_wg(
   [out_aval] = ctx.avals_out
   x = _ensure_ir_value(x, x_aval.dtype)
   out_type = mgpu_utils.dtype_to_ir_type(out_aval.dtype)
-  if not out_aval.shape:
-    # Special-case: reducing to a scalar.
-    if x_aval.ndim != 1:
-      # Flatten to 1D, since vector.reduction only supports 1D inputs.
-      x = vector_dialect.shape_cast(
-          ir.VectorType.get([x_aval.size], out_type), x
-      )
+  if not out_aval.shape and x_aval.ndim == 1:
+    # Special-case: reducing a vector to a scalar.
     reduction = vector_dialect.ReductionOp(out_type, kind, x)
+  elif not out_aval.shape:
+    # Every axis at once, to a scalar: vector.reduction takes one axis alone,
+    # and a tiled layout (an accumulator's) has none it flattens to.
+    reduction = vector_dialect.MultiDimReductionOp(
+        kind, x, _ensure_ir_value(acc, out_aval.dtype), axes
+    )
   else:
     acc_vec = vector_dialect.broadcast(
         ir.VectorType.get(out_aval.shape, out_type),
