@@ -55,8 +55,9 @@ from jax.experimental import pallas as pl
 def _covered_contexts() -> dict[int, str]:
   """The contexts and states the cache keys or checks, by the object (so that a
   module that re-exports one is covered as the module that defines it)."""
-  from jax.experimental.mosaic.gpu import lowering_inputs  # pylint: disable=g-import-not-at-top
+  from jax.experimental.mosaic.gpu import fragmented_array, lowering_inputs  # pylint: disable=g-import-not-at-top
   return {
+      id(fragmented_array._CONTRACTS): "keyed (whether its arithmetic contracts)",
       id(config.compute_on_context_manager): "keyed",
       id(config.xla_metadata_context_manager): "keyed",
       id(config.no_collectives): "keyed",
