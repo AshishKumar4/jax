@@ -85,12 +85,14 @@ jobs:
             # and COMPILER_MSVC, which Google's Windows toolchains define on every compile (XLA's
             # tools/toolchains/win2022/*/windows_cc_toolchain_config.bzl) and Bazel's does not: XLA's embedded
             # files define their alignment macro by it, clang-cl defining no __GNUC__ (44157019388:
-            # embed_gpu_specs.cc, "a type specifier is required" at ALIGN_ATTRIBUTE).
+            # embed_gpu_specs.cc, "a type specifier is required" at ALIGN_ATTRIBUTE). Its -D form, which clang-cl
+            # reads as /D: Git Bash rewrites a /D argument as a Windows path (44231428262: "no such target
+            # '//:Files/Git/DCOMPILER_MSVC'").
             Windows) config=(--bazel_options=--config=clang_local --bazel_options=--compiler=clang-cl
                              --bazel_options=--extra_toolchains=@@rules_cc++cc_configure_extension+local_config_cc//:cc-toolchain-x64_windows-clang-cl
                              --bazel_options=--extra_execution_platforms=//jax/tools/toolchains:x64_windows-clang-cl
                              --bazel_options=--copt=-Werror=mismatched-tags
-                             --bazel_options=--copt=/DCOMPILER_MSVC --bazel_options=--host_copt=/DCOMPILER_MSVC
+                             --bazel_options=--copt=-DCOMPILER_MSVC --bazel_options=--host_copt=-DCOMPILER_MSVC
                              --bazel_options=--linkopt=/FORCE:MULTIPLE --bazel_options=--host_linkopt=/FORCE:MULTIPLE
                              "--bazel_startup_options=--host_jvm_args=-Djava.security.properties=file:///$(cygpath -m "$PWD")/ci/bazel_dns_windows.security")
                      # LLVM 21: the runner's Windows SDK (10.0.26100, the only one it holds) declares
