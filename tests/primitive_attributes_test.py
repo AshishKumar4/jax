@@ -264,7 +264,7 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
         lambda: jax.lax.split(x, (2, 2), 2)[1],
         lambda: jax.lax.stack([x, x], 1), lambda: jax.lax.unstack(x, 2)[1],
         lambda: jnp.where(x > 20.0, x, jnp.flip(x, 2)), lambda: jnp.array(x, copy=True),
-        lambda: jnp.sort(jnp.flip(x, 2), axis=2),
+        lambda: jnp.sort(jnp.flip(x, 2), axis=2), lambda: jax.lax.optimization_barrier(x),
     ]
     allowed = set(np.asarray(x).ravel().tolist()) | {-7.0}
 
@@ -288,7 +288,7 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
     self.assertEqual({p.name for p in seen},
                      {"reshape", "squeeze", "broadcast_in_dim", "transpose", "rev", "slice", "dynamic_slice",
                       "dynamic_update_slice", "gather", "concatenate", "pad", "split", "stack", "unstack",
-                      "select_n", "copy", "sort"})
+                      "select_n", "copy", "sort", "optimization_barrier"})
     # Arithmetic and rounding are not rearrangements: an add, a convert, a dot,
     # an iota (its entries computed from their indices, rounded past a float's
     # mantissa: 2^24 + 1 is no float32).
