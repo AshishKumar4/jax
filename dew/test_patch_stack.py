@@ -382,8 +382,20 @@ def test_a_release_is_pushed_and_published_only_once_every_step_before_it_has_he
                                  text=True, check=False)
         assert refused.returncode != 0 and "BUILT_AT" in refused.stderr
         assert branches() == before and not calls.exists()
-    done = released("0.12.0.1.post40", commits["fix"])
-    assert done.returncode == 0
+    # Wheels built at a commit whose source differs from the composition only in what no native wheel is built from
+    # (a test, the jax package's Python): the release goes on (2026-11-18: post111's test skip on its built source).
+    run(checkout, "checkout", "-q", "-b", "built", base)
+    (checkout / "fix.py").write_text("fixed")
+    (checkout / "tests").mkdir(exist_ok=True)
+    (checkout / "tests" / "t.py").write_text("skipped before")
+    run(checkout, "add", "-A")
+    run(checkout, "commit", "-qm", "built")
+    built = run(checkout, "rev-parse", "HEAD")
+    run(checkout, "push", "-q", "origin", f"{built}:refs/heads/built")
+    done = subprocess.run(["bash", str(script), str(checkout), "0.12.0.1.post39", "0.12.0.1.post40",
+                           f"Release 0.12.0.1.post40, its plugins built at {built[:10]}", commits["fix"]],
+                          env={**environment, "BUILT_AT": built}, capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr
     stack = run(origin, "rev-parse", "v0.12.0.1-cache-key-pool-fingerprints")
     assert run(origin, "rev-parse", "release/0.12.0.1.post40") == stack
     assert run(origin, "show", f"{stack}:jax/version.py") == '_release_version: str | None = "0.12.0.1.post40"'
