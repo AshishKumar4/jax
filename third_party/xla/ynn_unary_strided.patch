@@ -1,24 +1,3 @@
-From 22e565e0867a1a68c7ebed1a565922baa57f8bfd Mon Sep 17 00:00:00 2001
-From: Ashish Kumar Singh <ashishkmr472@gmail.com>
-Date: Sun, 15 Nov 2026 16:50:40 -0600
-Subject: [PATCH] [XLA:CPU] YNNPACK's unary kernels read an input of any
- innermost stride as given
-
-YNN's unary kernels read their input contiguously in its innermost dimension, and make_unary_elementwise_impl
-asserted it, an assert compiled out of a release: a bf16 convert of a broadcast scalar, a stride-zero alias,
-read past the scalar as contiguous memory (NaN or garbage by process). The implementation gathers a block of
-an input whose innermost dimension is not contiguous into a buffer of the call's own, never writing the input,
-which its producer and other consumers share. Tested: a shared broadcast converted twice, reductions beside a
-shared clamp broadcast, and row sums of squares and softmax rows.
----
- third_party/xnnpack/BUILD                   |   5 +-
- third_party/xnnpack/workspace.bzl           |   1 +
- third_party/xnnpack/ynn_unary_strided.patch |  63 +++++++++
- xla/backends/cpu/tests/BUILD                |   3 +
- xla/backends/cpu/tests/ynn_fusion_test.cc   | 139 ++++++++++++++++++++
- 5 files changed, 210 insertions(+), 1 deletion(-)
- create mode 100644 third_party/xnnpack/ynn_unary_strided.patch
-
 diff --git a/third_party/xnnpack/BUILD b/third_party/xnnpack/BUILD
 index 0d978ffd2e..f68df4c10d 100644
 --- a/third_party/xnnpack/BUILD
@@ -32,7 +11,7 @@ index 0d978ffd2e..f68df4c10d 100644
 +    "ynn_unary_strided.patch",
 +])
 diff --git a/third_party/xnnpack/workspace.bzl b/third_party/xnnpack/workspace.bzl
-index d56ec2b0a8..8ce8da8021 100644
+index f89eb937ff..f28ffd0ad1 100644
 --- a/third_party/xnnpack/workspace.bzl
 +++ b/third_party/xnnpack/workspace.bzl
 @@ -21,6 +21,7 @@ def repo():
@@ -40,9 +19,9 @@ index d56ec2b0a8..8ce8da8021 100644
      tf_http_archive(
          name = "XNNPACK",
 +        patch_file = ["//third_party/xnnpack:ynn_unary_strided.patch"],
-         sha256 = "cb485a0fe76dec243568ec6ce6c0b75e18909ed7df5459921b46eaada332fe8f",
-         strip_prefix = "XNNPACK-0a66ebb5817fce48df605451444dcfc27a5e4ee4",
-         urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/0a66ebb5817fce48df605451444dcfc27a5e4ee4.zip"),
+         sha256 = "5ff6917a8425f2936101cee5a28538efd4d0dd835e29a8c23ef5131d76946ba9",
+         strip_prefix = "XNNPACK-8bf8d33a7285af155dd52ba7e280b63980c32472",
+         urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/8bf8d33a7285af155dd52ba7e280b63980c32472.zip"),
 diff --git a/third_party/xnnpack/ynn_unary_strided.patch b/third_party/xnnpack/ynn_unary_strided.patch
 new file mode 100644
 index 0000000000..aa9f4bc738
@@ -127,7 +106,7 @@ index e4e5e3541f..020a30460f 100644
          "//xla:error_spec",
          "//xla:literal",
 diff --git a/xla/backends/cpu/tests/ynn_fusion_test.cc b/xla/backends/cpu/tests/ynn_fusion_test.cc
-index 14260ee557..62c7f50793 100644
+index 2f80517891..99e9dbb727 100644
 --- a/xla/backends/cpu/tests/ynn_fusion_test.cc
 +++ b/xla/backends/cpu/tests/ynn_fusion_test.cc
 @@ -208,6 +208,145 @@ TEST_P(YnnFusionTest, Concatenate) {
@@ -276,6 +255,3 @@ index 14260ee557..62c7f50793 100644
  TEST_P(YnnFusionTest, Slice) {
    constexpr absl::string_view kModuleStr = R"(
      HloModule slice
--- 
-2.53.0
-
