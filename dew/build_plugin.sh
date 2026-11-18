@@ -11,6 +11,8 @@
 # cache, so a JAX version's cold build is paid once and a patch change rebuilds in minutes.
 #
 #   build_plugin.sh REF VERSION OUT [PYTHONS] [CUDAS]     on a Linux x86_64 or aarch64 host (its wheels' platform)
+#   DEW_PLUGIN_WHEELS=jaxlib DEW_PLUGIN_TESTS_BUILT=@xla//xla/service:hlo_cse_test_interpreter \
+#     build_plugin.sh REF VERSION OUT 3.12 12
 #   e.g. build_plugin.sh release/0.12.0.1.post44 0.12.0.1.post44 "$OUT"
 #
 # REF is a branch, a tag or a commit's sha. PYTHONS defaults to every Python Dew supports (its requires-python
@@ -97,6 +99,43 @@ fi
 if [ "${DEW_PLUGIN_TESTS_ONLY:-}" = 1 ]; then
   exit "$red"
 fi
+# DEW_PLUGIN_TESTS_BUILT: Bazel test targets built, never run, each target's binary and runfiles kept under
+# OUT/tests/<target> with a tarball beside (OUT/tests/<target>.tar.gz) and its build's exit in OUT/tests-built.tsv:
+# a build node runs no test (Dew's bible §8), so a target's binary runs where tests run, on the fleet (Main,
+# 2026-11-18). Each `target` or `target=FILTER`, the filter only recorded beside it for the run.
+keep_built() {
+  local target=$1 name=$2 binary
+  binary=$("${DEW_BAZEL:-bazel}" cquery --config=ci_linux_"$(uname -m)"_cuda"${cudas%% *}" \
+    --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --output=starlark \
+    --starlark:expr='target.files_to_run.executable.path if target.files_to_run.executable else ""') || return 1
+  # Each step checked by its own `|| return`: called as an `if`'s condition, set -e stops nothing inside it.
+  [ -n "$binary" ] || { echo "build_plugin: $target names no executable to keep"; return 1; }
+  mkdir -p "$out/tests/$name" || return 1
+  cp -L "$binary" "$out/tests/$name/" || return 1
+  if [ -d "$binary.runfiles" ]; then
+    cp -rL "$binary.runfiles" "$out/tests/$name/" || return 1
+    rm -f "$out/tests/$name/$(basename "$binary").runfiles/MANIFEST" || return 1
+  fi
+  tar -C "$out/tests" -czf "$out/tests/$name.tar.gz" "$name" || return 1
+}
+report=tests.tsv
+if [ -n "${DEW_PLUGIN_TESTS_BUILT:-}" ]; then
+  report=tests-built.tsv
+  printf 'target\tfilter\tseconds\texit\n' > "$out/tests-built.tsv"
+  for test in $DEW_PLUGIN_TESTS_BUILT; do
+    target=${test%%=*} filter=${test#*=} started=$(date +%s) code=0
+    [ "$filter" != "$test" ] || filter=
+    name=$(echo "$target" | tr '/:@' '___')
+    "${DEW_BAZEL:-bazel}" build --config=ci_linux_"$(uname -m)"_cuda"${cudas%% *}" \
+      --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" "$target" --keep_going > "$out/test-$name.log" 2>&1 || code=$?
+    # The target's executable, its runfiles beside it with their manifest dropped (its absolute paths are this
+    # node's, and a test's runfiles library reads the manifest over the tree), and the pair archived: a step that
+    # fails is the target's red build, never the job's exit (set -e), the wheels built after it either way.
+    [ "$code" != 0 ] || if ! keep_built "$target" "$name" >> "$out/test-$name.log" 2>&1; then code=1; fi
+    printf '%s\t%s\t%s\t%s\n' "$target" "$filter" "$(( $(date +%s) - started ))" "$code" >> "$out/tests-built.tsv"
+    [ "$code" = 0 ] || { grep -m 60 -E "error:|ERROR:" "$out/test-$name.log" || true; red=$code; }
+  done
+fi
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
@@ -106,6 +145,12 @@ for python in $pythons; do
     wheels=jax-cuda-plugin
     [ "$python" != "${pythons%% *}" ] || wheels=$wheels,jax-cuda-pjrt
     [ "$cuda" != "${cudas%% *}" ] || wheels=jaxlib,$wheels
+    # DEW_PLUGIN_WHEELS=jaxlib: jaxlib alone, a CPU change's wheel built without the CUDA plugins (an XLA CPU
+    # patch's proof, its first CUDA's config for the toolchain only).
+    if [ "${DEW_PLUGIN_WHEELS:-}" = jaxlib ]; then
+      [ "$cuda" = "${cudas%% *}" ] || continue
+      wheels=jaxlib
+    fi
     python3 build/build.py build --wheels="$wheels" --cuda_major_version="$cuda" --python_version="$python" \
       --bazel_options=--config=ci_linux_"$(uname -m)"_cuda"$cuda" --bazel_options=--repo_env=ML_WHEEL_TYPE=release \
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
@@ -133,5 +178,5 @@ tar -C "$out/debug" -czf "$out/debug-$(uname -m).tar.gz" .build-id
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
 column -t -s $'\t' "$out/builds.tsv"
 # A red test leaves the wheels built and fails the job.
-[ "$red" = 0 ] || { echo "build_plugin: the wheels are built; a test target was red ($red): OUT/tests.tsv" >&2
+[ "$red" = 0 ] || { echo "build_plugin: the wheels are built; a test target was red ($red): OUT/$report" >&2
                     exit "$red"; }
