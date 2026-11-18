@@ -305,7 +305,7 @@ index 7a8d840981..55d1edab3f 100644
 +    pointers.push_back(&allocation);
 +  }
 +  CompiledMemoryStats stats;
-+  stats.PopulateBufferStatsFromAllocations(pointers);
++  stats.PopulateBufferStatsFromAllocations(pointers, /*assignment=*/nullptr);
 +  const int64_t bytes = stats.argument_size_in_bytes +
 +                        stats.output_size_in_bytes -
 +                        stats.alias_size_in_bytes + stats.temp_size_in_bytes;
