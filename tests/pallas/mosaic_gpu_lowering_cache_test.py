@@ -713,6 +713,26 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
 
   # -- a kernel that reads what the topology is
 
+  def test_a_kernel_that_reads_no_mesh_is_one_entry_under_any_mesh(self):
+    # Its module is the same lowered alone or by each device of a mesh: a
+    # kernel certified on one device and the program running it per shard
+    # lower one kernel, which no placement keys apart.
+    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    alone = self.lower(env=devices)
+    self.assertEqual(alone["events"], ["miss"], alone)
+    for mesh in ("abstract2", "concrete2"):
+      with self.subTest(mesh):
+        meshed = self.lower(mesh=mesh, env=devices)
+        self.assertEqual(meshed["events"], ["hit"], meshed)
+        self.assertEqual(meshed["normalized"], alone["normalized"])
+
+  def test_a_kernel_that_reads_its_mesh_is_keyed_by_it(self):
+    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    abstract = self.lower(kernel="mesh_axis", mesh="abstract2", env=devices)
+    concrete = self.lower(kernel="mesh_axis", mesh="concrete2", env=devices)
+    self.assertEqual(abstract["events"], ["miss"], abstract)
+    self.assertEqual(concrete["events"], ["miss"], concrete)
+
   def test_a_multi_device_kernel_reads_the_snapshot_and_lowers_as_it_does_without_it(self):
     devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
     verify = {**devices, "JAX_PALLAS_LOWERING_CACHE_VERIFY": "1"}
