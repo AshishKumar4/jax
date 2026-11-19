@@ -13,22 +13,6 @@ together before it emits thunks (KernelCompiler::RunConcurrently, the calling th
 the pool's), outside the LLVM options lock, and each call's thunk takes its state (CustomCallThunk::Create's
 execution_state, CustomCallThunk::Instantiated the one instantiate). An instantiation's error is the compile's.
 ---
- xla/backends/gpu/codegen/BUILD                |   4 +
- .../codegen/cubin_custom_kernel_compiler.cc   |  42 +++++
- .../codegen/cubin_custom_kernel_compiler.h    |   3 +
- xla/backends/gpu/codegen/kernel_compiler.h    |  11 ++
- xla/backends/gpu/runtime/custom_call_thunk.cc |  51 ++++--
- xla/backends/gpu/runtime/custom_call_thunk.h  |  12 ++
- xla/ffi/api/api.h                             |   6 +
- xla/ffi/api/c_api.h                           |   5 +
- xla/ffi/ffi_registry.h                        |   6 +
- xla/service/gpu/BUILD                         |  30 ++++
- .../gpu/instantiate_concurrently_test.cc      | 133 ++++++++++++++++
- xla/service/gpu/thunk_emitter.cc              | 149 ++++++++++++++----
- xla/service/gpu/thunk_emitter.h               |  29 ++++
- 13 files changed, 434 insertions(+), 47 deletions(-)
- create mode 100644 xla/service/gpu/instantiate_concurrently_test.cc
-
 diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
 index 0580f1faff..3694b0cb84 100644
 --- a/xla/backends/gpu/codegen/BUILD
@@ -320,7 +304,7 @@ index 517f6fd9c9..15fd9da67f 100644
  }
  
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 9127d9e185..241ba0bc50 100644
+index daf95fd535..14073e9116 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -561,6 +561,8 @@ cc_library(
@@ -332,7 +316,7 @@ index 9127d9e185..241ba0bc50 100644
          "//xla/hlo/ir:hlo",
          "//xla/hlo/ir:hlo_instruction_utils",
          "//xla/mlir/utils:error_util",
-@@ -2185,6 +2187,34 @@ xla_test(
+@@ -2188,6 +2190,37 @@ xla_test(
      ],
  )
  
@@ -353,12 +337,15 @@ index 9127d9e185..241ba0bc50 100644
 +        "//xla/service:executable",
 +        "//xla/service:gpu_topology",
 +        "//xla/service:hlo_module_config",
++        "//xla/service/llvm_ir:llvm_command_line_options",
 +        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:env",
 +        "//xla/tsl/platform:statusor",
 +        "@com_google_absl//absl/status",
 +        "@com_google_absl//absl/status:status_matchers",
 +        "@com_google_absl//absl/status:statusor",
 +        "@com_google_absl//absl/strings:string_view",
++        "@com_google_absl//absl/synchronization",
 +        "@com_google_absl//absl/time",
 +        "@com_google_googletest//:gtest_main",
 +    ],
@@ -369,10 +356,10 @@ index 9127d9e185..241ba0bc50 100644
      srcs = ["gpu_compiler_test.cc"],
 diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
 new file mode 100644
-index 0000000000..bcbda9047d
+index 0000000000..1671073976
 --- /dev/null
 +++ b/xla/service/gpu/instantiate_concurrently_test.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,223 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -390,6 +377,7 @@ index 0000000000..bcbda9047d
 +
 +#include <atomic>
 +#include <memory>
++#include <optional>
 +
 +#include <gmock/gmock.h>
 +#include <gtest/gtest.h>
@@ -397,6 +385,7 @@ index 0000000000..bcbda9047d
 +#include "absl/status/status_matchers.h"
 +#include "absl/status/statusor.h"
 +#include "absl/strings/string_view.h"
++#include "absl/synchronization/notification.h"
 +#include "absl/time/clock.h"
 +#include "absl/time/time.h"
 +#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
@@ -408,8 +397,11 @@ index 0000000000..bcbda9047d
 +#include "xla/service/executable.h"
 +#include "xla/service/gpu_topology.h"
 +#include "xla/service/hlo_module_config.h"
++#include "xla/service/llvm_ir/llvm_command_line_options.h"
 +#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/env.h"
 +#include "xla/tsl/platform/statusor.h"
++#include "xla/tsl/platform/threadpool.h"
 +
 +namespace xla::gpu {
 +namespace {
@@ -441,6 +433,21 @@ index 0000000000..bcbda9047d
 +XLA_FFI_DEFINE_HANDLER(kInstantiateTogetherExecute,
 +                       []() { return absl::OkStatus(); }, ffi::Ffi::Bind());
 +
++static std::atomic<int> own_options_arrived = 0;
++static absl::Notification* own_options_gate = nullptr;
++
++// An instantiation that compiles with LLVM options of its own, as Mosaic GPU's
++// does: it takes the LLVM options lock with them once the test lets it.
++XLA_FFI_DEFINE_HANDLER(
++    kInstantiateWithOwnLlvmOptions,
++    []() -> absl::Status {
++      own_options_arrived.fetch_add(1);
++      own_options_gate->WaitForNotification();
++      llvm_ir::LLVMCommandLineOptionsLock lock({"-bonus-inst-threshold=3"});
++      return absl::OkStatus();
++    },
++    ffi::Ffi::BindInstantiate());
++
 +class InstantiateConcurrentlyTest : public HloPjRtGpuTestBase {
 + protected:
 +  void SetUp() override {
@@ -451,25 +458,41 @@ index 0000000000..bcbda9047d
 +        /*initialize=*/nullptr,
 +        /*execute=*/kInstantiateTogetherExecute,
 +    };
++    XLA_FFI_Handler_Bundle own_options = {
++        /*instantiate=*/kInstantiateWithOwnLlvmOptions,
++        /*prepare=*/nullptr,
++        /*initialize=*/nullptr,
++        /*execute=*/kInstantiateTogetherExecute,
++    };
 +    for (absl::string_view platform : {"CUDA", "ROCM"}) {
 +      xla::ffi::Ffi::RegisterStaticHandler(
 +          ffi::GetXlaFfiApi(), "xla.gpu.instantiate_together", platform,
 +          bundle, XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
++      xla::ffi::Ffi::RegisterStaticHandler(
++          ffi::GetXlaFfiApi(), "xla.gpu.instantiate_with_own_llvm_options",
++          platform, own_options,
++          XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
 +    }
 +    instantiate_together_arrived = 0;
++    own_options_arrived = 0;
 +  }
 +
++  // `hlo_text` compiled on two compile threads of its own, or on the shared
++  // `compile_threads` where given, as a client's compiles share its pool.
 +  absl::StatusOr<std::unique_ptr<Executable>> Compiled(
-+      absl::string_view hlo_text) {
++      absl::string_view hlo_text,
++      tsl::thread::ThreadPool* compile_threads = nullptr) {
 +    HloModuleConfig config = GetModuleConfigForTest();
-+    // Two compile threads.
-+    config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
-+        2);
++    if (compile_threads == nullptr) {
++      config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
++          2);
++    }
 +    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
 +                        ParseAndReturnVerifiedModule(hlo_text, config));
 +    Compiler::CompileOptions compile_options;
 +    compile_options.gpu_topology = GetSingleDeviceGpuTopology(
 +        /*platform_version=*/"", gpu_target_config());
++    compile_options.thread_pool = compile_threads;
 +    return compiler()->RunBackend(std::move(module), /*executor=*/nullptr,
 +                                  compile_options);
 +  }
@@ -502,6 +525,60 @@ index 0000000000..bcbda9047d
 +    })").status(),
 +              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
 +                                     HasSubstr("instantiation refused")));
++}
++
++// Another compile of the process holds the LLVM options lock with options of its
++// own while it waits for a kernel on the compile threads it shares with this
++// one (a client's pool). This compile's instantiations, waiting for the lock
++// with theirs, leave those threads free, so that kernel compiles, the lock is
++// released and they instantiate; on the compile threads they held both, and
++// every compile of the process waited on another (row 8602: an A100 decode
++// step's programs compiled together, hung).
++TEST_F(InstantiateConcurrentlyTest,
++       InstantiationsWaitingOnTheLlvmOptionsLockLeaveTheCompileThreadsFree) {
++  tsl::thread::ThreadPool compile_threads(tsl::Env::Default(), "compile", 2);
++  absl::Notification gate;
++  own_options_gate = &gate;
++  std::optional<absl::StatusOr<std::unique_ptr<Executable>>> compiled;
++  std::unique_ptr<tsl::Thread> compiling(tsl::Env::Default()->StartThread(
++      tsl::ThreadOptions(), "compiling", [&] {
++        compiled = Compiled(R"(
++          HloModule m
++          ENTRY main {
++            p0 = f32[8] parameter(0)
++            a = f32[8] custom-call(p0),
++              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
++              api_version=API_VERSION_TYPED_FFI
++            b = f32[8] custom-call(p0),
++              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
++              api_version=API_VERSION_TYPED_FFI
++            c = f32[8] custom-call(p0),
++              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
++              api_version=API_VERSION_TYPED_FFI
++            ROOT t = (f32[8], f32[8], f32[8]) tuple(a, b, c)
++          })",
++                            &compile_threads);
++      }));
++  absl::Time deadline = absl::Now() + absl::Seconds(60);
++  while (own_options_arrived.load() < 3 && absl::Now() < deadline) {
++    absl::SleepFor(absl::Milliseconds(1));
++  }
++  ASSERT_EQ(own_options_arrived.load(), 3);
++  absl::Notification kernel_compiled;
++  {
++    // The other compile: the lock held with its options while its kernel
++    // compiles on the shared compile threads.
++    llvm_ir::LLVMCommandLineOptionsLock other_compile(
++        {"-bonus-inst-threshold=2"});
++    gate.Notify();
++    compile_threads.Schedule([&] { kernel_compiled.Notify(); });
++    EXPECT_TRUE(
++        kernel_compiled.WaitForNotificationWithTimeout(absl::Seconds(30)));
++  }
++  kernel_compiled.WaitForNotification();
++  compiling.reset();
++  ASSERT_TRUE(compiled.has_value());
++  TF_EXPECT_OK(compiled->status());
 +}
 +
 +}  // namespace
@@ -756,6 +833,3 @@ index 46df8a0b2d..b7f33071c9 100644
    // Stores HloFusionAnalysis objects to ensure they outlive any asynchronous
    // operations that may hold references to them.
    std::vector<std::unique_ptr<HloFusionAnalysis>> analysis_garbage_collector_;
--- 
-2.53.0
-
