@@ -133,7 +133,7 @@ index 6bee1b46cd..a42c17649d 100644
          "//xla:xla_data_proto_cc",
          "//xla/codegen/emitters/ir:xla",
 diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.cc b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
-index cdff2b1100..000145eca9 100644
+index cdff2b1100..7c48f9ec6f 100644
 --- a/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 +++ b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 @@ -89,6 +89,7 @@ limitations under the License.
@@ -144,9 +144,9 @@ index cdff2b1100..000145eca9 100644
  #include "xla/status_macros.h"
  #include "xla/xla_data.pb.h"
  
-@@ -957,6 +958,18 @@ mlir::NamedAttribute GetFastMathFlagsForApproximationFunctions(
+@@ -744,6 +745,18 @@ Value CheckConstraints(const IndexingMap& map, ValueRange dims,
+   return ret;
  }
- }  // namespace
  
 +Value Uncontracted(const HloInstruction& instr, Value value) {
 +  if (instr.get_frontend_attribute(kXlaNoContractAttr) != "true") {
@@ -160,9 +160,9 @@ index cdff2b1100..000145eca9 100644
 +  return value;
 +}
 +
- absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
-     const HloInstruction* instr, mlir::func::FuncOp this_fn, ValueRange indices,
-     const OperandProvider& operand_provider,
+ namespace {
+ 
+ absl::StatusOr<SmallVector<Value, 1>> EmitTuple(
 @@ -1040,7 +1053,9 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
        if (element_type == PRED) {
          return MapElementwiseOp<mhlo::OrOp>(arg_types, operands, builder);
