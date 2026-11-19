@@ -83,10 +83,12 @@ class NoContractTest(jtu.JaxTestCase):
 
     def optimized(fn):
       # The compiled module's computations, their labels, source metadata and
-      # module name dropped, and the tables of the source's stack frames after
-      # its entry computation, the last, which a label's context adds a frame
+      # module name dropped, and the tables of the source's stack frames,
+      # wherever the module prints them, which a label's context adds a frame
       # to: what is fused, and how, alone.
       text = jax.jit(fn).lower(x, y, z).compile().as_text()
+      tables = r"^(?:FileNames|FunctionNames|FileLocations|StackFrames)\n"
+      text = re.sub(tables + r"(?:\d+ .*\n)*", "", text, flags=re.M)
       text = text[:text.index("\n}", text.index("\nENTRY ")) + 2]
       text = re.sub(r",? ?(?:frontend_attributes|metadata)=\{[^}]*\}", "", text)
       return re.sub(r"^HloModule \S+", "HloModule", text, flags=re.M)

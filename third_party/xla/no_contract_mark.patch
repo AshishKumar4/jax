@@ -365,10 +365,65 @@ index 21df392547..7954b2d3b2 100644
        const HloComputation& callee, absl::Span<llvm::Value* const> parameters,
        absl::string_view name, bool is_reducer) override;
 diff --git a/xla/service/hlo_cse.cc b/xla/service/hlo_cse.cc
-index fa0e3c3513..ee4ca3f4c9 100644
+index fa0e3c3513..c47098a872 100644
 --- a/xla/service/hlo_cse.cc
 +++ b/xla/service/hlo_cse.cc
-@@ -361,9 +361,14 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
+@@ -20,6 +20,7 @@ limitations under the License.
+ #include <optional>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "absl/container/flat_hash_map.h"
+ #include "absl/container/flat_hash_set.h"
+@@ -291,6 +292,41 @@ struct CseKey {
+   HloInstruction* hlo;
+ };
+ 
++// Whether `lhs` and `rhs`, computations equal but for their instructions'
++// labels, label alike: each pair of their instructions, matched from their
++// roots through their operands as computation equality matches them, both
++// labeled to round on their own (`kXlaNoContractAttr`) or neither, and the
++// computations each pair calls alike too. Merged, a fusion of a labeled
++// multiply and its unlabeled twin's would leave the label on the one or reach
++// the other.
++bool NoContractAlike(const HloComputation& lhs, const HloComputation& rhs) {
++  absl::flat_hash_set<std::pair<const HloInstruction*, const HloInstruction*>>
++      visited;
++  std::vector<std::pair<const HloInstruction*, const HloInstruction*>>
++      worklist = {{lhs.root_instruction(), rhs.root_instruction()}};
++  while (!worklist.empty()) {
++    auto [left, right] = worklist.back();
++    worklist.pop_back();
++    if (!visited.insert({left, right}).second) {
++      continue;
++    }
++    if (left->get_frontend_attribute(kXlaNoContractAttr) !=
++        right->get_frontend_attribute(kXlaNoContractAttr)) {
++      return false;
++    }
++    for (int64_t i = 0; i < left->called_computations().size(); ++i) {
++      if (!NoContractAlike(*left->called_computations()[i],
++                           *right->called_computations()[i])) {
++        return false;
++      }
++    }
++    for (int64_t i = 0; i < left->operand_count(); ++i) {
++      worklist.push_back({left->operand(i), right->operand(i)});
++    }
++  }
++  return true;
++}
++
+ }  // namespace
+ 
+ /*static*/
+@@ -357,13 +393,18 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
+   };
+   const auto eq_computations = [](const HloComputation* lhs,
+                                   const HloComputation* rhs) {
+-    return *lhs == *rhs;
++    return *lhs == *rhs && NoContractAlike(*lhs, *rhs);
    };
  
    auto cse_equal = [&](const CseKey& lhs, const CseKey& rhs) {
@@ -386,6 +441,56 @@ index fa0e3c3513..ee4ca3f4c9 100644
    };
  
    // HLO instructions are grouped into equivalency classes by using the
+diff --git a/xla/service/hlo_cse_test.cc b/xla/service/hlo_cse_test.cc
+index bd004c2f00..0d724126a7 100644
+--- a/xla/service/hlo_cse_test.cc
++++ b/xla/service/hlo_cse_test.cc
+@@ -242,6 +242,45 @@ TEST_F(HloCseTest, CseSafeZeroOperandAttrIsRespected) {
+   EXPECT_EQ(root->operand(0), root->operand(1));
+ }
+ 
++// A fusion whose multiply is labeled to round on its own (xla_no_contract) is
++// not its unlabeled twin: merged, the label would leave the one or reach the
++// other.
++TEST_F(HloCseTest, FusionsLabeledApartToRoundOnTheirOwnAreNotCombined) {
++  const char* const hlo_string = R"(
++    HloModule m
++
++    %labeled (p0: f32[8], p1: f32[8], p2: f32[8]) -> f32[8] {
++      %p0 = f32[8] parameter(0)
++      %p1 = f32[8] parameter(1)
++      %p2 = f32[8] parameter(2)
++      %mul = f32[8] multiply(%p1, %p2), frontend_attributes={xla_no_contract="true"}
++      ROOT %add = f32[8] add(%mul, %p0)
++    }
++
++    %unlabeled (q0: f32[8], q1: f32[8], q2: f32[8]) -> f32[8] {
++      %q0 = f32[8] parameter(0)
++      %q1 = f32[8] parameter(1)
++      %q2 = f32[8] parameter(2)
++      %mul.1 = f32[8] multiply(%q1, %q2)
++      ROOT %add.1 = f32[8] add(%mul.1, %q0)
++    }
++
++    ENTRY entry {
++      %x = f32[8] parameter(0)
++      %y = f32[8] parameter(1)
++      %z = f32[8] parameter(2)
++      %kept = f32[8] fusion(%z, %x, %y), kind=kLoop, calls=%labeled
++      %fused = f32[8] fusion(%z, %x, %y), kind=kLoop, calls=%unlabeled
++      ROOT %root = (f32[8], f32[8]) tuple(%kept, %fused)
++    })";
++  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
++  HloCSE cse(/*is_layout_sensitive=*/false);
++  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&cse, m.get()));
++  EXPECT_FALSE(changed);
++  HloInstruction* root = m->entry_computation()->root_instruction();
++  EXPECT_NE(root->operand(0), root->operand(1));
++}
++
+ // Test two identical while loops with same inputs
+ TEST_F(HloCseTest, WhileLoopsIdenticalConditionsAndBodiesSameInput) {
+   const char* const hlo_string = R"(
 diff --git a/xla/side_effect_util.cc b/xla/side_effect_util.cc
 index b17df58c2c..6562578855 100644
 --- a/xla/side_effect_util.cc
