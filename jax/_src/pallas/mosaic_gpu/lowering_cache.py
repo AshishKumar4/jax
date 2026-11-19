@@ -88,6 +88,7 @@ from typing import Any
 import jax
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src.lax import parallel as lax_parallel
 from jax._src import dtypes
 from jax._src import layout as jax_layout
 from jax._src import mesh as mesh_lib
@@ -308,6 +309,68 @@ def _jaxpr_encoded(
   return enc.copy(), encoded
 
 
+_MESH_READERS = frozenset({"multimem_store", "inline_mgpu"})
+"""Primitives whose lowering may read the JAX mesh whatever their params: a
+multicast store's peers, and inline Mosaic GPU code, which can read anything
+its launch context holds."""
+
+
+def _reads_jax_mesh(jaxpr: jax_core.Jaxpr, jax_mesh: Any) -> bool:
+  """Whether lowering `jaxpr` reads the JAX mesh it runs under: an `axis_index`
+  of one of its axes (`_axis_index`), a device id (a remote ref's, a signal's:
+  `_device_id_to_logical`), or a primitive of `_MESH_READERS`, in `jaxpr` or any
+  jaxpr its equations hold. Its lowering reads the mesh nowhere else
+  (`lowering.lower_pipelined_jaxpr_to_module`'s `mesh_info`), so a kernel that
+  reads none lowers to one module alone or by each device of any mesh."""
+  axes = set() if jax_mesh is None else set(jax_mesh.axis_names)
+  for eqn in jaxpr.eqns:
+    if eqn.primitive.name in _MESH_READERS:
+      return True
+    if eqn.primitive is lax_parallel.axis_index_p:
+      named = eqn.params["axis_name"]
+      if axes & set(named if isinstance(named, tuple) else (named,)):
+        return True
+    if any(_holds_device_id(value) for value in eqn.params.values()):
+      return True
+    if any(_reads_jax_mesh(sub, jax_mesh)
+           for sub in jax_core.jaxprs_in_params(eqn.params)):
+      return True
+  return False
+
+
+def _holds_device_id(value: Any) -> bool:
+  """Whether a param holds a device id: a `device_id` set on it or on anything
+  it holds (a remote ref's transform, a signal), however deep."""
+  if isinstance(value, (tuple, list)):
+    return any(map(_holds_device_id, value))
+  if isinstance(value, dict):
+    return any(map(_holds_device_id, value.values()))
+  if getattr(value, "device_id", None) is not None:
+    return True
+  if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    return any(_holds_device_id(getattr(value, field.name))
+               for field in dataclasses.fields(value))
+  return False
+
+
+def _axis_environment(jax_mesh: Any, placed: bool) -> Any:
+  """The axis environment a key reads: whole where the kernel reads its JAX
+  mesh, else without the mesh's axes, which a kernel reads only through it, in
+  one form whether or not a mesh is there."""
+  env = jax_core.get_axis_env()
+  if placed:
+    return env
+  dropped = set() if jax_mesh is None else set(jax_mesh.axis_names)
+
+  def kept(names) -> tuple[str, ...]:
+    return tuple(sorted(map(str, set(names) - dropped)))
+
+  sizes = sorted((str(name), size) for name, size in env.axis_sizes.items()
+                 if name not in dropped)
+  return (tuple(sizes),
+          kept(env.spmd_axis_names), kept(env.explicit_mesh_axis_names))
+
+
 def _key(
     ctx: mlir.LoweringRuleContext,
     gpu_mesh: gpu_core.Mesh,
@@ -323,6 +386,7 @@ def _key(
 ) -> str:
   enc, jaxpr_enc = _jaxpr_encoded(jaxpr)
   registries_lib.check_primitives(enc.primitives)
+  placed = _reads_jax_mesh(jaxpr, jax_mesh)
   parts = {
       "version": b"mosaic-gpu-lowering-cache-key-v1",
       "installation": code.digest or b"",
@@ -336,8 +400,10 @@ def _key(
       # the caller's own beside a hit's module (`_emit_mosaic_gpu_custom_call`).
       "compiler params": enc.encode(dataclasses.replace(params, metadata=b"")),
       "gpu mesh": enc.encode(gpu_mesh),
-      "jax mesh": enc.encode(jax_mesh),
-      "axis environment": enc.encode(jax_core.get_axis_env()),
+      # The JAX mesh where the kernel reads it (`_reads_jax_mesh`), else none:
+      # a kernel that reads none lowers to one module alone or per shard.
+      "jax mesh": enc.encode(jax_mesh if placed else None),
+      "axis environment": enc.encode(_axis_environment(jax_mesh, placed)),
       "forward compatibility": enc.encode(bool(ctx.is_forward_compat())),
       "lowering parameters": enc.encode(ctx.module_context.lowering_parameters),
       # What the lowering reads of the process, fixed while it runs.
@@ -347,9 +413,12 @@ def _key(
           inputs.nvshmem_available, inputs.known_multihost_mesh,
           inputs.smem_size_bound,
       )),
-      "abstract mesh": enc.encode(mesh_lib.get_abstract_mesh()),
-      "concrete mesh": enc.encode(mesh_lib.get_concrete_mesh()),
-      "physical mesh": enc.encode(mesh_lib.thread_resources.env.physical_mesh),
+      "abstract mesh": enc.encode(
+          mesh_lib.get_abstract_mesh() if placed else None),
+      "concrete mesh": enc.encode(
+          mesh_lib.get_concrete_mesh() if placed else None),
+      "physical mesh": enc.encode(
+          mesh_lib.thread_resources.env.physical_mesh if placed else None),
       "compute_on": enc.encode(config.compute_on_context_manager.value),
       "xla metadata": enc.encode(config.xla_metadata_context_manager.value),
       # Whether its float arithmetic may be contracted (a caller's
