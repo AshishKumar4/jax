@@ -356,10 +356,10 @@ index daf95fd535..14073e9116 100644
      srcs = ["gpu_compiler_test.cc"],
 diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
 new file mode 100644
-index 0000000000..1671073976
+index 0000000000..bead8a98ef
 --- /dev/null
 +++ b/xla/service/gpu/instantiate_concurrently_test.cc
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,227 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -546,24 +546,28 @@ index 0000000000..1671073976
 +          HloModule m
 +          ENTRY main {
 +            p0 = f32[8] parameter(0)
++            p1 = f32[8] parameter(1)
++            p2 = f32[8] parameter(2)
 +            a = f32[8] custom-call(p0),
 +              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
 +              api_version=API_VERSION_TYPED_FFI
-+            b = f32[8] custom-call(p0),
++            b = f32[8] custom-call(p1),
 +              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
 +              api_version=API_VERSION_TYPED_FFI
-+            c = f32[8] custom-call(p0),
++            c = f32[8] custom-call(p2),
 +              custom_call_target="xla.gpu.instantiate_with_own_llvm_options",
 +              api_version=API_VERSION_TYPED_FFI
 +            ROOT t = (f32[8], f32[8], f32[8]) tuple(a, b, c)
 +          })",
 +                            &compile_threads);
 +      }));
++  // Three calls of their own operands (no common subexpression joins them),
++  // each waiting at the gate until all three have arrived.
 +  absl::Time deadline = absl::Now() + absl::Seconds(60);
 +  while (own_options_arrived.load() < 3 && absl::Now() < deadline) {
 +    absl::SleepFor(absl::Milliseconds(1));
 +  }
-+  ASSERT_EQ(own_options_arrived.load(), 3);
++  EXPECT_EQ(own_options_arrived.load(), 3);
 +  absl::Notification kernel_compiled;
 +  {
 +    // The other compile: the lock held with its options while its kernel
