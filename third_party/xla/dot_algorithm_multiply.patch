@@ -11,18 +11,10 @@ emulation of a BF16 product (BF16_BF16_FP8X3, _FP8X4), whose result its
 emulation defines, is kept a dot.
 ---
 diff --git a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
-index c8407ee12f..b97b5deee3 100644
+index c8407ee12f..798bd10ce6 100644
 --- a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
 +++ b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
-@@ -34,6 +34,7 @@ limitations under the License.
- #include "xla/hlo/ir/hlo_module.h"
- #include "xla/hlo/ir/hlo_opcode.h"
- #include "xla/literal_util.h"
-+#include "xla/primitive_util.h"
- #include "xla/service/hlo_creation_utils.h"
- #include "xla/shape.h"
- #include "xla/status_macros.h"
-@@ -427,6 +428,41 @@ DotAlgorithmRewriter::MakeMultiplyForBF16BF16F32(HloInstruction* lhs,
+@@ -427,6 +427,39 @@ DotAlgorithmRewriter::MakeMultiplyForBF16BF16F32(HloInstruction* lhs,
    return UpcastToF32(result_bf16);
  }
  
@@ -53,11 +45,9 @@ index c8407ee12f..b97b5deee3 100644
 +absl::StatusOr<HloInstruction*>
 +DotAlgorithmRewriter::MakeMultiplyForF8F8F32(HloInstruction* lhs,
 +                                             HloInstruction* rhs) {
-+  TF_RET_CHECK(primitive_util::IsF8Type(lhs->shape().element_type()))
-+      << "Algorithm field set to ANY_F8_ANY_F8_F32, but the lhs isn't F8.";
-+  TF_RET_CHECK(primitive_util::IsF8Type(rhs->shape().element_type()))
-+      << "Algorithm field set to ANY_F8_ANY_F8_F32, but the rhs isn't F8.";
-+  // Multiplied in F32, where the product of two F8 values is exact.
++  // Multiplied in F32, where the product of two F8 values is exact: each
++  // operand F8, or a wider float of one's value where a GPU of no F8 products
++  // had them converted (float normalization), taken as it is.
 +  return Mult(UpcastToF32(lhs), UpcastToF32(rhs));
 +}
 +
