@@ -82,9 +82,12 @@ class NoContractTest(jtu.JaxTestCase):
     x, y, z = _operands()
 
     def optimized(fn):
-      # The compiled module with its labels, source metadata and module name
-      # dropped: what is fused, and how, alone.
+      # The compiled module's computations, their labels, source metadata and
+      # module name dropped, and the tables of the source's stack frames after
+      # its entry computation, the last, which a label's context adds a frame
+      # to: what is fused, and how, alone.
       text = jax.jit(fn).lower(x, y, z).compile().as_text()
+      text = text[:text.index("\n}", text.index("\nENTRY ")) + 2]
       text = re.sub(r",? ?(?:frontend_attributes|metadata)=\{[^}]*\}", "", text)
       return re.sub(r"^HloModule \S+", "HloModule", text, flags=re.M)
 
