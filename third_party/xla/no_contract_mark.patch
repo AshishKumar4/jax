@@ -1,6 +1,6 @@
 diff --git a/third_party/llvm/arithmetic_fence_vectorizable.patch b/third_party/llvm/arithmetic_fence_vectorizable.patch
 new file mode 100644
-index 0000000..8f748e9
+index 0000000000..8f748e9ed1
 --- /dev/null
 +++ b/third_party/llvm/arithmetic_fence_vectorizable.patch
 @@ -0,0 +1,12 @@
@@ -17,7 +17,7 @@ index 0000000..8f748e9
 +   default:
 +     return false;
 diff --git a/third_party/llvm/workspace.bzl b/third_party/llvm/workspace.bzl
-index ba37bcd..5f9b224 100644
+index ba37bcd14f..5f9b22448c 100644
 --- a/third_party/llvm/workspace.bzl
 +++ b/third_party/llvm/workspace.bzl
 @@ -36,6 +36,7 @@ def repo(name):
@@ -29,7 +29,7 @@ index ba37bcd..5f9b224 100644
          link_files = {"//third_party/llvm:run_lit.sh": "mlir/run_lit.sh"},
      )
 diff --git a/xla/backends/cpu/codegen/BUILD b/xla/backends/cpu/codegen/BUILD
-index a3759df..986ebb4 100644
+index a3759df9e0..986ebb4576 100644
 --- a/xla/backends/cpu/codegen/BUILD
 +++ b/xla/backends/cpu/codegen/BUILD
 @@ -232,6 +232,7 @@ cc_library(
@@ -41,7 +41,7 @@ index a3759df..986ebb4 100644
          "//xla/codegen/emitters/ir:xla_attrs_inc_gen",
          "//xla/codegen/emitters/transforms:lower_to_llvm_cpu_pass",
 diff --git a/xla/backends/cpu/codegen/fusion_compiler.cc b/xla/backends/cpu/codegen/fusion_compiler.cc
-index 6980ae4..726a72e 100644
+index 6980ae4fa1..e293f7ba05 100644
 --- a/xla/backends/cpu/codegen/fusion_compiler.cc
 +++ b/xla/backends/cpu/codegen/fusion_compiler.cc
 @@ -85,9 +85,13 @@ limitations under the License.
@@ -71,13 +71,13 @@ index 6980ae4..726a72e 100644
  }
  
 +// Each float add, subtract or multiply its emitter marked to round on its own
-+// (`emitters::kNoContractOpAttr`) fenced by `llvm.arithmetic.fence`, a
-+// multiply's result and an add's or subtract's operands, so no fused
-+// multiply-add forms across it when the kernel's arithmetic is made
-+// contractible after optimization (`llvm_ir::SetAllowContractOnFpArithmetic`).
-+// A float of 32 or 64 bits alone: narrower ones compute through conversions.
++// (`emitters::kNoContractOpAttr`, carried through the kernel's lowering to the
++// LLVM dialect) fenced by `llvm.arithmetic.fence`, a multiply's result and an
++// add's or subtract's operands, so no fused multiply-add forms across it when
++// the kernel's arithmetic is made contractible after optimization
++// (`llvm_ir::SetAllowContractOnFpArithmetic`). A float of 32 or 64 bits alone:
++// narrower ones compute through conversions.
 +void FenceUncontracted(mlir::ModuleOp module) {
-+  module.getContext()->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
 +  auto fenced = [](mlir::Type type) {
 +    auto element = mlir::dyn_cast<mlir::FloatType>(
 +        mlir::getElementTypeOrSelf(type));
@@ -96,12 +96,12 @@ index 6980ae4..726a72e 100644
 +      return mlir::LLVM::ArithmeticFenceOp::create(builder, op->getLoc(),
 +                                                  value.getType(), value);
 +    };
-+    if (mlir::isa<mlir::arith::MulFOp>(op)) {
++    if (mlir::isa<mlir::LLVM::FMulOp>(op)) {
 +      builder.setInsertionPointAfter(op);
 +      mlir::Value product = op->getResult(0);
 +      mlir::Value kept = fence(product);
 +      product.replaceAllUsesExcept(kept, kept.getDefiningOp());
-+    } else if (mlir::isa<mlir::arith::AddFOp, mlir::arith::SubFOp>(op)) {
++    } else if (mlir::isa<mlir::LLVM::FAddOp, mlir::LLVM::FSubOp>(op)) {
 +      for (mlir::OpOperand& operand : op->getOpOperands()) {
 +        operand.set(fence(operand.get()));
 +      }
@@ -112,16 +112,16 @@ index 6980ae4..726a72e 100644
  absl::Status RunPassPipeline(mlir::ModuleOp module, mlir::PassManager& pm,
                               mlir::interpreter::MlirCompilationTrace* trace,
                               int32_t verification_level) {
-@@ -594,6 +638,7 @@ absl::StatusOr<std::unique_ptr<llvm::Module>> FusionCompiler::Compile(
-     pm.printAsTextualPipeline(log_stream);
-     log_stream.write("\n\n", 2);
+@@ -596,6 +640,7 @@ absl::StatusOr<std::unique_ptr<llvm::Module>> FusionCompiler::Compile(
    }
-+  FenceUncontracted(mlir_module);
    ABSL_RETURN_IF_ERROR(
        RunPassPipeline(mlir_module, pm, nullptr, options_.verification_level));
++  FenceUncontracted(mlir_module);
  
+   if (should_dump_mlir_passes) {
+     DumpMlirModule(mlir_module, "post-lowering", *hlo_module_);
 diff --git a/xla/codegen/emitters/BUILD b/xla/codegen/emitters/BUILD
-index 6bee1b4..a42c176 100644
+index 6bee1b46cd..a42c17649d 100644
 --- a/xla/codegen/emitters/BUILD
 +++ b/xla/codegen/emitters/BUILD
 @@ -103,6 +103,7 @@ cc_library(
@@ -133,7 +133,7 @@ index 6bee1b4..a42c176 100644
          "//xla:xla_data_proto_cc",
          "//xla/codegen/emitters/ir:xla",
 diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.cc b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
-index cdff2b1..42dd1f3 100644
+index cdff2b1100..000145eca9 100644
 --- a/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 +++ b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 @@ -89,6 +89,7 @@ limitations under the License.
@@ -144,80 +144,118 @@ index cdff2b1..42dd1f3 100644
  #include "xla/status_macros.h"
  #include "xla/xla_data.pb.h"
  
-@@ -955,6 +956,24 @@ mlir::NamedAttribute GetFastMathFlagsForApproximationFunctions(
-       mlir::arith::FastMathFlagsAttr::get(builder.getContext(),
-                                           mlir::arith::FastMathFlags::afn));
+@@ -957,6 +958,18 @@ mlir::NamedAttribute GetFastMathFlagsForApproximationFunctions(
  }
-+
-+// `results`, the value of `instr` (an add, subtract or multiply), its operation
-+// marked `kNoContractOpAttr` where `instr` is labeled to round on its own
-+// (`kXlaNoContractAttr`): a backend that contracts fences it there.
-+SmallVector<Value, 1> Uncontracted(const HloInstruction& instr,
-+                                   SmallVector<Value, 1> results) {
-+  if (instr.get_frontend_attribute(kXlaNoContractAttr) != "true") {
-+    return results;
-+  }
-+  for (Value result : results) {
-+    if (mlir::Operation* op = result.getDefiningOp();
-+        op != nullptr && mlir::isa<mlir::FloatType>(
-+                             mlir::getElementTypeOrSelf(result.getType()))) {
-+      op->setAttr(kNoContractOpAttr, mlir::UnitAttr::get(op->getContext()));
-+    }
-+  }
-+  return results;
-+}
  }  // namespace
  
++Value Uncontracted(const HloInstruction& instr, Value value) {
++  if (instr.get_frontend_attribute(kXlaNoContractAttr) != "true") {
++    return value;
++  }
++  if (mlir::Operation* op = value.getDefiningOp();
++      op != nullptr &&
++      mlir::isa<mlir::FloatType>(mlir::getElementTypeOrSelf(value.getType()))) {
++    op->setAttr(kNoContractOpAttr, mlir::UnitAttr::get(op->getContext()));
++  }
++  return value;
++}
++
  absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
-@@ -1040,7 +1059,8 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
+     const HloInstruction* instr, mlir::func::FuncOp this_fn, ValueRange indices,
+     const OperandProvider& operand_provider,
+@@ -1040,7 +1053,9 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
        if (element_type == PRED) {
          return MapElementwiseOp<mhlo::OrOp>(arg_types, operands, builder);
        }
 -      return MapElementwiseOp<mhlo::AddOp>(arg_types, operands, builder);
-+      return Uncontracted(
-+          *instr, MapElementwiseOp<mhlo::AddOp>(arg_types, operands, builder));
++      return {{Uncontracted(*instr, MapElementwiseOp<mhlo::AddOp>(
++                                        arg_types, operands, builder)
++                                        .front())}};
      case HloOpcode::kAnd:
        return MapElementwiseOp<mhlo::AndOp>(arg_types, operands, builder);
      case HloOpcode::kAtan2:
-@@ -1121,7 +1141,8 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
+@@ -1121,7 +1136,9 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
        if (element_type == PRED) {
          return MapElementwiseOp<mhlo::AndOp>(arg_types, operands, builder);
        }
 -      return MapElementwiseOp<mhlo::MulOp>(arg_types, operands, builder);
-+      return Uncontracted(
-+          *instr, MapElementwiseOp<mhlo::MulOp>(arg_types, operands, builder));
++      return {{Uncontracted(*instr, MapElementwiseOp<mhlo::MulOp>(
++                                        arg_types, operands, builder)
++                                        .front())}};
      case HloOpcode::kMulhi: {
        auto type = operands[0].getType();
        auto int_type = mlir::dyn_cast<mlir::IntegerType>(type);
-@@ -1215,7 +1236,9 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
+@@ -1215,7 +1232,9 @@ absl::StatusOr<SmallVector<Value, 1>> HloToMlir(
      case HloOpcode::kSqrt:
        return MapElementwiseOp<mhlo::SqrtOp>(arg_types, operands, builder);
      case HloOpcode::kSubtract:
 -      return MapElementwiseOp<mhlo::SubtractOp>(arg_types, operands, builder);
-+      return Uncontracted(
-+          *instr,
-+          MapElementwiseOp<mhlo::SubtractOp>(arg_types, operands, builder));
++      return {{Uncontracted(*instr, MapElementwiseOp<mhlo::SubtractOp>(
++                                        arg_types, operands, builder)
++                                        .front())}};
      case HloOpcode::kTan:
        return MapElementwiseOp<mhlo::TanOp>(arg_types, operands, builder);
      case HloOpcode::kTanh:
 diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.h b/xla/codegen/emitters/elemental_hlo_to_mlir.h
-index 35637dc..3c55f95 100644
+index 35637dcb7d..7c3d3d6224 100644
 --- a/xla/codegen/emitters/elemental_hlo_to_mlir.h
 +++ b/xla/codegen/emitters/elemental_hlo_to_mlir.h
-@@ -41,6 +41,11 @@ limitations under the License.
+@@ -41,6 +41,18 @@ limitations under the License.
  namespace xla {
  namespace emitters {
  
 +// The unit attribute of a float add, subtract or multiply whose HLO instruction
 +// is labeled to round on its own (`kXlaNoContractAttr`): a backend that
 +// contracts arithmetic into fused multiply-adds fences the operation there.
++// A lowering that replaces the operation carries it (its discardable
++// attributes) to its replacement.
 +inline constexpr char kNoContractOpAttr[] = "xla.no_contract";
++
++// `value`, the value of `instr` (an add, subtract or multiply), its defining
++// operation marked `kNoContractOpAttr` where `instr` is labeled to round on its
++// own and `value` is a float.
++mlir::Value Uncontracted(const HloInstruction& instr, mlir::Value value);
 +
  using OperandProvider =
      std::function<absl::StatusOr<llvm::SmallVector<mlir::Value, 1>>(
          const HloInstruction* instr, int index, mlir::ValueRange indices)>;
+diff --git a/xla/codegen/xtile/codegen/emitter_helpers.cc b/xla/codegen/xtile/codegen/emitter_helpers.cc
+index 07fe5f404d..db1faaae6b 100644
+--- a/xla/codegen/xtile/codegen/emitter_helpers.cc
++++ b/xla/codegen/xtile/codegen/emitter_helpers.cc
+@@ -717,11 +717,13 @@ absl::StatusOr<Value> EmitElementwise(mlir::ImplicitLocOpBuilder& b,
+           return ma::OrIOp::create(b, inputs[0], inputs[1]);
+         }
+       }
+-      return mlir::stablehlo::AddOp::create(b, inputs[0], inputs[1]);
++      return emitters::Uncontracted(
++          hlo, mlir::stablehlo::AddOp::create(b, inputs[0], inputs[1]));
+     case HloOpcode::kSubtract:
+-      return Subtract(b, inputs);
++      return emitters::Uncontracted(hlo, Subtract(b, inputs));
+     case HloOpcode::kMultiply:
+-      return mlir::stablehlo::MulOp::create(b, inputs[0], inputs[1]);
++      return emitters::Uncontracted(
++          hlo, mlir::stablehlo::MulOp::create(b, inputs[0], inputs[1]));
+     case HloOpcode::kMaximum:
+       return Maximum(b, inputs);
+     case HloOpcode::kMinimum:
+diff --git a/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc b/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
+index 7cc16cd6ad..bd7d4fb6df 100644
+--- a/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
++++ b/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
+@@ -109,6 +109,9 @@ class LowerStableHloOpToArith : public mlir::OpRewritePattern<StableHloOp> {
+       } else {
+         auto new_op =
+             FloatArithOp::create(rewriter, op.getLoc(), op->getOperands());
++        // Its marks too (an add, subtract or multiply kept uncontracted,
++        // `emitters::kNoContractOpAttr`).
++        new_op->setDiscardableAttrs(op->getDiscardableAttrDictionary());
+         rewriter.replaceOp(op, new_op);
+       }
+     } else {
 diff --git a/xla/service/cpu/BUILD b/xla/service/cpu/BUILD
-index 3a47e7b..2ce6d89 100644
+index 3a47e7be03..2ce6d897c1 100644
 --- a/xla/service/cpu/BUILD
 +++ b/xla/service/cpu/BUILD
 @@ -1670,7 +1670,9 @@ cc_library(
@@ -239,7 +277,7 @@ index 3a47e7b..2ce6d89 100644
          "@com_google_absl//absl/strings:string_view",
          "@com_google_absl//absl/types:span",
 diff --git a/xla/service/cpu/elemental_ir_emitter.cc b/xla/service/cpu/elemental_ir_emitter.cc
-index 18a6065..84169f7 100644
+index 18a60659d7..84169f7892 100644
 --- a/xla/service/cpu/elemental_ir_emitter.cc
 +++ b/xla/service/cpu/elemental_ir_emitter.cc
 @@ -18,11 +18,13 @@ limitations under the License.
@@ -306,22 +344,22 @@ index 18a6065..84169f7 100644
      PrimitiveType prim_type, llvm::Value* value) {
    if (prim_type == F32 || prim_type == F64) {
 diff --git a/xla/service/cpu/elemental_ir_emitter.h b/xla/service/cpu/elemental_ir_emitter.h
-index 21df392..e8ce011 100644
+index 21df392547..7954b2d3b2 100644
 --- a/xla/service/cpu/elemental_ir_emitter.h
 +++ b/xla/service/cpu/elemental_ir_emitter.h
 @@ -85,6 +85,10 @@ class CpuElementalIrEmitter final : public ElementalIrEmitter {
    absl::StatusOr<llvm::Value*> EmitRsqrt(PrimitiveType prim_type,
                                           llvm::Value* value) override;
  
-+  absl::StatusOr<llvm::Value*> EmitFloatBinaryOp(const HloInstruction* op,
-+                                                 llvm::Value* lhs_value,
-+                                                 llvm::Value* rhs_value) override;
++  absl::StatusOr<llvm::Value*> EmitFloatBinaryOp(
++      const HloInstruction* op, llvm::Value* lhs_value,
++      llvm::Value* rhs_value) override;
 +
    absl::StatusOr<std::vector<llvm::Value*>> EmitThreadLocalCall(
        const HloComputation& callee, absl::Span<llvm::Value* const> parameters,
        absl::string_view name, bool is_reducer) override;
 diff --git a/xla/service/hlo_cse.cc b/xla/service/hlo_cse.cc
-index fa0e3c3..ee4ca3f 100644
+index fa0e3c3513..ee4ca3f4c9 100644
 --- a/xla/service/hlo_cse.cc
 +++ b/xla/service/hlo_cse.cc
 @@ -361,9 +361,14 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
@@ -343,7 +381,7 @@ index fa0e3c3..ee4ca3f 100644
  
    // HLO instructions are grouped into equivalency classes by using the
 diff --git a/xla/side_effect_util.cc b/xla/side_effect_util.cc
-index b17df58..6562578 100644
+index b17df58c2c..6562578855 100644
 --- a/xla/side_effect_util.cc
 +++ b/xla/side_effect_util.cc
 @@ -92,6 +92,8 @@ const char kMustFuseAttr[] = "MUST_FUSE";
@@ -356,7 +394,7 @@ index b17df58..6562578 100644
  
  const char kBufferingLevelAttr[] = "buffering_level";
 diff --git a/xla/side_effect_util.h b/xla/side_effect_util.h
-index 8dcd222..7324c96 100644
+index 8dcd2227ca..7324c96d2a 100644
 --- a/xla/side_effect_util.h
 +++ b/xla/side_effect_util.h
 @@ -182,6 +182,12 @@ extern const char kXlaLoopUnrollAttr[];
