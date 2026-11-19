@@ -41,7 +41,7 @@ index a3759df9e0..986ebb4576 100644
          "//xla/codegen/emitters/ir:xla_attrs_inc_gen",
          "//xla/codegen/emitters/transforms:lower_to_llvm_cpu_pass",
 diff --git a/xla/backends/cpu/codegen/fusion_compiler.cc b/xla/backends/cpu/codegen/fusion_compiler.cc
-index 6980ae4fa1..e293f7ba05 100644
+index 6980ae4fa1..5343d383a3 100644
 --- a/xla/backends/cpu/codegen/fusion_compiler.cc
 +++ b/xla/backends/cpu/codegen/fusion_compiler.cc
 @@ -85,9 +85,13 @@ limitations under the License.
@@ -66,17 +66,17 @@ index 6980ae4fa1..e293f7ba05 100644
  #include "xla/codegen/emitters/ir/xla_attrs.h.inc"
  #include "xla/codegen/emitters/ir/xla_dialect.h"
  #include "xla/codegen/emitters/ir/xla_ops.h"
-@@ -142,6 +147,45 @@ emitters::SimplifyArithPassOptions GetSimplifyArithPassOptions(
+@@ -142,6 +147,51 @@ emitters::SimplifyArithPassOptions GetSimplifyArithPassOptions(
    return options;
  }
  
 +// Each float add, subtract or multiply its emitter marked to round on its own
 +// (`emitters::kNoContractOpAttr`, carried through the kernel's lowering to the
-+// LLVM dialect) fenced by `llvm.arithmetic.fence`, a multiply's result and an
-+// add's or subtract's operands, so no fused multiply-add forms across it when
-+// the kernel's arithmetic is made contractible after optimization
-+// (`llvm_ir::SetAllowContractOnFpArithmetic`). A float of 32 or 64 bits alone:
-+// narrower ones compute through conversions.
++// LLVM dialect) fenced by `llvm.arithmetic.fence`, a multiply's operands and
++// result and an add's or subtract's operands, so no fused multiply-add forms
++// across it when the kernel's arithmetic is made contractible after
++// optimization (`llvm_ir::SetAllowContractOnFpArithmetic`). A float of 32 or 64
++// bits alone: narrower ones compute through conversions.
 +void FenceUncontracted(mlir::ModuleOp module) {
 +  auto fenced = [](mlir::Type type) {
 +    auto element = mlir::dyn_cast<mlir::FloatType>(
@@ -97,6 +97,12 @@ index 6980ae4fa1..e293f7ba05 100644
 +                                                  value.getType(), value);
 +    };
 +    if (mlir::isa<mlir::LLVM::FMulOp>(op)) {
++      // Its operands fenced too, so it is no other multiply of the same
++      // operands: a value numbering would join an unlabeled twin to it, whose
++      // own sum, its product then read twice, would contract no more.
++      for (mlir::OpOperand& operand : op->getOpOperands()) {
++        operand.set(fence(operand.get()));
++      }
 +      builder.setInsertionPointAfter(op);
 +      mlir::Value product = op->getResult(0);
 +      mlir::Value kept = fence(product);
@@ -112,7 +118,7 @@ index 6980ae4fa1..e293f7ba05 100644
  absl::Status RunPassPipeline(mlir::ModuleOp module, mlir::PassManager& pm,
                               mlir::interpreter::MlirCompilationTrace* trace,
                               int32_t verification_level) {
-@@ -596,6 +640,7 @@ absl::StatusOr<std::unique_ptr<llvm::Module>> FusionCompiler::Compile(
+@@ -596,6 +646,7 @@ absl::StatusOr<std::unique_ptr<llvm::Module>> FusionCompiler::Compile(
    }
    ABSL_RETURN_IF_ERROR(
        RunPassPipeline(mlir_module, pm, nullptr, options_.verification_level));
