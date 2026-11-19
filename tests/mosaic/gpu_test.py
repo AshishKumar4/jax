@@ -4675,6 +4675,7 @@ class Sm80Test(TestCase):
           dst_ref=tmp,
           gmem_slice=slices,
           implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
           barrier=barrier,
       )
       barrier.wait()
@@ -4704,6 +4705,7 @@ class Sm80Test(TestCase):
           dst_ref=tmp,
           gmem_slice=slices,
           implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
           barrier=barrier,
       )
       barrier.wait()
@@ -4773,6 +4775,7 @@ class Sm80Test(TestCase):
             dst_ref=tmp,
             gmem_slice=(ds(0, 64), ds(arith.addi(step, c(1, index)), 128)),
             implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+            oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
             barrier=barrier,
         )
         barrier.wait()
@@ -4818,6 +4821,7 @@ class Sm80Test(TestCase):
           dst_ref=tmp,
           gmem_slice=slices,
           implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
           barrier=barrier,
       )
       barrier.wait()
@@ -6268,6 +6272,7 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
           swizzle=swizzle,
           gmem_transform=mgpu.TileTransform(tiling),
           implementation=mgpu.AsyncCopyImplementation.CP_ASYNC,
+          oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
           barrier=barrier,
       )
       barrier.wait()
