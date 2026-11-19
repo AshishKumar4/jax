@@ -356,7 +356,7 @@ index daf95fd535..14073e9116 100644
      srcs = ["gpu_compiler_test.cc"],
 diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
 new file mode 100644
-index 0000000000..bead8a98ef
+index 0000000000..c6365e4f1c
 --- /dev/null
 +++ b/xla/service/gpu/instantiate_concurrently_test.cc
 @@ -0,0 +1,227 @@
@@ -478,15 +478,15 @@ index 0000000000..bead8a98ef
 +  }
 +
 +  // `hlo_text` compiled on two compile threads of its own, or on the shared
-+  // `compile_threads` where given, as a client's compiles share its pool.
++  // `compile_threads` where given, as a client's compiles share its pool (no
++  // parallelism forced, which the test base's 1 would: its compile and its
++  // instantiations one thread's alone).
 +  absl::StatusOr<std::unique_ptr<Executable>> Compiled(
 +      absl::string_view hlo_text,
 +      tsl::thread::ThreadPool* compile_threads = nullptr) {
 +    HloModuleConfig config = GetModuleConfigForTest();
-+    if (compile_threads == nullptr) {
-+      config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
-+          2);
-+    }
++    config.mutable_debug_options().set_xla_gpu_force_compilation_parallelism(
++        compile_threads == nullptr ? 2 : 0);
 +    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
 +                        ParseAndReturnVerifiedModule(hlo_text, config));
 +    Compiler::CompileOptions compile_options;
