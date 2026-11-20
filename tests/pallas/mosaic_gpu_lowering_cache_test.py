@@ -726,6 +726,31 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertEqual(meshed["events"], ["hit"], meshed)
         self.assertEqual(meshed["normalized"], alone["normalized"])
 
+  def test_a_kernel_that_carries_its_context_mesh_reads_none_and_is_one_entry(self):
+    # Its broadcast states the mesh it is traced under as its output's
+    # sharding (replicated over a shard_map's manual mesh, none alone), which
+    # no lowering of a kernel that reads no mesh reads: a launch certified
+    # alone and its program lowering it per shard (Dew's PF03, a hybrid
+    # decoder's recurrence kernels lowered twice) are one entry, each hit
+    # verified against a fresh meshed lowering.
+    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    verify = {**devices, "JAX_PALLAS_LOWERING_CACHE_VERIFY": "1"}
+    alone = self.lower(kernel="context_mesh", env=devices)
+    self.assertEqual(alone["events"], ["miss"], alone)
+    for mesh in ("abstract2", "concrete2"):
+      with self.subTest(mesh):
+        meshed = self.lower(kernel="context_mesh", mesh=mesh, env=verify)
+        self.assertCountEqual(meshed["events"], ["verified", "hit"], meshed)
+
+  def test_a_kernel_that_reads_a_fresh_axis_index_is_keyed_by_its_mesh(self):
+    # Its lowering reads the axis's size and stride (`lowering.axis_index`),
+    # as an `axis_index`'s does.
+    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    abstract = self.lower(kernel="fresh_axis", mesh="abstract2", env=devices)
+    concrete = self.lower(kernel="fresh_axis", mesh="concrete2", env=devices)
+    self.assertEqual(abstract["events"], ["miss"], abstract)
+    self.assertEqual(concrete["events"], ["miss"], concrete)
+
   def test_a_kernel_that_reads_its_mesh_is_keyed_by_it(self):
     devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
     abstract = self.lower(kernel="mesh_axis", mesh="abstract2", env=devices)
