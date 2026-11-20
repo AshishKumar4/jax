@@ -1,8 +1,8 @@
-From bbd8325366317f5c95ec0bb25ebf345cc4d3c50a Mon Sep 17 00:00:00 2001
+From 803ed43c3703a32a754c05845ffdbbbe56643d63 Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Fri, 20 Nov 2026 14:50:43 -0600
-Subject: [PATCH] [XLA:CPU] A deserialized thunk sequence keeps one resource
- across its nested sequences
+Subject: [PATCH] [XLA:CPU] A deserialized thunk sequence keeps one
+ communicator across its nested sequences
 
 The CPU thunk emitter gives every collective of a program one communicator resource, those in a while loop's body,
 a call's and a conditional's branches included, and a while, call or conditional thunk uses its nested sequences'
@@ -10,381 +10,486 @@ resources, so the execution graph orders a loop against the collectives beside i
 deserialized each nested sequence's resources apart (WhileThunkFromProto, CallThunkFromProto and
 ConditionalThunkFromProto each built a fresh serdes, and the resources the enclosing sequence listed for the nested
 thunk went unused): after a roundtrip a loop no longer shared its body's communicator with the collectives beside
-it, the graph lost that edge, and ranks entered the loop's all-reduce and an all-gather beside the loop in different
-orders, their rendezvous timing out.
+it, the graph lost those edges, and ranks entered the loop's all-reduce and an all-gather beside the loop in
+different orders, their rendezvous timing out.
 
-A serialized resource now carries an id unique across the sequence tree (ResourceUsersProto.resource_id), and one
-id-to-resource map is threaded through the nested sequences' serdes, so a resource shared across them is
-deserialized once. Resources of different ids stay apart (two communicators of one kind are two resources), and
-each top-level ToProto or FromProto call has its own map. A proto without ids (resource_id 0) deserializes as before.
+A serialized communicator now carries an id unique across the sequence tree (ResourceUsersProto.resource_id). Each
+top-level ToProto or FromProto builds its map (communicator to id, or id to communicator) on the stack and passes it
+by reference through the nested sequences, so a communicator shared across them deserializes once; communicators of
+different ids stay apart. Tokens keep the encoding without ids (infeed and outfeed thunks recreate theirs from their
+own protos), and a proto without ids deserializes as before. A sequence's resource rows now follow its first use of
+each resource, so its serialized bytes no longer depend on resource addresses. The public serdes interface is
+unchanged.
 ---
- xla/backends/cpu/runtime/thunk.proto          |   7 +
- .../cpu/runtime/thunk_proto_serdes.cc         | 132 +++++++++++++----
- xla/backends/cpu/runtime/thunk_proto_serdes.h |  15 ++
- .../cpu/runtime/thunk_sequence_serdes_test.cc | 140 ++++++++++++++++++
- 4 files changed, 263 insertions(+), 31 deletions(-)
+ xla/backends/cpu/runtime/BUILD                |   1 +
+ xla/backends/cpu/runtime/thunk.proto          |   8 +
+ .../cpu/runtime/thunk_proto_serdes.cc         | 200 +++++++++++----
+ .../cpu/runtime/thunk_sequence_serdes_test.cc | 230 ++++++++++++++++++
+ 4 files changed, 385 insertions(+), 54 deletions(-)
 
+diff --git a/xla/backends/cpu/runtime/BUILD b/xla/backends/cpu/runtime/BUILD
+index 14d1f55959..fc2c86ef60 100644
+--- a/xla/backends/cpu/runtime/BUILD
++++ b/xla/backends/cpu/runtime/BUILD
+@@ -1513,6 +1513,7 @@ xla_cc_test(
+         "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
++        "@com_google_absl//absl/status:status_matchers",
+         "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/strings:string_view",
+         "@com_google_absl//absl/types:span",
 diff --git a/xla/backends/cpu/runtime/thunk.proto b/xla/backends/cpu/runtime/thunk.proto
-index abba20a217..1b9f2ae926 100644
+index abba20a217..aed77cd09f 100644
 --- a/xla/backends/cpu/runtime/thunk.proto
 +++ b/xla/backends/cpu/runtime/thunk.proto
-@@ -326,6 +326,13 @@ message ThunkSequenceProto {
+@@ -326,6 +326,14 @@ message ThunkSequenceProto {
    message ResourceUsersProto {
      repeated int64 thunk_indices = 1;
      ResourceProto resource = 2;
-+    // The resource's id, from 1, unique across the serialized sequence and
-+    // every sequence nested in it (while, call and conditional thunks). A
-+    // resource used both in a nested sequence and in a sequence holding it
-+    // (one collective communicator for a while loop's body and the collectives
-+    // beside the loop) has one id, and is deserialized as one resource. 0:
-+    // serialized before ids, every sequence's resources deserialized apart.
++    // A collective communicator's id, from 1, unique across the serialized
++    // sequence and every sequence nested in it (while, call and conditional
++    // thunks): a communicator used both in a nested sequence and in a
++    // sequence holding it (one for a while loop's body and the collectives
++    // beside the loop) has one id, and is deserialized as one resource. 0: a
++    // token (infeed and outfeed thunks recreate theirs from their own protos),
++    // or a communicator serialized before ids, deserialized per sequence.
 +    int64 resource_id = 3;
    }
    repeated ThunkProto thunks = 1;
    repeated ResourceUsersProto thunk_resources = 2;
 diff --git a/xla/backends/cpu/runtime/thunk_proto_serdes.cc b/xla/backends/cpu/runtime/thunk_proto_serdes.cc
-index c07268e0c1..0f78b83806 100644
+index c07268e0c1..4456ee3d0c 100644
 --- a/xla/backends/cpu/runtime/thunk_proto_serdes.cc
 +++ b/xla/backends/cpu/runtime/thunk_proto_serdes.cc
-@@ -177,6 +177,21 @@ static absl::StatusOr<Thunk::Kind> ProtoThunkToThunkKind(
+@@ -177,8 +177,41 @@ static absl::StatusOr<Thunk::Kind> ProtoThunkToThunkKind(
    }
  }
  
-+// One resource keeps one identity across a thunk sequence and the sequences
-+// nested in it: the CPU thunk emitter gives every collective one communicator
-+// resource, those in a while loop's body included, and the execution graph
-+// orders the collectives (and the loop thunk, which uses its body's resources)
-+// by it. Deserializing each nested sequence's resources apart dropped that
-+// order between a loop and the collectives beside it, so ranks could enter
-+// them in different orders and never meet in the rendezvous.
-+struct ThunkSequenceSerDesProtobuf::ResourceIdentity {
-+  // Serialization: each resource's id, from 1, in the order the sequence tree
-+  // first uses it.
-+  absl::flat_hash_map<const Resource*, int64_t> ids;
-+  // Deserialization: the resource deserialized for each id.
-+  absl::flat_hash_map<int64_t, std::shared_ptr<Resource>> resources;
-+};
++// A program's collectives share one communicator resource, those in a while
++// loop's body, a call's and a conditional's branches included (the CPU thunk
++// emitter creates one), and a while, call or conditional thunk uses its nested
++// sequences' resources: the execution graph orders a loop against the
++// collectives beside it by that communicator. A serialized communicator carries
++// an id unique across the thunk sequence and the sequences nested in it
++// (ThunkSequenceProto.ResourceUsersProto.resource_id), so it deserializes as
++// one resource there too; deserialized apart, a loop lost its edges to the
++// collectives beside it, and ranks entered them in different orders and never
++// met in the rendezvous. Tokens keep the encoding without ids: infeed and
++// outfeed thunks recreate theirs from their own protos.
++//
++// Serialization: each communicator's id, from 1, in the order the sequence
++// tree first uses it.
++using CommunicatorIds = absl::flat_hash_map<const Resource*, int64_t>;
++// Deserialization: the communicator deserialized for each id.
++using CommunicatorsById =
++    absl::flat_hash_map<int64_t, std::shared_ptr<Resource>>;
++
++// One sequence of the tree a top-level ToProto or FromProto call walks, with
++// the tree's communicators.
++static absl::StatusOr<ThunkSequenceProto> ThunkSequenceToProto(
++    const ThunkSequence& thunk_sequence, CommunicatorIds& communicator_ids);
++static absl::StatusOr<std::unique_ptr<ThunkSequence>> ThunkSequenceFromProto(
++    const ThunkSequenceProto& proto, const HloModule* hlo_module,
++    const std::vector<BufferAllocation>* buffer_allocations,
++    CommunicatorsById& communicators);
 +
  class ThunkSerDesProtobuf : public SerDesBase<Thunk> {
-   friend class ThunkSequenceSerDesProtobuf;
+-  friend class ThunkSequenceSerDesProtobuf;
++  friend absl::StatusOr<ThunkSequenceProto> ThunkSequenceToProto(
++      const ThunkSequence& thunk_sequence, CommunicatorIds& communicator_ids);
++  friend absl::StatusOr<std::unique_ptr<ThunkSequence>> ThunkSequenceFromProto(
++      const ThunkSequenceProto& proto, const HloModule* hlo_module,
++      const std::vector<BufferAllocation>* buffer_allocations,
++      CommunicatorsById& communicators);
  
-@@ -185,7 +200,9 @@ class ThunkSerDesProtobuf : public SerDesBase<Thunk> {
-   explicit ThunkSerDesProtobuf(
-       const HloModule* hlo_module = nullptr,
-       const std::vector<BufferAllocation>* buffer_allocations = nullptr,
--      const std::vector<std::shared_ptr<Resource>>* thunk_resources = nullptr);
-+      const std::vector<std::shared_ptr<Resource>>* thunk_resources = nullptr,
-+      std::shared_ptr<ThunkSequenceSerDesProtobuf::ResourceIdentity>
-+          resource_identity = nullptr);
-   absl::StatusOr<std::string> Serialize(const Thunk& thunk) override;
-   absl::StatusOr<std::unique_ptr<Thunk>> Deserialize(
+  public:
+   // Buffer allocations and resources are not needed for serialization.
+@@ -191,9 +224,10 @@ class ThunkSerDesProtobuf : public SerDesBase<Thunk> {
        const std::string& serialized) override;
-@@ -200,15 +217,34 @@ class ThunkSerDesProtobuf : public SerDesBase<Thunk> {
-   const std::vector<BufferAllocation>* buffer_allocations_;
  
-   const std::vector<std::shared_ptr<Resource>>* thunk_resources_;
-+
-+  // The serdes of the sequences nested in a thunk: they share the identity of
-+  // the sequence holding the thunk (a thunk serialized on its own: one of
-+  // their own).
-+  ThunkSequenceSerDesProtobuf NestedSequenceSerDes() const;
-+
-+  std::shared_ptr<ThunkSequenceSerDesProtobuf::ResourceIdentity>
-+      resource_identity_;
- };
+  protected:
+-  absl::StatusOr<ThunkProto> ToProto(const Thunk& thunk) const;
++  absl::StatusOr<ThunkProto> ToProto(const Thunk& thunk,
++                                     CommunicatorIds& communicator_ids) const;
+   absl::StatusOr<std::unique_ptr<Thunk>> FromProto(
+-      const ThunkProto& proto) const;
++      const ThunkProto& proto, CommunicatorsById& communicators) const;
  
- ThunkSerDesProtobuf::ThunkSerDesProtobuf(
-     const HloModule* hlo_module,
-     const std::vector<BufferAllocation>* buffer_allocations,
--    const std::vector<std::shared_ptr<Resource>>* thunk_resources)
-+    const std::vector<std::shared_ptr<Resource>>* thunk_resources,
-+    std::shared_ptr<ThunkSequenceSerDesProtobuf::ResourceIdentity>
-+        resource_identity)
-     : hlo_module_(hlo_module),
-       buffer_allocations_(buffer_allocations),
--      thunk_resources_(thunk_resources) {}
-+      thunk_resources_(thunk_resources),
-+      resource_identity_(std::move(resource_identity)) {}
-+
-+ThunkSequenceSerDesProtobuf ThunkSerDesProtobuf::NestedSequenceSerDes() const {
-+  return ThunkSequenceSerDesProtobuf(
-+      hlo_module_, buffer_allocations_,
-+      resource_identity_
-+          ? resource_identity_
-+          : std::make_shared<ThunkSequenceSerDesProtobuf::ResourceIdentity>());
-+}
+  private:
+   const HloModule* hlo_module_;
+@@ -211,7 +245,8 @@ ThunkSerDesProtobuf::ThunkSerDesProtobuf(
+       thunk_resources_(thunk_resources) {}
  
  absl::StatusOr<std::string> ThunkSerDesProtobuf::Serialize(const Thunk& thunk) {
-   ABSL_ASSIGN_OR_RETURN(ThunkProto proto, ToProto(thunk));
-@@ -225,8 +261,9 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::Deserialize(
-   return FromProto(proto);
+-  ABSL_ASSIGN_OR_RETURN(ThunkProto proto, ToProto(thunk));
++  CommunicatorIds communicator_ids;
++  ABSL_ASSIGN_OR_RETURN(ThunkProto proto, ToProto(thunk, communicator_ids));
+   return proto.SerializeAsString();
+ }
+ 
+@@ -222,16 +257,18 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::Deserialize(
+     return absl::InternalError(
+         absl::StrFormat("Failed to parse thunk proto:\n %s", serialized));
+   }
+-  return FromProto(proto);
++  CommunicatorsById communicators;
++  return FromProto(proto, communicators);
  }
  
 -static absl::Status ToProto(const CallThunk& thunk, ThunkProto& proto) {
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes;
-+static absl::Status ToProto(
-+    const CallThunk& thunk, ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes) {
++static absl::Status ToProto(const CallThunk& thunk, ThunkProto& proto,
++                            CommunicatorIds& communicator_ids) {
    CallThunkProto* call_thunk_proto = proto.mutable_call_thunk();
  
    ABSL_ASSIGN_OR_RETURN(
-@@ -346,8 +383,9 @@ static absl::Status ToProto(const TopKThunk& thunk, ThunkProto& proto) {
+       *call_thunk_proto->mutable_called_sequence(),
+-      thunk_sequence_serdes.ToProto(thunk.called_executor().thunk_sequence()));
++      ThunkSequenceToProto(thunk.called_executor().thunk_sequence(),
++                           communicator_ids));
+   return absl::OkStatus();
+ }
+ 
+@@ -346,8 +383,8 @@ static absl::Status ToProto(const TopKThunk& thunk, ThunkProto& proto) {
    return absl::OkStatus();
  }
  
 -static absl::Status ToProto(const WhileThunk& thunk, ThunkProto& proto) {
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes;
-+static absl::Status ToProto(
-+    const WhileThunk& thunk, ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes) {
++static absl::Status ToProto(const WhileThunk& thunk, ThunkProto& proto,
++                            CommunicatorIds& communicator_ids) {
    WhileThunkProto* while_thunk_proto = proto.mutable_while_thunk();
    while_thunk_proto->mutable_trip_count()->set_contains_value(
        thunk.trip_count().has_value());
-@@ -418,10 +456,11 @@ static absl::Status ToProto(const KernelThunkBase& thunk, ThunkProto& proto) {
+@@ -357,11 +394,13 @@ static absl::Status ToProto(const WhileThunk& thunk, ThunkProto& proto) {
+ 
+   ABSL_ASSIGN_OR_RETURN(
+       *while_thunk_proto->mutable_cond_sequence(),
+-      thunk_sequence_serdes.ToProto(thunk.cond_executor().thunk_sequence()));
++      ThunkSequenceToProto(thunk.cond_executor().thunk_sequence(),
++                           communicator_ids));
+ 
+   ABSL_ASSIGN_OR_RETURN(
+       *while_thunk_proto->mutable_body_sequence(),
+-      thunk_sequence_serdes.ToProto(thunk.body_executor().thunk_sequence()));
++      ThunkSequenceToProto(thunk.body_executor().thunk_sequence(),
++                           communicator_ids));
+ 
+   ABSL_ASSIGN_OR_RETURN(*while_thunk_proto->mutable_cond_buffer(),
+                         thunk.cond_buffer().ToProto());
+@@ -418,17 +457,18 @@ static absl::Status ToProto(const KernelThunkBase& thunk, ThunkProto& proto) {
    return absl::OkStatus();
  }
  
 -static absl::Status ToProto(const ConditionalThunk& thunk, ThunkProto& proto) {
-+static absl::Status ToProto(
-+    const ConditionalThunk& thunk, ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes) {
++static absl::Status ToProto(const ConditionalThunk& thunk, ThunkProto& proto,
++                            CommunicatorIds& communicator_ids) {
    ConditionalThunkProto* conditional_thunk_proto =
        proto.mutable_conditional_thunk();
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes;
  
    conditional_thunk_proto->mutable_branch_sequences()->Reserve(
        thunk.branch_executors().size());
-@@ -475,7 +514,8 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
+   for (const auto& branch_executor : thunk.branch_executors()) {
+     ABSL_ASSIGN_OR_RETURN(
+         *conditional_thunk_proto->add_branch_sequences(),
+-        thunk_sequence_serdes.ToProto(branch_executor.thunk_sequence()));
++        ThunkSequenceToProto(branch_executor.thunk_sequence(),
++                             communicator_ids));
+   }
+ 
+   ABSL_ASSIGN_OR_RETURN(*conditional_thunk_proto->mutable_branch_index_buffer(),
+@@ -457,7 +497,7 @@ static absl::Status ToProto(const RngSeedThunk& thunk, ThunkProto& proto) {
+ }
+ 
+ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
+-    const Thunk& thunk) const {
++    const Thunk& thunk, CommunicatorIds& communicator_ids) const {
+   ThunkProto proto;
+   // NOTE OSS doesn't accept string_view as a parameter to set_kind
+   const auto kind_as_str_view = Thunk::KindToString(thunk.kind());
+@@ -475,7 +515,8 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
    switch (thunk.kind()) {
      case Thunk::Kind::kConditional:
        ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
 -          absl::down_cast<const ConditionalThunk&>(thunk), proto));
 +          absl::down_cast<const ConditionalThunk&>(thunk), proto,
-+          NestedSequenceSerDes()));
++          communicator_ids));
        break;
      case Thunk::Kind::kRngGetAndUpdateState:
        ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
-@@ -486,8 +526,9 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
+@@ -486,8 +527,8 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
            absl::down_cast<const KernelThunkBase&>(thunk), proto));
        break;
      case Thunk::Kind::kCall:
 -      ABSL_RETURN_IF_ERROR(
 -          ::xla::cpu::ToProto(absl::down_cast<const CallThunk&>(thunk), proto));
 +      ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
-+          absl::down_cast<const CallThunk&>(thunk), proto,
-+          NestedSequenceSerDes()));
++          absl::down_cast<const CallThunk&>(thunk), proto, communicator_ids));
        break;
      case Thunk::Kind::kInfeed:
        ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
-@@ -507,7 +548,8 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
+@@ -507,7 +548,7 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
        break;
      case Thunk::Kind::kWhile:
        ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
 -          absl::down_cast<const WhileThunk&>(thunk), proto));
-+          absl::down_cast<const WhileThunk&>(thunk), proto,
-+          NestedSequenceSerDes()));
++          absl::down_cast<const WhileThunk&>(thunk), proto, communicator_ids));
        break;
      case Thunk::Kind::kPartitionId:
        ABSL_RETURN_IF_ERROR(::xla::cpu::ToProto(
-@@ -536,11 +578,8 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
- }
+@@ -537,13 +578,12 @@ absl::StatusOr<ThunkProto> ThunkSerDesProtobuf::ToProto(
  
  static absl::StatusOr<std::unique_ptr<CallThunk>> CallThunkFromProto(
--    const ThunkProto& proto, const HloModule* hlo_module,
+     const ThunkProto& proto, const HloModule* hlo_module,
 -    const std::vector<BufferAllocation>* buffer_allocations) {
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes(hlo_module,
 -                                                    buffer_allocations);
 -
-+    const ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes) {
++    const std::vector<BufferAllocation>* buffer_allocations,
++    CommunicatorsById& communicators) {
    ABSL_ASSIGN_OR_RETURN(
        std::unique_ptr<ThunkSequence> call_sequence,
-       thunk_sequence_serdes.FromProto(proto.call_thunk().called_sequence()));
-@@ -551,11 +590,9 @@ static absl::StatusOr<std::unique_ptr<CallThunk>> CallThunkFromProto(
+-      thunk_sequence_serdes.FromProto(proto.call_thunk().called_sequence()));
++      ThunkSequenceFromProto(proto.call_thunk().called_sequence(), hlo_module,
++                             buffer_allocations, communicators));
+   ABSL_ASSIGN_OR_RETURN(Thunk::Info info, ThunkInfoFromProto(proto.info()));
  
+   return CallThunk::Create(std::move(info), std::move(*call_sequence));
+@@ -552,16 +592,15 @@ static absl::StatusOr<std::unique_ptr<CallThunk>> CallThunkFromProto(
  static absl::StatusOr<std::unique_ptr<ConditionalThunk>>
  ConditionalThunkFromProto(
--    const ThunkProto& proto, const HloModule* hlo_module,
-+    const ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes,
-     const std::vector<BufferAllocation>* buffer_allocations) {
+     const ThunkProto& proto, const HloModule* hlo_module,
+-    const std::vector<BufferAllocation>* buffer_allocations) {
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes(hlo_module,
 -                                                    buffer_allocations);
 -
++    const std::vector<BufferAllocation>* buffer_allocations,
++    CommunicatorsById& communicators) {
    std::vector<ThunkSequence> branch_sequences;
    for (const ThunkSequenceProto& branch_sequence_proto :
         proto.conditional_thunk().branch_sequences()) {
-@@ -783,11 +820,9 @@ static absl::StatusOr<std::unique_ptr<TopKThunk>> TopKThunkFromProto(
- }
+     ABSL_ASSIGN_OR_RETURN(
+         std::unique_ptr<ThunkSequence> branch_sequence,
+-        thunk_sequence_serdes.FromProto(branch_sequence_proto));
++        ThunkSequenceFromProto(branch_sequence_proto, hlo_module,
++                               buffer_allocations, communicators));
+     branch_sequences.push_back(std::move(*branch_sequence));
+   }
+   ABSL_ASSIGN_OR_RETURN(Thunk::Info info, ThunkInfoFromProto(proto.info()));
+@@ -784,16 +823,16 @@ static absl::StatusOr<std::unique_ptr<TopKThunk>> TopKThunkFromProto(
  
  static absl::StatusOr<std::unique_ptr<WhileThunk>> WhileThunkFromProto(
--    const ThunkProto& proto, const HloModule* hlo_module,
-+    const ThunkProto& proto,
-+    const ThunkSequenceSerDesProtobuf& thunk_sequence_serdes,
-     const std::vector<BufferAllocation>* buffer_allocations) {
+     const ThunkProto& proto, const HloModule* hlo_module,
+-    const std::vector<BufferAllocation>* buffer_allocations) {
 -  ThunkSequenceSerDesProtobuf thunk_sequence_serdes(hlo_module,
 -                                                    buffer_allocations);
 -
++    const std::vector<BufferAllocation>* buffer_allocations,
++    CommunicatorsById& communicators) {
    ABSL_ASSIGN_OR_RETURN(
        std::unique_ptr<ThunkSequence> cond_sequence,
-       thunk_sequence_serdes.FromProto(proto.while_thunk().cond_sequence()));
-@@ -876,9 +911,10 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::FromProto(
+-      thunk_sequence_serdes.FromProto(proto.while_thunk().cond_sequence()));
++      ThunkSequenceFromProto(proto.while_thunk().cond_sequence(), hlo_module,
++                             buffer_allocations, communicators));
+   ABSL_ASSIGN_OR_RETURN(
+       std::unique_ptr<ThunkSequence> body_sequence,
+-      thunk_sequence_serdes.FromProto(proto.while_thunk().body_sequence()));
++      ThunkSequenceFromProto(proto.while_thunk().body_sequence(), hlo_module,
++                             buffer_allocations, communicators));
+ 
+   ABSL_ASSIGN_OR_RETURN(Thunk::Info info, ThunkInfoFromProto(proto.info()));
+ 
+@@ -856,7 +895,7 @@ static absl::StatusOr<std::unique_ptr<RngSeedThunk>> RngSeedThunkFromProto(
+ }
+ 
+ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::FromProto(
+-    const ThunkProto& proto) const {
++    const ThunkProto& proto, CommunicatorsById& communicators) const {
+   CHECK(buffer_allocations_ != nullptr);
+   CHECK(thunk_resources_ != nullptr);
+   ABSL_ASSIGN_OR_RETURN(Thunk::Kind kind, ProtoThunkToThunkKind(proto));
+@@ -876,9 +915,11 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::FromProto(
  
    switch (kind) {
      case Thunk::Kind::kCall:
 -      return CallThunkFromProto(proto, hlo_module_, buffer_allocations_);
-+      return CallThunkFromProto(proto, NestedSequenceSerDes());
++      return CallThunkFromProto(proto, hlo_module_, buffer_allocations_,
++                                communicators);
      case Thunk::Kind::kConditional:
 -      return ConditionalThunkFromProto(proto, hlo_module_, buffer_allocations_);
-+      return ConditionalThunkFromProto(proto, NestedSequenceSerDes(),
-+                                       buffer_allocations_);
++      return ConditionalThunkFromProto(proto, hlo_module_, buffer_allocations_,
++                                       communicators);
      case Thunk::Kind::kInfeed:
        return InfeedThunkFromProto(proto, *buffer_allocations_);
      case Thunk::Kind::kKernel:
-@@ -892,7 +928,8 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::FromProto(
+@@ -892,7 +933,8 @@ absl::StatusOr<std::unique_ptr<Thunk>> ThunkSerDesProtobuf::FromProto(
      case Thunk::Kind::kTopK:
        return TopKThunkFromProto(proto, *buffer_allocations_);
      case Thunk::Kind::kWhile:
 -      return WhileThunkFromProto(proto, hlo_module_, buffer_allocations_);
-+      return WhileThunkFromProto(proto, NestedSequenceSerDes(),
-+                                 buffer_allocations_);
++      return WhileThunkFromProto(proto, hlo_module_, buffer_allocations_,
++                                 communicators);
      case Thunk::Kind::kPartitionId:
        return PartitionIdThunkFromProto(proto, *buffer_allocations_);
      case Thunk::Kind::kReplicaId:
-@@ -912,6 +949,14 @@ ThunkSequenceSerDesProtobuf::ThunkSequenceSerDesProtobuf(
-     const std::vector<BufferAllocation>* buffer_allocations)
-     : hlo_module_(hlo_module), buffer_allocations_(buffer_allocations) {}
- 
-+ThunkSequenceSerDesProtobuf::ThunkSequenceSerDesProtobuf(
-+    const HloModule* hlo_module,
-+    const std::vector<BufferAllocation>* buffer_allocations,
-+    std::shared_ptr<ResourceIdentity> resource_identity)
-+    : hlo_module_(hlo_module),
-+      buffer_allocations_(buffer_allocations),
-+      resource_identity_(std::move(resource_identity)) {}
-+
- absl::StatusOr<std::string> ThunkSequenceSerDesProtobuf::Serialize(
-     const ThunkSequence& thunk_sequence) {
-   ABSL_ASSIGN_OR_RETURN(ThunkSequenceProto proto, ToProto(thunk_sequence));
-@@ -930,7 +975,12 @@ ThunkSequenceSerDesProtobuf::Deserialize(const std::string& serialized) {
+@@ -930,24 +972,50 @@ ThunkSequenceSerDesProtobuf::Deserialize(const std::string& serialized) {
  
  absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
      const ThunkSequence& thunk_sequence) const {
 -  ThunkSerDesProtobuf thunk_serdes(hlo_module_, buffer_allocations_);
-+  std::shared_ptr<ResourceIdentity> resource_identity =
-+      resource_identity_ ? resource_identity_
-+                         : std::make_shared<ResourceIdentity>();
-+  ThunkSerDesProtobuf thunk_serdes(hlo_module_, buffer_allocations_,
-+                                   /*thunk_resources=*/nullptr,
-+                                   resource_identity);
++  CommunicatorIds communicator_ids;
++  return ThunkSequenceToProto(thunk_sequence, communicator_ids);
++}
++
++absl::StatusOr<std::unique_ptr<ThunkSequence>>
++ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
++  CommunicatorsById communicators;
++  return ThunkSequenceFromProto(proto, hlo_module_, buffer_allocations_,
++                                communicators);
++}
++
++static absl::StatusOr<ThunkSequenceProto> ThunkSequenceToProto(
++    const ThunkSequence& thunk_sequence, CommunicatorIds& communicator_ids) {
++  ThunkSerDesProtobuf thunk_serdes;
    ThunkSequenceProto proto;
    proto.mutable_thunks()->Reserve(thunk_sequence.size());
  
-@@ -942,6 +992,8 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
-       Resource* resource = resource_use.resource().get();
++  // Resources in the order the sequence first uses them, so the serialized
++  // rows do not depend on where the resources were allocated.
++  std::vector<const Resource*> resources;
++  absl::flat_hash_map<const Resource*, std::vector<size_t>> resource_users;
+   size_t thunk_index = 0;
+-  absl::flat_hash_map<Resource*, std::vector<size_t>> resource_users;
+   for (auto& thunk : thunk_sequence) {
+-    ABSL_ASSIGN_OR_RETURN(*proto.add_thunks(), thunk_serdes.ToProto(*thunk));
++    // A nested sequence's communicators get their ids here, before the thunk
++    // holding it lists them among its resource uses below.
++    ABSL_ASSIGN_OR_RETURN(*proto.add_thunks(),
++                          thunk_serdes.ToProto(*thunk, communicator_ids));
+     for (auto& resource_use : thunk->resource_uses()) {
+-      Resource* resource = resource_use.resource().get();
++      const Resource* resource = resource_use.resource().get();
        if (resource) {
-         resource_users[resource].push_back(thunk_index);
-+        resource_identity->ids.try_emplace(
-+            resource, resource_identity->ids.size() + 1);
+-        resource_users[resource].push_back(thunk_index);
++        auto [it, inserted] = resource_users.try_emplace(resource);
++        if (inserted) {
++          resources.push_back(resource);
++          if (resource->kind() == Resource::kCollectiveCommunicator) {
++            communicator_ids.try_emplace(resource, communicator_ids.size() + 1);
++          }
++        }
++        it->second.push_back(thunk_index);
        }
      }
      thunk_index++;
-@@ -968,6 +1020,7 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
-     for (size_t user : users) {
-       resource_users_proto->add_thunk_indices(user);
-     }
-+    resource_users_proto->set_resource_id(resource_identity->ids.at(resource));
    }
  
+-  for (const auto& [resource, users] : resource_users) {
++  for (const Resource* resource : resources) {
+     ThunkSequenceProto::ResourceUsersProto* resource_users_proto =
+         proto.add_thunk_resources();
+ 
+@@ -959,13 +1027,14 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
+       case Resource::Kind::kCollectiveCommunicator:
+         resource_users_proto->mutable_resource()->set_kind(
+             ResourceProto::COLLECTIVE_COMMUNICATOR);
++        resource_users_proto->set_resource_id(communicator_ids.at(resource));
+         break;
+       default:
+         return absl::InvalidArgumentError(
+             absl::StrFormat("Unsupported resource kind: %d", resource->kind()));
+     }
+ 
+-    for (size_t user : users) {
++    for (size_t user : resource_users.at(resource)) {
+       resource_users_proto->add_thunk_indices(user);
+     }
+   }
+@@ -973,8 +1042,10 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
    return proto;
-@@ -976,6 +1029,9 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
- absl::StatusOr<std::unique_ptr<ThunkSequence>>
- ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+ }
+ 
+-absl::StatusOr<std::unique_ptr<ThunkSequence>>
+-ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
++static absl::StatusOr<std::unique_ptr<ThunkSequence>> ThunkSequenceFromProto(
++    const ThunkSequenceProto& proto, const HloModule* hlo_module,
++    const std::vector<BufferAllocation>* buffer_allocations,
++    CommunicatorsById& communicators) {
    auto thunk_sequence = std::make_unique<ThunkSequence>();
-+  std::shared_ptr<ResourceIdentity> resource_identity =
-+      resource_identity_ ? resource_identity_
-+                         : std::make_shared<ResourceIdentity>();
  
    // For every thunk we store a list of resources that are used by the thunk.
-   std::vector<std::vector<std::shared_ptr<Resource>>> thunk_resources;
-@@ -985,6 +1041,19 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
-     ABSL_ASSIGN_OR_RETURN(
-         std::shared_ptr<Resource> resource,
-         CreateResourceFromProto(resource_users_proto.resource()));
-+    // A resource this sequence shares with a sequence nested in it, or with
-+    // the sequences holding it, is the one deserialized there.
+@@ -982,9 +1053,30 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+   thunk_resources.resize(proto.thunks_size());
+ 
+   for (const auto& resource_users_proto : proto.thunk_resources()) {
+-    ABSL_ASSIGN_OR_RETURN(
+-        std::shared_ptr<Resource> resource,
+-        CreateResourceFromProto(resource_users_proto.resource()));
++    std::shared_ptr<Resource> resource;
 +    if (int64_t id = resource_users_proto.resource_id(); id != 0) {
-+      auto [it, inserted] =
-+          resource_identity->resources.try_emplace(id, resource);
-+      if (!inserted && it->second->kind() != resource->kind()) {
++      // Only communicators carry ids, so a communicator this sequence shares
++      // with the sequences holding it or nested in it is the one deserialized
++      // there.
++      if (resource_users_proto.resource().kind() !=
++          ResourceProto::COLLECTIVE_COMMUNICATOR) {
 +        return absl::InvalidArgumentError(absl::StrFormat(
-+            "Resource %d is both a %s and a %s resource.", id,
-+            Resource::ToString(it->second->kind()),
-+            Resource::ToString(resource->kind())));
++            "Resource %d has an id, which only collective communicators carry, "
++            "but is a %s.",
++            id,
++            ResourceProto::Kind_Name(resource_users_proto.resource().kind())));
 +      }
-+      resource = it->second;
++      if (auto it = communicators.find(id); it != communicators.end()) {
++        resource = it->second;
++      } else {
++        ABSL_ASSIGN_OR_RETURN(
++            resource, CreateResourceFromProto(resource_users_proto.resource()));
++        communicators.emplace(id, resource);
++      }
++    } else {
++      ABSL_ASSIGN_OR_RETURN(
++          resource, CreateResourceFromProto(resource_users_proto.resource()));
 +    }
      for (size_t user : resource_users_proto.thunk_indices()) {
        thunk_resources[user].push_back(resource);
      }
-@@ -993,7 +1062,8 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+@@ -992,10 +1084,10 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+ 
    size_t thunk_index = 0;
    for (const ThunkProto& thunk_proto : proto.thunks()) {
-     ThunkSerDesProtobuf thunk_serdes(hlo_module_, buffer_allocations_,
--                                     &thunk_resources[thunk_index++]);
-+                                     &thunk_resources[thunk_index++],
-+                                     resource_identity);
+-    ThunkSerDesProtobuf thunk_serdes(hlo_module_, buffer_allocations_,
++    ThunkSerDesProtobuf thunk_serdes(hlo_module, buffer_allocations,
+                                      &thunk_resources[thunk_index++]);
      ABSL_ASSIGN_OR_RETURN(std::unique_ptr<Thunk> thunk,
-                           thunk_serdes.FromProto(thunk_proto));
+-                          thunk_serdes.FromProto(thunk_proto));
++                          thunk_serdes.FromProto(thunk_proto, communicators));
      thunk_sequence->push_back(std::move(thunk));
-diff --git a/xla/backends/cpu/runtime/thunk_proto_serdes.h b/xla/backends/cpu/runtime/thunk_proto_serdes.h
-index 58636205b4..22deb497b6 100644
---- a/xla/backends/cpu/runtime/thunk_proto_serdes.h
-+++ b/xla/backends/cpu/runtime/thunk_proto_serdes.h
-@@ -40,6 +40,10 @@ void ForEachThunkProto(const ThunkSequenceProto& proto,
- 
- class ThunkSequenceSerDesProtobuf : public SerDesBase<ThunkSequence> {
-  public:
-+  // The resources of one thunk sequence and the sequences nested in it, by
-+  // their serialized ids (ThunkSequenceProto.ResourceUsersProto.resource_id).
-+  struct ResourceIdentity;
-+
-   // For serialization, `hlo_module` and `buffer_allocations` are optional. For
-   // deserialization, both are required as we rely on the HLO module to resolve
-   // thunks that were generated from `HloComputation`s, and we also need buffer
-@@ -48,6 +52,16 @@ class ThunkSequenceSerDesProtobuf : public SerDesBase<ThunkSequence> {
-       const HloModule* hlo_module = nullptr,
-       const std::vector<BufferAllocation>* buffer_allocations = nullptr);
- 
-+  // Serdes of a sequence nested in a thunk (a while loop's body, a call's or a
-+  // conditional's branch): it shares `resource_identity` with the sequences
-+  // holding it, so a resource they share keeps one identity across the
-+  // roundtrip. Without one (the constructor above), each ToProto or FromProto
-+  // call starts its own.
-+  ThunkSequenceSerDesProtobuf(
-+      const HloModule* hlo_module,
-+      const std::vector<BufferAllocation>* buffer_allocations,
-+      std::shared_ptr<ResourceIdentity> resource_identity);
-+
-   absl::StatusOr<std::string> Serialize(
-       const ThunkSequence& thunk_sequence) override;
-   absl::StatusOr<std::unique_ptr<ThunkSequence>> Deserialize(
-@@ -61,6 +75,7 @@ class ThunkSequenceSerDesProtobuf : public SerDesBase<ThunkSequence> {
-  private:
-   const HloModule* hlo_module_;
-   const std::vector<BufferAllocation>* buffer_allocations_;
-+  std::shared_ptr<ResourceIdentity> resource_identity_;
- };
- 
- // Registry for Thunk serialization/deserialization.
+   }
+   return thunk_sequence;
 diff --git a/xla/backends/cpu/runtime/thunk_sequence_serdes_test.cc b/xla/backends/cpu/runtime/thunk_sequence_serdes_test.cc
-index b96226abb7..c475fd9de1 100644
+index b96226abb7..cf2e939a6b 100644
 --- a/xla/backends/cpu/runtime/thunk_sequence_serdes_test.cc
 +++ b/xla/backends/cpu/runtime/thunk_sequence_serdes_test.cc
-@@ -1389,6 +1389,146 @@ TYPED_TEST(ThunkSequenceSerdesTest, ResourceSharingRecounstruction) {
+@@ -31,6 +31,7 @@ limitations under the License.
+ #include "absl/log/check.h"
+ #include "absl/status/status.h"
+ #include "absl/status/status_macros.h"
++#include "absl/status/status_matchers.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+@@ -1389,6 +1390,235 @@ TYPED_TEST(ThunkSequenceSerdesTest, ResourceSharingRecounstruction) {
    }
  }
  
++// Appends `thunk` to `thunk_sequence`; a fatal failure if it is an error.
++void Append(ThunkSequence& thunk_sequence,
++            absl::StatusOr<std::unique_ptr<Thunk>> thunk) {
++  ABSL_ASSERT_OK(thunk);
++  thunk_sequence.push_back(*std::move(thunk));
++}
++
 +// The communicator resource of every collective thunk in `thunk_sequence` and
 +// the sequences nested in it, in a depth-first order that two sequences of the
 +// same structure share.
@@ -428,64 +533,66 @@ index b96226abb7..c475fd9de1 100644
 +      Resource::Create(Resource::Kind::kCollectiveCommunicator);
 +
 +  ThunkSequence thunk_sequence;
-+  TF_ASSERT_OK_AND_ASSIGN(thunk_sequence.emplace_back(),
-+                          this->CreateAllGatherThunk(first));
++  ASSERT_NO_FATAL_FAILURE(
++      Append(thunk_sequence, this->CreateAllGatherThunk(first)));
 +  {
 +    ThunkSequence cond_sequence;
-+    TF_ASSERT_OK_AND_ASSIGN(cond_sequence.emplace_back(),
-+                            this->CreateAllToAllThunk(first));
++    ASSERT_NO_FATAL_FAILURE(
++        Append(cond_sequence, this->CreateAllToAllThunk(first)));
 +    ThunkSequence body_sequence;
-+    TF_ASSERT_OK_AND_ASSIGN(body_sequence.emplace_back(),
-+                            this->CreateAllReduceThunk(first));
-+    TF_ASSERT_OK_AND_ASSIGN(body_sequence.emplace_back(),
-+                            this->CreateReduceScatterThunk(second));
-+    ASSERT_TRUE(this->AddPredBufferAllocation().ok());
++    ASSERT_NO_FATAL_FAILURE(
++        Append(body_sequence, this->CreateAllReduceThunk(first)));
++    ASSERT_NO_FATAL_FAILURE(
++        Append(body_sequence, this->CreateReduceScatterThunk(second)));
++    ABSL_ASSERT_OK(this->AddPredBufferAllocation());
 +    const BufferAllocation& cond_allocation =
 +        this->buffer_allocations_[this->buffer_allocations_.size() - 1];
-+    TF_ASSERT_OK_AND_ASSIGN(
-+        thunk_sequence.emplace_back(),
++    ASSERT_NO_FATAL_FAILURE(Append(
++        thunk_sequence,
 +        WhileThunk::Create(Thunk::Info(),
 +                           CreateBufferAllocationSlice(cond_allocation),
 +                           std::move(cond_sequence), std::move(body_sequence),
-+                           /*trip_count=*/std::nullopt));
++                           /*trip_count=*/std::nullopt)));
 +  }
 +  {
 +    ThunkSequence called_sequence;
-+    TF_ASSERT_OK_AND_ASSIGN(called_sequence.emplace_back(),
-+                            this->CreateAllReduceThunk(first));
-+    TF_ASSERT_OK_AND_ASSIGN(
-+        thunk_sequence.emplace_back(),
-+        CallThunk::Create(Thunk::Info(), std::move(called_sequence)));
++    ASSERT_NO_FATAL_FAILURE(
++        Append(called_sequence, this->CreateAllReduceThunk(first)));
++    ASSERT_NO_FATAL_FAILURE(
++        Append(thunk_sequence,
++               CallThunk::Create(Thunk::Info(), std::move(called_sequence))));
 +  }
 +  {
 +    std::vector<ThunkSequence> branch_sequences(2);
-+    TF_ASSERT_OK_AND_ASSIGN(branch_sequences[0].emplace_back(),
-+                            this->CreateAllGatherThunk(first));
-+    TF_ASSERT_OK_AND_ASSIGN(branch_sequences[1].emplace_back(),
-+                            this->CreateCollectivePermuteThunk(second));
-+    ASSERT_TRUE(this->AddPredBufferAllocation().ok());
++    ASSERT_NO_FATAL_FAILURE(
++        Append(branch_sequences[0], this->CreateAllGatherThunk(first)));
++    ASSERT_NO_FATAL_FAILURE(Append(branch_sequences[1],
++                                   this->CreateCollectivePermuteThunk(second)));
++    ABSL_ASSERT_OK(this->AddPredBufferAllocation());
 +    const BufferAllocation& branch_index_allocation =
 +        this->buffer_allocations_[this->buffer_allocations_.size() - 1];
-+    TF_ASSERT_OK_AND_ASSIGN(
-+        thunk_sequence.emplace_back(),
++    ASSERT_NO_FATAL_FAILURE(Append(
++        thunk_sequence,
 +        ConditionalThunk::Create(
 +            Thunk::Info(), CreateBufferAllocationSlice(branch_index_allocation),
-+            std::move(branch_sequences)));
++            std::move(branch_sequences))));
 +  }
-+  TF_ASSERT_OK_AND_ASSIGN(thunk_sequence.emplace_back(),
-+                          this->CreateReduceScatterThunk(second));
++  ASSERT_NO_FATAL_FAILURE(
++      Append(thunk_sequence, this->CreateReduceScatterThunk(second)));
 +
-+  TF_ASSERT_OK_AND_ASSIGN(std::string serialized,
-+                          this->Serialize(thunk_sequence));
-+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<ThunkSequence> deserialized,
-+                          this->Deserialize(serialized));
-+  ASSERT_TRUE(this->VerifyThunkSequenceEquality(thunk_sequence, *deserialized));
++  absl::StatusOr<std::string> serialized = this->Serialize(thunk_sequence);
++  ABSL_ASSERT_OK(serialized);
++  absl::StatusOr<std::unique_ptr<ThunkSequence>> deserialized =
++      this->Deserialize(*serialized);
++  ABSL_ASSERT_OK(deserialized);
++  ASSERT_TRUE(
++      this->VerifyThunkSequenceEquality(thunk_sequence, **deserialized));
 +
 +  // Every collective shares a communicator after the roundtrip exactly when it
 +  // did before it.
 +  std::vector<const Resource*> before, after;
 +  CollectCommunicatorResources(thunk_sequence, before);
-+  CollectCommunicatorResources(*deserialized, after);
++  CollectCommunicatorResources(**deserialized, after);
 +  ASSERT_EQ(before.size(), 8u);
 +  ASSERT_EQ(after.size(), before.size());
 +  for (size_t i = 0; i < before.size(); ++i) {
@@ -498,31 +605,111 @@ index b96226abb7..c475fd9de1 100644
 +
 +  // So the while, call and conditional thunks use the communicators of the
 +  // collectives beside them, which the execution graph orders them by.
++  const ThunkSequence& sequence = **deserialized;
 +  const Resource* first_after =
-+      absl::down_cast<const CollectiveThunk&>(*(*deserialized)[0])
++      absl::down_cast<const CollectiveThunk&>(*sequence[0])
 +          .op_resources()
 +          .communicator_resource.get();
 +  const Resource* second_after =
-+      absl::down_cast<const CollectiveThunk&>(*(*deserialized)[4])
++      absl::down_cast<const CollectiveThunk&>(*sequence[4])
 +          .op_resources()
 +          .communicator_resource.get();
 +  ASSERT_NE(first_after, second_after);
 +  using Used = absl::flat_hash_set<const Resource*>;
-+  EXPECT_EQ(UsedResources(*(*deserialized)[1]),
-+            (Used{first_after, second_after}));
-+  EXPECT_EQ(UsedResources(*(*deserialized)[2]), Used{first_after});
-+  EXPECT_EQ(UsedResources(*(*deserialized)[3]),
-+            (Used{first_after, second_after}));
++  EXPECT_EQ(UsedResources(*sequence[1]), (Used{first_after, second_after}));
++  EXPECT_EQ(UsedResources(*sequence[2]), Used{first_after});
++  EXPECT_EQ(UsedResources(*sequence[3]), (Used{first_after, second_after}));
 +
 +  // A second deserialization of the same bytes has resources of its own.
-+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<ThunkSequence> deserialized_again,
-+                          this->Deserialize(serialized));
++  absl::StatusOr<std::unique_ptr<ThunkSequence>> deserialized_again =
++      this->Deserialize(*serialized);
++  ABSL_ASSERT_OK(deserialized_again);
 +  std::vector<const Resource*> again;
-+  CollectCommunicatorResources(*deserialized_again, again);
++  CollectCommunicatorResources(**deserialized_again, again);
 +  ASSERT_EQ(again.size(), after.size());
 +  for (size_t i = 0; i < again.size(); ++i) {
 +    EXPECT_FALSE(absl::c_linear_search(after, again[i])) << "collective " << i;
 +  }
++}
++
++// A sequence's resource rows follow its first use of each resource, whatever
++// the resources' addresses, so a sequence serializes to the same bytes each
++// time. Communicators carry ids, numbered as the sequence tree first uses them
++// (a loop's body before the loop's own row); tokens carry none.
++TYPED_TEST(ThunkSequenceSerdesTest, ResourceRowsInFirstUseOrder) {
++  std::shared_ptr<Resource> first =
++      Resource::Create(Resource::Kind::kCollectiveCommunicator);
++  std::shared_ptr<Resource> second =
++      Resource::Create(Resource::Kind::kCollectiveCommunicator);
++  std::shared_ptr<Resource> token = Resource::Create(Resource::Kind::kToken);
++
++  ThunkSequence thunk_sequence;
++  ASSERT_NO_FATAL_FAILURE(
++      Append(thunk_sequence, this->CreateAllGatherThunk(second)));
++  {
++    ThunkSequence body_sequence;
++    ASSERT_NO_FATAL_FAILURE(
++        Append(body_sequence, this->CreateAllReduceThunk(first)));
++    ABSL_ASSERT_OK(this->AddPredBufferAllocation());
++    const BufferAllocation& cond_allocation =
++        this->buffer_allocations_[this->buffer_allocations_.size() - 1];
++    ASSERT_NO_FATAL_FAILURE(Append(
++        thunk_sequence,
++        WhileThunk::Create(Thunk::Info(),
++                           CreateBufferAllocationSlice(cond_allocation),
++                           /*cond_sequence=*/ThunkSequence(),
++                           std::move(body_sequence),
++                           /*trip_count=*/std::nullopt)));
++  }
++  {
++    ABSL_ASSERT_OK(this->AddBufferAllocations(1));
++    const BufferAllocation& infeed_allocation =
++        this->buffer_allocations_[this->buffer_allocations_.size() - 1];
++    ASSERT_NO_FATAL_FAILURE(Append(
++        thunk_sequence,
++        InfeedThunk::Create(
++            Thunk::Info(),
++            {{CreateBufferAllocationSlice(infeed_allocation),
++              this->literals_.back().shape()}},
++            InfeedThunk::InfeedResources{/*consume_token=*/token,
++                                         /*produce_token=*/token})));
++  }
++  ASSERT_NO_FATAL_FAILURE(
++      Append(thunk_sequence, this->CreateAllToAllThunk(first)));
++  ASSERT_NO_FATAL_FAILURE(
++      Append(thunk_sequence, this->CreateReduceScatterThunk(second)));
++
++  auto* serdes = absl::down_cast<ThunkSequenceSerDesProtobuf*>(
++      this->thunk_sequence_serdes());
++  ASSERT_NE(serdes, nullptr);
++  absl::StatusOr<ThunkSequenceProto> proto = serdes->ToProto(thunk_sequence);
++  ABSL_ASSERT_OK(proto);
++
++  // `second` is first used by thunk 0 and given id 1; the loop's body, written
++  // before the loop's row, gives `first` id 2; the token, first used by thunk
++  // 2, has no id.
++  ASSERT_EQ(proto->thunk_resources_size(), 3);
++  const auto& rows = proto->thunk_resources();
++  EXPECT_EQ(rows[0].resource().kind(), ResourceProto::COLLECTIVE_COMMUNICATOR);
++  EXPECT_EQ(rows[0].resource_id(), 1);
++  EXPECT_EQ(std::vector<int64_t>(rows[0].thunk_indices().begin(),
++                                 rows[0].thunk_indices().end()),
++            (std::vector<int64_t>{0, 4}));
++  EXPECT_EQ(rows[1].resource().kind(), ResourceProto::COLLECTIVE_COMMUNICATOR);
++  EXPECT_EQ(rows[1].resource_id(), 2);
++  EXPECT_EQ(std::vector<int64_t>(rows[1].thunk_indices().begin(),
++                                 rows[1].thunk_indices().end()),
++            (std::vector<int64_t>{1, 3}));
++  EXPECT_EQ(rows[2].resource().kind(), ResourceProto::TOKEN);
++  EXPECT_EQ(rows[2].resource_id(), 0);
++  const ThunkSequenceProto& body =
++      proto->thunks(1).while_thunk().body_sequence();
++  ASSERT_EQ(body.thunk_resources_size(), 1);
++  EXPECT_EQ(body.thunk_resources(0).resource_id(), 2);
++
++  absl::StatusOr<ThunkSequenceProto> again = serdes->ToProto(thunk_sequence);
++  ABSL_ASSERT_OK(again);
++  EXPECT_EQ(again->SerializeAsString(), proto->SerializeAsString());
 +}
 +
  void ForEachThunkProtoCountTestHelper(
