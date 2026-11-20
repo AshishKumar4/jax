@@ -1,4 +1,4 @@
-From 803ed43c3703a32a754c05845ffdbbbe56643d63 Mon Sep 17 00:00:00 2001
+From acf5dc3949b641ff6d453b07b352b8705c5e798c Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Fri, 20 Nov 2026 14:50:43 -0600
 Subject: [PATCH] [XLA:CPU] A deserialized thunk sequence keeps one
@@ -23,9 +23,9 @@ unchanged.
 ---
  xla/backends/cpu/runtime/BUILD                |   1 +
  xla/backends/cpu/runtime/thunk.proto          |   8 +
- .../cpu/runtime/thunk_proto_serdes.cc         | 200 +++++++++++----
- .../cpu/runtime/thunk_sequence_serdes_test.cc | 230 ++++++++++++++++++
- 4 files changed, 385 insertions(+), 54 deletions(-)
+ .../cpu/runtime/thunk_proto_serdes.cc         | 237 ++++++++++++------
+ .../cpu/runtime/thunk_sequence_serdes_test.cc | 230 +++++++++++++++++
+ 4 files changed, 400 insertions(+), 76 deletions(-)
 
 diff --git a/xla/backends/cpu/runtime/BUILD b/xla/backends/cpu/runtime/BUILD
 index 14d1f55959..fc2c86ef60 100644
@@ -59,7 +59,7 @@ index abba20a217..aed77cd09f 100644
    repeated ThunkProto thunks = 1;
    repeated ResourceUsersProto thunk_resources = 2;
 diff --git a/xla/backends/cpu/runtime/thunk_proto_serdes.cc b/xla/backends/cpu/runtime/thunk_proto_serdes.cc
-index c07268e0c1..4456ee3d0c 100644
+index c07268e0c1..fea135c3f2 100644
 --- a/xla/backends/cpu/runtime/thunk_proto_serdes.cc
 +++ b/xla/backends/cpu/runtime/thunk_proto_serdes.cc
 @@ -177,8 +177,41 @@ static absl::StatusOr<Thunk::Kind> ProtoThunkToThunkKind(
@@ -334,7 +334,7 @@ index c07268e0c1..4456ee3d0c 100644
      case Thunk::Kind::kPartitionId:
        return PartitionIdThunkFromProto(proto, *buffer_allocations_);
      case Thunk::Kind::kReplicaId:
-@@ -930,24 +972,50 @@ ThunkSequenceSerDesProtobuf::Deserialize(const std::string& serialized) {
+@@ -930,51 +972,73 @@ ThunkSequenceSerDesProtobuf::Deserialize(const std::string& serialized) {
  
  absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
      const ThunkSequence& thunk_sequence) const {
@@ -356,10 +356,9 @@ index c07268e0c1..4456ee3d0c 100644
    ThunkSequenceProto proto;
    proto.mutable_thunks()->Reserve(thunk_sequence.size());
  
-+  // Resources in the order the sequence first uses them, so the serialized
-+  // rows do not depend on where the resources were allocated.
-+  std::vector<const Resource*> resources;
-+  absl::flat_hash_map<const Resource*, std::vector<size_t>> resource_users;
++  // Each resource's row, appended when the sequence first uses the resource,
++  // so the serialized rows do not depend on where it was allocated.
++  absl::flat_hash_map<const Resource*, int> resource_rows;
    size_t thunk_index = 0;
 -  absl::flat_hash_map<Resource*, std::vector<size_t>> resource_users;
    for (auto& thunk : thunk_sequence) {
@@ -370,44 +369,64 @@ index c07268e0c1..4456ee3d0c 100644
 +                          thunk_serdes.ToProto(*thunk, communicator_ids));
      for (auto& resource_use : thunk->resource_uses()) {
 -      Resource* resource = resource_use.resource().get();
-+      const Resource* resource = resource_use.resource().get();
-       if (resource) {
+-      if (resource) {
 -        resource_users[resource].push_back(thunk_index);
-+        auto [it, inserted] = resource_users.try_emplace(resource);
-+        if (inserted) {
-+          resources.push_back(resource);
-+          if (resource->kind() == Resource::kCollectiveCommunicator) {
-+            communicator_ids.try_emplace(resource, communicator_ids.size() + 1);
-+          }
-+        }
-+        it->second.push_back(thunk_index);
++      const Resource* resource = resource_use.resource().get();
++      if (!resource) {
++        continue;
        }
++      auto [row, inserted] =
++          resource_rows.try_emplace(resource, proto.thunk_resources_size());
++      if (inserted) {
++        ThunkSequenceProto::ResourceUsersProto* resource_users_proto =
++            proto.add_thunk_resources();
++        switch (resource->kind()) {
++          case Resource::Kind::kToken:
++            resource_users_proto->mutable_resource()->set_kind(
++                ResourceProto::TOKEN);
++            break;
++          case Resource::Kind::kCollectiveCommunicator:
++            resource_users_proto->mutable_resource()->set_kind(
++                ResourceProto::COLLECTIVE_COMMUNICATOR);
++            resource_users_proto->set_resource_id(
++                communicator_ids
++                    .try_emplace(resource, communicator_ids.size() + 1)
++                    .first->second);
++            break;
++          default:
++            return absl::InvalidArgumentError(absl::StrFormat(
++                "Unsupported resource kind: %d", resource->kind()));
++        }
++      }
++      proto.mutable_thunk_resources(row->second)
++          ->add_thunk_indices(thunk_index);
      }
      thunk_index++;
    }
  
 -  for (const auto& [resource, users] : resource_users) {
-+  for (const Resource* resource : resources) {
-     ThunkSequenceProto::ResourceUsersProto* resource_users_proto =
-         proto.add_thunk_resources();
- 
-@@ -959,13 +1027,14 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
-       case Resource::Kind::kCollectiveCommunicator:
-         resource_users_proto->mutable_resource()->set_kind(
-             ResourceProto::COLLECTIVE_COMMUNICATOR);
-+        resource_users_proto->set_resource_id(communicator_ids.at(resource));
-         break;
-       default:
-         return absl::InvalidArgumentError(
-             absl::StrFormat("Unsupported resource kind: %d", resource->kind()));
-     }
- 
+-    ThunkSequenceProto::ResourceUsersProto* resource_users_proto =
+-        proto.add_thunk_resources();
+-
+-    switch (resource->kind()) {
+-      case Resource::Kind::kToken:
+-        resource_users_proto->mutable_resource()->set_kind(
+-            ResourceProto::TOKEN);
+-        break;
+-      case Resource::Kind::kCollectiveCommunicator:
+-        resource_users_proto->mutable_resource()->set_kind(
+-            ResourceProto::COLLECTIVE_COMMUNICATOR);
+-        break;
+-      default:
+-        return absl::InvalidArgumentError(
+-            absl::StrFormat("Unsupported resource kind: %d", resource->kind()));
+-    }
+-
 -    for (size_t user : users) {
-+    for (size_t user : resource_users.at(resource)) {
-       resource_users_proto->add_thunk_indices(user);
-     }
-   }
-@@ -973,8 +1042,10 @@ absl::StatusOr<ThunkSequenceProto> ThunkSequenceSerDesProtobuf::ToProto(
+-      resource_users_proto->add_thunk_indices(user);
+-    }
+-  }
+-
    return proto;
  }
  
@@ -420,7 +439,7 @@ index c07268e0c1..4456ee3d0c 100644
    auto thunk_sequence = std::make_unique<ThunkSequence>();
  
    // For every thunk we store a list of resources that are used by the thunk.
-@@ -982,9 +1053,30 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+@@ -982,9 +1046,30 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
    thunk_resources.resize(proto.thunks_size());
  
    for (const auto& resource_users_proto : proto.thunk_resources()) {
@@ -454,7 +473,7 @@ index c07268e0c1..4456ee3d0c 100644
      for (size_t user : resource_users_proto.thunk_indices()) {
        thunk_resources[user].push_back(resource);
      }
-@@ -992,10 +1084,10 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
+@@ -992,10 +1077,10 @@ ThunkSequenceSerDesProtobuf::FromProto(const ThunkSequenceProto& proto) const {
  
    size_t thunk_index = 0;
    for (const ThunkProto& thunk_proto : proto.thunks()) {
