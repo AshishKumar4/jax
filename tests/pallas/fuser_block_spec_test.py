@@ -374,6 +374,40 @@ class PullBlockSpecTest(jtu.JaxTestCase):
             kernel_fn((0, 0, 0), scalar_prefetch_values, (), x), fn(x)
         )
 
+  def test_a_cast_to_vary_tiles_by_its_operands_block_and_is_the_identity_on_a_tile(self):
+    # Under a shard_map checking variance, a consumer adding an invariant
+    # value to a varying one stages a cast of the invariant one to vary
+    # (`pvary`): its block is its operand's, and a kernel's tile, which carries
+    # no mesh's types, takes it as the identity.
+    mesh = jax.sharding.AbstractMesh((2,), ('x',))
+    out_spec = pl.BlockSpec((128, 128), lambda i, j: (i, j))
+    pulled = {}
+
+    def body(g, b):
+      def f(g, b):
+        return g + b
+
+      pulled['kernel'], pulled['specs'], _ = block_spec_lib.pull_block_spec(
+          f, out_spec, grid_len=2,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )(g, b)
+      return g + b
+
+    traced = jax.make_jaxpr(jax.shard_map(
+        body, mesh=mesh, in_specs=(jax.P('x'), jax.P()), out_specs=jax.P('x'),
+        check_vma=True,
+    ))(jax.ShapeDtypeStruct((1024, 512), jnp.float32),
+       jax.ShapeDtypeStruct((512, 512), jnp.float32))
+    self.assertIn('pvary', str(traced))
+    g_spec, b_spec = pulled['specs']
+    self.assertEqual(g_spec.block_shape, (128, 128))
+    self.assertEqual(b_spec.block_shape, (128, 128))
+    g = np.ones((128, 128), dtype=np.float32)
+    b = 2.0 * np.ones((128, 128), dtype=np.float32)
+    with config._check_vma(False):
+      out = pulled['kernel']((0, 0), (), g, b)
+    np.testing.assert_array_equal(out, g + b)
+
   def test_an_optimization_barrier_passes_each_operands_block_through(self):
     # A compensated sum's terms, kept apart by a barrier inside an epilogue.
     def f(x, y):
