@@ -35,6 +35,7 @@ from typing import Any, Protocol, cast
 import jax
 from jax import lax
 from jax._src import ad_util
+from jax._src import config
 from jax._src import core
 from jax._src import custom_derivatives
 from jax._src import hijax
@@ -698,7 +699,7 @@ def _pull_block_transform(
             len(jaxpr.invars), jaxpr.debug_info.func_name)
         # Load from SMEM
         args = [_load_scalar_prefetch(a) for a in args]
-        return core.eval_jaxpr(jaxpr, [], *args)
+        return _eval_scalar_prefetch(jaxpr, *args)
 
       scalar_prefetch_fn = functools.partial(
           _scalar_prefetch_fn, scalar_prefetch_jaxpr
@@ -2953,7 +2954,10 @@ def push_block_spec(
       out_type = tree_util.tree_unflatten(
           out_tree,
           [
-              jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
+              # Typed as it varies along manual mesh axes, which a checked
+              # map's pallas_call reads of an output's shape.
+              jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype,
+                                   manual_axis_type=v.aval.mat)
               for v in jaxpr.outvars
           ],
       )
@@ -3128,7 +3132,7 @@ def _push_block_spec_jaxpr(
             len(sp_jaxpr.invars), sp_jaxpr.debug_info.func_name)
         # Load from SMEM
         args = [_load_scalar_prefetch(a) for a in args]
-        return core.eval_jaxpr(sp_jaxpr, [], *args)
+        return _eval_scalar_prefetch(sp_jaxpr, *args)
 
       ctx.scalar_prefetch_fn = functools.partial(
           _scalar_prefetch_fn, scalar_prefetch_jaxpr
@@ -3391,6 +3395,49 @@ for _prim in (
 ):
   register_eltwise_rule(_prim)
 del _prim
+
+
+# A cast of a value's type along manual mesh axes (to vary, as JAX stages one
+# where a consumer under a shard_map checking variance reads an invariant value
+# beside a varying one; from reduced to varying): an element of its output is
+# its operand's at the same index. On values the map types (the check on) it is
+# bound, so what reads it is checked as written; on a kernel's tile, which
+# carries no mesh's types (the check off), it is the identity, as `pvary` is
+# where nothing checks variance.
+_MANUAL_CASTS = (core.pvary_p, core.reduced_vary_cast_p)
+
+
+def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
+  return ctx.prim.bind(x, **params) if config._check_vma.value else x
+
+
+for _prim in _MANUAL_CASTS:
+  register_pull_block_spec_rule(_prim)(_eltwise_pull_rule)
+  register_usage_rule(_prim)(_eltwise_usage_rule)
+  register_push_block_spec_rule(_prim)(_eltwise_push_rule)
+  register_eval_rule(_prim)(_manual_cast_eval_rule)
+del _prim
+
+
+def _eval_scalar_prefetch(jaxpr: core.Jaxpr, *args):
+  """`jaxpr`, an index map's scalar prefetch program, evaluated on `args`, each
+  cast along manual mesh axes read as `_manual_cast_eval_rule` reads it."""
+  if config._check_vma.value:
+    return core.eval_jaxpr(jaxpr, [], *args)
+  env = dict(zip(jaxpr.invars, args, strict=True))
+
+  def read(v):
+    return v.val if isinstance(v, core.Literal) else env[v]
+
+  for eqn in jaxpr.eqns:
+    invals = [read(v) for v in eqn.invars]
+    if eqn.primitive in _MANUAL_CASTS:
+      outvals = invals
+    else:
+      outvals = eqn.primitive.bind(*invals, **eqn.params)
+      outvals = outvals if eqn.primitive.multiple_results else [outvals]
+    env.update(zip(eqn.outvars, outvals, strict=True))
+  return [read(v) for v in jaxpr.outvars]
 
 
 # An optimization barrier: each output its operand as it is, a block of one the
