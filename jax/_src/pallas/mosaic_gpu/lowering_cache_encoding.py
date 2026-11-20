@@ -675,6 +675,12 @@ class Encoder:
     ])
 
   def _sharding(self, x: named_sharding.NamedSharding, depth: int) -> bytes:
+    if not self.placed:
+      # A kernel that reads no mesh: a sharding its equations carry (a nested
+      # jit's context mesh, a broadcast's) is its program's placement, which
+      # no lowering of its body reads, as an aval's is (`_shaped_array`): the
+      # kernel traced alone and by each shard of a manual mesh is one entry.
+      return b"N"
     return seq(b"Sh", [
         self._e(x.mesh, depth + 1), self._e(x.spec, depth + 1),
         self._e(x._memory_kind, depth + 1),
@@ -682,6 +688,9 @@ class Encoder:
     ])
 
   def _mesh(self, mesh: Any, depth: int) -> bytes:
+    if not self.placed:
+      # A mesh an equation of a kernel that reads none carries (`_sharding`).
+      return b"N"
     if isinstance(mesh, mesh_lib.AbstractMesh):
       return seq(b"Ma", [
           self._e(tuple(mesh.axis_sizes), depth + 1),
