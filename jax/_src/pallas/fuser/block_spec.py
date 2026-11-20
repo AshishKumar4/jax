@@ -3393,6 +3393,24 @@ for _prim in (
 del _prim
 
 
+# A cast of a value's type along manual mesh axes (to vary, as JAX stages one
+# where a consumer under a shard_map checking variance reads an invariant value
+# beside a varying one; from reduced to varying): an element of its output is
+# its operand's at the same index, and a kernel's tile, which carries no mesh's
+# types, takes it as the identity.
+def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
+  del ctx, params
+  return x
+
+
+for _prim in (core.pvary_p, core.reduced_vary_cast_p):
+  register_pull_block_spec_rule(_prim)(_eltwise_pull_rule)
+  register_usage_rule(_prim)(_eltwise_usage_rule)
+  register_push_block_spec_rule(_prim)(_eltwise_push_rule)
+  register_eval_rule(_prim)(_manual_cast_eval_rule)
+del _prim
+
+
 # An optimization barrier: each output its operand as it is, a block of one the
 # same block of the other.
 @register_pull_block_spec_rule(lax.optimization_barrier_p)
