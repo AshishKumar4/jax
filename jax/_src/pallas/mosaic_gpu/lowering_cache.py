@@ -88,12 +88,15 @@ from typing import Any
 import jax
 from jax._src import config
 from jax._src import core as jax_core
-from jax._src.lax import parallel as lax_parallel
 from jax._src import dtypes
 from jax._src import layout as jax_layout
 from jax._src import mesh as mesh_lib
 from jax._src import monitoring
+from jax._src import pjit
+from jax._src import tree_util
 from jax._src.interpreters import mlir
+from jax._src.lax import lax
+from jax._src.lax import parallel as lax_parallel
 from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
@@ -297,12 +300,13 @@ def _jaxpr_encoded(
     jaxpr: jax_core.Jaxpr, placed: bool,
 ) -> tuple[encoding.Encoder, bytes]:
   """An encoder that has encoded `jaxpr`, its avals' placement where `placed`
-  (`encoding.Encoder`), and its encoding: the state a key's later parts are
-  encoded on from, the same whether `jaxpr` was met before."""
+  and, where not, none of the placement fields its equations' audited
+  lowerings ignore (`_placement`), and its encoding: the state a key's
+  later parts are encoded on from, the same whether `jaxpr` was met before."""
   with _ENCODED_JAXPRS_LOCK:
     found = _ENCODED_JAXPRS.get(jaxpr, {}).get(placed)
   if found is None:
-    enc = encoding.Encoder(placed)
+    enc = encoding.Encoder(placed, {} if placed else _placement())
     found = enc, enc.encode(jaxpr)
     with _ENCODED_JAXPRS_LOCK:
       _ENCODED_JAXPRS.setdefault(jaxpr, {})[placed] = found
@@ -310,10 +314,39 @@ def _jaxpr_encoded(
   return enc.copy(), encoded
 
 
-_MESH_READERS = frozenset({"multimem_store", "inline_mgpu"})
+_MESH_READERS = frozenset({
+    "multimem_store", "multimem_load_reduce", "semaphore_signal_multicast",
+    "semaphore_signal", "semaphore_signal_parallel", "inline_mgpu",
+})
 """Primitives whose lowering may read the JAX mesh whatever their params: a
-multicast store's peers, and inline Mosaic GPU code, which can read anything
-its launch context holds."""
+multicast store's and load's peers, a multicast signal's, a signal that may
+name a device by an operand (its device id flattened into its arguments, which
+no param states), and inline Mosaic GPU code, which can read anything its
+launch context holds."""
+
+def _placement() -> dict[jax_core.Primitive, tuple[str, ...]]:
+  """The params of each primitive that state its program's placement alone,
+  which its stock Mosaic GPU lowering rule and resource estimator never read:
+  a nested jit's context mesh (the jit rule lowers its jaxpr), a broadcast's
+  output sharding and a reshard's destination (each lowered as the values it
+  holds). Audited rule by rule, read only where every rule a lowering
+  dispatches through is JAX's own (`registries_lib.State.extended`): a
+  primitive whose lowering reads a sharding (a reshape refusing an explicit
+  one) is not listed, so its params key as they are."""
+  return {
+      pjit.jit_p: ("ctx_mesh",),
+      lax.broadcast_in_dim_p: ("sharding",),
+      pjit.reshard_p: ("dst_sharding", "concrete_mesh"),
+  }
+
+
+def _axis_readers() -> frozenset[jax_core.Primitive]:
+  """Primitives whose lowering reads the size and stride of the JAX mesh axis
+  they name (`lowering.axis_index`, `fresh` or not), by identity: another
+  primitive of one of their names reads nothing of it."""
+  from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives  # pylint: disable=g-import-not-at-top
+  return frozenset({lax_parallel.axis_index_p,
+                    gpu_primitives.fresh_axis_index_p})
 
 
 def _reads_jax_mesh(jaxpr: jax_core.Jaxpr, jax_mesh: Any) -> bool:
@@ -344,13 +377,17 @@ def _mesh_reads(jaxpr: jax_core.Jaxpr) -> tuple[bool, frozenset[Any]]:
   if found is not None:
     return found
   whole, axes = False, set()
+  readers = _axis_readers()
   for eqn in jaxpr.eqns:
     if (eqn.primitive.name in _MESH_READERS
-        or any(_holds_device_id(value) for value in eqn.params.values())):
+        or any(_param_reads_mesh(value) for value in eqn.params.values())):
       whole = True
-    if eqn.primitive is lax_parallel.axis_index_p:
+    if eqn.primitive in readers:
       named = eqn.params["axis_name"]
-      axes.update(named if isinstance(named, tuple) else (named,))
+      # An `axis_index`'s names one axis or a tuple of them; a fresh index's,
+      # whatever its value, is the one name its lowering looks up.
+      grouped = isinstance(named, tuple) and eqn.primitive is lax_parallel.axis_index_p
+      axes.update(named if grouped else (named,))
     for sub in jax_core.jaxprs_in_params(eqn.params):
       held_whole, held_axes = _mesh_reads(sub)
       whole, axes = whole or held_whole, axes | held_axes
@@ -360,18 +397,52 @@ def _mesh_reads(jaxpr: jax_core.Jaxpr) -> tuple[bool, frozenset[Any]]:
   return found
 
 
-def _holds_device_id(value: Any) -> bool:
-  """Whether a param holds a device id: a `device_id` set on it or on anything
-  it holds (a remote ref's transform, a signal), however deep."""
+def _param_reads_mesh(value: Any) -> bool:
+  """Whether a param makes its equation's lowering read the JAX mesh: a
+  `device_id` set on it or on anything it holds (a remote ref's transform, a
+  signal), however deep; a remote or multicast ref's transform (`PeerMemRef`,
+  `MulticastRef`) in it or in an arguments' tree (`args_tree`), its node types
+  read without building any node, so a ref whose device id is an operand is
+  found; or a layout other than JAX's own (`_stock_layout`), whose `to_mgpu`
+  may read the axis environment its lowering runs in."""
+  if isinstance(value, tree_util.PyTreeDef):
+    return _tree_holds_peer(value)
   if isinstance(value, (tuple, list)):
-    return any(map(_holds_device_id, value))
+    return any(map(_param_reads_mesh, value))
   if isinstance(value, dict):
-    return any(map(_holds_device_id, value.values()))
-  if getattr(value, "device_id", None) is not None:
+    return any(map(_param_reads_mesh, value.values()))
+  if (isinstance(value, (gpu_core.PeerMemRef, gpu_core.MulticastRef))
+      or getattr(value, "device_id", None) is not None):
+    return True
+  if hasattr(value, "to_mgpu") and not _stock_layout(value):
     return True
   if dataclasses.is_dataclass(value) and not isinstance(value, type):
-    return any(_holds_device_id(getattr(value, field.name))
+    return any(_param_reads_mesh(getattr(value, field.name))
                for field in dataclasses.fields(value))
+  return False
+
+
+def _tree_holds_peer(tree: tree_util.PyTreeDef) -> bool:
+  """Whether `tree`'s nodes include a remote or multicast ref's transform, a
+  subclass's too, as their lowerings match them."""
+  data = tree.node_data()
+  if (data is not None and isinstance(data[0], type)
+      and issubclass(data[0], (gpu_core.PeerMemRef, gpu_core.MulticastRef))):
+    return True
+  return any(map(_tree_holds_peer, tree.children()))
+
+
+def _stock_layout(value: Any) -> bool:
+  """Whether `value`, a layout a lowering builds with its `to_mgpu`, is one of
+  JAX's own, all through (a parameterized or reduced one's held layout too):
+  any other may read the axis environment its lowering runs in."""
+  kind = type(value)
+  if kind in (gpu_core.Layout, gpu_core.TMEMLayout):
+    return True
+  if kind is gpu_core.ParameterizedLayout:
+    return type(value.layout_cls) in (gpu_core.Layout, gpu_core.TMEMLayout)
+  if kind is gpu_core.ReducedLayout:
+    return _stock_layout(value.layout)
   return False
 
 
@@ -403,16 +474,18 @@ def _key(
     params: gpu_core.CompilerParams,
     inputs: mgpu_lowering_inputs.LoweringInputs,
     code: sealing.Seal,
-    dispatch: bytes,
+    dispatch: registries_lib.State,
     constants: bytes,
 ) -> str:
-  placed = _reads_jax_mesh(jaxpr, jax_mesh)
+  # Placed where it reads its mesh, or where a rule a lowering dispatches
+  # through is an extension's, which may read the mesh by any of its inputs.
+  placed = dispatch.extended or _reads_jax_mesh(jaxpr, jax_mesh)
   enc, jaxpr_enc = _jaxpr_encoded(jaxpr, placed)
   registries_lib.check_primitives(enc.primitives)
   parts = {
       "version": b"mosaic-gpu-lowering-cache-key-v1",
       "installation": code.digest or b"",
-      "what it dispatches through": dispatch,
+      "what it dispatches through": dispatch.digest,
       "constants": constants,
       "jaxpr": jaxpr_enc,
       # The rule's arguments.
@@ -587,7 +660,7 @@ def lower_unpipelined_jaxpr_to_module(
     dispatch = registries_lib.current()
     key = _key(
         ctx, gpu_mesh, jax_mesh, jaxpr, in_shapes, out_shapes, params, inputs,
-        code, dispatch.digest, constants_lib.digest(),
+        code, dispatch, constants_lib.digest(),
     )
   except sealing.Unsealed as e:
     _say_once(str(e))
