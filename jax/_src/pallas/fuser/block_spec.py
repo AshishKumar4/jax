@@ -35,6 +35,7 @@ from typing import Any, Protocol, cast
 import jax
 from jax import lax
 from jax._src import ad_util
+from jax._src import config
 from jax._src import core
 from jax._src import custom_derivatives
 from jax._src import hijax
@@ -2953,7 +2954,10 @@ def push_block_spec(
       out_type = tree_util.tree_unflatten(
           out_tree,
           [
-              jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
+              # Typed as it varies along manual mesh axes, which a checked
+              # map's pallas_call reads of an output's shape.
+              jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype,
+                                   manual_axis_type=v.aval.mat)
               for v in jaxpr.outvars
           ],
       )
@@ -3390,6 +3394,38 @@ for _prim in (
     lax.reduce_precision_p, lax.copy_p, lax.erf_p, lax.erfc_p, lax.erf_inv_p,
 ):
   register_eltwise_rule(_prim)
+del _prim
+
+
+# A cast of a value's type along manual mesh axes (to vary, as JAX stages one
+# where a consumer under a shard_map checking variance reads an invariant value
+# beside a varying one; from reduced to varying): an element of its output is
+# its operand's at the same index. On values the map types (the check on) it is
+# bound, so what reads it is checked as written; on a kernel's tile, which
+# carries no mesh's types (the check off), it is the identity, as `pvary` is
+# where nothing checks variance. Read as scalar prefetch it is refused: an
+# index map replays its program on prefetched values, which carry no mesh's
+# types wherever it is traced, so a program typed by them cannot run there.
+def _manual_cast_usage_rule(
+    ctx: UsageRuleContext, used_out: set[Usage], **params
+) -> Sequence[set[Usage]]:
+  del params
+  if Usage.SCALAR_PREFETCH in used_out:
+    raise NotImplementedError(
+        f'{ctx.prim.name} read as scalar prefetch: a prefetched value carries'
+        ' no manual mesh axes to cast along')
+  return [used_out]
+
+
+def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
+  return ctx.prim.bind(x, **params) if config._check_vma.value else x
+
+
+for _prim in (core.pvary_p, core.reduced_vary_cast_p):
+  register_pull_block_spec_rule(_prim)(_eltwise_pull_rule)
+  register_usage_rule(_prim)(_manual_cast_usage_rule)
+  register_push_block_spec_rule(_prim)(_eltwise_push_rule)
+  register_eval_rule(_prim)(_manual_cast_eval_rule)
 del _prim
 
 
