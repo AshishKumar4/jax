@@ -726,6 +726,21 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertEqual(meshed["events"], ["hit"], meshed)
         self.assertEqual(meshed["normalized"], alone["normalized"])
 
+  def test_a_kernel_that_carries_its_context_mesh_reads_none_and_is_one_entry(self):
+    # Its equations carry the mesh it is traced under (a nested jit's context
+    # mesh, a broadcast's sharding), Manual inside a shard_map and none alone,
+    # which no lowering of a kernel that reads no mesh reads: a launch
+    # certified alone and its program lowering it per shard (Dew's PF03, a
+    # hybrid decoder's recurrence kernels lowered twice) are one entry.
+    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    alone = self.lower(kernel="context_mesh", env=devices)
+    self.assertEqual(alone["events"], ["miss"], alone)
+    for mesh in ("abstract2", "concrete2"):
+      with self.subTest(mesh):
+        meshed = self.lower(kernel="context_mesh", mesh=mesh, env=devices)
+        self.assertEqual(meshed["events"], ["hit"], meshed)
+        self.assertEqual(meshed["normalized"], alone["normalized"])
+
   def test_a_kernel_that_reads_its_mesh_is_keyed_by_it(self):
     devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
     abstract = self.lower(kernel="mesh_axis", mesh="abstract2", env=devices)

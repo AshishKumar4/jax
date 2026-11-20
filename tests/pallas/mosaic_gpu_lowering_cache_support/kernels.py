@@ -48,6 +48,24 @@ def plain(size, power, params, scale):
   return kernel
 
 
+def context_mesh(size, power, params, scale):
+  """A kernel that reads no mesh whose body's equations carry the one it is
+  traced under: a nested jit's (`jnp.where`'s `ctx_mesh`) and a broadcast's
+  (`jnp.full`'s `sharding`)."""
+  del power, params
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+  )
+  def kernel(x_ref, o_ref):
+    x = x_ref[...]
+    o_ref[...] = jnp.where(x > 0, x, jnp.full(x.shape, scale, x.dtype))
+
+  return kernel
+
+
 def mesh_axis(size, power, params, scale):
   """A kernel that reads the index of the JAX mesh's axis "x" it runs under."""
   del power, params
