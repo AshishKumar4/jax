@@ -374,6 +374,83 @@ class PullBlockSpecTest(jtu.JaxTestCase):
             kernel_fn((0, 0, 0), scalar_prefetch_values, (), x), fn(x)
         )
 
+  def test_a_cast_to_vary_tiles_by_its_operands_block_and_is_bound_only_where_checked(self):
+    # Under a shard_map checking variance, a consumer adding an invariant
+    # value to a varying one stages a cast of the invariant one to vary
+    # (`pvary`): its block is its operand's and its pushed output is typed as
+    # it varies; on whole values the map types, the pulled kernel binds the
+    # cast, so the sum is checked as written; on a kernel's tile, which carries
+    # no mesh's types (the check off), the cast is the identity.
+    mesh = jax.sharding.AbstractMesh((2,), ('x',))
+    out_spec = pl.BlockSpec((128, 128), lambda i, j: (i, j))
+    pulled = {}
+
+    def f(g, b):
+      return g + b
+
+    def body(g, b):
+      pulled['kernel'], pulled['specs'], _ = block_spec_lib.pull_block_spec(
+          f, out_spec, grid_len=2,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )(g, b)
+      _, pulled['out_type'] = block_spec_lib.push_block_spec(
+          f, out_spec, out_spec, return_out_type=True)(g, b)
+      whole, _, _ = block_spec_lib.pull_block_spec(
+          f, pl.BlockSpec(g.shape, lambda i, j: (i, j)), grid_len=2,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )(g, b)
+      return whole((0, 0), (), g, b)
+
+    data = jax.sharding.NamedSharding(mesh, jax.P('x'))
+    same = jax.sharding.NamedSharding(mesh, jax.P())
+    traced = jax.make_jaxpr(jax.shard_map(
+        body, mesh=mesh, in_specs=(jax.P('x'), jax.P()), out_specs=jax.P('x'),
+        check_vma=True,
+    ))(jax.ShapeDtypeStruct((1024, 512), jnp.float32, sharding=data),
+       jax.ShapeDtypeStruct((512, 512), jnp.float32, sharding=same))
+    self.assertIn('pvary', str(traced))
+    g_spec, b_spec = pulled['specs']
+    self.assertEqual(g_spec.block_shape, (128, 128))
+    self.assertEqual(b_spec.block_shape, (128, 128))
+    self.assertEqual(pulled['out_type'].manual_axis_type.varying,
+                     frozenset({'x'}))
+    g = np.ones((128, 128), dtype=np.float32)
+    b = 2.0 * np.ones((128, 128), dtype=np.float32)
+    with config._check_vma(False):
+      out = pulled['kernel']((0, 0), (), g, b)
+    np.testing.assert_array_equal(out, g + b)
+
+  def test_a_cast_to_vary_read_as_scalar_prefetch_is_refused(self):
+    # A slice's start computed from an invariant scalar and a varying one
+    # under a checked shard_map stages a cast of the invariant one in the
+    # index map's scalar prefetch program, which runs on prefetched values,
+    # typed by no mesh: fusing it is refused, naming the cast, where an index
+    # map that fails when called would be returned.
+    mesh = jax.sharding.AbstractMesh((2,), ('x',))
+
+    def body(x, i):
+      k = lax.axis_index('x')
+
+      def f():
+        return lax.dynamic_slice(x, ((i + k) * 128, 0), (128, 512))
+
+      with self.assertRaisesRegex(NotImplementedError,
+                                  'pvary read as scalar prefetch'):
+        f2, values, _ = block_spec_lib.get_fusion_values(f)
+        block_spec_lib.pull_block_spec(
+            f2, pl.BlockSpec((128, 128), lambda r, c, *_: (0, c)), grid_len=2,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(values)
+      return x
+
+    data = jax.sharding.NamedSharding(mesh, jax.P('x'))
+    same = jax.sharding.NamedSharding(mesh, jax.P())
+    jax.make_jaxpr(jax.shard_map(
+        body, mesh=mesh, in_specs=(jax.P('x'), jax.P()), out_specs=jax.P('x'),
+        check_vma=True,
+    ))(jax.ShapeDtypeStruct((1024, 512), jnp.float32, sharding=data),
+       jax.ShapeDtypeStruct((), jnp.int32, sharding=same))
+
   def test_an_optimization_barrier_passes_each_operands_block_through(self):
     # A compensated sum's terms, kept apart by a barrier inside an epilogue.
     def f(x, y):
