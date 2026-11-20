@@ -168,7 +168,11 @@ class Encoder:
   encodes.
   """
 
-  def __init__(self):
+  def __init__(self, placed: bool = True):
+    # Whether an aval's placement (its sharding and its manual axes) is
+    # encoded: not for a kernel that reads no mesh (`lowering_cache`'s
+    # `_reads_jax_mesh`), whose avals are a shard's or the whole's alike.
+    self.placed = placed
     self.primitives: dict[jax_core.Primitive, bool] = {}
     self._callables: list[Any] = []
     # The bare `object()`s met (the axis name `warp_map` makes), by id, and the
@@ -194,7 +198,9 @@ class Encoder:
     encoding on from either gives the same bytes."""
     other = object.__new__(Encoder)
     for name, value in vars(self).items():
-      setattr(other, name, value.copy())
+      # Its tables copied; its settings, immutable, shared.
+      setattr(other, name,
+              value.copy() if isinstance(value, (dict, list)) else value)
     return other
 
   # -- the dispatch
@@ -654,8 +660,8 @@ class Encoder:
     return seq(b"Av", [
         self._e(tuple(aval.shape), depth + 1), self._e(aval.dtype, depth + 1),
         self._e(bool(aval.weak_type), depth + 1),
-        self._e(aval.sharding, depth + 1),
-        self._e(aval.manual_axis_type, depth + 1),
+        self._e(aval.sharding if self.placed else None, depth + 1),
+        self._e(aval.manual_axis_type if self.placed else None, depth + 1),
         self._e(aval.memory_space, depth + 1), self._e(aval.layout, depth + 1),
     ])
 
