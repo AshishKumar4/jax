@@ -2954,9 +2954,11 @@ def push_block_spec(
       out_type = tree_util.tree_unflatten(
           out_tree,
           [
-              # Typed as it varies along manual mesh axes, which a checked
-              # map's pallas_call reads of an output's shape.
+              # Typed as it varies along manual mesh axes, on its mesh: what a
+              # checked map's pallas_call reads of an output's shape, and a
+              # trace's input made of it.
               jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype,
+                                   sharding=v.aval.sharding,
                                    manual_axis_type=v.aval.mat)
               for v in jaxpr.outvars
           ],
