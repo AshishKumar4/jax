@@ -113,6 +113,13 @@ archive_override(
         # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
         # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554).
         "//third_party:xla/dot_algorithm_multiply.patch",
+        # A CPU executable deserialized (from the compilation cache) keeps one collective communicator across a
+        # while loop's body, a call's and a conditional's branches and the sequence holding them, as the compile
+        # emits it: each nested sequence's resources deserialized apart dropped every resource edge between a
+        # loop and the collectives beside it, and ranks entered a loop's all-reduce and an all-gather beside it in
+        # different orders until their rendezvous timed out (row 10128: a sharded mamba step aborted on every load
+        # of its cache entry, never compiled fresh).
+        "//third_party:xla/cpu_serdes_collective_resources.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
