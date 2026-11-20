@@ -48,6 +48,21 @@ def plain(size, power, params, scale):
   return kernel
 
 
+def mesh_axis(size, power, params, scale):
+  """A kernel that reads the index of the JAX mesh's axis "x" it runs under."""
+  del power, params
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+  )
+  def kernel(x_ref, o_ref):
+    o_ref[...] = x_ref[...] * scale + lax.axis_index("x").astype(jnp.float32)
+
+  return kernel
+
+
 def smem(size, power, params, scale):
   """A kernel that holds shared memory: `size` float32s of it."""
   del params
