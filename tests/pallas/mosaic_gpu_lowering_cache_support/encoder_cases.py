@@ -192,9 +192,10 @@ def jaxpr_once():
 
   cache_encoding.Encoder._jaxpr = counted
   try:
-    first_encoder, first = lowering_cache._jaxpr_encoded(jaxpr)
+    # Encoded as a kernel that reads no mesh is (`_reads_jax_mesh`): no aval's placement.
+    first_encoder, first = lowering_cache._jaxpr_encoded(jaxpr, False)
     met = len(walked)
-    second_encoder, second = lowering_cache._jaxpr_encoded(jaxpr)
+    second_encoder, second = lowering_cache._jaxpr_encoded(jaxpr, False)
   finally:
     cache_encoding.Encoder._jaxpr = walk
   later = (jax.typeof(jnp.ones((8,), jnp.float32)),)
