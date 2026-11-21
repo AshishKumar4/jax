@@ -78,6 +78,24 @@ class PeakLiveTest(jtu.JaxTestCase):
         sorted(buffer.parameter for buffer in live if buffer.kind == "parameter"),
         [0, 1])
 
+  @jtu.run_on_devices("cpu")
+  def test_a_name_behind_a_sharding_constraint_tags_its_producer(self):
+    # The constraint is replaced in XLA, its attributes dropped, so the name
+    # goes on the product it constrains.
+    sharding = jax.NamedSharding(jax.make_mesh((1,), ("x",)), P())
+
+    def step(x, w):
+      constrained = jax.lax.with_sharding_constraint(x @ w, sharding)
+      return ad_checkpoint.checkpoint_name(constrained, "hidden")
+
+    rows = jax.ShapeDtypeStruct((16, 8), jnp.float32)
+    weight = jax.ShapeDtypeStruct((8, 8), jnp.float32)
+    text = jax.jit(step).lower(rows, weight).as_text()
+    products = [line for line in text.splitlines() if "dot_general" in line]
+    self.assertTrue(products, text)
+    self.assertTrue(
+        all('checkpoint_name = "hidden"' in line for line in products), text)
+
   @jtu.run_on_devices("cuda")
   def test_a_probe_on_the_devices_twin_states_the_devices_own_compile(self):
     # The probe: a compile for a compile-only twin of the attached device,

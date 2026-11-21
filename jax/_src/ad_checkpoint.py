@@ -944,11 +944,12 @@ def _name_lowering(ctx, x, *, name):
   # `checkpoint_name`, comma-separated), which XLA keeps on the instruction
   # defining its buffer: a compile's live buffers name the residuals a policy
   # saves (`Compiled.peak_live`). A parameter has no defining op to carry them.
+  # A sharding constraint is no defining op: XLA replaces it and keeps only its
+  # sharding, so its operand's producer carries the names (`mlir._get_owner`).
   del ctx
-  op = x.owner
-  if op is None or isinstance(op, ir.Block):
+  op = mlir._get_owner(x)
+  if not isinstance(op, ir.Operation):
     return [x]
-  op = op.operation
   attributes = (
       {a.name: a.attr for a in ir.DictAttr(op.attributes["mhlo.frontend_attributes"])}
       if "mhlo.frontend_attributes" in op.attributes else {})
