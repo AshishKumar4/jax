@@ -3167,9 +3167,11 @@ def push_block_spec(
       out_type = tree_util.tree_unflatten(
           out_tree,
           [
+              # On its mesh: a trace's input made of it reads its sharding.
               jax.ShapeDtypeStruct(
                   v.aval.shape,
                   v.aval.dtype,
+                  sharding=v.aval.sharding,
                   manual_axis_type=(
                       v.aval.mat if config._check_vma.value else None
                   ),
