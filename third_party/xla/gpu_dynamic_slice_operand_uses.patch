@@ -1,0 +1,3106 @@
+From 64ab5927ce832a6d59383d9632e27ae652495809 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sat, 21 Nov 2026 04:00:00 -0600
+Subject: [PATCH] [XLA:GPU] Backport: output-to-operand aliasing in
+ DynamicSliceFusionV2, and every operand use checked before sharing buffers
+
+Two upstream commits, unchanged, on XLA d867969800:
+- 63ed7d6a6f "[XLA:GPU] Support output-to-operand aliasing in DynamicSliceFusionV2" (PiperOrigin-RevId 1002127461).
+- bdf1e5789f "Check all operand uses before sharing buffers" (openxla/xla#51490, Henning Becker).
+A dynamic-slice fusion around a cuBLAS GEMM with beta 1 whose output, accumulator and a slice operand share one
+buffer (B == C == D) read its operand after the GEMM began writing it, a write-after-read race on an A100;
+buffer sharing now checks every use of an operand, not its first.
+---
+diff --git a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
+index 182fce0d29..64c4385061 100644
+--- a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
++++ b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
+@@ -20,6 +20,7 @@ limitations under the License.
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
++#include <vector>
+ 
+ #include "absl/base/casts.h"
+ #include "absl/status/status.h"
+@@ -101,6 +102,36 @@ XLA_FFI_DEFINE_HANDLER(kMemsetConst, MemsetConst,
+ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_test$$memset_const",
+                          kPlatform, kMemsetConst);
+ 
++static absl::Status InPlaceAddValue(se::Stream* stream,
++                                    ffi::BufferR1<F32> input,
++                                    ffi::Result<ffi::BufferR1<F32>> result,
++                                    float value) {
++  se::DeviceAddressBase src = input.device_memory();
++  se::DeviceAddressBase dst = result->device_memory();
++  if (!(src == dst)) {
++    return absl::InvalidArgumentError(
++        "InPlaceAddValue: expected input and result buffers to alias");
++  }
++  size_t num_elements = input.element_count();
++  std::vector<float> host_buf(num_elements);
++  ABSL_RETURN_IF_ERROR(stream->Memcpy(host_buf.data(), src, src.size()));
++  ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
++  for (float& elem : host_buf) {
++    elem += value;
++  }
++  return stream->Memcpy(&dst, host_buf.data(), dst.size());
++}
++
++XLA_FFI_DEFINE_HANDLER(kInPlaceAddValue, InPlaceAddValue,
++                       ffi::Ffi::Bind()
++                           .Ctx<ffi::Stream>()
++                           .Arg<ffi::BufferR1<F32>>()
++                           .Ret<ffi::BufferR1<F32>>()
++                           .Attr<float>("value"));
++
++XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_test$$inplace_add_value",
++                         kPlatform, kInPlaceAddValue);
++
+ class DynamicSliceFusionV2Test : public HloPjRtGpuTestBase {
+  protected:
+   DebugOptions GetDebugOptionsForTest() const override {
+@@ -1631,5 +1662,154 @@ TEST_F(DynamicSliceFusionV2Test, OobClampingAccumulatesInLastSlice) {
+   EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
+ }
+ 
++TEST_F(DynamicSliceFusionV2Test, OutputToOperandAliasingScanDisjointBuffers) {
++  const char* hlo = R"(
++    HloModule test, is_scheduled=true
++
++    %dsf_computation {
++      %p_in = f32[4,4] parameter(0)
++      %p_out = f32[4,4] parameter(1)
++      %p_i = s32[] parameter(2)
++      %zero = s32[] constant(0)
++      %ds = f32[1,4] dynamic-slice(%p_in, %p_i, %zero),
++        dynamic_slice_sizes={1,4},
++        backend_config={"dynamic_slice_config":
++          {"loop_index":0,"linear":{"byte_offset":0,"byte_stride":16}}}
++      %ds_1d = f32[4] bitcast(%ds)
++      %call = f32[4] custom-call(%ds_1d),
++        custom_call_target="__xla_test$$inplace_add_value",
++        api_version=API_VERSION_TYPED_FFI,
++        output_to_operand_aliasing={{}: (0, {})},
++        backend_config="{value = 10.0 : f32}"
++      %call_2d = f32[1,4] bitcast(%call)
++      ROOT %dus = f32[4,4]
++        dynamic-update-slice(%p_out, %call_2d, %p_i, %zero),
++        backend_config={"dynamic_slice_config":
++          {"loop_index":0,"linear":{"byte_offset":0,"byte_stride":16}}}
++    }
++
++    body {
++      param = (s32[], f32[4,4], f32[4,4]) parameter(0)
++      i = s32[] get-tuple-element(param), index=0
++      in_buf = f32[4,4] get-tuple-element(param), index=1
++      out_buf = f32[4,4] get-tuple-element(param), index=2
++      updated = f32[4,4] fusion(in_buf, out_buf, i),
++        kind=kCustom, calls=%dsf_computation,
++        backend_config={"fusion_backend_config":{
++          "kind":"__custom_fusion",
++          "custom_fusion_config":
++            {"name":"dynamic_slice_fusion"}}}
++      one = s32[] constant(1)
++      next_i = s32[] add(i, one)
++      ROOT tuple = (s32[], f32[4,4], f32[4,4]) tuple(next_i, in_buf, updated)
++    }
++
++    cond {
++      param = (s32[], f32[4,4], f32[4,4]) parameter(0)
++      i = s32[] get-tuple-element(param), index=0
++      limit = s32[] constant(4)
++      ROOT cmp = pred[] compare(i, limit), direction=LT
++    }
++
++    ENTRY main {
++      in_buf = f32[4,4] parameter(0)
++      zero = s32[] constant(0)
++      init_out = f32[4,4] broadcast(f32[] constant(0)), dimensions={}
++      init = (s32[], f32[4,4], f32[4,4]) tuple(zero, in_buf, init_out)
++      while = (s32[], f32[4,4], f32[4,4])
++        while(init), condition=cond, body=body
++      ROOT result = f32[4,4] get-tuple-element(while), index=2
++    }
++  )";
++
++  Literal input = LiteralUtil::CreateR2<float>({{1.0f, 2.0f, 3.0f, 4.0f},
++                                                {5.0f, 6.0f, 7.0f, 8.0f},
++                                                {9.0f, 10.0f, 11.0f, 12.0f},
++                                                {13.0f, 14.0f, 15.0f, 16.0f}});
++  Literal expected =
++      LiteralUtil::CreateR2<float>({{11.0f, 12.0f, 13.0f, 14.0f},
++                                    {15.0f, 16.0f, 17.0f, 18.0f},
++                                    {19.0f, 20.0f, 21.0f, 22.0f},
++                                    {23.0f, 24.0f, 25.0f, 26.0f}});
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
++  ASSERT_OK_AND_ASSIGN(Literal result, Execute(std::move(module), {&input},
++                                               /*run_hlo_passes=*/false));
++  EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
++}
++
++TEST_F(DynamicSliceFusionV2Test, OutputToOperandAliasingInPlaceSameBuffer) {
++  const char* hlo = R"(
++    HloModule test, is_scheduled=true
++
++    %dsf_computation {
++      %p_buf = f32[4,4] parameter(0)
++      %p_i = s32[] parameter(1)
++      %zero = s32[] constant(0)
++      %ds = f32[1,4] dynamic-slice(%p_buf, %p_i, %zero),
++        dynamic_slice_sizes={1,4},
++        backend_config={"dynamic_slice_config":
++          {"loop_index":0,"linear":{"byte_offset":0,"byte_stride":16}}}
++      %ds_1d = f32[4] bitcast(%ds)
++      %call = f32[4] custom-call(%ds_1d),
++        custom_call_target="__xla_test$$inplace_add_value",
++        api_version=API_VERSION_TYPED_FFI,
++        output_to_operand_aliasing={{}: (0, {})},
++        backend_config="{value = 10.0 : f32}"
++      %call_2d = f32[1,4] bitcast(%call)
++      ROOT %dus = f32[4,4]
++        dynamic-update-slice(%p_buf, %call_2d, %p_i, %zero),
++        backend_config={"dynamic_slice_config":
++          {"loop_index":0,"linear":{"byte_offset":0,"byte_stride":16}}}
++    }
++
++    body {
++      param = (s32[], f32[4,4]) parameter(0)
++      i = s32[] get-tuple-element(param), index=0
++      buf = f32[4,4] get-tuple-element(param), index=1
++      updated = f32[4,4] fusion(buf, i),
++        kind=kCustom, calls=%dsf_computation,
++        backend_config={"fusion_backend_config":{
++          "kind":"__custom_fusion",
++          "custom_fusion_config":
++            {"name":"dynamic_slice_fusion"}}}
++      one = s32[] constant(1)
++      next_i = s32[] add(i, one)
++      ROOT tuple = (s32[], f32[4,4]) tuple(next_i, updated)
++    }
++
++    cond {
++      param = (s32[], f32[4,4]) parameter(0)
++      i = s32[] get-tuple-element(param), index=0
++      limit = s32[] constant(4)
++      ROOT cmp = pred[] compare(i, limit), direction=LT
++    }
++
++    ENTRY main {
++      buf = f32[4,4] parameter(0)
++      zero = s32[] constant(0)
++      init = (s32[], f32[4,4]) tuple(zero, buf)
++      while = (s32[], f32[4,4])
++        while(init), condition=cond, body=body
++      ROOT result = f32[4,4] get-tuple-element(while), index=1
++    }
++  )";
++
++  Literal input = LiteralUtil::CreateR2<float>({{1.0f, 2.0f, 3.0f, 4.0f},
++                                                {5.0f, 6.0f, 7.0f, 8.0f},
++                                                {9.0f, 10.0f, 11.0f, 12.0f},
++                                                {13.0f, 14.0f, 15.0f, 16.0f}});
++  Literal expected =
++      LiteralUtil::CreateR2<float>({{11.0f, 12.0f, 13.0f, 14.0f},
++                                    {15.0f, 16.0f, 17.0f, 18.0f},
++                                    {19.0f, 20.0f, 21.0f, 22.0f},
++                                    {23.0f, 24.0f, 25.0f, 26.0f}});
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
++  ASSERT_OK_AND_ASSIGN(Literal result, Execute(std::move(module), {&input},
++                                               /*run_hlo_passes=*/false));
++  EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
++}
++
+ }  // namespace
+ }  // namespace xla::gpu
+diff --git a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
+index 042a155c99..0572043f1f 100644
+--- a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
++++ b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
+@@ -15,6 +15,7 @@ limitations under the License.
+ 
+ #include "xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <optional>
+ #include <string>
+@@ -57,8 +58,11 @@ namespace {
+ // DynamicSlice instruction feeding the hero through zero or more no-op
+ // instructions (bitcasts, GTEs).
+ struct SlicedParameter {
++  // Index of the operand in the hero instruction.
++  int64_t operand_number = 0;
++
+   // The Slice or DynamicSlice instruction at the start of the chain.
+-  HloInstruction* slice;
++  HloInstruction* slice = nullptr;
+ 
+   // Bitcasts/GTEs between the slice and the hero (topological order).
+   std::vector<HloInstruction*> noops;
+@@ -126,6 +130,13 @@ bool IsAlignedSlice(const HloInstruction* instr) {
+   return slice_bytes % kXlaAllocatedBufferAlignBytes == 0;
+ }
+ 
++const HloInstruction* StripBitcasts(const HloInstruction* instr) {
++  while (instr->opcode() == HloOpcode::kBitcast) {
++    instr = instr->operand(0);
++  }
++  return instr;
++}
++
+ bool HasSupportedShapes(const HloInstruction* hero) {
+   for (const HloInstruction* operand : hero->operands()) {
+     if (operand->shape().IsTuple()) {
+@@ -161,6 +172,21 @@ bool HasSupportedShapes(const HloInstruction* hero) {
+       }
+     }
+   }
++  if (const auto* callable = DynCast<HloCallableInstruction>(hero)) {
++    for (const auto& [output_index, operand_pair] :
++         callable->output_to_operand_aliasing()) {
++      int64_t op_idx = operand_pair.first;
++      for (int64_t i = 0; i < hero->operand_count(); ++i) {
++        if (i != op_idx && StripBitcasts(hero->operand(i)) ==
++                               StripBitcasts(hero->operand(op_idx))) {
++          LOG(WARNING) << "DynamicSliceFusionRewriterV2: skipping "
++                       << hero->name() << " because aliased operand " << op_idx
++                       << " shares instruction with operand " << i;
++          return false;
++        }
++      }
++    }
++  }
+   return true;
+ }
+ 
+@@ -172,7 +198,8 @@ using OptLevel = DynamicSliceFusionRewriterV2::OptLevel;
+ using CaptureSlice = DynamicSliceFusionRewriterV2::CaptureSlice;
+ using CaptureUpdateSlice = DynamicSliceFusionRewriterV2::CaptureUpdateSlice;
+ 
+-std::optional<SlicedParameter> ResolveSlicedParameter(HloInstruction* operand,
++std::optional<SlicedParameter> ResolveSlicedParameter(int64_t operand_number,
++                                                      HloInstruction* operand,
+                                                       OptLevel opt_level) {
+   HloInstruction* current = operand;
+ 
+@@ -221,7 +248,7 @@ std::optional<SlicedParameter> ResolveSlicedParameter(HloInstruction* operand,
+       return std::nullopt;
+     }
+     absl::c_reverse(noops);
+-    return SlicedParameter{slice, std::move(noops)};
++    return SlicedParameter{operand_number, slice, std::move(noops)};
+   }
+ 
+   if (auto* ds = DynCast<HloDynamicSliceInstruction>(current)) {
+@@ -232,7 +259,7 @@ std::optional<SlicedParameter> ResolveSlicedParameter(HloInstruction* operand,
+       return std::nullopt;
+     }
+     absl::c_reverse(noops);
+-    return SlicedParameter{ds, std::move(noops)};
++    return SlicedParameter{operand_number, ds, std::move(noops)};
+   }
+ 
+   return std::nullopt;
+@@ -244,22 +271,13 @@ std::vector<SlicedParameter> ResolveSlicedParameters(
+   std::vector<SlicedParameter> result;
+   for (int64_t i = 0; i < hero->operand_count(); ++i) {
+     HloInstruction* operand = hero->mutable_operand(i);
+-    auto param = ResolveSlicedParameter(operand, opt_level);
++    auto param = ResolveSlicedParameter(i, operand, opt_level);
+     if (!param.has_value()) {
+       continue;
+     }
+     if (!capture_slice(hero, i, param->slice)) {
+       continue;
+     }
+-    // In O2 mode, the chain output may differ from the hero's operand when
+-    // we looked through a tuple/GTE barrier. Replace the hero's operand so
+-    // BuildFusionPlan sees a connected graph. Safe because the hero will be
+-    // replaced by the fusion.
+-    HloInstruction* chain_output =
+-        param->noops.empty() ? param->slice : param->noops.back();
+-    if (chain_output != operand) {
+-      CHECK_OK(hero->ReplaceOperandWith(i, chain_output));
+-    }
+     result.push_back(std::move(*param));
+   }
+   return result;
+@@ -408,6 +426,100 @@ std::vector<SlicedResult> ResolveSlicedResults(
+   return ResolveNonTupleSlicedResult(hero, capture_update_slice);
+ }
+ 
++absl::Status FilterAliasedParametersAndResults(
++    HloInstruction* hero, std::vector<SlicedParameter>& sliced_params,
++    std::vector<SlicedResult>& sliced_results) {
++  const auto* callable = DynCast<HloCallableInstruction>(hero);
++  if (callable == nullptr) {
++    return absl::OkStatus();
++  }
++
++  auto find_sliced_param = [&](int64_t op_idx) -> const SlicedParameter* {
++    for (const SlicedParameter& param : sliced_params) {
++      if (param.operand_number == op_idx) {
++        return &param;
++      }
++    }
++    return nullptr;
++  };
++
++  auto op_source = [&](int64_t op_idx) -> const HloInstruction* {
++    if (const SlicedParameter* param = find_sliced_param(op_idx)) {
++      return StripBitcasts(param->slice->operand(0));
++    }
++    return StripBitcasts(hero->operand(op_idx));
++  };
++
++  auto find_sliced_result = [&](int64_t leaf_idx) -> SlicedResult* {
++    for (SlicedResult& res : sliced_results) {
++      if (res.result_number == leaf_idx) {
++        return &res;
++      }
++    }
++    return nullptr;
++  };
++
++  for (const auto& [output_index, operand_pair] :
++       callable->output_to_operand_aliasing()) {
++    int64_t op_idx = operand_pair.first;
++    int64_t leaf_idx = output_index.empty() ? 0 : output_index[0];
++    const SlicedParameter* aliased_param = find_sliced_param(op_idx);
++    SlicedResult* res = find_sliced_result(leaf_idx);
++
++    if (res != nullptr && res->update_slice != nullptr) {
++      const HloInstruction* dus = res->update_slice;
++      const HloInstruction* dus_target = dus->operand(0);
++      const HloInstruction* dus_buf = StripBitcasts(dus_target);
++
++      bool can_capture_dus = true;
++      for (int64_t i = 0; i < hero->operand_count(); ++i) {
++        if (i != op_idx && op_source(i) == dus_buf) {
++          can_capture_dus = false;
++          break;
++        }
++      }
++      if (can_capture_dus && op_source(op_idx) == dus_buf) {
++        if (aliased_param != nullptr &&
++            aliased_param->slice->opcode() == HloOpcode::kDynamicSlice &&
++            aliased_param->slice->operand(0) == dus_target) {
++          ABSL_ASSIGN_OR_RETURN(
++              auto slice_cfg,
++              aliased_param->slice->backend_config<GpuBackendConfig>());
++          ABSL_ASSIGN_OR_RETURN(auto dus_cfg,
++                                dus->backend_config<GpuBackendConfig>());
++          can_capture_dus = slice_cfg.dynamic_slice_config() ==
++                            dus_cfg.dynamic_slice_config();
++        } else {
++          can_capture_dus = false;
++        }
++      }
++      if (!can_capture_dus) {
++        if (hero->shape().IsTuple()) {
++          res->update_slice = nullptr;
++          res->noops.resize(1);
++        } else {
++          sliced_results.clear();
++          res = nullptr;
++        }
++      }
++    }
++
++    if ((res == nullptr || res->update_slice == nullptr) &&
++        aliased_param == nullptr) {
++      const HloInstruction* target_buf = StripBitcasts(hero->operand(op_idx));
++      sliced_params.erase(
++          std::remove_if(sliced_params.begin(), sliced_params.end(),
++                         [&](const SlicedParameter& param) {
++                           return param.operand_number != op_idx &&
++                                  StripBitcasts(param.slice->operand(0)) ==
++                                      target_buf;
++                         }),
++          sliced_params.end());
++    }
++  }
++  return absl::OkStatus();
++}
++
+ //===----------------------------------------------------------------------===//
+ // Resolve offset expressions
+ //===----------------------------------------------------------------------===//
+@@ -480,6 +592,18 @@ std::optional<DynamicSliceFusionPlan> BuildFusionPlan(
+     return std::nullopt;
+   }
+ 
++  // In O2 mode, the chain output may differ from the hero's operand when we
++  // looked through a tuple/GTE barrier. Replace the hero's operand so
++  // BuildFusionPlan and CreateFusionBody see a connected graph. Safe because
++  // the hero will be replaced by the fusion.
++  for (const SlicedParameter& param : sliced_params) {
++    HloInstruction* chain_output =
++        param.noops.empty() ? param.slice : param.noops.back();
++    if (chain_output != hero->operand(param.operand_number)) {
++      CHECK_OK(hero->ReplaceOperandWith(param.operand_number, chain_output));
++    }
++  }
++
+   // Instructions to clone into the fusion body, in dependency order.
+   std::vector<HloInstruction*> clone_instructions;
+   // Membership set for clone_instructions, used to avoid duplicate clones.
+@@ -795,6 +919,8 @@ absl::StatusOr<bool> DynamicSliceFusionRewriterV2::RunImpl(
+                                                    options_.capture_slice);
+       auto sliced_results =
+           ResolveSlicedResults(hero, options_.capture_update_slice);
++      ABSL_RETURN_IF_ERROR(FilterAliasedParametersAndResults(
++          hero, sliced_params, sliced_results));
+       ABSL_ASSIGN_OR_RETURN(
+           bool hero_changed,
+           RewriteHero(module, hero, sliced_params, sliced_results));
+diff --git a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
+index 2dae0bfdc1..b572d93800 100644
+--- a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
++++ b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
+@@ -2893,5 +2893,323 @@ TEST_F(DynamicSliceFusionRewriterV2Test,
+   RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected);
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Output-to-operand aliasing tests
++//===----------------------------------------------------------------------===//
++
++TEST_F(DynamicSliceFusionRewriterV2Test,
++       OutputToOperandAliasingScanPatternFused) {
++  const char* hlo = R"(
++    HloModule test
++
++    body {
++      p0 = (s32[], f32[4,8,8], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      input = f32[4,8,8] get-tuple-element(p0), index=1
++      output = f32[4,8,8] get-tuple-element(p0), index=2
++      c0 = s32[] constant(0)
++      ds = f32[1,8,8] dynamic-slice(input, ivar, c0, c0),
++          dynamic_slice_sizes={1,8,8}
++      bitcast_in = f32[8,8] bitcast(ds)
++      hero = f32[8,8] custom-call(bitcast_in),
++          custom_call_target="fake_target",
++          output_to_operand_aliasing={{}: (0, {})}
++      bitcast_out = f32[1,8,8] bitcast(hero)
++      dus = f32[4,8,8] dynamic-update-slice(output, bitcast_out, ivar, c0, c0)
++      c1 = s32[] constant(1)
++      next_ivar = s32[] add(ivar, c1)
++      ROOT result = (s32[], f32[4,8,8], f32[4,8,8]) tuple(next_ivar, input, dus)
++    }
++
++    condition {
++      p0 = (s32[], f32[4,8,8], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      c4 = s32[] constant(4)
++      ROOT cmp = pred[] compare(ivar, c4), direction=LT
++    }
++
++    ENTRY main {
++      input = f32[4,8,8] parameter(0)
++      output = f32[4,8,8] parameter(1)
++      c0 = s32[] constant(0)
++      tuple = (s32[], f32[4,8,8], f32[4,8,8]) tuple(c0, input, output)
++      ROOT while = (s32[], f32[4,8,8], f32[4,8,8]) while(tuple),
++          condition=condition, body=body,
++          backend_config={"known_trip_count":{"n":"4"},
++                          "known_init_step":{"init":"0","step":"1"},
++                          "known_induction_variable":{"tuple_index":"0"}}
++    }
++  )";
++
++  const char* expected = R"(
++    ; CHECK:     %dynamic-slice-fusion{{.*}} {
++    ; CHECK:       {{.*}} dynamic-slice(
++    ; CHECK:       {{.*}} bitcast(
++    ; CHECK:       {{.*}} custom-call(
++    ; CHECK-SAME:         custom_call_target="fake_target"
++    ; CHECK-SAME:         output_to_operand_aliasing={{[{][{][}]: [(]0, [{][}][)][}]}}
++    ; CHECK:       {{.*}} bitcast(
++    ; CHECK:       ROOT {{.*}} dynamic-update-slice(
++    ; CHECK:     }
++    ; CHECK:     body
++    ; CHECK-NOT:   dynamic-slice(
++    ; CHECK-NOT:   dynamic-update-slice(
++    ; CHECK:       {{.*}} fusion(
++    ; CHECK-SAME:         kind=kCustom
++    ; CHECK-SAME:         "name":"dynamic_slice_fusion"
++    ; CHECK:     }
++  )";
++
++  auto f32_488 = ShapeUtil::MakeShape(F32, {4, 8, 8});
++  auto f32_188 = ShapeUtil::MakeShape(F32, {1, 8, 8});
++  std::vector<Offset> offsets = {{0, Offset::Parameter(1)},
++                                 {1, Offset::Constant(0)},
++                                 {2, Offset::Constant(0)}};
++
++  auto fusion_checks = [&](HloModule* module) {
++    auto* hero = DynamicSliceFusion::FindHero(FindDsfBody(module));
++
++    ASSERT_OK_AND_ASSIGN(auto params,
++                         DynamicSliceFusion::ResolveParameters(hero));
++    EXPECT_THAT(params, ElementsAre(Param{0, f32_488, f32_188,
++                                          MakeConfig(0, 0, 256), offsets}));
++
++    ASSERT_OK_AND_ASSIGN(auto results,
++                         DynamicSliceFusion::ResolveResults(hero));
++    EXPECT_THAT(results, ElementsAre(Result{2, 0, f32_488, f32_188,
++                                            MakeConfig(0, 0, 256), offsets}));
++  };
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected, fusion_checks);
++}
++
++TEST_F(DynamicSliceFusionRewriterV2Test,
++       OutputToOperandAliasingInPlaceSameSliceFused) {
++  const char* hlo = R"(
++    HloModule test
++
++    body {
++      p0 = (s32[], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      buf = f32[4,8,8] get-tuple-element(p0), index=1
++      c0 = s32[] constant(0)
++      ds = f32[1,8,8] dynamic-slice(buf, ivar, c0, c0),
++          dynamic_slice_sizes={1,8,8}
++      bitcast_in = f32[8,8] bitcast(ds)
++      hero = f32[8,8] custom-call(bitcast_in),
++          custom_call_target="fake_target",
++          output_to_operand_aliasing={{}: (0, {})}
++      bitcast_out = f32[1,8,8] bitcast(hero)
++      dus = f32[4,8,8] dynamic-update-slice(buf, bitcast_out, ivar, c0, c0)
++      c1 = s32[] constant(1)
++      next_ivar = s32[] add(ivar, c1)
++      ROOT result = (s32[], f32[4,8,8]) tuple(next_ivar, dus)
++    }
++
++    condition {
++      p0 = (s32[], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      c4 = s32[] constant(4)
++      ROOT cmp = pred[] compare(ivar, c4), direction=LT
++    }
++
++    ENTRY main {
++      buf = f32[4,8,8] parameter(0)
++      c0 = s32[] constant(0)
++      tuple = (s32[], f32[4,8,8]) tuple(c0, buf)
++      ROOT while = (s32[], f32[4,8,8]) while(tuple),
++          condition=condition, body=body,
++          backend_config={"known_trip_count":{"n":"4"},
++                          "known_init_step":{"init":"0","step":"1"},
++                          "known_induction_variable":{"tuple_index":"0"}}
++    }
++  )";
++
++  const char* expected = R"(
++    ; CHECK:     %dynamic-slice-fusion{{.*}} {
++    ; CHECK:       {{.*}} dynamic-slice(
++    ; CHECK:       {{.*}} bitcast(
++    ; CHECK:       {{.*}} custom-call(
++    ; CHECK-SAME:         custom_call_target="fake_target"
++    ; CHECK:       {{.*}} bitcast(
++    ; CHECK:       ROOT {{.*}} dynamic-update-slice(
++    ; CHECK:     }
++    ; CHECK:     body
++    ; CHECK-NOT:   dynamic-slice(
++    ; CHECK-NOT:   dynamic-update-slice(
++    ; CHECK:       {{.*}} fusion(
++    ; CHECK-SAME:         kind=kCustom
++    ; CHECK-SAME:         "name":"dynamic_slice_fusion"
++    ; CHECK:     }
++  )";
++
++  auto f32_488 = ShapeUtil::MakeShape(F32, {4, 8, 8});
++  auto f32_188 = ShapeUtil::MakeShape(F32, {1, 8, 8});
++  std::vector<Offset> offsets = {{0, Offset::Parameter(1)},
++                                 {1, Offset::Constant(0)},
++                                 {2, Offset::Constant(0)}};
++
++  auto fusion_checks = [&](HloModule* module) {
++    auto* hero = DynamicSliceFusion::FindHero(FindDsfBody(module));
++
++    ASSERT_OK_AND_ASSIGN(auto params,
++                         DynamicSliceFusion::ResolveParameters(hero));
++    EXPECT_THAT(params, ElementsAre(Param{0, f32_488, f32_188,
++                                          MakeConfig(0, 0, 256), offsets}));
++
++    ASSERT_OK_AND_ASSIGN(auto results,
++                         DynamicSliceFusion::ResolveResults(hero));
++    EXPECT_THAT(results, ElementsAre(Result{0, 0, f32_488, f32_188,
++                                            MakeConfig(0, 0, 256), offsets}));
++  };
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected, fusion_checks);
++}
++
++TEST_F(DynamicSliceFusionRewriterV2Test,
++       OutputToOperandAliasingSameBufferDifferentOffsetsDropsDus) {
++  const char* hlo = R"(
++    HloModule test
++
++    body {
++      p0 = (s32[], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      buf = f32[4,8,8] get-tuple-element(p0), index=1
++      c0 = s32[] constant(0)
++      c1 = s32[] constant(1)
++      ds = f32[1,8,8] dynamic-slice(buf, ivar, c0, c0),
++          dynamic_slice_sizes={1,8,8}
++      bitcast_in = f32[8,8] bitcast(ds)
++      hero = f32[8,8] custom-call(bitcast_in),
++          custom_call_target="fake_target",
++          output_to_operand_aliasing={{}: (0, {})}
++      bitcast_out = f32[1,8,8] bitcast(hero)
++      next_ivar = s32[] add(ivar, c1)
++      dus = f32[4,8,8] dynamic-update-slice(buf, bitcast_out, next_ivar, c0, c0)
++      ROOT result = (s32[], f32[4,8,8]) tuple(next_ivar, dus)
++    }
++
++    condition {
++      p0 = (s32[], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      c3 = s32[] constant(3)
++      ROOT cmp = pred[] compare(ivar, c3), direction=LT
++    }
++
++    ENTRY main {
++      buf = f32[4,8,8] parameter(0)
++      c0 = s32[] constant(0)
++      tuple = (s32[], f32[4,8,8]) tuple(c0, buf)
++      ROOT while = (s32[], f32[4,8,8]) while(tuple),
++          condition=condition, body=body,
++          backend_config={"known_trip_count":{"n":"3"},
++                          "known_init_step":{"init":"0","step":"1"},
++                          "known_induction_variable":{"tuple_index":"0"}}
++    }
++  )";
++
++  const char* expected = R"(
++    ; CHECK:     %dynamic-slice-fusion{{.*}} {
++    ; CHECK:       {{.*}} dynamic-slice(
++    ; CHECK:       {{.*}} bitcast(
++    ; CHECK:       ROOT {{.*}} custom-call(
++    ; CHECK-SAME:         custom_call_target="fake_target"
++    ; CHECK-NOT:   dynamic-update-slice(
++    ; CHECK:     }
++    ; CHECK:     body
++    ; CHECK:       {{.*}} fusion(
++    ; CHECK-SAME:         kind=kCustom
++    ; CHECK-SAME:         "name":"dynamic_slice_fusion"
++    ; CHECK:       {{.*}} dynamic-update-slice(
++    ; CHECK:     }
++  )";
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected);
++}
++
++TEST_F(DynamicSliceFusionRewriterV2Test,
++       OutputToOperandAliasingDusTargetSharedWithNonAliasedOperandDropsDus) {
++  const char* hlo = R"(
++    HloModule test
++
++    body {
++      p0 = (s32[], f32[4,8,8], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      input = f32[4,8,8] get-tuple-element(p0), index=1
++      output = f32[4,8,8] get-tuple-element(p0), index=2
++      c0 = s32[] constant(0)
++      ds0 = f32[1,8,8] dynamic-slice(input, ivar, c0, c0),
++          dynamic_slice_sizes={1,8,8}
++      bc0 = f32[8,8] bitcast(ds0)
++      ds1 = f32[1,8,8] dynamic-slice(output, ivar, c0, c0),
++          dynamic_slice_sizes={1,8,8}
++      bc1 = f32[8,8] bitcast(ds1)
++      hero = f32[8,8] custom-call(bc0, bc1),
++          custom_call_target="fake_target",
++          output_to_operand_aliasing={{}: (0, {})}
++      bitcast_out = f32[1,8,8] bitcast(hero)
++      dus = f32[4,8,8] dynamic-update-slice(output, bitcast_out, ivar, c0, c0)
++      c1 = s32[] constant(1)
++      next_ivar = s32[] add(ivar, c1)
++      ROOT result = (s32[], f32[4,8,8], f32[4,8,8]) tuple(next_ivar, input, dus)
++    }
++
++    condition {
++      p0 = (s32[], f32[4,8,8], f32[4,8,8]) parameter(0)
++      ivar = s32[] get-tuple-element(p0), index=0
++      c4 = s32[] constant(4)
++      ROOT cmp = pred[] compare(ivar, c4), direction=LT
++    }
++
++    ENTRY main {
++      input = f32[4,8,8] parameter(0)
++      output = f32[4,8,8] parameter(1)
++      c0 = s32[] constant(0)
++      tuple = (s32[], f32[4,8,8], f32[4,8,8]) tuple(c0, input, output)
++      ROOT while = (s32[], f32[4,8,8], f32[4,8,8]) while(tuple),
++          condition=condition, body=body,
++          backend_config={"known_trip_count":{"n":"4"},
++                          "known_init_step":{"init":"0","step":"1"},
++                          "known_induction_variable":{"tuple_index":"0"}}
++    }
++  )";
++
++  const char* expected = R"(
++    ; CHECK:     %dynamic-slice-fusion{{.*}} {
++    ; CHECK:       {{.*}} dynamic-slice(
++    ; CHECK:       {{.*}} dynamic-slice(
++    ; CHECK:       ROOT {{.*}} custom-call(
++    ; CHECK-SAME:         custom_call_target="fake_target"
++    ; CHECK-NOT:   dynamic-update-slice(
++    ; CHECK:     }
++    ; CHECK:     body
++    ; CHECK:       {{.*}} fusion(
++    ; CHECK-SAME:         kind=kCustom
++    ; CHECK-SAME:         "name":"dynamic_slice_fusion"
++    ; CHECK:       {{.*}} dynamic-update-slice(
++    ; CHECK:     }
++  )";
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected);
++}
++
++TEST_F(DynamicSliceFusionRewriterV2Test,
++       OutputToOperandAliasingDuplicateAliasedOperandSkipped) {
++  const char* hlo = R"(
++    HloModule test
++
++    ENTRY main {
++      %p0 = f32[2,8,8]{2,1,0} parameter(0)
++      %slice0 = f32[1,8,8]{2,1,0} slice(%p0), slice={[1:2], [0:8], [0:8]}
++      %bitcast0 = f32[8,8]{1,0} bitcast(%slice0)
++      ROOT %hero = f32[8,8]{1,0} custom-call(%bitcast0, %bitcast0),
++        custom_call_target="fake_target",
++        output_to_operand_aliasing={{}: (0, {})}
++    }
++  )";
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), std::nullopt);
++}
++
+ }  // namespace
+ }  // namespace xla::gpu
+diff --git a/xla/hlo/analysis/BUILD b/xla/hlo/analysis/BUILD
+index 72797f003c..161388d501 100644
+--- a/xla/hlo/analysis/BUILD
++++ b/xla/hlo/analysis/BUILD
+@@ -235,6 +235,8 @@ cc_library(
+     deps = [
+         ":alias_info",
+         ":hlo_operand_index",
++        "//xla:frontend_attributes",
++        "//xla:literal",
+         "//xla:shape_util",
+         "//xla:status_macros",
+         "//xla:util",
+@@ -279,9 +281,11 @@ xla_cc_test(
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:test",
++        "//xla/hlo/testlib:verified_hlo_module",
+         "//xla/hlo/transforms/simplifiers:flatten_call_graph",
+         "//xla/hlo/transforms/simplifiers:hlo_dce",
+         "//xla/service:hlo_buffer",
++        "//xla/service:hlo_module_config",
+         "//xla/service:hlo_value",
+         "//xla/tsl/lib/core:status_test_util",
+         "//xla/tsl/platform:statusor",
+diff --git a/xla/hlo/analysis/alias_info.h b/xla/hlo/analysis/alias_info.h
+index 257107d8a1..1019603015 100644
+--- a/xla/hlo/analysis/alias_info.h
++++ b/xla/hlo/analysis/alias_info.h
+@@ -71,6 +71,13 @@ class AliasInfo {
+     return std::nullopt;
+   }
+ 
++  // Returns whether `instruction` can be ignored when tracing fusion in-place
++  // aliases because it does not change the underlying buffer. Backends may
++  // override this to add target-specific no-op wrappers.
++  virtual bool IsNoOpForAliasAnalysis(const HloInstruction* instruction) const {
++    return instruction->opcode() == HloOpcode::kBitcast;
++  }
++
+  protected:
+   // Backend-specific hook that allows to deviate from the default must-alias
+   // rules in GetInPlaceInputOutputPairs(). If an empty optional is returned,
+@@ -81,13 +88,6 @@ class AliasInfo {
+     return std::nullopt;
+   }
+ 
+-  // Returns whether `instruction` can be ignored when tracing fusion in-place
+-  // aliases because it does not change the underlying buffer. Backends may
+-  // override this to add target-specific no-op wrappers.
+-  virtual bool IsNoOpForAliasAnalysis(const HloInstruction* instruction) const {
+-    return instruction->opcode() == HloOpcode::kBitcast;
+-  }
+-
+  private:
+   // Returns in-place pairs for an output source instruction while analyzing a
+   // fusion body. Nested fusion annotations are not inherited here; only aliases
+diff --git a/xla/hlo/analysis/hlo_dataflow_analysis.cc b/xla/hlo/analysis/hlo_dataflow_analysis.cc
+index 1a3308ba4d..bd3e79ed37 100644
+--- a/xla/hlo/analysis/hlo_dataflow_analysis.cc
++++ b/xla/hlo/analysis/hlo_dataflow_analysis.cc
+@@ -15,12 +15,14 @@ limitations under the License.
+ 
+ #include "xla/hlo/analysis/hlo_dataflow_analysis.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+ #include <optional>
+ #include <queue>
+ #include <string>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+@@ -38,6 +40,7 @@ limitations under the License.
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+ #include "tsl/platform/platform.h"
++#include "xla/frontend_attributes.h"
+ #include "xla/hlo/analysis/alias_info.h"
+ #include "xla/hlo/analysis/hlo_operand_index.h"
+ #include "xla/hlo/ir/hlo_casting_utils.h"
+@@ -49,6 +52,7 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/hlo/utils/hlo_query.h"
+ #include "xla/layout.h"
++#include "xla/literal.h"
+ #include "xla/map_util.h"
+ #include "xla/service/call_graph.h"
+ #include "xla/service/hlo_value.h"
+@@ -88,6 +92,33 @@ bool IsCrossBufferSliceFusion(const HloInstruction* instruction) {
+   return root->IsCustomFusion();
+ }
+ 
++// Returns true if `instruction` (or its wrapped async instruction or an
++// enclosing kWhile instruction) is annotated as reading and writing disjoint
++// buffer regions.
++bool HasDisjointReadWriteRegions(const HloInstruction* instruction) {
++  if (instruction == nullptr) {
++    return false;
++  }
++  if (HasDisjointReadWriteRegionsAttr(instruction)) {
++    return true;
++  }
++  if (instruction->IsAsynchronous()) {
++    const HloInstruction* wrapped = instruction->async_wrapped_instruction();
++    if (wrapped != nullptr && HasDisjointReadWriteRegionsAttr(wrapped)) {
++      return true;
++    }
++  }
++  if (instruction->parent() != nullptr) {
++    for (const HloInstruction* caller :
++         instruction->parent()->caller_instructions(HloOpcode::kWhile)) {
++      if (HasDisjointReadWriteRegionsAttr(caller)) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ // Returns true if the async op `async_op` wraps an op whose loop-carried async
+ // state forwards the in-flight output (index {1}) to the async-update/done: a
+ // dynamic-slice, a dynamic-update-slice or a cross_buffer_slice fusion.
+@@ -103,6 +134,321 @@ bool WrapsSliceOrCrossBufferSlice(const HloInstruction* async_op) {
+   }
+ }
+ 
++bool HasExplicitFusionOutputToOperandAliasing(
++    const HloFusionInstruction* fusion, const HloOperandIndex& in_place_operand,
++    const ShapeIndex& user_index) {
++  for (const auto& [output_idx, operand_and_idx] :
++       fusion->output_to_operand_aliasing()) {
++    if (output_idx == user_index &&
++        operand_and_idx.first == in_place_operand.operand_number &&
++        operand_and_idx.second == in_place_operand.operand_index) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool HasExtraRelevantUse(const HloInstruction* inst, const ShapeIndex& idx,
++                         const HloInstruction* expected_user) {
++  for (const HloInstruction* u : inst->users()) {
++    if (!idx.empty() && u->opcode() == HloOpcode::kGetTupleElement &&
++        u->tuple_index() != idx.front()) {
++      continue;
++    }
++    if (u != expected_user) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool IsMatchingInPlaceDusReadSlice(const HloInstruction* slice,
++                                   const HloInstruction* base_inst,
++                                   const HloInstruction* dus) {
++  if (dus->opcode() != HloOpcode::kDynamicUpdateSlice ||
++      slice->operand_count() == 0 || slice->operand(0) != base_inst ||
++      slice->OperandIndices(base_inst).size() != 1 ||
++      !ShapeUtil::EqualIgnoringElementType(base_inst->shape(),
++                                           dus->operand(0)->shape()) ||
++      !ShapeUtil::EqualIgnoringElementType(slice->shape(),
++                                           dus->operand(1)->shape())) {
++    return false;
++  }
++  if (slice->opcode() == HloOpcode::kDynamicSlice) {
++    if (ShapeUtil::IsEffectiveScalar(slice->shape())) {
++      return true;
++    }
++    for (int64_t i = 1; i < slice->operand_count(); ++i) {
++      if (slice->operand(i) != dus->operand(i + 1)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  if (slice->opcode() == HloOpcode::kSlice) {
++    for (int64_t stride : slice->slice_strides()) {
++      if (stride != 1) {
++        return false;
++      }
++    }
++    if (ShapeUtil::IsEffectiveScalar(slice->shape())) {
++      return true;
++    }
++    const int64_t rank = slice->shape().dimensions().size();
++    for (int64_t d = 0; d < rank; ++d) {
++      const HloInstruction* dus_idx = dus->operand(d + 2);
++      if (dus_idx->opcode() != HloOpcode::kConstant ||
++          !ShapeUtil::IsEffectiveScalar(dus_idx->shape())) {
++        return false;
++      }
++      std::optional<int64_t> idx_val = dus_idx->literal().GetFirstInteger();
++      if (!idx_val.has_value()) {
++        return false;
++      }
++      const int64_t clamped_start =
++          std::clamp(*idx_val, int64_t{0},
++                     dus->operand(0)->shape().dimensions(d) -
++                         dus->operand(1)->shape().dimensions(d));
++      if (clamped_start != slice->slice_starts(d)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  return false;
++}
++
++bool CanFusionInPlaceParameterShareBuffer(
++    const HloFusionInstruction* fusion, const HloOperandIndex& in_place_operand,
++    const ShapeIndex& user_index, const AliasInfo* alias_info,
++    const HloInstruction* outer_operand,
++    const ShapeIndex& outer_operand_index) {
++  const HloInstruction* target_param =
++      fusion->fused_parameter(in_place_operand.operand_number);
++  const ShapeIndex& target_param_idx = in_place_operand.operand_index;
++  const HloInstruction* root = fusion->fused_expression_root();
++
++  const HloInstruction* curr = root;
++  ShapeIndex curr_idx = user_index;
++  const HloInstruction* output_source = nullptr;
++  ShapeIndex output_source_idx;
++  bool crossed_nested_fusion_below_output_source = false;
++  bool has_extra_output_use =
++      HasExtraRelevantUse(root, user_index, /*expected_user=*/nullptr);
++  bool has_extra_input_use = false;
++  std::vector<std::pair<const HloInstruction*, ShapeIndex>> input_spine;
++
++  while (curr != target_param || curr_idx != target_param_idx) {
++    const HloInstruction* prev = nullptr;
++    ShapeIndex prev_idx;
++    if (curr->opcode() == HloOpcode::kTuple && !curr_idx.empty()) {
++      prev = curr->operand(curr_idx.front());
++      prev_idx = ShapeIndex(curr_idx.begin() + 1, curr_idx.end());
++    } else if (curr->opcode() == HloOpcode::kGetTupleElement) {
++      prev = curr->operand(0);
++      prev_idx = curr_idx;
++      prev_idx.push_front(curr->tuple_index());
++    } else if (curr_idx.empty() && alias_info->IsNoOpForAliasAnalysis(curr)) {
++      prev = curr->operand(0);
++    } else {
++      if (output_source != nullptr && curr->opcode() != HloOpcode::kFusion) {
++        return false;
++      }
++      std::optional<HloOperandIndex> matched_in;
++      for (const auto& [in_op, out_idx] :
++           alias_info->GetInPlaceInputOutputPairs(curr)) {
++        if (out_idx == curr_idx) {
++          if (matched_in.has_value() && *matched_in != in_op) {
++            return false;
++          }
++          matched_in = in_op;
++        }
++      }
++      if (!matched_in.has_value()) {
++        return false;
++      }
++      if (const auto* nested_fusion = DynCast<HloFusionInstruction>(curr)) {
++        const bool check_nested_body =
++            output_source == nullptr ||
++            !HasExplicitFusionOutputToOperandAliasing(nested_fusion,
++                                                      *matched_in, curr_idx);
++        if (check_nested_body &&
++            !CanFusionInPlaceParameterShareBuffer(nested_fusion, *matched_in,
++                                                  curr_idx, alias_info,
++                                                  /*outer_operand=*/nullptr,
++                                                  /*outer_operand_index=*/{})) {
++          return false;
++        }
++        if (output_source != nullptr) {
++          crossed_nested_fusion_below_output_source = true;
++        }
++      }
++      if (output_source == nullptr) {
++        output_source = curr;
++        output_source_idx = curr_idx;
++      }
++      prev = curr->operand(matched_in->operand_number);
++      prev_idx = matched_in->operand_index;
++    }
++
++    if (curr->OperandIndices(prev).size() != 1) {
++      return false;
++    }
++    const bool prev_has_extra_use = HasExtraRelevantUse(prev, prev_idx, curr);
++    if (output_source == nullptr) {
++      has_extra_output_use |= prev_has_extra_use;
++    } else {
++      has_extra_input_use |= prev_has_extra_use;
++      input_spine.emplace_back(prev, prev_idx);
++    }
++    curr = prev;
++    curr_idx = std::move(prev_idx);
++  }
++
++  if (output_source == nullptr) {
++    return false;
++  }
++  if (!has_extra_output_use && !has_extra_input_use) {
++    return true;
++  }
++
++  if (outer_operand != nullptr && outer_operand_index.empty()) {
++    if (std::optional<bool> hint = alias_info->MayAlias(
++            outer_operand, outer_operand_index, fusion, user_index)) {
++      return *hint;
++    }
++  }
++
++  if (has_extra_output_use || fusion->IsCustomFusion() ||
++      output_source->opcode() != HloOpcode::kDynamicUpdateSlice ||
++      !output_source_idx.empty() || crossed_nested_fusion_below_output_source) {
++    return false;
++  }
++
++  using Pos = std::pair<const HloInstruction*, ShapeIndex>;
++  std::queue<Pos> base_q;
++  absl::flat_hash_set<Pos> base_visited;
++  auto enqueue_base = [&](const HloInstruction* inst, ShapeIndex idx) {
++    Pos pos{inst, std::move(idx)};
++    if (base_visited.insert(pos).second) {
++      base_q.push(std::move(pos));
++    }
++  };
++
++  std::queue<Pos> slice_q;
++  absl::flat_hash_set<Pos> slice_visited;
++  auto enqueue_slice = [&](const HloInstruction* inst, ShapeIndex idx) {
++    Pos pos{inst, std::move(idx)};
++    if (slice_visited.insert(pos).second) {
++      slice_q.push(std::move(pos));
++    }
++  };
++
++  for (const auto& [inst, idx] : input_spine) {
++    enqueue_base(inst, idx);
++  }
++
++  while (!base_q.empty()) {
++    auto [base_inst, base_idx] = std::move(base_q.front());
++    base_q.pop();
++    if (base_inst == root) {
++      return false;
++    }
++    for (const HloInstruction* u : base_inst->users()) {
++      if (!base_idx.empty()) {
++        if (u->opcode() != HloOpcode::kGetTupleElement) {
++          return false;
++        }
++        if (u->tuple_index() != base_idx.front()) {
++          continue;
++        }
++        enqueue_base(u, ShapeIndex(base_idx.begin() + 1, base_idx.end()));
++        continue;
++      }
++      if (u == output_source) {
++        if (u->OperandIndices(base_inst).size() != 1 ||
++            u->operand(0) != base_inst) {
++          return false;
++        }
++        continue;
++      }
++      if (u->opcode() == HloOpcode::kTuple) {
++        for (int64_t op_no : u->OperandIndices(base_inst)) {
++          enqueue_base(u, ShapeIndex{op_no});
++        }
++        continue;
++      }
++      if (alias_info->IsNoOpForAliasAnalysis(u) ||
++          (u->opcode() == HloOpcode::kReshape &&
++           ShapeUtil::ReshapeIsBitcast(u->operand(0)->shape(), u->shape()))) {
++        enqueue_base(u, ShapeIndex{});
++        continue;
++      }
++      if (IsMatchingInPlaceDusReadSlice(u, base_inst, output_source)) {
++        enqueue_slice(u, ShapeIndex{});
++        continue;
++      }
++      return false;
++    }
++  }
++
++  while (!slice_q.empty()) {
++    auto [slice_inst, slice_idx] = std::move(slice_q.front());
++    slice_q.pop();
++    if (slice_inst == root) {
++      return false;
++    }
++    for (const HloInstruction* u : slice_inst->users()) {
++      if (!slice_idx.empty()) {
++        if (u->opcode() != HloOpcode::kGetTupleElement) {
++          return false;
++        }
++        if (u->tuple_index() != slice_idx.front()) {
++          continue;
++        }
++        enqueue_slice(u, ShapeIndex(slice_idx.begin() + 1, slice_idx.end()));
++        continue;
++      }
++      if (u == output_source) {
++        if (u->OperandIndices(slice_inst).size() != 1 ||
++            u->operand(1) != slice_inst) {
++          return false;
++        }
++        continue;
++      }
++      if (u->opcode() == HloOpcode::kTuple) {
++        for (int64_t op_no : u->OperandIndices(slice_inst)) {
++          enqueue_slice(u, ShapeIndex{op_no});
++        }
++        continue;
++      }
++      if (u->opcode() == HloOpcode::kBitcast ||
++          (u->opcode() == HloOpcode::kReshape &&
++           ShapeUtil::ReshapeIsBitcast(u->operand(0)->shape(), u->shape()))) {
++        enqueue_slice(u, ShapeIndex{});
++        continue;
++      }
++      if (u->opcode() == HloOpcode::kCopy) {
++        return false;
++      }
++      bool all_elementwise = true;
++      for (int64_t op_no : u->OperandIndices(slice_inst)) {
++        if (!u->IsElementwiseOnOperand(op_no)) {
++          all_elementwise = false;
++          break;
++        }
++      }
++      if (all_elementwise) {
++        enqueue_slice(u, ShapeIndex{});
++        continue;
++      }
++      return false;
++    }
++  }
++
++  return true;
++}
++
+ // CalculatePostOrderSchedule traverses a module and assign a ordinal to each
+ // instruction based the postorder dependency.
+ int64_t CalculatePostOrderScheduleHelper(
+@@ -143,6 +489,22 @@ absl::flat_hash_map<HloInstruction*, int64_t> CalculatePostOrderSchedule(
+   return map;
+ }
+ 
++// Mirrors `MayUseOperandValue` in `hlo_value.cc`: instructions that pass nested
++// or tuple values through transparently do not record an `HloUse` unless they
++// are a computation root holding `operand_value`.
++bool MayUseOperandValue(const ShapeIndex& operand_index,
++                        const HloInstruction* user) {
++  switch (user->opcode()) {
++    case HloOpcode::kGetTupleElement:
++    case HloOpcode::kCopy:
++      return operand_index.empty();
++    case HloOpcode::kTuple:
++      return false;
++    default:
++      return true;
++  }
++}
++
+ }  // namespace
+ using absl::StrAppend;
+ using absl::StrCat;
+@@ -1923,16 +2285,18 @@ absl::Status HloDataflowAnalysis::Verify() const {
+ bool HloDataflowAnalysis::DoesNotUseOperandBuffer(
+     const HloInstruction* operand, const ShapeIndex& index,
+     const HloInstruction* user) const {
+-  // Return false if no value at 'operand' and 'index' is used at 'user'.
++  // Return false if any value at 'operand' and 'index' is used at 'user'.
+   for (const HloValue* value : GetValueSet(operand, index).values()) {
+     for (const HloUse& use : value->GetUses()) {
+       if (use.instruction == user) {
+         if (user->IsLoopFusion()) {
+           HloInstruction* fusion_param =
+               user->fused_parameter(use.operand_number);
+-          const HloValue& value =
+-              GetValueDefinedAt(fusion_param, use.operand_index);
+-          return value.GetUses().empty();
++          if (GetValueDefinedAt(fusion_param, use.operand_index)
++                  .GetUses()
++                  .empty()) {
++            continue;
++          }
+         }
+         return false;
+       }
+@@ -1997,21 +2361,9 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
+   // Check that operand and user emit the same shape and layout.
+   if (shapes_equal) {
+     // Must-alias relationship returns true for in-place operations (DUS and DUS
+-    // fusions), regardless of the backend.
+-    // Cache uses of value and alias_info->GetInPlaceInputOutputPairs to speed
+-    // up repeated calls.
+-    auto [operand_it, operand_inserted] =
+-        cache_share_buffer_with_operand_.try_emplace(
+-            std::make_pair(operand, operand_index),
+-            absl::flat_hash_set<HloUse>());
+-    if (operand_inserted) {
+-      // Iterate over all values in the value set since pipelining or loop
+-      // crossing can introduce multiple values.
+-      for (const HloValue* val : GetValueSet(operand, operand_index).values()) {
+-        auto uses = val->GetUses();
+-        operand_it->second.insert(uses.begin(), uses.end());
+-      }
+-    }
++    // fusions), regardless of the backend, provided `operand` is not also read
++    // through another operand position (unless disjoint read/write regions are
++    // guaranteed).
+     auto [user_it, user_inserted] = cache_share_buffer_with_user_.try_emplace(
+         user, absl::flat_hash_map<ShapeIndex, std::vector<HloOperandIndex>>());
+     if (user_inserted) {
+@@ -2022,14 +2374,28 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
+             operand_and_output_index.first);
+       }
+     }
+-    auto& uses = operand_it->second;
+-    auto& user_pairs = user_it->second;
++    const auto& user_pairs = user_it->second;
+     auto pairs_it = user_pairs.find(user_index);
+     if (pairs_it != user_pairs.end()) {
+-      for (const auto& operand_index : pairs_it->second) {
+-        if (uses.contains(HloUse{user, operand_index.operand_number,
+-                                 operand_index.operand_index})) {
+-          return true;
++      const auto* fusion = DynCast<HloFusionInstruction>(user);
++      for (const HloOperandIndex& in_place_operand : pairs_it->second) {
++        if (user->operand(in_place_operand.operand_number) == operand &&
++            in_place_operand.operand_index == operand_index) {
++          if (HasDisjointReadWriteRegions(user)) {
++            return true;
++          }
++          if (user->OperandIndices(operand).size() != 1) {
++            return alias_info
++                ->MayAlias(operand, operand_index, user, user_index)
++                .value_or(false);
++          }
++          if (fusion == nullptr || HasExplicitFusionOutputToOperandAliasing(
++                                       fusion, in_place_operand, user_index)) {
++            return true;
++          }
++          return CanFusionInPlaceParameterShareBuffer(fusion, in_place_operand,
++                                                      user_index, alias_info,
++                                                      operand, operand_index);
+         }
+       }
+     }
+@@ -2045,18 +2411,24 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
+   }
+ 
+   if (user->opcode() == HloOpcode::kFusion) {
+-    HloInstruction* fusion_param =
+-        user->fused_parameter(user->operand_index(operand));
+-    const HloValue& fusion_param_value =
+-        GetValueDefinedAt(fusion_param, operand_index);
+-
+     if (user->IsLoopFusion() || user->IsInputFusion()) {
+-      return AreTransitiveUsesElementwiseOrTuple(fusion_param);
++      return absl::c_all_of(user->OperandIndices(operand),
++                            [&](int64_t operand_number) {
++                              return AreTransitiveUsesElementwiseOrTuple(
++                                  user->fused_parameter(operand_number));
++                            });
+     }
+ 
+     if (user->IsOutputFusion() &&
+         user->fused_expression_root()->opcode() == HloOpcode::kAdd) {
+       // Output fusion with kAdd fused root.
++      const auto operand_indices = user->OperandIndices(operand);
++      if (operand_indices.size() != 1) {
++        return false;
++      }
++      HloInstruction* fusion_param = user->fused_parameter(operand_indices[0]);
++      const HloValue& fusion_param_value =
++          GetValueDefinedAt(fusion_param, operand_index);
+ 
+       // Check if one operand of kAdd fused root is kDot or kConvolution.
+       auto* add = user->fused_expression_root();
+@@ -2153,7 +2525,36 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
+ 
+   // Loop fusions that contain transposing copies won't reach here as they have
+   // different layouts, which fails the check in the beginning of this function.
+-  return user->IsElementwiseOnOperand(user->operand_index(operand));
++  return absl::c_all_of(user->OperandIndices(operand),
++                        [&](int64_t operand_number) {
++                          return user->IsElementwiseOnOperand(operand_number);
++                        });
++}
++
++bool HloDataflowAnalysis::CanShareOperandValueBufferWithUser(
++    const HloValue& operand_value, HloInstruction* user,
++    const ShapeIndex& user_index, const AliasInfo* alias_info) const {
++  const auto is_root_position = [&]() {
++    return user->IsRoot() && absl::c_any_of(operand_value.positions(),
++                                            [user](const HloPosition& pos) {
++                                              return pos.instruction == user;
++                                            });
++  };
++  bool used_by_user = false;
++  for (const HloPosition& position : operand_value.positions()) {
++    if (!user->IsUserOf(position.instruction)) {
++      continue;
++    }
++    if (!MayUseOperandValue(position.index, user) && !is_root_position()) {
++      continue;
++    }
++    if (!CanShareOperandBufferWithUser(position.instruction, position.index,
++                                       user, user_index, alias_info)) {
++      return false;
++    }
++    used_by_user = true;
++  }
++  return used_by_user;
+ }
+ 
+ absl::Status HloDataflowPropagation::ForEachCallBoundaryWithStatus(
+diff --git a/xla/hlo/analysis/hlo_dataflow_analysis.h b/xla/hlo/analysis/hlo_dataflow_analysis.h
+index 34f6259a2b..f88eba6531 100644
+--- a/xla/hlo/analysis/hlo_dataflow_analysis.h
++++ b/xla/hlo/analysis/hlo_dataflow_analysis.h
+@@ -185,6 +185,17 @@ class HloDataflowAnalysis {
+                                      const ShapeIndex& user_index,
+                                      const AliasInfo* alias_info) const;
+ 
++  // Returns true if 'user' (at 'user_index') can share the buffer of
++  // 'operand_value'. The user may read the value through several positions
++  // (e.g. an instruction and a bitcast of it) or through several operands, and
++  // all of them are backed by the same buffer. So this returns true only if
++  // 'user' uses 'operand_value' at least once and every such use allows
++  // sharing according to CanShareOperandBufferWithUser.
++  bool CanShareOperandValueBufferWithUser(const HloValue& operand_value,
++                                          HloInstruction* user,
++                                          const ShapeIndex& user_index,
++                                          const AliasInfo* alias_info) const;
++
+   const HloModule& module() const { return module_; }
+ 
+   // Returns true if the operation is the start/done of an asynchronous
+@@ -367,14 +378,11 @@ class HloDataflowAnalysis {
+   // An explicit graph holding phi values and edges.
+   PhiGraph phi_graph_;
+ 
+-  // Caches for CanShareOperandBufferWithUser.
++  // Cache for CanShareOperandBufferWithUser.
+   mutable absl::flat_hash_map<
+       HloInstruction*,
+       absl::flat_hash_map<ShapeIndex, std::vector<HloOperandIndex>>>
+       cache_share_buffer_with_user_;
+-  mutable absl::flat_hash_map<std::pair<HloInstruction*, ShapeIndex>,
+-                              absl::flat_hash_set<HloUse>>
+-      cache_share_buffer_with_operand_;
+ };
+ 
+ // Options controlling which computation boundaries are visited by
+diff --git a/xla/hlo/analysis/hlo_dataflow_analysis_test.cc b/xla/hlo/analysis/hlo_dataflow_analysis_test.cc
+index d276d86945..40bd594e9c 100644
+--- a/xla/hlo/analysis/hlo_dataflow_analysis_test.cc
++++ b/xla/hlo/analysis/hlo_dataflow_analysis_test.cc
+@@ -47,10 +47,12 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_schedule.h"
+ #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+ #include "xla/hlo/testlib/test.h"
++#include "xla/hlo/testlib/verified_hlo_module.h"
+ #include "xla/hlo/transforms/simplifiers/flatten_call_graph.h"
+ #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
+ #include "xla/literal_util.h"
+ #include "xla/service/hlo_buffer.h"
++#include "xla/service/hlo_module_config.h"
+ #include "xla/service/hlo_value.h"
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+@@ -3114,6 +3116,80 @@ ENTRY main {
+       dataflow_analysis->DoesNotUseOperandBuffer(tuple_param, {0}, fusion));
+ }
+ 
++TEST_F(DoesNotUseOperandBufferTest, LoopFusionDeadAndLiveUsesOfSameValue) {
++  absl::string_view hlo_str = R"hlo(
++HloModule LoopFusionDeadAndLiveUsesOfSameValue
++
++fused_tuple_use {
++  p0 = (f32[8], f32[8]) parameter(0)
++  gte1 = f32[8] get-tuple-element(p0), index=1
++  ROOT neg = f32[8] negate(gte1)
++}
++
++fused_multi_operand_use {
++  p0 = (f32[8], f32[8]) parameter(0)
++  gte1 = f32[8] get-tuple-element(p0), index=1
++  p1 = f32[8] parameter(1)
++  ROOT add = f32[8] add(gte1, p1)
++}
++
++fused_dead_only {
++  p0 = (f32[8], f32[8]) parameter(0)
++  gte1 = f32[8] get-tuple-element(p0), index=1
++  ROOT neg = f32[8] negate(gte1)
++}
++
++ENTRY main {
++  x = f32[8] parameter(0)
++  y = f32[8] parameter(1)
++  tup_xx = (f32[8], f32[8]) tuple(x, x)
++  fusion_tuple = f32[8] fusion(tup_xx), kind=kLoop, calls=fused_tuple_use
++  tup_xy = (f32[8], f32[8]) tuple(x, y)
++  bc = f32[8] bitcast(x)
++  fusion_multi = f32[8] fusion(tup_xy, bc), kind=kLoop, calls=fused_multi_operand_use
++  fusion_dead = f32[8] fusion(tup_xy), kind=kLoop, calls=fused_dead_only
++  ROOT out = (f32[8], f32[8], f32[8]) tuple(fusion_tuple, fusion_multi, fusion_dead)
++}
++)hlo";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* y = FindInstruction(module.get(), "y");
++  HloInstruction* tup_xx = FindInstruction(module.get(), "tup_xx");
++  HloInstruction* fusion_tuple = FindInstruction(module.get(), "fusion_tuple");
++  HloInstruction* tup_xy = FindInstruction(module.get(), "tup_xy");
++  HloInstruction* bc = FindInstruction(module.get(), "bc");
++  HloInstruction* fusion_multi = FindInstruction(module.get(), "fusion_multi");
++  HloInstruction* fusion_dead = FindInstruction(module.get(), "fusion_dead");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  // Even though `x`'s first use at `fusion_tuple` (tuple index 0) is dead, `x`
++  // is still read through tuple index 1.
++  EXPECT_FALSE(dataflow_analysis->DoesNotUseOperandBuffer(x, {}, fusion_tuple));
++  EXPECT_FALSE(
++      dataflow_analysis->DoesNotUseOperandBuffer(tup_xx, {0}, fusion_tuple));
++  EXPECT_FALSE(
++      dataflow_analysis->DoesNotUseOperandBuffer(tup_xx, {1}, fusion_tuple));
++
++  // Even though `x`'s first use at `fusion_multi` (operand 0, tuple index 0)
++  // is dead, `x`'s buffer is still read through operand 1 (`bc`).
++  EXPECT_FALSE(dataflow_analysis->DoesNotUseOperandBuffer(x, {}, fusion_multi));
++  EXPECT_FALSE(
++      dataflow_analysis->DoesNotUseOperandBuffer(tup_xy, {0}, fusion_multi));
++  EXPECT_FALSE(
++      dataflow_analysis->DoesNotUseOperandBuffer(bc, {}, fusion_multi));
++
++  // When `x` is only passed in the dead tuple slot, its buffer is unused.
++  EXPECT_TRUE(dataflow_analysis->DoesNotUseOperandBuffer(x, {}, fusion_dead));
++  EXPECT_TRUE(
++      dataflow_analysis->DoesNotUseOperandBuffer(tup_xy, {0}, fusion_dead));
++  EXPECT_FALSE(dataflow_analysis->DoesNotUseOperandBuffer(y, {}, fusion_dead));
++  EXPECT_FALSE(
++      dataflow_analysis->DoesNotUseOperandBuffer(tup_xy, {1}, fusion_dead));
++}
++
+ class CanShareOperandBufferWithUserTest
+     : public HloHardwareIndependentTestBase {
+  protected:
+@@ -3173,6 +3249,322 @@ ENTRY main {
+       param0, {}, fusion, {}, &alias_info_));
+ }
+ 
++TEST_F(CanShareOperandBufferWithUserTest,
++       LoopFusionWithDuplicateOperandNonElementwiseOnSecondParamCantAlias) {
++  std::string hlo_str = R"(
++HloModule LoopFusionWithDuplicateOperandNonElementwiseOnSecondParamCantAlias
++
++fused_computation {
++  p0 = f32[2,2] parameter(0)
++  p1 = f32[2,2] parameter(1)
++  reverse = f32[2,2] reverse(p1), dimensions={0,1}
++  ROOT add = f32[2,2] add(p0, reverse)
++}
++
++ENTRY main {
++  param0 = f32[2,2] parameter(0)
++  ROOT fusion = f32[2,2] fusion(param0, param0), kind=kLoop, calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
++                                        hlo_str, GetModuleConfigForTest()));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  auto dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceDusFusionWithAliasedBitcastSecondParamCantShareValueBuffer) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceDusFusionWithAliasedBitcastSecondParamCantShareValueBuffer
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  p1 = f32[8] parameter(1)
++  p2 = s32[] parameter(2)
++  rev = f32[8] reverse(p1), dimensions={0}
++  slice = f32[3] slice(rev), slice={[0:3]}
++  ROOT dus = f32[8] dynamic-update-slice(p0, slice, p2)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  bc = f32[8] bitcast(param0)
++  starts = s32[] constant(2)
++  ROOT fusion = f32[8] fusion(param0, bc, starts), kind=kLoop,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* bc = FindInstruction(module.get(), "bc");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      bc, {}, fusion, {}, &alias_info_));
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandValueBufferWithUser(
++      dataflow_analysis->GetValueDefinedAt(param0), fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceDusFusionWithDuplicateOperandNonElementwiseCantAlias) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceDusFusionWithDuplicateOperandNonElementwiseCantAlias
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  p1 = f32[8] parameter(1)
++  p2 = s32[] parameter(2)
++  rev = f32[8] reverse(p1), dimensions={0}
++  slice = f32[3] slice(rev), slice={[0:3]}
++  ROOT dus = f32[8] dynamic-update-slice(p0, slice, p2)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  starts = s32[] constant(2)
++  ROOT fusion = f32[8] fusion(param0, param0, starts), kind=kLoop,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {}, &alias_info_));
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandValueBufferWithUser(
++      dataflow_analysis->GetValueDefinedAt(param0), fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceDusFusionSameParamAsBaseAndUpdateCantAlias) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceDusFusionSameParamAsBaseAndUpdateCantAlias
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  zero = s32[] constant(0)
++  ROOT dus = f32[8] dynamic-update-slice(p0, p0, zero)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  ROOT fusion = f32[8] fusion(param0), kind=kLoop, calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceDusFusionMismatchedDynamicSliceCantAlias) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceDusFusionMismatchedDynamicSliceCantAlias
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  zero = s32[] constant(0)
++  one = s32[] constant(1)
++  ds = f32[4] dynamic-slice(p0, one), dynamic_slice_sizes={4}
++  neg = f32[4] negate(ds)
++  ROOT dus = f32[8] dynamic-update-slice(p0, neg, zero)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  ROOT fusion = f32[8] fusion(param0), kind=kLoop, calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceMultiOutputDusFusionWithExtraUseCantAlias) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceMultiOutputDusFusionWithExtraUseCantAlias
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  p1 = f32[4] parameter(1)
++  zero = s32[] constant(0)
++  dus = f32[8] dynamic-update-slice(p0, p1, zero)
++  neg = f32[8] negate(p0)
++  ROOT out = (f32[8], f32[8]) tuple(dus, neg)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  param1 = f32[4] parameter(1)
++  ROOT fusion = (f32[8], f32[8]) fusion(param0, param1), kind=kLoop,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {0}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceDusFusionMatchingDynamicSliceCanAlias) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceDusFusionMatchingDynamicSliceCanAlias
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  p1 = s32[] parameter(1)
++  ds = f32[4] dynamic-slice(p0, p1), dynamic_slice_sizes={4}
++  neg = f32[4] negate(ds)
++  ROOT dus = f32[8] dynamic-update-slice(p0, neg, p1)
++}
++
++ENTRY main {
++  param0 = f32[8] parameter(0)
++  param1 = s32[] parameter(1)
++  ROOT fusion = f32[8] fusion(param0, param1), kind=kLoop,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* param0 = FindInstruction(module.get(), "param0");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_TRUE(dataflow_analysis->CanShareOperandBufferWithUser(
++      param0, {}, fusion, {}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceCollectivePermuteStartDuplicateOperandRequiresDisjointRegions) {
++  absl::string_view hlo_str = R"(
++HloModule InPlaceCollectivePermuteStartDuplicateOperand, replica_count=2
++
++ENTRY main {
++  buf0 = f32[128,128]{1,0} parameter(0)
++  buf1 = f32[128,128]{1,0} parameter(1)
++  zero = s32[] constant(0)
++  sixty_four = s32[] constant(64)
++  read_offset = (s32[], s32[]) tuple(zero, zero)
++  write_offset = (s32[], s32[]) tuple(sixty_four, zero)
++  cp_no_attr = (f32[128,128]{1,0}, f32[128,128]{1,0}, u32[], u32[])
++      collective-permute-start(buf0, buf0, read_offset, write_offset),
++      channel_id=1, source_target_pairs={{0,1}}, slice_sizes={{64,128}}
++  done0 = f32[128,128]{1,0} collective-permute-done(cp_no_attr)
++  cp_disjoint = (f32[128,128]{1,0}, f32[128,128]{1,0}, u32[], u32[])
++      collective-permute-start(buf1, buf1, read_offset, write_offset),
++      channel_id=2, source_target_pairs={{0,1}}, slice_sizes={{64,128}},
++      frontend_attributes={xla_disjoint_read_write_regions="true"}
++  done1 = f32[128,128]{1,0} collective-permute-done(cp_disjoint)
++  ROOT out = (f32[128,128]{1,0}, f32[128,128]{1,0}) tuple(done0, done1)
++}
++)";
++  HloModuleConfig config = GetModuleConfigForTest(/*replica_count=*/2);
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str, config));
++
++  HloInstruction* buf0 = FindInstruction(module.get(), "buf0");
++  HloInstruction* buf1 = FindInstruction(module.get(), "buf1");
++  HloInstruction* cp_no_attr = FindInstruction(module.get(), "cp_no_attr");
++  HloInstruction* cp_disjoint = FindInstruction(module.get(), "cp_disjoint");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      buf0, {}, cp_no_attr, {1}, &alias_info_));
++  EXPECT_TRUE(dataflow_analysis->CanShareOperandBufferWithUser(
++      buf1, {}, cp_disjoint, {1}, &alias_info_));
++}
++
++TEST_F(CanShareOperandBufferWithUserTest,
++       InPlaceAsyncStartDuplicateOperandChecksWrappedDisjointRegions) {
++  absl::string_view hlo_str = R"hlo(
++HloModule InPlaceAsyncStartDuplicateOperand
++
++async_no_attr {
++  p0 = f32[8] parameter(0)
++  p1 = f32[8] parameter(1)
++  ROOT cc = f32[8] custom-call(p0, p1), custom_call_target="foo"
++}
++
++async_wrapped_disjoint {
++  p0 = f32[8] parameter(0)
++  p1 = f32[8] parameter(1)
++  ROOT cc = f32[8] custom-call(p0, p1), custom_call_target="foo",
++      frontend_attributes={xla_disjoint_read_write_regions="true"}
++}
++
++ENTRY main {
++  buf0 = f32[8] parameter(0)
++  buf1 = f32[8] parameter(1)
++  start_no_attr = ((f32[8], f32[8]), f32[8], u32[])
++      async-start(buf0, buf0), calls=async_no_attr,
++      output_to_operand_aliasing={{1}: (0, {})}
++  done0 = f32[8] async-done(start_no_attr)
++  start_disjoint = ((f32[8], f32[8]), f32[8], u32[])
++      async-start(buf1, buf1), calls=async_wrapped_disjoint,
++      output_to_operand_aliasing={{1}: (0, {})}
++  done1 = f32[8] async-done(start_disjoint)
++  ROOT out = (f32[8], f32[8]) tuple(done0, done1)
++}
++)hlo";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_str));
++
++  HloInstruction* buf0 = FindInstruction(module.get(), "buf0");
++  HloInstruction* buf1 = FindInstruction(module.get(), "buf1");
++  HloInstruction* start_no_attr =
++      FindInstruction(module.get(), "start_no_attr");
++  HloInstruction* start_disjoint =
++      FindInstruction(module.get(), "start_disjoint");
++
++  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
++
++  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
++      buf0, {}, start_no_attr, {1}, &alias_info_));
++  EXPECT_TRUE(dataflow_analysis->CanShareOperandBufferWithUser(
++      buf1, {}, start_disjoint, {1}, &alias_info_));
++}
++
+ TEST_F(CanShareOperandBufferWithUserTest,
+        MultiOutputFusionCanAliasOperandBuffer) {
+   std::string hlo_str = R"(
+diff --git a/xla/service/buffer_assignment.cc b/xla/service/buffer_assignment.cc
+index ab793ebece..781e374633 100644
+--- a/xla/service/buffer_assignment.cc
++++ b/xla/service/buffer_assignment.cc
+@@ -2097,28 +2097,22 @@ bool BufferAssigner::LiveRangeInterferes(
+   DCHECK((assignment->hlo_live_range().total_order_scheduled()));
+ 
+   // An HloValue can hold multiple instruction positions during its lifetime
+-  // (e.g. when passed into a while loop tuple or bitcast view).
+-  // operand_live_range.end_position points to the last instruction in
+-  // schedule order (which may be a tuple instruction inside a loop body).
+-  // However, a downstream user instruction might directly consume a
+-  // different position of the value (such as the definition instruction
+-  // before the loop). Therefore, we must check all positions of the
+-  // HloValue to see if any instruction can share its buffer with the user.
++  // (e.g. when passed into a while loop tuple or bitcast view). The user does
++  // not necessarily consume the position at which the live range of the value
++  // ends (which may be a tuple instruction inside a loop body). It may consume
++  // a different position (such as the definition instruction before the loop),
++  // or several positions (such as an instruction and a bitcast of it). All
++  // positions are backed by the same buffer, so the user can only share that
++  // buffer if every position that it consumes allows it.
+   auto can_share_as_operand = [&assignment, this](
+                                   const HloValue* user_value,
+                                   const HloValue* operand_value) {
+     if (user_value->instruction()->opcode() == HloOpcode::kCopy) {
+       return false;
+     }
+-    for (const HloPosition& operand_pos : operand_value->positions()) {
+-      if (user_value->instruction()->IsUserOf(operand_pos.instruction) &&
+-          assignment->dataflow_analysis().CanShareOperandBufferWithUser(
+-              operand_pos.instruction, operand_pos.index,
+-              user_value->instruction(), user_value->index(), alias_info_)) {
+-        return true;
+-      }
+-    }
+-    return false;
++    return assignment->dataflow_analysis().CanShareOperandValueBufferWithUser(
++        *operand_value, user_value->instruction(), user_value->index(),
++        alias_info_);
+   };
+ 
+   bool interferes = false;
+diff --git a/xla/service/buffer_assignment_test.cc b/xla/service/buffer_assignment_test.cc
+index 60bb3cced0..2e4859a676 100644
+--- a/xla/service/buffer_assignment_test.cc
++++ b/xla/service/buffer_assignment_test.cc
+@@ -1340,6 +1340,216 @@ ENTRY main {
+   EXPECT_EQ(x_inter_buffer.index(), x_final_buffer.index());
+ }
+ 
++TEST_F(BufferAssignmentTest, ValueAlsoReadThroughBitcastIsNotReusedForOutput) {
++  // The fusion reads the value defined by `x` twice: elementwise through `x`,
++  // and in reversed order through `view`, a bitcast of `x`. The fusion's result
++  // must not be placed in the buffer of `x`: the fusion would overwrite
++  // elements that it still has to read.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[8]{0} parameter(0)
++  p1 = s32[1,8]{1,0} parameter(1)
++  reverse = s32[1,8]{1,0} reverse(p1), dimensions={1}
++  bitcast = s32[8]{0} bitcast(reverse)
++  ROOT add = s32[8]{0} add(p0, bitcast)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  view = s32[1,8]{1,0} bitcast(x)
++  ROOT out = s32[8]{0} fusion(x, view), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice out_slice,
++                       buffers->GetUniqueSlice(out, {}));
++  EXPECT_FALSE(x_slice.OverlapsWith(out_slice));
++}
++
++TEST_F(BufferAssignmentTest,
++       ValueReadElementwiseOnlyThroughBitcastIsNotReusedForOutput) {
++  // Like ValueAlsoReadThroughBitcastIsNotReusedForOutput, but mirrored: `view`
++  // is read elementwise and has the shape of the result, and `x` itself is read
++  // in reversed order.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[1,8]{1,0} parameter(0)
++  p1 = s32[8]{0} parameter(1)
++  reverse = s32[8]{0} reverse(p1), dimensions={0}
++  bitcast = s32[1,8]{1,0} bitcast(reverse)
++  ROOT add = s32[1,8]{1,0} add(p0, bitcast)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  view = s32[1,8]{1,0} bitcast(x)
++  ROOT out = s32[1,8]{1,0} fusion(view, x), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice out_slice,
++                       buffers->GetUniqueSlice(out, {}));
++  EXPECT_FALSE(x_slice.OverlapsWith(out_slice));
++}
++
++TEST_F(BufferAssignmentTest, ValueReadTwiceThroughTupleIsNotReusedForOutput) {
++  // The fusion reads the value defined by `x` through two get-tuple-elements of
++  // the same shape, so it is not a user of `x` itself. It reads `gte0`
++  // elementwise and `gte1` in reversed order.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[8]{0} parameter(0)
++  p1 = s32[8]{0} parameter(1)
++  reverse = s32[8]{0} reverse(p1), dimensions={0}
++  ROOT add = s32[8]{0} add(p0, reverse)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  tuple = (s32[8]{0}, s32[8]{0}) tuple(x, x)
++  gte0 = s32[8]{0} get-tuple-element(tuple), index=0
++  gte1 = s32[8]{0} get-tuple-element(tuple), index=1
++  ROOT out = s32[8]{0} fusion(gte0, gte1), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice out_slice,
++                       buffers->GetUniqueSlice(out, {}));
++  EXPECT_FALSE(x_slice.OverlapsWith(out_slice));
++}
++
++TEST_F(BufferAssignmentTest, ValueReadElementwiseTwiceThroughTupleIsReused) {
++  // Like ValueReadTwiceThroughTupleIsNotReusedForOutput, but the fusion reads
++  // both get-tuple-elements elementwise, so its result can be placed in the
++  // buffer of `x`.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[8]{0} parameter(0)
++  p1 = s32[8]{0} parameter(1)
++  ROOT add = s32[8]{0} add(p0, p1)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  tuple = (s32[8]{0}, s32[8]{0}) tuple(x, x)
++  gte0 = s32[8]{0} get-tuple-element(tuple), index=0
++  gte1 = s32[8]{0} get-tuple-element(tuple), index=1
++  ROOT out = s32[8]{0} fusion(gte0, gte1), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice out_slice,
++                       buffers->GetUniqueSlice(out, {}));
++  EXPECT_EQ(x_slice, out_slice);
++}
++
++TEST_F(BufferAssignmentTest, ValueAlsoReadThroughBitcastIsNotReusedForTemp) {
++  // Like ValueAlsoReadThroughBitcastIsNotReusedForOutput, but the fusion's
++  // result is a temporary, so both buffers are placed by the heap simulator.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[8]{0} parameter(0)
++  p1 = s32[1,8]{1,0} parameter(1)
++  reverse = s32[1,8]{1,0} reverse(p1), dimensions={1}
++  bitcast = s32[8]{0} bitcast(reverse)
++  ROOT add = s32[8]{0} add(p0, bitcast)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  view = s32[1,8]{1,0} bitcast(x)
++  temp = s32[8]{0} fusion(x, view), kind=kLoop, calls=fused_computation
++  ROOT out = s32[4]{0} slice(temp), slice={[0:8:2]}
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* temp = FindInstruction(module.get(), "temp");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice temp_slice,
++                       buffers->GetUniqueSlice(temp, {}));
++  EXPECT_FALSE(x_slice.OverlapsWith(temp_slice));
++}
++
++TEST_F(BufferAssignmentTest, ValuePassedTwiceAsOperandIsNotReusedForOutput) {
++  // The fusion reads `x` through two distinct operand slots of the same shape:
++  // `p0` is read elementwise, while `p1` is read in reversed order.
++  const char* const hlo_text = R"(
++HloModule test, is_scheduled=true
++
++fused_computation {
++  p0 = s32[8]{0} parameter(0)
++  p1 = s32[8]{0} parameter(1)
++  reverse = s32[8]{0} reverse(p1), dimensions={0}
++  ROOT add = s32[8]{0} add(p0, reverse)
++}
++
++ENTRY main {
++  a = s32[8]{0} parameter(0)
++  x = s32[8]{0} negate(a)
++  ROOT out = s32[8]{0} fusion(x, x), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* x = FindInstruction(module.get(), "x");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  auto buffers = RunBufferAssignmentWithSequentialOrdering(module.get());
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice x_slice,
++                       buffers->GetUniqueSlice(x, {}));
++  ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice out_slice,
++                       buffers->GetUniqueSlice(out, {}));
++  EXPECT_FALSE(x_slice.OverlapsWith(out_slice));
++}
++
+ TEST_F(BufferAssignmentTest, CanUseAllocationDoesNotMixInputOutputColors) {
+   // Even when a backend allows S(0) temps to be assigned to S(1) temp
+   // allocations, input/output allocations must match raw colors. They are
+diff --git a/xla/service/copy_insertion_test.cc b/xla/service/copy_insertion_test.cc
+index f641999989..9e17a42e94 100644
+--- a/xla/service/copy_insertion_test.cc
++++ b/xla/service/copy_insertion_test.cc
+@@ -3459,6 +3459,44 @@ ENTRY main {
+   EXPECT_EQ(CountCopies(*module), 1);
+ }
+ 
++TEST_F(CopyInsertionTest,
++       FusedDynamicUpdateSliceMultiPositionBitcastRequiresCopy) {
++  absl::string_view hlo_string = R"(
++HloModule Module
++
++fused_computation {
++  p0 = f32[8] parameter(0)
++  p1 = f32[8] parameter(1)
++  rev = f32[8] reverse(p1), dimensions={0}
++  slice = f32[3] slice(rev), slice={[0:3]}
++  c0 = s32[] constant(0)
++  ROOT dus = f32[8] dynamic-update-slice(p0, slice, c0)
++}
++
++ENTRY main {
++  param = f32[8] parameter(0)
++  negate = f32[8] negate(param)
++  bc = f32[8] bitcast(negate)
++  ROOT fusion = f32[8] fusion(negate, bc), kind=kLoop, calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_string));
++  InsertCopies(module.get());
++  EXPECT_EQ(CountCopies(*module), 1);
++  EXPECT_THAT(module->entry_computation()->root_instruction(),
++              op::Fusion(op::Copy(op::Negate()), op::Bitcast(op::Negate())));
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> special_case_module,
++                       ParseAndReturnVerifiedModule(hlo_string));
++  CopyInsertion copy_insertion(&alias_info_);
++  ASSERT_THAT(copy_insertion.AddSpecialCaseCopies(special_case_module.get()),
++              ::absl_testing::IsOk());
++  EXPECT_EQ(CountCopies(*special_case_module), 1);
++  EXPECT_THAT(special_case_module->entry_computation()->root_instruction(),
++              op::Fusion(op::Negate(), op::Copy(op::Bitcast(op::Negate()))));
++}
++
+ TEST_F(CopyInsertionTest, MultiOutputFusedDynamicUpdateSliceCopy) {
+   // Tests multi-output fusion with two DUS outputs, requiring two copies.
+   absl::string_view hlo_string = R"(
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index d10ad3500e..483aa5b844 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -3200,8 +3200,8 @@ cc_library(
+     hdrs = ["alias_info.h"],
+     compatible_with = get_compatible_with_portable(),
+     deps = [
+-        ":backend_configs_cc",
+         ":hlo_fusion_analysis",
++        ":ir_emission_utils",
+         "//xla:shape_util",
+         "//xla/hlo/analysis:alias_info",
+         "//xla/hlo/ir:hlo",
+@@ -3220,6 +3220,7 @@ xla_cc_test(
+         ":alias_info",
+         ":gpu_device_info_for_tests",
+         "//xla:shape_util",
++        "//xla/hlo/analysis:hlo_dataflow_analysis",
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:test",
+@@ -3255,6 +3256,7 @@ xla_cc_test(
+         ":nvptx_alias_info",
+         "//xla:shape_util",
+         "//xla/hlo/ir:hlo",
++        "//xla/hlo/parser:hlo_parser",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:test",
+         "//xla/stream_executor:device_description",
+diff --git a/xla/service/gpu/alias_info.cc b/xla/service/gpu/alias_info.cc
+index 41844eeea1..91c81fdcdc 100644
+--- a/xla/service/gpu/alias_info.cc
++++ b/xla/service/gpu/alias_info.cc
+@@ -18,6 +18,7 @@ limitations under the License.
+ #include <cstdint>
+ #include <optional>
+ #include <queue>
++#include <tuple>
+ #include <utility>
+ 
+ #include "absl/algorithm/container.h"
+@@ -29,8 +30,8 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_instructions.h"
+ #include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/primitive_util.h"
+-#include "xla/service/gpu/backend_configs.pb.h"
+ #include "xla/service/gpu/hlo_fusion_analysis.h"
++#include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
+ #include "xla/stream_executor/device_description.h"
+@@ -84,8 +85,10 @@ std::optional<bool> FusionCanShareBufferHint(
+   // being on this path).
+   // In addition to that, we can also share the buffer for Scatter fusions if
+   // the scatter is the single output of the fusion.
+-  HloInstruction* fusion_param =
+-      user->fused_parameter(user->operand_index(operand));
++  // If 'operand' is passed to the fusion several times, all the corresponding
++  // fusion parameters read the same buffer, so we have to check the paths from
++  // all of them. This is the same as checking a single fusion parameter with
++  // the users of all of them.
+   HloInstruction* output = user->fused_expression_root();
+   for (int64_t index : user_index) {
+     if (output->opcode() != HloOpcode::kTuple) {
+@@ -97,13 +100,22 @@ std::optional<bool> FusionCanShareBufferHint(
+   if (non_bitcast_root->opcode() == HloOpcode::kBitcast) {
+     non_bitcast_root = non_bitcast_root->operand(0);
+   }
+-  std::queue<HloInstruction*> q;
+-  absl::flat_hash_set<HloInstruction*> visited;
+-  q.push(fusion_param);
+-  visited.insert(fusion_param);
++  std::queue<std::pair<HloInstruction*, bool>> q;
++  absl::flat_hash_set<HloInstruction*> non_ds_visited;
++  absl::flat_hash_set<HloInstruction*> ds_visited;
++  auto enqueue = [&](HloInstruction* instr, bool from_ds) {
++    absl::flat_hash_set<HloInstruction*>& visited_set =
++        from_ds ? ds_visited : non_ds_visited;
++    if (visited_set.insert(instr).second) {
++      q.push({instr, from_ds});
++    }
++  };
++  for (int64_t operand_number : user->OperandIndices(operand)) {
++    enqueue(user->fused_parameter(operand_number), /*from_ds=*/false);
++  }
+   bool found_path_to_output = false;
+   while (!q.empty()) {
+-    HloInstruction* hlo_operand = q.front();
++    auto [hlo_operand, from_ds] = q.front();
+     q.pop();
+     if (hlo_operand == output) {
+       found_path_to_output = true;
+@@ -116,30 +128,39 @@ std::optional<bool> FusionCanShareBufferHint(
+       continue;
+     }
+     for (HloInstruction* hlo : hlo_operand->users()) {
+-      if (visited.insert(hlo).second) {
+-        q.push(hlo);
+-      }
+       // For scatter, we can share the buffer if the path goes through one of
+       // the scatter inputs.
+-      if (hlo == non_bitcast_root && hlo->opcode() == HloOpcode::kScatter) {
++      if (!from_ds && hlo == non_bitcast_root &&
++          hlo->opcode() == HloOpcode::kScatter) {
+         int64_t num_scatter_inputs =
+             hlo->shape().IsTuple() ? hlo->shape().tuple_shapes().size() : 1;
+         if (hlo->operand_index(hlo_operand) < num_scatter_inputs &&
+             absl::c_count(hlo->operands(), hlo_operand) == 1) {
++          if (hlo->shape().IsTuple() &&
++              user_index != ShapeIndex{hlo->operand_index(hlo_operand)}) {
++            return false;
++          }
++          enqueue(hlo, /*from_ds=*/false);
+           continue;
+         }
+       }
+       // For sort, we can share the buffer if the operand appears only once. We
+       // can share it with that output buffer that corresponds to the operand.
+-      if (hlo == non_bitcast_root && hlo->opcode() == HloOpcode::kSort &&
++      if (!from_ds && hlo == non_bitcast_root &&
++          hlo->opcode() == HloOpcode::kSort &&
+           absl::c_count(hlo->operands(), hlo_operand) == 1) {
+-        if (user_index != ShapeIndex{hlo->operand_index(hlo_operand)}) {
++        if (hlo->shape().IsTuple() &&
++            user_index != ShapeIndex{hlo->operand_index(hlo_operand)}) {
+           return false;
+         }
++        enqueue(hlo, /*from_ds=*/false);
+         continue;
+       }
+-      if (non_bitcast_root->opcode() == HloOpcode::kDynamicUpdateSlice &&
++      if (!from_ds &&
++          non_bitcast_root->opcode() == HloOpcode::kDynamicUpdateSlice &&
+           hlo->opcode() == HloOpcode::kDynamicSlice &&
++          hlo->operand(0) == hlo_operand &&
++          hlo->OperandIndices(hlo_operand).size() == 1 &&
+           non_bitcast_root->operand(0) == hlo->operand(0) &&
+           hlo->shape() == non_bitcast_root->operand(1)->shape()) {
+         // We can still share the buffer in this case if the same slice is
+@@ -159,26 +180,30 @@ std::optional<bool> FusionCanShareBufferHint(
+             }
+           }
+         }
+-      } else if ((!hlo->IsElementwiseOnOperand(
+-                      hlo->operand_index(hlo_operand)) ||
+-                  hlo->opcode() == HloOpcode::kCopy) &&
+-                 hlo->opcode() != HloOpcode::kBitcast &&
+-                 hlo->opcode() != HloOpcode::kTuple && hlo != reduction_hero) {
+-        // This check also catches the case that we reach a different fusion
+-        // output, as that fusion output would have a tuple op as user, which we
+-        // do not allow here.
+-        // Even if 'hlo' is not elementwise on the operand, it is ok if we are
+-        // coming from the second operand and 'hlo' is a DynamicUpdateSlice
+-        // which is the non_bitcast_root. This corresponds to the special case
+-        // above, where we allow a DynamicSlice if it accesses the exact same
+-        // slice than the DynamicUpdateSlice. When we are coming from the first
+-        // operand, IsElementwiseOnOperand() will return true for a
+-        // DynamicUpdateSlice.
+-        if (hlo != non_bitcast_root ||
+-            hlo->opcode() != HloOpcode::kDynamicUpdateSlice ||
+-            hlo->operand_index(hlo_operand) != 1) {
+-          return false;
++        enqueue(hlo, /*from_ds=*/true);
++      } else {
++        for (int64_t op_idx : hlo->OperandIndices(hlo_operand)) {
++          if ((!hlo->IsElementwiseOnOperand(op_idx) ||
++               hlo->opcode() == HloOpcode::kCopy) &&
++              hlo->opcode() != HloOpcode::kBitcast &&
++              hlo->opcode() != HloOpcode::kTuple && hlo != reduction_hero) {
++            // This check also catches the case that we reach a different fusion
++            // output, as that fusion output would have a tuple op as user,
++            // which we do not allow here.
++            // Even if 'hlo' is not elementwise on the operand, it is ok if we
++            // are coming from the second operand after visiting a matching
++            // DynamicSlice and 'hlo' is a DynamicUpdateSlice which is the
++            // non_bitcast_root. When we are coming from the first operand,
++            // IsElementwiseOnOperand() will return true for a
++            // DynamicUpdateSlice.
++            if (!from_ds || hlo != non_bitcast_root ||
++                hlo->opcode() != HloOpcode::kDynamicUpdateSlice ||
++                op_idx != 1) {
++              return false;
++            }
++          }
+         }
++        enqueue(hlo, hlo == non_bitcast_root ? false : from_ds);
+       }
+     }
+   }
+@@ -187,12 +212,22 @@ std::optional<bool> FusionCanShareBufferHint(
+     // whether that fusion output has the same iteration order. If not, we
+     // cannot share.
+     bool other_root_was_reached = false;
++    bool reached_other_non_elementwise_root = false;
+     bool reached_root_has_transpose_hero = false;
+     for (auto [root, hero] :
+          llvm::zip(analysis.fusion_roots(), analysis.fusion_heroes())) {
+-      if (visited.find(&root.instruction()) != visited.end()) {
++      if (non_ds_visited.contains(&root.instruction()) ||
++          ds_visited.contains(&root.instruction())) {
+         if (&root.instruction() != output) {
+           other_root_was_reached = true;
++          const HloInstruction* non_bitcast_other_root = &root.instruction();
++          if (non_bitcast_other_root->opcode() == HloOpcode::kBitcast) {
++            non_bitcast_other_root = non_bitcast_other_root->operand(0);
++          }
++          if (non_bitcast_other_root != reduction_hero &&
++              !non_bitcast_other_root->IsElementwise()) {
++            reached_other_non_elementwise_root = true;
++          }
+         }
+         if (hero.opcode() == HloOpcode::kTranspose ||
+             hero.opcode() == HloOpcode::kCopy) {
+@@ -207,9 +242,10 @@ std::optional<bool> FusionCanShareBufferHint(
+       // Special case: multi-output fusions with Scatter or DynamicUpdateSlice.
+       // For Scatter, we currently do not support multi-output fusions anyway,
+       // but still handle it here. To be on the safe side, check for
+-      // !IsElementwise() instead of checking whether it is Scatter or
+-      // DynamicUpdateSlice.
++      // !IsElementwise() on both the target root and any other reached root
++      // (excluding reduction_hero).
+       if (!non_bitcast_root->IsElementwise() ||
++          reached_other_non_elementwise_root ||
+           reached_root_has_transpose_hero) {
+         return false;
+       }
+@@ -231,6 +267,36 @@ std::optional<bool> GpuAliasInfo::MayAlias(const HloInstruction* operand,
+                                            const ShapeIndex& user_index) const {
+   const HloFusionInstruction* fusion = DynCast<HloFusionInstruction>(user);
+   if (fusion != nullptr) {
++    if (GetCustomFusionConfigName(fusion) == kDynamicSliceFusionConfigName) {
++      // DynamicSliceFusionRewriterV2 creates these fusions before CopyInsertion
++      // without setting output_to_operand_aliasing, and
++      // DynamicSliceFusionV2Thunk::VerifyBufferAssignment requires the DUS
++      // output to alias its target parameter even when that parameter has
++      // additional internal uses inside the fusion.
++      if (!operand_index.empty() ||
++          fusion->OperandIndices(operand).size() != 1 ||
++          !MustAlias(operand, operand_index, fusion, user_index)) {
++        return false;
++      }
++      const HloInstruction* output = fusion->fused_expression_root();
++      ShapeIndex idx = user_index;
++      while (true) {
++        std::tie(output, idx) = FollowTupleIndirection(output, idx);
++        if (idx.empty() && IsNoOpForAliasAnalysis(output)) {
++          output = output->operand(0);
++          continue;
++        }
++        break;
++      }
++      for (const auto& [in_op, out_idx] : GetInPlaceInputOutputPairs(output)) {
++        if (out_idx == idx &&
++            output->OperandIndices(output->operand(in_op.operand_number))
++                    .size() != 1) {
++          return false;
++        }
++      }
++      return true;
++    }
+     return FusionCanShareBufferHint(operand, fusion, user_index,
+                                     device_description_);
+   }
+diff --git a/xla/service/gpu/alias_info.h b/xla/service/gpu/alias_info.h
+index 62128479ee..e277b90793 100644
+--- a/xla/service/gpu/alias_info.h
++++ b/xla/service/gpu/alias_info.h
+@@ -38,9 +38,9 @@ class GpuAliasInfo : public AliasInfo {
+                                const HloInstruction* user,
+                                const ShapeIndex& user_index) const override;
+ 
+- protected:
+   bool IsNoOpForAliasAnalysis(const HloInstruction* instruction) const override;
+ 
++ protected:
+   se::DeviceDescription device_description_;
+ };
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/alias_info_test.cc b/xla/service/gpu/alias_info_test.cc
+index bbebfa8ad3..50bfb1ef04 100644
+--- a/xla/service/gpu/alias_info_test.cc
++++ b/xla/service/gpu/alias_info_test.cc
+@@ -19,6 +19,7 @@ limitations under the License.
+ #include <optional>
+ 
+ #include "absl/log/check.h"
++#include "xla/hlo/analysis/hlo_dataflow_analysis.h"
+ #include "xla/hlo/ir/hlo_computation.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_module.h"
+@@ -54,6 +55,8 @@ class AliasInfoTest : public HloHardwareIndependentTestBase {
+     return alias_info_.MayAlias(operand, {}, fusion, user_index);
+   }
+ 
++  const GpuAliasInfo* alias_info() const { return &alias_info_; }
++
+  private:
+   const se::DeviceDescription device_description_{
+       xla::gpu::TestGpuDeviceInfo::CudaOrRocmDeviceInfo()};
+@@ -82,6 +85,53 @@ ENTRY main {
+   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
+ }
+ 
++TEST_F(AliasInfoTest, BufferCanBeSharedDuplicateOperandElementwise) {
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  param_0.1 = f32[2,3]{1,0} parameter(0)
++  param_1.1 = f32[2,3]{1,0} parameter(1)
++  ROOT add = f32[2,3]{1,0} add(param_0.1, param_1.1)
++}
++
++ENTRY main {
++  param_0 = f32[2,3]{1,0} parameter(0)
++  ROOT fusion = f32[2,3]{1,0} fusion(param_0, param_0), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
++}
++
++TEST_F(AliasInfoTest, BufferCannotBeSharedDuplicateOperandNonElementwise) {
++  // The fusion reads its operand through both parameters, elementwise through
++  // the first one and in reversed order through the second one.
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  param_0.1 = f32[2,3]{1,0} parameter(0)
++  param_1.1 = f32[2,3]{1,0} parameter(1)
++  reverse = f32[2,3]{1,0} reverse(param_1.1), dimensions={0,1}
++  ROOT add = f32[2,3]{1,0} add(param_0.1, reverse)
++}
++
++ENTRY main {
++  param_0 = f32[2,3]{1,0} parameter(0)
++  ROOT fusion = f32[2,3]{1,0} fusion(param_0, param_0), kind=kLoop, calls=fused_computation
++}
++)";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
++}
++
+ TEST_F(AliasInfoTest, BufferCanBeSharedBitcastedShape) {
+   const char* const kModuleString = R"(
+ HloModule fusion
+@@ -403,6 +453,56 @@ TEST_F(AliasInfoTest, BufferCanBeSharedVariadicScatterFusion) {
+   HloInstruction* fusion = module->entry_computation()->root_instruction();
+   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {0}));
+   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(1), {1}));
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(1), {0}));
++}
++
++TEST_F(AliasInfoTest,
++       BufferCannotBeSharedVariadicScatterFusionDuplicateFusionOperand) {
++  const char* const kModuleString = R"(
++    HloModule fusion
++
++    add_mul {
++      lhs_0 = s32[] parameter(0)
++      rhs_0 = s32[] parameter(2)
++      add = s32[] add(lhs_0, rhs_0)
++      lhs_1 = s32[] parameter(1)
++      rhs_1 = s32[] parameter(3)
++      mul = s32[] multiply(lhs_1, rhs_1)
++      ROOT tuple = (s32[], s32[]) tuple(add, mul)
++    }
++
++    fused_computation {
++      p0 = s32[3,3] parameter(0)
++      p1 = s32[3,3] parameter(1)
++      p2 = s32[3] parameter(2)
++      p3 = s32[3,2] parameter(3)
++      p4 = s32[3,2] parameter(4)
++      indices = s32[3] add(p2, p2)
++      ROOT scatter = (s32[3,3], s32[3,3]) scatter(p0, p1, indices, p3, p4),
++          to_apply=add_mul,
++          update_window_dims={1},
++          inserted_window_dims={0},
++          scatter_dims_to_operand_dims={0},
++          index_vector_dim=1
++    }
++
++    ENTRY main {
++      parameter0 = s32[3,3] parameter(0)
++      parameter2 = s32[3] parameter(1)
++      parameter3 = s32[3,2] parameter(2)
++      parameter4 = s32[3,2] parameter(3)
++      ROOT fusion = (s32[3,3], s32[3,3]) fusion(
++          parameter0, parameter0, parameter2, parameter3, parameter4),
++          kind=kInput, calls=fused_computation
++    }
++    )";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {0}));
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
+ }
+ 
+ TEST_F(AliasInfoTest,
+@@ -524,6 +624,33 @@ TEST_F(AliasInfoTest, BufferCanBeSharedSortFusion) {
+   ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {2}));
+ }
+ 
++TEST_F(AliasInfoTest, BufferCanBeSharedSingleOperandSortFusion) {
++  const char* const kModuleString = R"(
++    HloModule module
++
++    sorting_computation {
++      %lhs_key = s32[] parameter(0)
++      %rhs_key = s32[] parameter(1)
++      ROOT %compare = pred[] compare(%lhs_key, %rhs_key), direction=LT
++    }
++
++    sort_fusion {
++      p0 = s32[16384]{0} parameter(0)
++      ROOT sort = s32[16384]{0} sort(p0), dimensions={0}, is_stable=true, to_apply=sorting_computation
++    }
++
++    ENTRY main {
++      p = s32[16384]{0} parameter(0)
++      ROOT fusion = s32[16384]{0} fusion(p), kind=kInput, calls=sort_fusion
++    }
++    )";
++
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
++}
++
+ TEST_F(AliasInfoTest, BufferCannotBeSharedSortFusionDuplicateSortOperand) {
+   const char* const kModuleString = R"(
+     HloModule module
+@@ -933,5 +1060,159 @@ ENTRY main {
+   ExpectOptionalFalse(MayAlias(fusion, fusion->operand(1), {1, 0}));
+ }
+ 
++TEST_F(AliasInfoTest, BufferCannotBeSharedWhenDusUsesSameParamAsBaseAndUpdate) {
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  p0 = s32[2,3]{1,0} parameter(0)
++  zero = s32[] constant(0)
++  ROOT dus = s32[2,3]{1,0} dynamic-update-slice(p0, p0, zero, zero)
++}
++
++ENTRY main {
++  param_0 = s32[2,3]{1,0} parameter(0)
++  ROOT fusion = s32[2,3]{1,0} fusion(param_0), kind=kInput,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloDataflowAnalysis> dataflow,
++                       HloDataflowAnalysis::Run(*module));
++  EXPECT_FALSE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {}, alias_info()));
++}
++
++TEST_F(AliasInfoTest,
++       BufferCannotBeSharedMultiOutputFusionReachingOtherNonElementwiseRoot) {
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  p0 = s32[2,3]{1,0} parameter(0)
++  p1 = s32[1,2]{1,0} parameter(1)
++  p2 = s32[] parameter(2)
++  zero = s32[] constant(0)
++  dus = s32[2,3]{1,0} dynamic-update-slice(p0, p1, p2, zero)
++  neg = s32[2,3]{1,0} negate(p0)
++  ROOT output = (s32[2,3]{1,0}, s32[2,3]{1,0}) tuple(dus, neg)
++}
++
++ENTRY main {
++  param_0 = s32[2,3]{1,0} parameter(0)
++  param_1 = s32[1,2]{1,0} parameter(1)
++  param_2 = s32[] parameter(2)
++  ROOT fusion = (s32[2,3]{1,0}, s32[2,3]{1,0}) fusion(
++      param_0, param_1, param_2), kind=kInput, calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {0}));
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloDataflowAnalysis> dataflow,
++                       HloDataflowAnalysis::Run(*module));
++  EXPECT_FALSE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {0}, alias_info()));
++  EXPECT_FALSE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {1}, alias_info()));
++}
++
++TEST_F(AliasInfoTest,
++       BufferCannotBeSharedWhenNonDsPathAlsoFeedsDusUpdateOperand) {
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  p0 = s32[2]{0} parameter(0)
++  p1 = s32[] parameter(1)
++  ds = s32[2]{0} dynamic-slice(p0, p1), dynamic_slice_sizes={2}
++  sum = s32[2]{0} add(ds, p0)
++  ROOT dus = s32[2]{0} dynamic-update-slice(p0, sum, p1)
++}
++
++ENTRY main {
++  param_0 = s32[2]{0} parameter(0)
++  param_1 = s32[] parameter(1)
++  ROOT fusion = s32[2]{0} fusion(param_0, param_1), kind=kInput,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloDataflowAnalysis> dataflow,
++                       HloDataflowAnalysis::Run(*module));
++  EXPECT_FALSE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {}, alias_info()));
++}
++
++TEST_F(AliasInfoTest,
++       BufferCannotBeSharedWhenParamFeedsDynamicSliceStartIndex) {
++  const char* const kModuleString = R"(
++HloModule fusion
++
++fused_computation {
++  p0 = s32[1]{0} parameter(0)
++  idx = s32[] bitcast(p0)
++  ds = s32[1]{0} dynamic-slice(p0, idx), dynamic_slice_sizes={1}
++  ROOT dus = s32[1]{0} dynamic-update-slice(p0, ds, idx)
++}
++
++ENTRY main {
++  param_0 = s32[1]{0} parameter(0)
++  ROOT fusion = s32[1]{0} fusion(param_0), kind=kInput,
++      calls=fused_computation
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloDataflowAnalysis> dataflow,
++                       HloDataflowAnalysis::Run(*module));
++  EXPECT_FALSE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {}, alias_info()));
++}
++
++TEST_F(AliasInfoTest, BufferCanBeSharedForInPlaceDynamicSliceCustomFusion) {
++  const char* const kModuleString = R"(
++HloModule dynamic_slice_fusion
++
++%dsf_computation {
++  %p0 = f32[4,4]{1,0} parameter(0)
++  %p1 = s32[] parameter(1)
++  %p2 = s32[] parameter(2)
++  %fill = f32[4]{0} custom-call(%p0),
++      custom_call_target="__xla_test$$scaled_memset",
++      api_version=API_VERSION_TYPED_FFI
++  %fill_2d = f32[1,4]{1,0} bitcast(%fill)
++  ROOT %dus = f32[4,4]{1,0} dynamic-update-slice(%p0, %fill_2d, %p1, %p2)
++}
++
++ENTRY main {
++  buf = f32[4,4]{1,0} parameter(0)
++  i = s32[] parameter(1)
++  zero = s32[] constant(0)
++  ROOT %dynamic_slice_fusion = f32[4,4]{1,0} fusion(buf, i, zero),
++      kind=kCustom, calls=%dsf_computation,
++      backend_config={"fusion_backend_config":{"kind":"__custom_fusion","custom_fusion_config":{"name":"dynamic_slice_fusion"}}}
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
++                       ParseAndReturnVerifiedModule(kModuleString));
++  HloInstruction* fusion = module->entry_computation()->root_instruction();
++  ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloDataflowAnalysis> dataflow,
++                       HloDataflowAnalysis::Run(*module));
++  EXPECT_TRUE(dataflow->CanShareOperandBufferWithUser(
++      fusion->mutable_operand(0), {}, fusion, {}, alias_info()));
++}
++
+ }  // namespace
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/nvptx_alias_info.cc b/xla/service/gpu/nvptx_alias_info.cc
+index 888caf93e9..4e506fbe03 100644
+--- a/xla/service/gpu/nvptx_alias_info.cc
++++ b/xla/service/gpu/nvptx_alias_info.cc
+@@ -34,9 +34,10 @@ std::optional<bool> NVPTXAliasInfo::MayAlias(
+     // NCCL all-reduce and collective-broadcast can be performed in-place.
+     case HloOpcode::kAllReduce:
+     case HloOpcode::kCollectiveBroadcast:
+-      return user->operand_count() == 1 ||
+-             (user_index.size() == 1 &&
+-              user->operand(user_index[0]) == operand);
++      return absl::c_count(user->operands(), operand) == 1 &&
++             (user->operand_count() == 1 ||
++              (user_index.size() == 1 &&
++               user->operand(user_index[0]) == operand));
+     case HloOpcode::kCustomCall:
+       // The matrix bias operand can be overwritten in-place.
+       // See https://docs.nvidia.com/cuda/cublas/#cublasltmatmul.
+diff --git a/xla/service/gpu/nvptx_alias_info_test.cc b/xla/service/gpu/nvptx_alias_info_test.cc
+index 882316fb90..005c950208 100644
+--- a/xla/service/gpu/nvptx_alias_info_test.cc
++++ b/xla/service/gpu/nvptx_alias_info_test.cc
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_computation.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/parser/hlo_parser.h"
+ #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+ #include "xla/hlo/testlib/test.h"
+ #include "xla/service/gpu/gpu_device_info_for_tests.h"
+@@ -119,5 +120,87 @@ ENTRY main {
+   ExpectOptionalFalse(MayAlias(matmul, matmul->operand(2), {0}));
+ }
+ 
++TEST_F(NVPTXAliasInfoTest, VariadicAllReduceSharesOnlyUniqueMatchingOperands) {
++  const char* const kDistinctModuleString = R"(
++HloModule m
++
++add {
++  lhs = f32[] parameter(0)
++  rhs = f32[] parameter(1)
++  ROOT sum = f32[] add(lhs, rhs)
++}
++
++ENTRY main {
++  p0 = f32[8]{0} parameter(0)
++  p1 = f32[8]{0} parameter(1)
++  ROOT ar = (f32[8]{0}, f32[8]{0}) all-reduce(p0, p1), replica_groups={},
++      to_apply=add
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> distinct_module,
++                       ParseAndReturnVerifiedModule(kDistinctModuleString));
++  HloInstruction* ar = distinct_module->entry_computation()->root_instruction();
++  ExpectOptionalTrue(MayAlias(ar, ar->operand(0), {0}));
++  ExpectOptionalTrue(MayAlias(ar, ar->operand(1), {1}));
++  ExpectOptionalFalse(MayAlias(ar, ar->operand(0), {1}));
++  ExpectOptionalFalse(MayAlias(ar, ar->operand(1), {0}));
++
++  const char* const kDuplicateModuleString = R"(
++HloModule m
++
++add {
++  lhs = f32[] parameter(0)
++  rhs = f32[] parameter(1)
++  ROOT sum = f32[] add(lhs, rhs)
++}
++
++ENTRY main {
++  p0 = f32[8]{0} parameter(0)
++  ROOT ar = (f32[8]{0}, f32[8]{0}) all-reduce(p0, p0), replica_groups={},
++      to_apply=add
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> duplicate_module,
++                       ParseAndReturnVerifiedModule(kDuplicateModuleString));
++  HloInstruction* dup_ar =
++      duplicate_module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(dup_ar, dup_ar->operand(0), {0}));
++  ExpectOptionalFalse(MayAlias(dup_ar, dup_ar->operand(0), {1}));
++}
++
++TEST_F(NVPTXAliasInfoTest,
++       CollectiveBroadcastCannotShareDuplicateVariadicOperand) {
++  const char* const kSingleModuleString = R"(
++HloModule m, replica_count=2
++
++ENTRY main {
++  p0 = f32[8]{0} parameter(0)
++  ROOT cb = f32[8]{0} collective-broadcast(p0), replica_groups={{0,1}}
++}
++)";
++  ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<xla::HloModule> single_module,
++      ParseAndReturnVerifiedModule(
++          kSingleModuleString, GetModuleConfigForTest(/*replica_count=*/2)));
++  HloInstruction* single_cb =
++      single_module->entry_computation()->root_instruction();
++  ExpectOptionalTrue(MayAlias(single_cb, single_cb->operand(0), {}));
++
++  const char* const kDuplicateModuleString = R"(
++HloModule m, replica_count=2
++
++ENTRY main {
++  p0 = f32[8]{0} parameter(0)
++  ROOT cb = (f32[8]{0}, f32[8]{0}) collective-broadcast(p0, p0),
++      replica_groups={{0,1}}
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> dup_module,
++                       ParseAndReturnUnverifiedModule(kDuplicateModuleString));
++  HloInstruction* dup_cb = dup_module->entry_computation()->root_instruction();
++  ExpectOptionalFalse(MayAlias(dup_cb, dup_cb->operand(0), {0}));
++  ExpectOptionalFalse(MayAlias(dup_cb, dup_cb->operand(0), {1}));
++}
++
+ }  // namespace
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/thunk_emitter.cc b/xla/service/gpu/thunk_emitter.cc
+index 5d1be01679..3302245690 100644
+--- a/xla/service/gpu/thunk_emitter.cc
++++ b/xla/service/gpu/thunk_emitter.cc
+@@ -1910,6 +1910,48 @@ Future<ThunkSequence> ThunkEmitter::EmitDynamicSliceFusionV2(
+             &embedded_allocations[parameters.size() + leaf_idx], 0, byte_size));
+       });
+ 
++  // If the hero has output-to-operand aliasing, the hero expects its aliased
++  // operand and output leaf to point to the same buffer. When the fusion
++  // reads from and writes to different buffers (e.g. a scan reading from `in`
++  // and updating `out` via DUS), copy the input slice into the output slice
++  // first and point both the hero operand and output at the output slice.
++  ThunkSequence copy_thunks;
++  if (const auto* callable = DynCast<HloCallableInstruction>(hero)) {
++    for (const auto& [output_index, operand_pair] :
++         callable->output_to_operand_aliasing()) {
++      int64_t op_idx = operand_pair.first;
++      TF_RET_CHECK(op_idx >= 0 && op_idx < parameters.size());
++      TF_RET_CHECK(operand_pair.second.empty());
++      TF_RET_CHECK(output_index.size() <= 1);
++      int64_t leaf_idx = output_index.empty() ? 0 : output_index[0];
++      TF_RET_CHECK(leaf_idx >= 0 && leaf_idx < results.size());
++
++      BufferAllocation::Slice src_slice = overrides[hero->operand(op_idx)][0];
++      BufferAllocation::Slice dst_slice = overrides[hero][leaf_idx];
++      if (parameter_buffers[parameters[op_idx].parameter_number] !=
++          result_buffers[results[leaf_idx].result_number]) {
++        copy_thunks.Emplace<DeviceToDeviceCopyThunk>(
++            Thunk::ThunkInfo::WithProfileAnnotation(
++                instr, ir_emitter_context_->GetNextThunkId()),
++            /*source_buffer=*/
++            ShapedSlice{src_slice, hero->operand(op_idx)->shape()},
++            /*destination_buffer=*/
++            ShapedSlice{dst_slice,
++                        ShapeUtil::GetSubshape(hero->shape(), output_index)},
++            /*mem_size=*/src_slice.size());
++      } else {
++        // When the aliased input parameter and output result share the same
++        // underlying buffer, DynamicSliceFusionRewriterV2 only fuses the DUS if
++        // its DynamicSliceConfig matches the input slice's config (so both
++        // resolve to the exact same runtime slice and no copy is needed).
++        TF_RET_CHECK(parameters[op_idx].slice_config ==
++                     results[leaf_idx].update_config);
++      }
++
++      overrides[hero->operand(op_idx)] = {dst_slice};
++    }
++  }
++
+   auto overrides_cleanup = InstallAllocationOverrides(std::move(overrides));
+ 
+   Thunk::ThunkInfo info = Thunk::ThunkInfo::WithProfileAnnotation(
+@@ -1924,7 +1966,13 @@ Future<ThunkSequence> ThunkEmitter::EmitDynamicSliceFusionV2(
+        parameters = std::move(parameters),
+        parameter_buffers = std::move(parameter_buffers),
+        embedded_allocations = std::move(embedded_allocations),
++       copy_thunks = std::move(copy_thunks),
+        verify_offsets](ThunkSequence embedded_thunks) mutable {
++        if (!copy_thunks.empty()) {
++          embedded_thunks.insert(embedded_thunks.begin(),
++                                 std::make_move_iterator(copy_thunks.begin()),
++                                 std::make_move_iterator(copy_thunks.end()));
++        }
+         return ThunkSequence::Of<DynamicSliceFusionV2Thunk>(
+             std::move(info), std::move(parameters), std::move(results),
+             std::move(parameter_buffers), std::move(result_buffers),
+diff --git a/xla/service/heap_simulator/heap_simulator.cc b/xla/service/heap_simulator/heap_simulator.cc
+index 8975c1f8af..1dc657e03e 100644
+--- a/xla/service/heap_simulator/heap_simulator.cc
++++ b/xla/service/heap_simulator/heap_simulator.cc
+@@ -432,7 +432,8 @@ absl::Status HeapSimulator::RunComputation(
+         continue;
+       }
+       if (options_.may_reuse_operand_buffers &&
+-          hlo_buffer->values().size() == 1) {
++          hlo_buffer->values().size() == 1 &&
++          value->instruction()->opcode() != HloOpcode::kCopy) {
+         // We don't support sharing an aliased buffer
+         // (hlo_buffer->values().size() > 1) with its operand.
+         for (const HloInstruction* operand : value->instruction()->operands()) {
+@@ -469,15 +470,15 @@ absl::Status HeapSimulator::RunComputation(
+               continue;
+             }
+ 
+-            // The instruction that defines the operand value can be different
+-            // from the actual operand, if directly passing the defining
+-            // instruction into "CanShareOperandBufferWithUser" it creates a
+-            // check failure. The first condition guards against that case.
++            // Only share with values that the user consumes through their
++            // defining instruction. The user may also read the value through
++            // other positions (e.g. a bitcast of it) or through several
++            // operands. All of them are backed by the same buffer, so every use
++            // of the value by the user has to allow sharing.
+             if (value->instruction()->IsUserOf(operand_value->instruction()) &&
+-                value->instruction()->opcode() != HloOpcode::kCopy &&
+-                dataflow_analysis.CanShareOperandBufferWithUser(
+-                    operand_value->instruction(), operand_value->index(),
+-                    value->instruction(), value->index(), alias_info)) {
++                dataflow_analysis.CanShareOperandValueBufferWithUser(
++                    *operand_value, value->instruction(), value->index(),
++                    alias_info)) {
+               // Remove the operand buffer right before sharing (allocating) a
+               // new one.
+               Free(operand_value, operand_value->instruction());
+diff --git a/xla/service/heap_simulator/heap_simulator_test.cc b/xla/service/heap_simulator/heap_simulator_test.cc
+index cf3d051442..ecab6239ff 100644
+--- a/xla/service/heap_simulator/heap_simulator_test.cc
++++ b/xla/service/heap_simulator/heap_simulator_test.cc
+@@ -580,6 +580,41 @@ TEST_F(HeapSimulatorTest, MultiplyAdd) {
+   tracker.ExpectSharedBuffers(add, {}, mul, {});
+ }
+ 
++TEST_F(HeapSimulatorTest,
++       CannotShareOperandWhenSecondaryBitcastPositionCannotShare) {
++  const char* const hlo_text = R"(
++HloModule CannotShareOperandWhenSecondaryBitcastPositionCannotShare
++
++fused_add {
++  p0 = f32[4] parameter(0)
++  p1 = f32[1,4] parameter(1)
++  rev = f32[1,4] reverse(p1), dimensions={1}
++  bc_rev = f32[4] bitcast(rev)
++  ROOT add = f32[4] add(p0, bc_rev)
++}
++
++ENTRY main {
++  param = f32[4] parameter(0)
++  mul = f32[4] negate(param)
++  bc = f32[1,4] bitcast(mul)
++  fusion = f32[4] fusion(mul, bc), kind=kLoop, calls=fused_add
++  ROOT out = f32[4] exponential(fusion)
++}
++)";
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                       ParseAndReturnVerifiedModule(hlo_text));
++  HloInstruction* param = FindInstruction(module.get(), "param");
++  HloInstruction* mul = FindInstruction(module.get(), "mul");
++  HloInstruction* bc = FindInstruction(module.get(), "bc");
++  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
++  HloInstruction* out = FindInstruction(module.get(), "out");
++
++  HeapSimulatorTracker tracker(std::move(module),
++                               {param, mul, bc, fusion, out});
++  EXPECT_NE(tracker.OffsetAt(mul, {}), tracker.OffsetAt(fusion, {}));
++  EXPECT_EQ(tracker.OffsetAt(fusion, {}), tracker.OffsetAt(out, {}));
++}
++
+ class CanShareWithSameShapeAliasInfo : public AliasInfo {
+  public:
+   std::optional<bool> MayAlias(const HloInstruction* operand, const ShapeIndex&,
+diff --git a/xla/tests/cpu_gpu_fusion_test.cc b/xla/tests/cpu_gpu_fusion_test.cc
+index 0ee5084860..f395d6ea41 100644
+--- a/xla/tests/cpu_gpu_fusion_test.cc
++++ b/xla/tests/cpu_gpu_fusion_test.cc
+@@ -945,6 +945,45 @@ ENTRY entry {
+   EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
+ }
+ 
++TEST_F(CpuGpuFusionTest, ViewReversedDoesNotCorruptSharedBuffer) {
++  const char* const hlo = R"hlo(
++HloModule view_reversed
++
++ENTRY main {
++  a = s32[65536] parameter(0)
++  x_raw = s32[65536] negate(a)
++  x = s32[65536] opt-barrier(x_raw)
++  y_raw = s32[1,65536] reshape(x)
++  y = s32[1,65536] opt-barrier(y_raw)
++  y_rev = s32[1,65536] reverse(y), dimensions={1}
++  y_rev_1d = s32[65536] reshape(y_rev)
++  ROOT out = s32[65536] add(x, y_rev_1d)
++}
++)hlo";
++  EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{0, 0}));
++}
++
++TEST_F(CpuGpuFusionTest, TemporaryViewReversedDoesNotCorruptSharedBuffer) {
++  const char* const hlo = R"hlo(
++HloModule result_is_temporary
++
++ENTRY main {
++  a = s32[65536] parameter(0)
++  x_raw = s32[65536] negate(a)
++  x = s32[65536] opt-barrier(x_raw)
++  y_raw = s32[1,65536] reshape(x)
++  y = s32[1,65536] opt-barrier(y_raw)
++  y_rev = s32[1,65536] reverse(y), dimensions={1}
++  y_rev_1d = s32[65536] reshape(y_rev)
++  z_raw = s32[65536] add(x, y_rev_1d)
++  z = s32[65536] opt-barrier(z_raw)
++  z_slice = s32[32768] slice(z), slice={[0:65536:2]}
++  ROOT out = s32[32768] negate(z_slice)
++}
++)hlo";
++  EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{0, 0}));
++}
++
+ void BM_ParallelFusion(::testing::benchmark::State& state) {
+   // Simple element-wise computation to benchmark parallel task partitioning.
+ 

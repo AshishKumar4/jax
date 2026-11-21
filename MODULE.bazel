@@ -120,6 +120,11 @@ archive_override(
         # different orders until their rendezvous timed out (row 10128: a sharded mamba step aborted on every load
         # of its cache entry, never compiled fresh).
         "//third_party:xla/cpu_serdes_collective_resources.patch",
+        # Upstream's output-to-operand aliasing in DynamicSliceFusionV2 (63ed7d6a6f) and its buffer sharing
+        # checking every use of an operand (bdf1e5789f, openxla/xla#51490): a dynamic-slice fusion around a cuBLAS
+        # GEMM with beta 1 whose output, accumulator and a slice operand shared one buffer read the operand after
+        # the GEMM began writing it, a write-after-read race on an A100 (rows 10112, 8372, 9762).
+        "//third_party:xla/gpu_dynamic_slice_operand_uses.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
