@@ -125,6 +125,9 @@ archive_override(
         # GEMM with beta 1 whose output, accumulator and a slice operand shared one buffer read the operand after
         # the GEMM began writing it, a write-after-read race on an A100 (rows 10112, 8372, 9762).
         "//third_party:xla/gpu_dynamic_slice_operand_uses.patch",
+        # The backport at this pin: its sharing check reads HloValue's operand-use rule (kDomain transparent
+        # here, removed upstream), and its tests' host copies use executor-allocated memory.
+        "//third_party:xla/gpu_dynamic_slice_operand_uses_pin.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],

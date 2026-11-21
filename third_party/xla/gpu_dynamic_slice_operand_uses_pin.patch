@@ -1,0 +1,148 @@
+From 6cf13fa34f11a08e9645f3971d532a0cca42eea6 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 20 Nov 2026 22:23:48 -0600
+Subject: [PATCH] [XLA] Operand-uses backport, pin adjustments: one operand-use
+ rule, and test host copies the stream contract allows
+
+The backported buffer-sharing check carried its own copy of HloValue's
+MayUseOperandValue, written after upstream removed kDomain, so at this pin it
+counted a kDomain user as a use where HloValue::ComputeUses does not. The
+check now calls the pin's predicate, declared in hlo_value.h.
+
+The backported GPU tests' in-place FFI handler copied through a std::vector,
+where Stream::Memcpy takes host memory StreamExecutor::HostMemoryAllocate
+allocates, and returned while its upload could still read the vector. It
+copies through an executor allocation and waits for the upload.
+---
+ xla/backends/gpu/tests/BUILD                    |  2 ++
+ .../gpu/tests/dynamic_slice_fusion_v2_test.cc   | 17 ++++++++++++-----
+ xla/hlo/analysis/hlo_dataflow_analysis.cc       | 16 ----------------
+ xla/service/hlo_value.cc                        |  8 ++------
+ xla/service/hlo_value.h                         |  6 ++++++
+ 5 files changed, 22 insertions(+), 27 deletions(-)
+
+diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
+index 5e3a694ca6..9fa2af6f32 100644
+--- a/xla/backends/gpu/tests/BUILD
++++ b/xla/backends/gpu/tests/BUILD
+@@ -456,7 +456,9 @@ xla_test(
+         "//xla/backends/gpu/runtime:while_loop",
+         "//xla/ffi",
+         "//xla/stream_executor:device_address",
++        "//xla/stream_executor:memory_allocation",
+         "//xla/stream_executor:stream",
++        "//xla/stream_executor:stream_executor_h",
+         "//xla/tests:literal_test_util",
+         "//xla/tsl/platform:test",
+         "@com_google_absl//absl/base",
+diff --git a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
+index 64c4385061..32e3b0b017 100644
+--- a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
++++ b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
+@@ -35,7 +35,9 @@ limitations under the License.
+ #include "xla/literal_util.h"
+ #include "xla/shape_util.h"
+ #include "xla/stream_executor/device_address.h"
++#include "xla/stream_executor/memory_allocation.h"
+ #include "xla/stream_executor/stream.h"
++#include "xla/stream_executor/stream_executor.h"
+ #include "xla/tests/literal_test_util.h"
+ #include "xla/tsl/platform/test.h"
+ #include "xla/xla.pb.h"
+@@ -113,13 +115,18 @@ static absl::Status InPlaceAddValue(se::Stream* stream,
+         "InPlaceAddValue: expected input and result buffers to alias");
+   }
+   size_t num_elements = input.element_count();
+-  std::vector<float> host_buf(num_elements);
+-  ABSL_RETURN_IF_ERROR(stream->Memcpy(host_buf.data(), src, src.size()));
++  // The stream copies through host memory its executor allocates
++  // (`Stream::Memcpy`), held until the upload completes.
++  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<se::MemoryAllocation> host,
++                        stream->parent()->HostMemoryAllocate(src.size()));
++  float* host_buf = static_cast<float*>(host->address().opaque());
++  ABSL_RETURN_IF_ERROR(stream->Memcpy(host_buf, src, src.size()));
+   ABSL_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+-  for (float& elem : host_buf) {
+-    elem += value;
++  for (size_t i = 0; i < num_elements; ++i) {
++    host_buf[i] += value;
+   }
+-  return stream->Memcpy(&dst, host_buf.data(), dst.size());
++  ABSL_RETURN_IF_ERROR(stream->Memcpy(&dst, host_buf, dst.size()));
++  return stream->BlockHostUntilDone();
+ }
+ 
+ XLA_FFI_DEFINE_HANDLER(kInPlaceAddValue, InPlaceAddValue,
+diff --git a/xla/hlo/analysis/hlo_dataflow_analysis.cc b/xla/hlo/analysis/hlo_dataflow_analysis.cc
+index bd3e79ed37..600576dbab 100644
+--- a/xla/hlo/analysis/hlo_dataflow_analysis.cc
++++ b/xla/hlo/analysis/hlo_dataflow_analysis.cc
+@@ -489,22 +489,6 @@ absl::flat_hash_map<HloInstruction*, int64_t> CalculatePostOrderSchedule(
+   return map;
+ }
+ 
+-// Mirrors `MayUseOperandValue` in `hlo_value.cc`: instructions that pass nested
+-// or tuple values through transparently do not record an `HloUse` unless they
+-// are a computation root holding `operand_value`.
+-bool MayUseOperandValue(const ShapeIndex& operand_index,
+-                        const HloInstruction* user) {
+-  switch (user->opcode()) {
+-    case HloOpcode::kGetTupleElement:
+-    case HloOpcode::kCopy:
+-      return operand_index.empty();
+-    case HloOpcode::kTuple:
+-      return false;
+-    default:
+-      return true;
+-  }
+-}
+-
+ }  // namespace
+ using absl::StrAppend;
+ using absl::StrCat;
+diff --git a/xla/service/hlo_value.cc b/xla/service/hlo_value.cc
+index 03eb00b51e..8f8fe4e8ca 100644
+--- a/xla/service/hlo_value.cc
++++ b/xla/service/hlo_value.cc
+@@ -116,12 +116,6 @@ std::string HloValue::ToString(int indent) const {
+   return out;
+ }
+ 
+-namespace {
+-
+-// Returns true if the instruction 'user' may use the value at the given
+-// ShapeIndex in the given operand. Generally, instruction which pass through
+-// values transparently without reading the value are not considered to use the
+-// value.
+ bool MayUseOperandValue(const ShapeIndex& index, const HloInstruction* user) {
+   switch (user->opcode()) {
+     case HloOpcode::kGetTupleElement:
+@@ -143,6 +137,8 @@ bool MayUseOperandValue(const ShapeIndex& index, const HloInstruction* user) {
+   }
+ }
+ 
++namespace {
++
+ // The shared list of a tuple shaped instruction's nested value users
+ // amortizes one scan of a long user list across the many values nested in
+ // that instruction, which otherwise each scan it. Below this many users the
+diff --git a/xla/service/hlo_value.h b/xla/service/hlo_value.h
+index dd1fa5378e..05cd39a49f 100644
+--- a/xla/service/hlo_value.h
++++ b/xla/service/hlo_value.h
+@@ -110,6 +110,12 @@ struct HloUse {
+ 
+ std::ostream& operator<<(std::ostream& out, const HloUse& use);
+ 
++// Returns true if the instruction 'user' may use the value at the given
++// ShapeIndex in the given operand. Generally, instruction which pass through
++// values transparently without reading the value are not considered to use the
++// value.
++bool MayUseOperandValue(const ShapeIndex& index, const HloInstruction* user);
++
+ // HloDataflowAnalysis uses this subclass of BufferValue.
+ class HloValue : public BufferValue {
+  public:
+-- 
+2.53.0
+
