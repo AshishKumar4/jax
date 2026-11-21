@@ -154,6 +154,44 @@ class InterpretThreadMapTest(jtu.JaxTestCase):
                           [13.0, 14.0, 15.0, 16.0])
 
 
+@jtu.thread_unsafe_test_class()
+class InterpretThreadMapCompileTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if not jtu.test_device_matches(['cpu']):
+      self.skipTest('CPU-only test')
+
+  def test_a_body_traced_again_compiles_once_for_all_its_threads(self):
+    # Two thread maps of eight threads over one body, each traced anew (a
+    # kernel's forward and transpose traces make new jaxprs of one text): one
+    # compile, where each thread compiling its own raced the others to an empty
+    # cache, and each new jaxpr compiled again.
+    from jax._src import dispatch
+    from jax._src import monitoring
+
+    compiles = []
+
+    def counted(event, duration, **kwargs):
+      del duration
+      if event == dispatch.BACKEND_COMPILE_EVENT and "_run" in kwargs.get(
+          "fun_name", ""):
+        compiles.append(kwargs["fun_name"])
+
+    def f(thread, token, x):
+      del token
+      return jnp.cos(x * 1.25 + thread.astype(jnp.float32))
+
+    x = jnp.arange(7, dtype=jnp.float32)
+    monitoring.register_event_duration_secs_listener(counted)
+    try:
+      for _ in range(2):
+        jax.block_until_ready(thread_map(f, 8, jnp.int32(0), x))
+    finally:
+      monitoring.unregister_event_duration_listener(counted)
+    self.assertLen(compiles, 1, compiles)
+
+
 # A process whose CPU client holds every unit of its in-flight semaphore (32,
 # cpu_client.h) in computations that each run a host callback, every callback
 # waiting at a barrier until all hold theirs, each callback then running a
