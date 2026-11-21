@@ -109,6 +109,10 @@ archive_override(
         # unlabeled twins kept apart by CSE and contracted as before; LLVM widens the fence (row 7953: Dew's
         # error-free transforms' products contracted into fused multiply-adds, their compensations lost).
         "//third_party:xla/no_contract_mark.patch",
+        # A compile-only GPU device states the client's memory spaces (device, pinned_host, unpinned_host), so a
+        # program compiled ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the
+        # default memory dropped (row 8372: a host step prepared without a GPU compiled other programs than its run).
+        "//third_party:xla/compile_only_memory_spaces.patch",
         # A small dot strength-reduces as its precision algorithm states, each multiplied and summed as it says
         # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
         # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554).
