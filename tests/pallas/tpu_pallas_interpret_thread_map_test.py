@@ -173,6 +173,9 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
     # printed jaxpr does not show; each body computes with its own.
     seen = []
 
+    def record(value):
+      seen.append(np.asarray(value).tolist())
+
     def body(vector):
       @jax.jit
       def shifted(thread):
@@ -180,8 +183,7 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
 
       def f(thread, token):
         del token
-        io_callback(lambda value: seen.append(np.asarray(value).tolist()),
-                    None, shifted(thread))
+        io_callback(record, None, shifted(thread))
       return f
 
     for offset in (10.0, 20.0):
