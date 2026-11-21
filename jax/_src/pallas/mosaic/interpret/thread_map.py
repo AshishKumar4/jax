@@ -16,11 +16,14 @@ import collections
 from concurrent import futures
 import contextlib
 import functools
-import sys
+import hashlib
 import threading
+from typing import Any
 
 import jax
 from jax._src import callback
+from jax._src import core
+from jax._src import source_info_util
 from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
@@ -84,19 +87,105 @@ _COMPILED_HELD = 256
 _compiled_lock = threading.Lock()
 
 
+class _Identity:
+  """A value keyed by its identity (one no key states by its contents), held so
+  its identity is not reused while a key holds it."""
+  __slots__ = ["value"]
+
+  def __init__(self, value):
+    self.value = value
+
+  def __eq__(self, other):
+    return isinstance(other, _Identity) and other.value is self.value
+
+  def __hash__(self):
+    return id(self.value)
+
+
+def _array(value) -> tuple:
+  array = np.asarray(value)
+  return ("array", array.shape, str(array.dtype),
+          hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+
+
+def _structure(jaxpr) -> tuple:
+  """`jaxpr` as a key equal for two jaxprs that compute alike: its binders'
+  types, its equations' primitives, operands by position, parameters (`_value`)
+  and contexts, its effects, and a closed jaxpr's constants by their bytes.
+  Its source locations and debug names are none of it."""
+  if isinstance(jaxpr, core.ClosedJaxpr):
+    return ("closed", _structure(jaxpr.jaxpr),
+            tuple(_value(const) for const in jaxpr.consts))
+  numbered: dict[Any, int] = {}
+
+  def bound(variables) -> tuple:
+    for variable in variables:
+      numbered[variable] = len(numbered)
+    return tuple(_aval(variable.aval) for variable in variables)
+
+  def read(atom):
+    if isinstance(atom, core.Literal):
+      return ("literal", _value(atom.val), _aval(atom.aval))
+    return numbered[atom]
+
+  binders = (bound(jaxpr.constvars), bound(jaxpr.invars))
+  equations = []
+  for eqn in jaxpr.eqns:
+    operands = tuple(read(atom) for atom in eqn.invars)
+    equations.append((
+        eqn.primitive, operands,
+        tuple(sorted((name, _value(param))
+                     for name, param in eqn.params.items())),
+        eqn.ctx, frozenset(eqn.effects), bound(eqn.outvars)))
+  return ("jaxpr", binders, tuple(equations),
+          tuple(read(atom) for atom in jaxpr.outvars), frozenset(jaxpr.effects))
+
+
+def _aval(aval) -> tuple:
+  return (type(aval).__name__, str(aval), getattr(aval, "weak_type", None))
+
+
+def _value(value):
+  """A parameter's key: a jaxpr's structure, an array's bytes, a partial
+  function's function and arguments, a host callback's function and argument
+  tree, a source location as the place it names (it reports errors alone), a
+  number with its type (True, 1 and 1.0 are equal), any other hashable value
+  itself (its own equality), else its identity."""
+  if isinstance(value, (core.Jaxpr, core.ClosedJaxpr)):
+    return _structure(value)
+  if isinstance(value, (np.ndarray, np.generic, jax.Array)):
+    return _array(value)
+  if isinstance(value, functools.partial):
+    return ("partial", _value(value.func),
+            tuple(_value(argument) for argument in value.args),
+            tuple(sorted((name, _value(argument))
+                         for name, argument in value.keywords.items())))
+  if isinstance(value, callback._FlatCallback):
+    return ("callback", _value(value.callback_func), value.in_tree)
+  if isinstance(value, source_info_util.SourceInfo):
+    return ("source", source_info_util.summarize(value))
+  if isinstance(value, (tuple, list)):
+    return (type(value).__name__, tuple(_value(element) for element in value))
+  if isinstance(value, (bool, int, float, complex)):
+    return (type(value).__name__, value)
+  try:
+    hash(value)
+  except TypeError:
+    return _Identity(value)
+  return value
+
+
 def _key(jaxpr, consts, args) -> tuple:
-  """What decides a thread map body's executable: its jaxpr as printed in full
-  (an object whose meaning is its identity prints its address) and its
-  arguments' types and devices, each device the object of its own client (two
-  leased clients' first devices print alike). A kernel's forward, tangent and
-  transpose traces each make a new jaxpr of one text; keyed by the jaxpr
-  object, each compiled again (a recurrence test's 76 bodies were 44 texts)."""
-  with np.printoptions(threshold=sys.maxsize):
-    text = str(jaxpr)
+  """What decides a thread map body's executable: its jaxpr's structure
+  (`_structure`) and its arguments' types and devices, each device the object
+  of its own client (two leased clients' first devices print alike). A
+  kernel's forward, tangent and transpose traces each make a new jaxpr of one
+  structure; keyed by the jaxpr object, each compiled again (a recurrence
+  test's 76 bodies were 44 texts)."""
   types = tuple(
       (np.shape(leaf), str(leaf.dtype), frozenset(leaf.devices()))
       for leaf in jax.tree.leaves((consts, args)))
-  return text, types
+  return _structure(jaxpr), types
 
 
 def _compiled(jaxpr, consts, args):
