@@ -113,6 +113,12 @@ archive_override(
         # hlo_computation.cc: reduce ((f32[32], f32[32])) vs bitcast (f32[32]), a compensated (hi, lo) sum over a
         # one-element axis on an A100, row 10742), and bitcast a mixed precision one across element types.
         "//third_party:xla/reduce_degenerate_variadic.patch",
+        # A scatter's indices are flattened in their own type: ScatterDeterminismExpander's S64 strides made S32
+        # indices an s32 x s64 dot, which the elemental emitter multiplied as `arith.muli (i32, i64)` and LLVM IR
+        # translation refused (RET_CHECK mlir_kernel_emitter.cc:705) under deterministic ops with the algebraic
+        # simplifier off, an accuracy check's reference as written (row 10741); and the emitter multiplies any
+        # mixed precision dot's operands in one type.
+        "//third_party:xla/mixed_index_dot.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],
