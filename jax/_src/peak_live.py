@@ -135,19 +135,21 @@ constant's, a closed-over constant's), None where no op on its path states its
 dimensions (a custom call that states none)."""
 
 _SAME_POSITIONS = frozenset((
-    "abs", "add", "and", "atan2", "bitcast-convert", "cbrt", "ceil", "clamp",
-    "clz", "compare", "complex", "convert", "cos", "divide", "erf", "exp",
-    "expm1", "floor", "imag", "is-finite", "log", "log1p", "logistic", "map",
-    "maximum", "minimum", "multiply", "negate", "not", "or", "popcnt", "power",
+    "abs", "acos", "acosh", "add", "and", "asin", "asinh", "atan2", "atanh",
+    "bitcast-convert", "cbrt", "ceil", "clamp", "compare", "complex",
+    "convert", "cosh", "cosine", "count-leading-zeros", "divide", "erf",
+    "exp2", "exponential", "exponential-minus-one", "floor", "imag",
+    "is-finite", "log", "log-plus-one", "log2", "logistic", "map", "maximum",
+    "minimum", "mulhi", "multiply", "negate", "not", "or", "popcnt", "power",
     "real", "reduce-precision", "remainder", "round-nearest-afz",
     "round-nearest-even", "rsqrt", "select", "shift-left",
-    "shift-right-arithmetic", "shift-right-logical", "sign", "sin", "sqrt",
-    "stochastic-convert", "subtract", "tan", "tanh", "xor", "copy", "reverse",
-    "cholesky", "triangular-solve", "fft", "slice", "dynamic-slice", "pad",
-    "dynamic-update-slice", "concatenate", "set-dimension-size",
-    "add-dependency", "domain", "reduce-window", "select-and-scatter",
-    "all-reduce", "all-reduce-start", "all-reduce-done", "all-gather",
-    "reduce-scatter", "all-to-all", "collective-permute",
+    "shift-right-arithmetic", "shift-right-logical", "sign", "sine", "sinh",
+    "sqrt", "stochastic-convert", "subtract", "tan", "tanh", "xor", "copy",
+    "reverse", "cholesky", "triangular-solve", "fft", "slice",
+    "dynamic-slice", "pad", "dynamic-update-slice", "concatenate",
+    "set-dimension-size", "add-dependency", "domain", "reduce-window",
+    "select-and-scatter", "all-reduce", "all-reduce-start", "all-reduce-done",
+    "all-gather", "reduce-scatter", "all-to-all", "collective-permute",
     "collective-broadcast", "all-gather-done", "collective-permute-done",
     "copy-done", "async-update",
 ))
@@ -224,7 +226,7 @@ def _of(instruction: Any, operands: list[Any], operand_shapes: list[Any],
     return _filled(shape, frozenset())
   if opcode == "tuple":
     return list(operands)
-  if opcode == "optimization-barrier":
+  if opcode == "opt-barrier":
     return operands[0]
   if opcode == "get-tuple-element":
     return operands[0][instruction.tuple_index]
