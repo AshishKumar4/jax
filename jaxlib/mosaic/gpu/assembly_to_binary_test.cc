@@ -159,7 +159,10 @@ class AssemblyToBinaryTest : public ::testing::Test {
 };
 
 TEST_F(AssemblyToBinaryTest, AnEntrySpillingNothingStatesZeroBytes) {
-  EXPECT_EQ(SpilledBytes(*Assembled(PtxModule(1, 4, 0), 1)), 0);
+  // A comment naming the shared-memory spilling pragma enables nothing.
+  std::string ptx = PtxModule(1, 4, 0);
+  ptx.insert(ptx.find("{\n") + 2, "// .pragma \"enable_smem_spilling\";\n");
+  EXPECT_EQ(SpilledBytes(*Assembled(ptx, 1)), 0);
 }
 
 TEST_F(AssemblyToBinaryTest, AnEntryShortOfRegistersStatesTheBytesItSpilled) {

@@ -36,6 +36,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -69,7 +70,7 @@ constexpr absl::string_view kLoss = ") Potential Performance Loss: ";
 
 // The PTX pragma letting ptxas spill registers to shared memory (CUDA 13),
 // spills `--warn-on-spills` does not report.
-constexpr llvm::StringLiteral kSharedMemorySpilling = "enable_smem_spilling";
+constexpr llvm::StringLiteral kSharedMemorySpilling = "\"enable_smem_spilling\"";
 
 absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
     const se::cuda::CompilationProvider& compilation_provider,
@@ -103,8 +104,13 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
 std::optional<int64_t> EntrySpilledBytes(mlir::gpu::ObjectAttr object,
                                          llvm::StringRef ptx,
                                          const ModuleStats& stats) {
-  if (ptx.contains(kSharedMemorySpilling)) {
-    return std::nullopt;
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef line : lines) {
+    llvm::StringRef code = line.split("//").first;
+    if (code.contains(".pragma") && code.contains(kSharedMemorySpilling)) {
+      return std::nullopt;
+    }
   }
   mlir::IntegerAttr entries;
   if (mlir::DictionaryAttr properties = object.getProperties()) {
