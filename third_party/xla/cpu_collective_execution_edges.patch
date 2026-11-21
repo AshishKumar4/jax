@@ -1,0 +1,198 @@
+From b82b1280a5b8bfc9d23a8c8770d81d93f646dcb4 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sat, 21 Nov 2026 16:25:01 -0600
+Subject: [PATCH] [XLA:CPU] Use execution edges for collective communicator
+ resources
+
+Backport of openxla/xla bd5b6fb67b (2026-10-20), less its version.h bump.
+
+Resource::kCollectiveCommunicator mapped to NodeEdge::Kind::kScheduling, which
+only waits for an earlier thunk's Execute() to return before the next
+collective starts. A WhileThunk or ConditionalThunk returns from Execute()
+before the collectives inside it have run, or even started, so later
+collectives start beside them; on a multi-device CPU client their blocking
+rendezvous take every worker of the pool and the device the first one waits
+for never runs. Each collective, and each container thunk holding one, now
+completes before the next collective starts.
+---
+ .../cpu/runtime/thunk_executor_test.cc        | 25 ++++----------
+ xla/runtime/execution_graph.h                 | 33 ++++++++++---------
+ xla/runtime/execution_graph_test.cc           | 21 +++++-------
+ 3 files changed, 32 insertions(+), 47 deletions(-)
+
+diff --git a/xla/backends/cpu/runtime/thunk_executor_test.cc b/xla/backends/cpu/runtime/thunk_executor_test.cc
+index 69e931c..9061342 100644
+--- a/xla/backends/cpu/runtime/thunk_executor_test.cc
++++ b/xla/backends/cpu/runtime/thunk_executor_test.cc
+@@ -203,21 +203,12 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> AddI32Thunk::Execute(
+   if (params.intra_op_threadpool) {
+     auto event = tsl::MakeConstructedAsyncValueRef<ExecuteEvent>();
+ 
+-    // Collective communicator resource creates only a scheduling edge,
+-    // incrementing the shared resource value from the intra-op thread pool
+-    // might lead to data races. ThunkExecutor will only guarantee that calls
+-    // to Execute() are properly synchronized.
+-    if (shared_resource_ &&
+-        *shared_resource_ == Resource::kCollectiveCommunicator) {
+-      shared_resource++;
+-    }
+-
+     params.intra_op_threadpool->getPool()->Schedule([&, event, execute] {
+-      // Token creates an execution edge, and it means that dependent thunks
+-      // will wait for the completion of execution of all dependencies, and we
+-      // verify that we don't have data races by mutating shared resource from a
+-      // task that runs on a thread pool.
+-      if (shared_resource_ && *shared_resource_ == Resource::kToken) {
++      // Resource uses create an execution edge, and it means that dependent
++      // thunks will wait for the completion of execution of all dependencies,
++      // and we verify that we don't have data races by mutating shared
++      // resource from a task that runs on a thread pool.
++      if (shared_resource_) {
+         shared_resource++;
+       }
+ 
+@@ -786,7 +777,6 @@ auto NumTestThunks() {
+ 
+ // Create aliases for all possible combinations of shared resource use.
+ static constexpr auto kToken = Resource::Kind::kToken;
+-static constexpr auto kComm = Resource::Kind::kCollectiveCommunicator;
+ static constexpr auto kNoResource = SharedResourceUse::Kind::kNo;
+ static constexpr auto kAllResource = SharedResourceUse::Kind::kAll;
+ static constexpr auto kRandomResource = SharedResourceUse::Kind::kRandom;
+@@ -800,10 +790,7 @@ INSTANTIATE_TEST_SUITE_P(
+         /*shared_resource_use=*/
+         testing::Values(SharedResourceUse{kNoResource, kToken},
+                         SharedResourceUse{kAllResource, kToken},
+-                        SharedResourceUse{kRandomResource, kToken},
+-                        SharedResourceUse{kNoResource, kComm},
+-                        SharedResourceUse{kAllResource, kComm},
+-                        SharedResourceUse{kRandomResource, kComm}),
++                        SharedResourceUse{kRandomResource, kToken}),
+         /*inject_errors=*/testing::Bool(),
+         /*use_priority_ready_queue=*/testing::Bool()));
+ 
+diff --git a/xla/runtime/execution_graph.h b/xla/runtime/execution_graph.h
+index 197a38a..7e8a4a6 100644
+--- a/xla/runtime/execution_graph.h
++++ b/xla/runtime/execution_graph.h
+@@ -53,10 +53,10 @@ namespace xla {
+ // from/to the same or overlapping buffer slices concurrently), or resource
+ // races (using the same mutable resource concurrently).
+ //
+-// Resources can behave as buffers and require an execution order (operation
+-// must wait for the completion of execution of all dependencies), or as a
+-// scheduling barrier (operation must wait for the completion of scheduling of
+-// all dependencies). See more details in the `NodeEdge::Kind` definition.
++// Resources can require an execution order (an operation must wait for all
++// dependencies to finish executing) or a scheduling barrier (an operation must
++// wait for all dependencies to start executing). Currently all resources use
++// execution order; see `NodeEdge::Kind` for details.
+ //
+ // We use buffer and resource use conflicts to define an execution order of
+ // operations as a directed acyclic graph (DAG) that satisfies all dependencies.
+@@ -121,28 +121,29 @@ class ExecutionGraph {
+     enum class Kind {
+       // If two operations have a scheduling edge between them, then the
+       // dependent operation must be scheduled (start execution) after the
+-      // dependency operation scheduled (started execution), however it doesn't
+-      // have to wait for the completion of execution. We use this type of
+-      // edge to guarantee that operations that share the same resource (i.e.
+-      // collective communicator) start execution in a deterministic order
+-      // across different ranks, however the execution of operations can
+-      // overlap and finish in any order, and backend-implementation specific.
++      // dependency operation has been scheduled (started execution), without
++      // waiting for it to finish. Currently no `Resource::Kind` uses
++      // `kScheduling`; it is retained for operations whose `Execute()` starts
++      // work in a deterministic order across ranks before returning.
+       kScheduling,
+ 
+       // If two operations have an execution edge between them, then the
+-      // dependent operation must wait for the completion of dependency
+-      // operation execution. We use this type of edge to order execution of
+-      // operations that read and write from/to the same buffers, as otherwise
+-      // we may create data races.
++      // dependent operation must wait for the dependency operation to finish
++      // executing. We use this type of edge to order operations that read and
++      // write the same buffers or share stateful resources (such as collective
++      // communicators), as otherwise we may create races.
+       kExecution,
+     };
+ 
++    // Currently all resources map to `kExecution`. `kCollectiveCommunicator`
++    // cannot use `kScheduling` because container operations (such as while
++    // loops and conditionals) may return from `Execute()` before their nested
++    // collectives have started.
+     static constexpr NodeEdge::Kind KindOf(Resource::Kind resource) {
+       switch (resource) {
+         case Resource::kToken:
+-          return NodeEdge::Kind::kExecution;
+         case Resource::kCollectiveCommunicator:
+-          return NodeEdge::Kind::kScheduling;
++          return NodeEdge::Kind::kExecution;
+       }
+     }
+ 
+diff --git a/xla/runtime/execution_graph_test.cc b/xla/runtime/execution_graph_test.cc
+index abda1ef..9f87c8e 100644
+--- a/xla/runtime/execution_graph_test.cc
++++ b/xla/runtime/execution_graph_test.cc
+@@ -195,13 +195,11 @@ TEST(ExecutionGraphTest, CollectivesResourceOrdering) {
+   EXPECT_THAT(execution_graph.sink(), ElementsAre(2));
+ 
+   EXPECT_THAT(execution_graph.out_edges(0),
+-              ElementsAre(NodeEdge{kScheduling, 1}));
++              ElementsAre(NodeEdge{kExecution, 1}));
+ 
+   EXPECT_THAT(execution_graph.in_edges(1),
+-              ElementsAre(NodeEdge{kScheduling, 0}));
++              ElementsAre(NodeEdge{kExecution, 0}));
+ 
+-  // We have buffer conflicts, and a resource conflict, so in this case we
+-  // must add an execution edge as it provides stronger ordering guarantee
+   EXPECT_THAT(execution_graph.out_edges(1),
+               ElementsAre(NodeEdge{kExecution, 2}));
+   EXPECT_THAT(execution_graph.in_edges(2),
+@@ -245,7 +243,7 @@ TEST(ExecutionGraphTest, TransitiveReduction) {
+   EXPECT_EQ(execution_graph.priority(2), 0);
+ }
+ 
+-TEST(ExecutionGraphTest, TransitiveReductionKeepsExecutionEdge) {
++TEST(ExecutionGraphTest, TransitiveReductionWithResourceEdge) {
+   BufferAllocation alloc(/*index=*/0, /*size=*/80, /*color=*/0);
+   Shape slice_shape = ShapeUtil::MakeShape(F32, {10});
+   BufferAllocation::Slice slice(&alloc, /*offset=*/0, /*size=*/40);
+@@ -254,9 +252,8 @@ TEST(ExecutionGraphTest, TransitiveReductionKeepsExecutionEdge) {
+ 
+   std::vector<Operation> operations;
+ 
+-  // All three operations connected with scheduling edges, but because execution
+-  // edge provides stronger ordering guarantee, we must keep an 0-2 execution
+-  // edge, or we might get a data race.
++  // All three operations are connected with resource execution edges, so
++  // transitive reduction removes the direct 0-2 buffer execution edge.
+   operations.push_back(Operation({BufferUse::Write(slice, slice_shape)},
+                                  {ResourceUse::Write(resource)}));
+   operations.push_back(
+@@ -271,15 +268,15 @@ TEST(ExecutionGraphTest, TransitiveReductionKeepsExecutionEdge) {
+   EXPECT_THAT(execution_graph.sink(), ElementsAre(2));
+ 
+   EXPECT_THAT(execution_graph.out_edges(0),
+-              ElementsAre(NodeEdge{kScheduling, 1}, NodeEdge{kExecution, 2}));
++              ElementsAre(NodeEdge{kExecution, 1}));
+ 
+   EXPECT_THAT(execution_graph.in_edges(1),
+-              ElementsAre(NodeEdge{kScheduling, 0}));
++              ElementsAre(NodeEdge{kExecution, 0}));
+   EXPECT_THAT(execution_graph.out_edges(1),
+-              ElementsAre(NodeEdge{kScheduling, 2}));
++              ElementsAre(NodeEdge{kExecution, 2}));
+ 
+   EXPECT_THAT(execution_graph.in_edges(2),
+-              ElementsAre(NodeEdge{kExecution, 0}, NodeEdge{kScheduling, 1}));
++              ElementsAre(NodeEdge{kExecution, 1}));
+ 
+   EXPECT_EQ(execution_graph.priority(0), 2);
+   EXPECT_EQ(execution_graph.priority(1), 1);
+-- 
+2.53.0
+

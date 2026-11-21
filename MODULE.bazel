@@ -147,6 +147,10 @@ archive_override(
         # simplifier off, an accuracy check's reference as written (row 10741); and the emitter multiplies any
         # mixed precision dot's operands in one type.
         "//third_party:xla/mixed_index_dot.patch",
+        # A CPU collective waits for the last one to complete, not to start (upstream bd5b6fb67b, less its version
+        # bump): a while loop's thunk returns before its collective starts, so the next loops' collectives took
+        # every worker and a multi-device CPU program hung (row 5397: 11 of 12 processes of a plain JAX program).
+        "//third_party:xla/cpu_collective_execution_edges.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
