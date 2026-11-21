@@ -20,6 +20,7 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax._src import config
+from jax._src import core as jax_core
 from jax._src import state
 from jax._src import test_util as jtu
 from jax._src.pallas import einshape as einshape_lib
@@ -414,6 +415,10 @@ class PullBlockSpecTest(jtu.JaxTestCase):
     self.assertEqual(b_spec.block_shape, (128, 128))
     self.assertEqual(pulled['out_type'].manual_axis_type.varying,
                      frozenset({'x'}))
+    # Reusable as a trace's input: its aval varies as the pushed output does.
+    self.assertEqual(
+        jax_core.shaped_abstractify(pulled['out_type']).mat.varying,
+        frozenset({'x'}))
     g = np.ones((128, 128), dtype=np.float32)
     b = 2.0 * np.ones((128, 128), dtype=np.float32)
     with config._check_vma(False):
