@@ -1,22 +1,22 @@
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index 29cda46ec8..0ffc4ba458 100644
+index 262dd0348c..83935d4bc7 100644
 --- a/xla/debug_options_flags.cc
 +++ b/xla/debug_options_flags.cc
-@@ -4215,7 +4215,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
-       DebugOptions::EarlyExitPoint_Name(
-           debug_options->xla_gpu_experimental_early_exit()),
-       "Exits compilation early at the specified point. Available options: "
--      "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT."));
-+      "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
-+      "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
-   flag_list->push_back(tsl::Flag(
-       "xla_gpu_print_compilation_stats",
-       bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
+@@ -4317,7 +4317,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+         DebugOptions::EarlyExitPoint_Name(
+             debug_options->xla_gpu_experimental_early_exit()),
+         "Exits compilation early at the specified point. Available options: "
+-        "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT."));
++        "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
++        "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
+     flag_list->push_back(tsl::Flag(
+         "xla_gpu_print_compilation_stats",
+         bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
 diff --git a/xla/pjrt/BUILD b/xla/pjrt/BUILD
-index 374377c75c..473a9815a0 100644
+index 9ad3697f5b..f1f500cf7f 100644
 --- a/xla/pjrt/BUILD
 +++ b/xla/pjrt/BUILD
-@@ -1888,9 +1888,12 @@ cc_library(
+@@ -1924,9 +1924,12 @@ cc_library(
          "//xla:shape_util",
          "//xla/pjrt/proto:executable_metadata_proto_cc",
          "//xla/service:buffer_assignment",
@@ -135,11 +135,11 @@ index 4e0dcd88ec..657d054268 100644
    }
    const int num_replicas = hlo_module->config().replica_count();
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 5d3dbb4a79..2379daef91 100644
+index 65df6abd84..8088ae65c0 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -2220,6 +2220,28 @@ cc_library(
-     ] + xla_internal(["//xla/service/gpu/google:export_hlo"]),
+@@ -2292,6 +2292,28 @@ xla_test(
+     ],
  )
  
 +xla_test(
@@ -167,7 +167,7 @@ index 5d3dbb4a79..2379daef91 100644
  xla_test(
      name = "gpu_compiler_test",
      srcs = ["gpu_compiler_test.cc"],
-@@ -2381,6 +2403,7 @@ cc_library(
+@@ -2453,6 +2475,7 @@ cc_library(
          "//xla/pjrt:compiled_memory_stats",
          "//xla/service:compiled_module",
          "//xla/service:executable",
@@ -175,7 +175,7 @@ index 5d3dbb4a79..2379daef91 100644
          "//xla/stream_executor:device_description",
          "//xla/stream_executor:platform",
          "@com_google_absl//absl/status",
-@@ -2399,7 +2422,6 @@ cc_library(
+@@ -2471,7 +2494,6 @@ cc_library(
          "//xla:xla_proto_cc",
          "//xla/hlo/ir:hlo",
          "//xla/pjrt:compiled_memory_stats",
@@ -184,7 +184,7 @@ index 5d3dbb4a79..2379daef91 100644
          "//xla/service:executable",
          "//xla/stream_executor:device_description",
 diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compile_module_to_llvm_ir.h
-index f0048ca152..9fe68605c0 100644
+index f0048ca152..4d91cd9b97 100644
 --- a/xla/service/gpu/compile_module_to_llvm_ir.h
 +++ b/xla/service/gpu/compile_module_to_llvm_ir.h
 @@ -63,6 +63,13 @@ struct CompileModuleResults {
@@ -336,10 +336,10 @@ index a97cc01a72..7498f1351d 100644
  
  }  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
-index f2368312d5..69983b65ad 100644
+index 0b7c7c8e24..08bd23af52 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -2784,6 +2784,55 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
+@@ -2673,6 +2673,55 @@ absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(
  }
  }  // namespace
  
@@ -395,7 +395,7 @@ index f2368312d5..69983b65ad 100644
  absl::StatusOr<GpuCompiler::CompileResultWithMetadata>
  GpuCompiler::CompileToBackendResult(
      HloModule* module, llvm::LLVMContext* llvm_context,
-@@ -2796,20 +2844,6 @@ GpuCompiler::CompileToBackendResult(
+@@ -2685,20 +2734,6 @@ GpuCompiler::CompileToBackendResult(
        module->config().debug_options().xla_gpu_kernel_cache_file();
    const bool use_cache = !cache_path.empty();
  
@@ -416,7 +416,7 @@ index f2368312d5..69983b65ad 100644
    MaybeOwningThreadPool thread_pool = CreateMaybeOwningThreadPool(
        /*parallelism=*/module->config()
            .debug_options()
-@@ -2817,9 +2851,8 @@ GpuCompiler::CompileToBackendResult(
+@@ -2706,9 +2741,8 @@ GpuCompiler::CompileToBackendResult(
        /*default_thread_pool=*/options.thread_pool,
        /*default_parallelism=*/tsl::port::MaxParallelism());
  
@@ -428,7 +428,7 @@ index f2368312d5..69983b65ad 100644
  
    absl::Mutex module_stats_m_;
    ModuleStats module_stats;
-@@ -3123,6 +3156,15 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
+@@ -3012,6 +3046,15 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
        RunHloPassesIfNeeded(std::move(hlo_module), options.executor(),
                             compile_options));
  
@@ -445,10 +445,10 @@ index f2368312d5..69983b65ad 100644
        AotCompilationOptions::EarlyExitPoint::kNone) {
      std::vector<std::unique_ptr<CompiledModule>> results;
 diff --git a/xla/service/gpu/gpu_compiler.h b/xla/service/gpu/gpu_compiler.h
-index 057c82b673..7ed8ee0a09 100644
+index 71b26b0d55..abfd9ac2d9 100644
 --- a/xla/service/gpu/gpu_compiler.h
 +++ b/xla/service/gpu/gpu_compiler.h
-@@ -207,6 +207,19 @@ class GpuCompiler : public LLVMCompiler {
+@@ -205,6 +205,19 @@ class GpuCompiler : public LLVMCompiler {
      CompileModuleResults compile_module_results;
    };
  
@@ -563,10 +563,10 @@ index 0000000000..c35ec4b2b0
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/xla.proto b/xla/xla.proto
-index 6cb420f86f..87170977dd 100644
+index 5b7234e759..6e4c78dd3e 100644
 --- a/xla/xla.proto
 +++ b/xla/xla.proto
-@@ -538,6 +538,8 @@ message DebugOptions {
+@@ -539,6 +539,8 @@ message DebugOptions {
    enum EarlyExitPoint {
      EARLY_EXIT_POINT_UNSET = 0;
      EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT = 1;

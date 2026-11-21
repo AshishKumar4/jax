@@ -1,8 +1,8 @@
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index 0ffc4ba458..f70e845f5c 100644
+index 83935d4bc7..c403d8187d 100644
 --- a/xla/debug_options_flags.cc
 +++ b/xla/debug_options_flags.cc
-@@ -587,6 +587,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
+@@ -581,6 +581,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
    opts.set_xla_early_exit_with_layouts(false);
    opts.set_xla_gpu_experimental_early_exit(
        DebugOptions::EARLY_EXIT_POINT_UNSET);
@@ -10,26 +10,26 @@ index 0ffc4ba458..f70e845f5c 100644
    opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
    opts.set_xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl(true);
    opts.set_xla_gpu_ragged_all_to_all_mode(
-@@ -4217,6 +4218,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
-       "Exits compilation early at the specified point. Available options: "
-       "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
-       "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
-+  flag_list->push_back(tsl::Flag(
-+      "xla_gpu_memory_limit_early_exit_bytes",
-+      int64_setter_for(
-+          &DebugOptions::set_xla_gpu_memory_limit_early_exit_bytes),
-+      debug_options->xla_gpu_memory_limit_early_exit_bytes(),
-+      "If positive, a compile whose buffer assignment holds more device bytes "
-+      "(argument + output - alias + temp) than this stops after buffer "
-+      "assignment: no code is emitted and executing it fails."));
-   flag_list->push_back(tsl::Flag(
-       "xla_gpu_print_compilation_stats",
-       bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
+@@ -4319,6 +4320,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+         "Exits compilation early at the specified point. Available options: "
+         "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
+         "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
++    flag_list->push_back(tsl::Flag(
++        "xla_gpu_memory_limit_early_exit_bytes",
++        int64_setter_for(
++            &DebugOptions::set_xla_gpu_memory_limit_early_exit_bytes),
++        debug_options->xla_gpu_memory_limit_early_exit_bytes(),
++        "If positive, a compile whose buffer assignment holds more device "
++        "bytes (argument + output - alias + temp) than this stops after buffer "
++        "assignment: no code is emitted and executing it fails."));
+     flag_list->push_back(tsl::Flag(
+         "xla_gpu_print_compilation_stats",
+         bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 3b6df285f8..d6feca81ac 100644
+index 8ed5a15fce..8123ec5606 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -857,6 +857,7 @@ cc_library(
+@@ -863,6 +863,7 @@ cc_library(
          "//xla/client:executable_build_options",
          "//xla/core/collectives:clique_key",
          "//xla/hlo/ir:hlo",
@@ -37,7 +37,7 @@ index 3b6df285f8..d6feca81ac 100644
          "//xla/pjrt/proto:compile_options_proto_cc",
          "//xla/runtime:device_id",
          "//xla/runtime:hang_watchdog",
-@@ -2244,6 +2245,32 @@ xla_test(
+@@ -2316,6 +2317,32 @@ xla_test(
      ],
  )
  
@@ -250,10 +250,10 @@ index 0000000000..4ae39ba021
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
-index 7a8d840981..55d1edab3f 100644
+index 8e3fdad3e3..76787d0ef8 100644
 --- a/xla/service/gpu/gpu_executable.cc
 +++ b/xla/service/gpu/gpu_executable.cc
-@@ -73,6 +73,7 @@ limitations under the License.
+@@ -75,6 +75,7 @@ limitations under the License.
  #include "xla/hlo/ir/hlo_input_output_alias_config.h"
  #include "xla/hlo/ir/hlo_instruction.h"
  #include "xla/hlo/ir/hlo_opcode.h"
@@ -261,7 +261,7 @@ index 7a8d840981..55d1edab3f 100644
  #include "xla/pjrt/proto/compile_options.pb.h"
  #include "xla/runtime/device_id.h"
  #include "xla/runtime/hang_watchdog.h"
-@@ -633,7 +634,11 @@ GpuExecutable::GpuExecutable(
+@@ -635,7 +636,11 @@ GpuExecutable::GpuExecutable(
        buffer_allocations_debug_summary_(
            std::move(buffer_allocations_debug_summary)),
        collective_use_minimal_resource_(collective_use_minimal_resource),
@@ -274,7 +274,7 @@ index 7a8d840981..55d1edab3f 100644
    if (has_module() && enable_debug_info_manager_) {
      XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                 buffer_assignment_proto_);
-@@ -1541,6 +1546,15 @@ absl::Status GpuExecutable::ExecuteThunks(
+@@ -1643,6 +1648,15 @@ absl::Status GpuExecutable::ExecuteThunks(
          {{"module_name", module_name_}});
    });
  
@@ -290,7 +290,7 @@ index 7a8d840981..55d1edab3f 100644
    if (VLOG_IS_ON(5)) {
      LogChangedAllocationsInBetweenExecutions(buffer_allocations, run_options);
    }
-@@ -1583,6 +1597,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
+@@ -1685,6 +1699,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
    return size;
  }
  
@@ -318,7 +318,7 @@ index 7a8d840981..55d1edab3f 100644
  absl::StatusOr<absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>>
  GetOutputInfo(const HloModule& hlo_module, const BufferAssignment& assignment) {
    const HloInstruction* root =
-@@ -1707,6 +1742,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+@@ -1809,6 +1844,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
  
    *proto.mutable_buffer_assignment() = buffer_assignment_proto_;
    proto.set_buffer_allocations_debug_summary(buffer_allocations_debug_summary_);
@@ -326,7 +326,7 @@ index 7a8d840981..55d1edab3f 100644
  
    if (has_module()) {
      *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
-@@ -1789,6 +1825,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
+@@ -1891,6 +1927,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
      std::shared_ptr<HloModule> debug_module) {
    Params params;
    params.debug_options = std::move(debug_options);
@@ -380,10 +380,10 @@ index 5b1c40b7c3..e88c327991 100644
    reserved 7;
  }
 diff --git a/xla/xla.proto b/xla/xla.proto
-index 87170977dd..9d2657e70f 100644
+index 6e4c78dd3e..638af0c6df 100644
 --- a/xla/xla.proto
 +++ b/xla/xla.proto
-@@ -1875,6 +1875,14 @@ message DebugOptions {
+@@ -1908,6 +1908,15 @@ message DebugOptions {
    // xla_early_exit_with_layouts.
    optional EarlyExitPoint xla_gpu_experimental_early_exit = 549;
  
@@ -393,17 +393,9 @@ index 87170977dd..9d2657e70f 100644
 +  // it fails. The bytes compared are its compiled memory stats' device bytes,
 +  // argument + output - alias + temp (CompiledMemoryStats), the device memory a
 +  // run of the program holds at once. Within the limit, the compile finishes.
-+  optional int64 xla_gpu_memory_limit_early_exit_bytes = 584;
++  // Numbered apart from upstream's next ids, which a fork's field would meet.
++  optional int64 xla_gpu_memory_limit_early_exit_bytes = 100001;
 +
    // If true, the triton fusion emitter will ignore IsTritonSupportedInstruction
    // We need this to enable triton scaled dot emitter for testing.
    optional bool xla_gpu_experimental_scaled_dot_with_triton = 410;
-@@ -2062,7 +2070,7 @@ message DebugOptions {
-   // cache miss.
-   optional bool xla_fail_on_autotune_cache_miss = 583;
- 
--  // Next id: 584
-+  // Next id: 585
- 
-   // Extra options to pass to the compilation backend (e.g. LLVM); specific
-   // interpretation of these values is left to the backend.

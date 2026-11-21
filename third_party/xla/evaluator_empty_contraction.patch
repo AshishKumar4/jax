@@ -9,15 +9,11 @@ dot over an empty contraction, [m, 0] by [0, n], raised SIGFPE, and XLA:CPU's co
 where the algebraic simplifier, which rewrites it first, was off. Its product is its sums of nothing, zeros,
 returned without contracting. hlo_evaluator_test holds it.
 ---
- xla/hlo/evaluator/hlo_evaluator.cc      |  6 ++++++
- xla/hlo/evaluator/hlo_evaluator_test.cc | 24 ++++++++++++++++++++++++
- 2 files changed, 30 insertions(+)
-
 diff --git a/xla/hlo/evaluator/hlo_evaluator.cc b/xla/hlo/evaluator/hlo_evaluator.cc
-index f803233c14..d9bcb07e9c 100644
+index 6f4b276e5c..b848520eb1 100644
 --- a/xla/hlo/evaluator/hlo_evaluator.cc
 +++ b/xla/hlo/evaluator/hlo_evaluator.cc
-@@ -5299,6 +5299,12 @@ static std::unique_ptr<Array2D<T>> MatmulArray2DImpl(const Array2D<T>& lhs,
+@@ -5308,6 +5308,12 @@ static std::unique_ptr<Array2D<T>> MatmulArray2DImpl(const Array2D<T>& lhs,
    int k = lhs.width();
    int n = rhs.width();
    auto result = std::make_unique<Array2D<T>>(m, n);
@@ -31,10 +27,10 @@ index f803233c14..d9bcb07e9c 100644
    using ConstTensor = Eigen::Tensor<const T, 2, Eigen::RowMajor>;
    using Tensor = Eigen::Tensor<T, 2, Eigen::RowMajor>;
 diff --git a/xla/hlo/evaluator/hlo_evaluator_test.cc b/xla/hlo/evaluator/hlo_evaluator_test.cc
-index fed4b1e043..1bc990d09b 100644
+index 852954f212..00180b3777 100644
 --- a/xla/hlo/evaluator/hlo_evaluator_test.cc
 +++ b/xla/hlo/evaluator/hlo_evaluator_test.cc
-@@ -3464,6 +3464,30 @@ ENTRY main {
+@@ -3540,6 +3540,30 @@ ENTRY main {
    EXPECT_TRUE(LiteralTestUtil::Near(expected, result, fft_error_));
  }
  
@@ -65,6 +61,3 @@ index fed4b1e043..1bc990d09b 100644
  TEST_F(HloEvaluatorTest, 1D_IFFT_4_on_c64x4) {
    const char* hlo_text = R"(
  HloModule Fft
--- 
-2.53.0
-

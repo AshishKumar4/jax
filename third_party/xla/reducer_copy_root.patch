@@ -8,11 +8,6 @@ Shardy's export holds a sharding on a reducer region's root as a copy of its add
 promoted reducer as a binary of the root's opcode and aborted on the copy ('Invalid binary instruction opcode
 copy'), and MatchReductionComputation read such a reducer as no reduction.
 ---
- .../collectives/all_reduce_promotion.cc       |  9 +++--
- .../collectives/all_reduce_promotion_test.cc  | 34 +++++++++++++++++++
- xla/service/collective_ops_utils.cc           |  5 +++
- 3 files changed, 46 insertions(+), 2 deletions(-)
-
 diff --git a/xla/hlo/transforms/collectives/all_reduce_promotion.cc b/xla/hlo/transforms/collectives/all_reduce_promotion.cc
 index 510136341c..f788a8919a 100644
 --- a/xla/hlo/transforms/collectives/all_reduce_promotion.cc
@@ -103,6 +98,3 @@ index d2c39d0143..4fed36aa35 100644
    auto kind = MatchReductionInstruction(root);
    if (kind && !Match(root, m::Op()
                                 .WithBinaryOperandsAnyOrder(m::Parameter(0),
--- 
-2.53.0
-

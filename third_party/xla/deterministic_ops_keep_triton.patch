@@ -1,8 +1,8 @@
 diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
-index 9741e3f90e..245aa92c09 100644
+index b039bf2055..2a3bec5831 100644
 --- a/xla/backends/gpu/tests/BUILD
 +++ b/xla/backends/gpu/tests/BUILD
-@@ -756,6 +756,7 @@ lit_test_suite_for_gpus(
+@@ -823,6 +823,7 @@ lit_test_suite_for_gpus(
              "bitcast-convert.hlo",
              "calling_convention.hlo",
              "dot_bf16.hlo",
@@ -35,31 +35,11 @@ index 0000000000..7803644306
 +  b = f32[8,16,128]{2,1,0} parameter(1)
 +  ROOT d = f32[8,128,128]{2,1,0} dot(a, b), lhs_batch_dims={1}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}, operand_precision={highest,highest}
 +}
-diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index 0d31acc243..29cda46ec8 100644
---- a/xla/debug_options_flags.cc
-+++ b/xla/debug_options_flags.cc
-@@ -4282,11 +4282,10 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
-       "xla_gpu_experimental_deterministic_ops_triton",
-       setter_for_xla_gpu_experimental_deterministic_ops_triton,
-       /*default_value_for_display=*/"off",
--      "Controls whether Triton is enabled when deterministic ops are requested "
--      "(--xla_gpu_deterministic_ops or "
--      "--xla_gpu_exclude_nondeterministic_ops). "
--      "Supported modes: 'off' (default) and 'unchecked' (enables Triton and "
--      "skips correctness checks)."));
-+      "Not read: deterministic ops (--xla_gpu_deterministic_ops or "
-+      "--xla_gpu_exclude_nondeterministic_ops) keep Triton whatever it states, "
-+      "a Triton GEMM taking no split-k (ConfigAssignerPass::GetEnabledBackends). "
-+      "Modes: 'off' and 'unchecked'."));
-   flag_list->push_back(tsl::Flag(
-       "xla_gpu_require_exact_blas_lt_algorithm",
-       bool_setter_for(
-diff --git a/xla/service/gpu/autotuning/config_assigner_pass.cc b/xla/service/gpu/autotuning/config_assigner_pass.cc
-index a447765d19..57ef651cb5 100644
---- a/xla/service/gpu/autotuning/config_assigner_pass.cc
-+++ b/xla/service/gpu/autotuning/config_assigner_pass.cc
-@@ -504,12 +504,11 @@ std::vector<autotuner::Backend> GetEnabledBackendTypes(
+diff --git a/xla/backends/gpu/transforms/config_assigner_pass.cc b/xla/backends/gpu/transforms/config_assigner_pass.cc
+index c3f66bcfb5..74d1dee08c 100644
+--- a/xla/backends/gpu/transforms/config_assigner_pass.cc
++++ b/xla/backends/gpu/transforms/config_assigner_pass.cc
+@@ -505,12 +505,11 @@ std::vector<autotuner::Backend> GetEnabledBackendTypes(
      disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT_FISSION);
    }
  
@@ -77,11 +57,11 @@ index a447765d19..57ef651cb5 100644
  
    if (!debug_options.xla_gpu_experimental_enable_tensor_ir()) {
      disabled_autotune_backends.push_back(autotuner::Backend::TENSOR_IR);
-diff --git a/xla/service/gpu/autotuning/config_assigner_pass_test.cc b/xla/service/gpu/autotuning/config_assigner_pass_test.cc
-index df0afdf26c..29326628bd 100644
---- a/xla/service/gpu/autotuning/config_assigner_pass_test.cc
-+++ b/xla/service/gpu/autotuning/config_assigner_pass_test.cc
-@@ -1014,30 +1014,28 @@ TEST_F(AutotunerFlagsTest, GetEnabledBackendsRespectsDeterminism) {
+diff --git a/xla/backends/gpu/transforms/config_assigner_pass_test.cc b/xla/backends/gpu/transforms/config_assigner_pass_test.cc
+index 6e42ff762f..e3d204a48a 100644
+--- a/xla/backends/gpu/transforms/config_assigner_pass_test.cc
++++ b/xla/backends/gpu/transforms/config_assigner_pass_test.cc
+@@ -1093,30 +1093,28 @@ TEST_F(AutotunerFlagsTest, GetEnabledBackendsRespectsDeterminism) {
          /*thread_pool=*/nullptr, &mlir_context_pool);
    };
  
@@ -131,3 +111,24 @@ index df0afdf26c..29326628bd 100644
  }
  
  TEST_F(AutotunerFlagsTest, GetEnabledBackendsRespectsTensorIrFlag) {
+diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
+index 497208a7ee..262dd0348c 100644
+--- a/xla/debug_options_flags.cc
++++ b/xla/debug_options_flags.cc
+@@ -4385,11 +4385,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+         "xla_gpu_experimental_deterministic_ops_triton",
+         setter_for_xla_gpu_experimental_deterministic_ops_triton,
+         /*default_value_for_display=*/"off",
+-        "Controls whether Triton is enabled when deterministic ops are "
+-        "requested (--xla_gpu_deterministic_ops or "
+-        "--xla_gpu_exclude_nondeterministic_ops). Supported modes: 'off' "
+-        "(default) and 'unchecked' (enables Triton and skips correctness "
+-        "checks)."));
++        "Not read: deterministic ops (--xla_gpu_deterministic_ops or "
++        "--xla_gpu_exclude_nondeterministic_ops) keep Triton whatever it "
++        "states, a Triton GEMM taking no split-k "
++        "(GetEnabledBackendTypes). Modes: 'off' and "
++        "'unchecked'."));
+     flag_list->push_back(tsl::Flag(
+         "xla_gpu_require_exact_blas_lt_algorithm",
+         bool_setter_for(

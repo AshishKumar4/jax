@@ -11,7 +11,7 @@ index 0d978ffd2e..f68df4c10d 100644
 +    "ynn_unary_strided.patch",
 +])
 diff --git a/third_party/xnnpack/workspace.bzl b/third_party/xnnpack/workspace.bzl
-index f89eb937ff..f28ffd0ad1 100644
+index d5a35d0f0c..d96487bd9f 100644
 --- a/third_party/xnnpack/workspace.bzl
 +++ b/third_party/xnnpack/workspace.bzl
 @@ -21,6 +21,7 @@ def repo():
@@ -19,9 +19,9 @@ index f89eb937ff..f28ffd0ad1 100644
      tf_http_archive(
          name = "XNNPACK",
 +        patch_file = ["//third_party/xnnpack:ynn_unary_strided.patch"],
-         sha256 = "5ff6917a8425f2936101cee5a28538efd4d0dd835e29a8c23ef5131d76946ba9",
-         strip_prefix = "XNNPACK-8bf8d33a7285af155dd52ba7e280b63980c32472",
-         urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/8bf8d33a7285af155dd52ba7e280b63980c32472.zip"),
+         sha256 = "62bdcc276bc2233c34771e29d8dbf5811efc09520067d0b5a364b88bd7269233",
+         strip_prefix = "XNNPACK-7baca675bedab9b8a835deb0a3148f9a3364788c",
+         urls = tf_mirror_urls("https://github.com/google/XNNPACK/archive/7baca675bedab9b8a835deb0a3148f9a3364788c.zip"),
 diff --git a/third_party/xnnpack/ynn_unary_strided.patch b/third_party/xnnpack/ynn_unary_strided.patch
 new file mode 100644
 index 0000000000..aa9f4bc738

@@ -10,20 +10,11 @@ serving PjRtExecutableMetadata with the executable's compiled memory stats, the 
 compile's or one stopped after buffer assignment), and PjRtCApiExecutable::GetCompiledMemoryStats fills the
 assignment from it where the plugin serves the extension.
 ---
- xla/pjrt/c/BUILD                              | 26 +++++++
- ...pjrt_c_api_gpu_executable_metadata_test.cc | 77 +++++++++++++++++++
- xla/pjrt/c/pjrt_c_api_gpu_internal.cc         | 26 ++++++-
- xla/pjrt/c_api_client/BUILD                   |  1 +
- xla/pjrt/c_api_client/pjrt_c_api_client.cc    | 21 +++++
- xla/pjrt/c_api_client/pjrt_c_api_client.h     |  7 +-
- 6 files changed, 154 insertions(+), 4 deletions(-)
- create mode 100644 xla/pjrt/c/pjrt_c_api_gpu_executable_metadata_test.cc
-
 diff --git a/xla/pjrt/c/BUILD b/xla/pjrt/c/BUILD
-index 514cb384a9..3893f12c2f 100644
+index c7822c081a..2b17fce1b9 100644
 --- a/xla/pjrt/c/BUILD
 +++ b/xla/pjrt/c/BUILD
-@@ -667,12 +667,14 @@ cc_library(
+@@ -702,12 +702,14 @@ cc_library(
          "//xla/pjrt:pjrt_executable",
          "//xla/pjrt/extensions/abi_version:gpu_abi_version_extension",
          "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
@@ -38,7 +29,7 @@ index 514cb384a9..3893f12c2f 100644
          "//xla/python:custom_call_batch_partitioner",
          "//xla/python:custom_partition_callback",
          "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
-@@ -772,6 +774,30 @@ cc_library(
+@@ -807,6 +809,30 @@ cc_library(
      ],
  )
  
@@ -153,7 +144,7 @@ index 0000000000..9d30514ebd
 +}  // namespace
 +}  // namespace pjrt
 diff --git a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
-index b2c419b8d8..74c0bc32ff 100644
+index 355c44d4a4..3365f54bb5 100644
 --- a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
 +++ b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
 @@ -17,6 +17,7 @@ limitations under the License.
@@ -180,7 +171,7 @@ index b2c419b8d8..74c0bc32ff 100644
  #include "xla/python/custom_call_batch_partitioner.h"
  #include "xla/python/custom_partition_callback.h"
  #include "xla/service/compiler.h"
-@@ -503,6 +506,22 @@ PLUGIN_Profiler_Api profiler_api{
+@@ -517,6 +520,22 @@ PLUGIN_Profiler_Api profiler_api{
      /*collect_data=*/xla::profiler::PLUGIN_Profiler_CollectData,
  };
  
@@ -203,7 +194,7 @@ index b2c419b8d8..74c0bc32ff 100644
  PJRT_Profiler_Extension profiler_extension{
      PJRT_Extension_Base{
          /*struct_size=*/PJRT_Profiler_Extension_STRUCT_SIZE,
-@@ -655,8 +674,13 @@ const PJRT_Api* GetGpuPjrtApi() {
+@@ -679,8 +698,13 @@ const PJRT_Api* GetGpuPjrtApi() {
    static PJRT_Xla_Transform_Extension xla_transform_extension =
        pjrt::CreateXlaTransformExtension(&shardings_extension.base);
  
@@ -219,10 +210,10 @@ index b2c419b8d8..74c0bc32ff 100644
    static const PJRT_Api pjrt_api = pjrt::CreatePjrtApi(
        pjrt::gpu_plugin::PJRT_Client_Create,
 diff --git a/xla/pjrt/c_api_client/BUILD b/xla/pjrt/c_api_client/BUILD
-index b335ba45e4..eaa5517ee2 100644
+index 8572361fca..5492517dea 100644
 --- a/xla/pjrt/c_api_client/BUILD
 +++ b/xla/pjrt/c_api_client/BUILD
-@@ -102,6 +102,7 @@ cc_library(
+@@ -104,6 +104,7 @@ cc_library(
          "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_extension",
          "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_interface_impl",
          "//xla/pjrt/proto:compile_options_proto_cc",
@@ -231,10 +222,10 @@ index b335ba45e4..eaa5517ee2 100644
          "//xla/pjrt/proto:pjrt_partial_program_proto_cc",
          "//xla/pjrt/proto:topology_description_proto_cc",
 diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.cc b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
-index 2c3eaa3149..79546a9106 100644
+index 4fef82cea1..18ea0501f8 100644
 --- a/xla/pjrt/c_api_client/pjrt_c_api_client.cc
 +++ b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
-@@ -95,6 +95,7 @@ limitations under the License.
+@@ -96,6 +96,7 @@ limitations under the License.
  #include "xla/pjrt/pjrt_layout.h"
  #include "xla/pjrt/pjrt_topology_description_registry.h"
  #include "xla/pjrt/proto/compile_options.pb.h"
@@ -242,7 +233,7 @@ index 2c3eaa3149..79546a9106 100644
  #include "xla/pjrt/proto/pjrt_abi_version.pb.h"
  #include "xla/pjrt/proto/topology_description.pb.h"
  #include "xla/pjrt/scoped_async_tracking_event.h"
-@@ -2423,6 +2424,26 @@ absl::StatusOr<std::vector<Shape>> PjRtCApiExecutable::GetOutputShapes() const {
+@@ -2417,6 +2418,26 @@ absl::StatusOr<std::vector<Shape>> PjRtCApiExecutable::GetOutputShapes() const {
    return std::vector<Shape>{shape};
  }
  
@@ -270,10 +261,10 @@ index 2c3eaa3149..79546a9106 100644
  PjRtCApiExecutable::GetSerializedExecutableMetadata() const {
    auto executable_metadata_extension =
 diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.h b/xla/pjrt/c_api_client/pjrt_c_api_client.h
-index 5105242196..5a98212610 100644
+index 94fd25100d..58bb50c700 100644
 --- a/xla/pjrt/c_api_client/pjrt_c_api_client.h
 +++ b/xla/pjrt/c_api_client/pjrt_c_api_client.h
-@@ -746,9 +746,10 @@ class PjRtCApiExecutable : public PjRtExecutable {
+@@ -756,9 +756,10 @@ class PjRtCApiExecutable : public PjRtExecutable {
  
    absl::StatusOr<std::shared_ptr<HloModule>> GetHloModule() const override;
  
@@ -287,6 +278,3 @@ index 5105242196..5a98212610 100644
  
    std::optional<std::vector<OpSharding>> GetParameterShardings() const override;
  
--- 
-2.53.0
-

@@ -73,7 +73,7 @@ index 164979de51..849f74eb02 100644
  TEST_F(FlashAttentionBMMScalePaddingMaskSoftmaxBMM,
         Flash_Attention_Training_BMM1_PaddingMask_Softmax_BMM2_BF16) {
 diff --git a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
-index adba9b7364..f6a4ee749b 100644
+index b9d9c6e077..f36b59fa01 100644
 --- a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
 +++ b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
 @@ -18,6 +18,7 @@ limitations under the License.

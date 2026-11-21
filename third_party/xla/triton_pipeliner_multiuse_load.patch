@@ -1,6 +1,6 @@
 diff --git a/third_party/triton/common/pipeliner_multiuse_load.patch b/third_party/triton/common/pipeliner_multiuse_load.patch
 new file mode 100644
-index 0000000..8027cff
+index 0000000000..8027cffc81
 --- /dev/null
 +++ b/third_party/triton/common/pipeliner_multiuse_load.patch
 @@ -0,0 +1,31 @@
@@ -36,10 +36,11 @@ index 0000000..8027cff
 +   return false;
 + }
 diff --git a/third_party/triton/common/series b/third_party/triton/common/series
+index 4afb9c5650..536994d011 100644
 --- a/third_party/triton/common/series
 +++ b/third_party/triton/common/series
-@@ -39,3 +39,4 @@
- llvm_cl1020994322.patch
+@@ -40,3 +40,4 @@ llvm_cl1020994322.patch
  llvm_cl1022503860.patch
  llvm_cl1022888649.patch
+ allocate_warp_groups_stable_sort.patch
 +pipeliner_multiuse_load.patch

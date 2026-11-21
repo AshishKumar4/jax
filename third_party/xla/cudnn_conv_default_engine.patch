@@ -1,8 +1,8 @@
 diff --git a/xla/stream_executor/cuda/cuda_dnn.cc b/xla/stream_executor/cuda/cuda_dnn.cc
-index aa9135b252..c56ac17ffc 100644
+index f2c228d294..53328c02ab 100644
 --- a/xla/stream_executor/cuda/cuda_dnn.cc
 +++ b/xla/stream_executor/cuda/cuda_dnn.cc
-@@ -3951,9 +3951,39 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> GetExecPlanFromHeuristics(
+@@ -3978,9 +3978,39 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> GetExecPlanFromHeuristics(
               << ". absl::Status of final plan: " << CudnnStatusToString(status);
  }
  
