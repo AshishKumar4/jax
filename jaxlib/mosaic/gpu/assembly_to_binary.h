@@ -16,14 +16,11 @@ limitations under the License.
 #ifndef JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 #define JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 
-#include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/strings/string_view.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
-#include "xla/stream_executor/kernel_stats.h"
 
 namespace mosaic {
 namespace gpu {
@@ -44,25 +41,21 @@ inline constexpr char kAssemblerNotesAttr[] = "mosaic_gpu.assembler_notes";
 // Loss: <message>`).
 std::vector<PtxasNote> PtxasNotes(absl::string_view log);
 
-// The module attribute an assembled module's spilled bytes are kept in
-// (`LaunchSpilledBytes`), an integer, where they are known: absent where its
-// launch's scope is not established.
+// The module attribute keeping the bytes ptxas spilled assembling the module's
+// one binary, an integer: its functions' spill stores and loads together (a
+// stack frame its functions' own locals take, libdevice's sinf range
+// reduction's, is none of them). Set only where they are known, the module
+// holding one binary whose assembly defines one kernel entry
+// (`kKernelEntriesProperty`),
+// every function of it then that entry or one it calls; the pass removes any
+// the module held before it.
 inline constexpr char kSpilledBytesAttr[] = "mosaic_gpu.spilled_bytes";
-
-// The bytes ptxas spilled assembling a binary of `entries` kernel entries: its
-// functions' spill stores and loads (`stats`, StreamExecutor's, read from the
-// spill warnings every compilation provider asks ptxas for, so a function it
-// holds none of spilled nothing). Known where the binary has one entry, its
-// every function then that entry or one it calls; unknown otherwise. A stack
-// frame its functions' own locals take (libdevice's sinf range reduction) is
-// none of them.
-std::optional<int64_t> LaunchSpilledBytes(const ModuleStats& stats,
-                                          int64_t entries);
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
 // `gpu.binary` ops wrapping a CUBIN binary, each for the compute capability its
 // object's NVVM target names, keeping what ptxas noted of a loss of
-// performance in the module's `kAssemblerNotesAttr`.
+// performance in the module's `kAssemblerNotesAttr` and what it spilled in its
+// `kSpilledBytesAttr`.
 void registerAssemblyToBinaryPass(
     const stream_executor::cuda::CompilationProvider* compilation_provider);
 

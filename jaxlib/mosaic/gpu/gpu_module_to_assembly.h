@@ -30,6 +30,11 @@ namespace gpu {
 // wrapping a PTX assembly.
 void registerGpuModuleToAssemblyPass();
 
+// The property of an assembly object (`gpu.object`'s properties) stating the
+// kernel entries its assembly defines, an integer: its LLVM module's functions
+// of the PTX kernel calling convention with a body, each an `.entry`.
+inline constexpr char kKernelEntriesProperty[] = "kernel_entries";
+
 // Initializes the NVPTX target on first call.
 void EnsureLLVMNVPTXTargetIsRegistered();
 

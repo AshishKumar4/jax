@@ -49,10 +49,12 @@ limitations under the License.
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/LLVM.h"
 #include "jaxlib/mosaic/gpu/dump.h"
+#include "jaxlib/mosaic/gpu/gpu_module_to_assembly.h"
 #include "jaxlib/mosaic/pass_boilerplate.h"
 #include "xla/stream_executor/cuda/compilation_options.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/kernel_stats.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace mosaic {
@@ -86,6 +88,27 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
       ptx_str.substr(0, start_pos).str(),
       absl::StrFormat(".version %d.%d", major_version, minor_version),
       ptx_str.substr(end_pos).str());
+}
+
+// The bytes ptxas spilled assembling `object`, known where its assembly
+// defines one kernel entry (`kKernelEntriesProperty`), every function of it
+// then that entry or one it calls: its functions' spill stores and loads
+// (`stats`, read from the spill warnings Mosaic GPU's compilation providers ask
+// ptxas for, so a function it holds none of spilled nothing).
+std::optional<int64_t> EntrySpilledBytes(mlir::gpu::ObjectAttr object,
+                                         const ModuleStats& stats) {
+  mlir::IntegerAttr entries;
+  if (mlir::DictionaryAttr properties = object.getProperties()) {
+    entries = properties.getAs<mlir::IntegerAttr>(kKernelEntriesProperty);
+  }
+  if (!entries || entries.getInt() != 1) {
+    return std::nullopt;
+  }
+  int64_t spilled = 0;
+  for (const auto& [function, kernel] : stats) {
+    spilled += kernel.store_bytes_spilled + kernel.load_bytes_spilled;
+  }
+  return spilled;
 }
 
 // The compute capability an object's PTX is compiled for: its NVVM target's
@@ -137,8 +160,9 @@ class AssemblyToBinaryPass
     compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
     std::vector<mlir::Attribute> notes;
-    // The bytes the module's one binary spilled, where it has one and they are
-    // known (`LaunchSpilledBytes`).
+    // The bytes the module's binaries spilled, each where it is known
+    // (`EntrySpilledBytes`); the attribute states them for one binary alone.
+    module->removeAttr(kSpilledBytesAttr);
     int64_t binaries = 0;
     std::optional<int64_t> spilled;
 
@@ -198,8 +222,7 @@ class AssemblyToBinaryPass
                            dump_opts.dump_path);
       }
       ++binaries;
-      spilled = LaunchSpilledBytes(sass_or->module_stats,
-                                   ptx_str.count(".entry "));
+      spilled = EntrySpilledBytes(object, sass_or->module_stats);
       for (const PtxasNote& note :
            PtxasNotes(*sass_or->compilation_log)) {
         notes.push_back(b.getDictionaryAttr(
@@ -253,18 +276,6 @@ std::vector<PtxasNote> PtxasNotes(absl::string_view log) {
                          line.substr(loss + kLoss.size())))});
   }
   return notes;
-}
-
-std::optional<int64_t> LaunchSpilledBytes(const ModuleStats& stats,
-                                          int64_t entries) {
-  if (entries != 1) {
-    return std::nullopt;
-  }
-  int64_t spilled = 0;
-  for (const auto& [function, kernel] : stats) {
-    spilled += kernel.store_bytes_spilled + kernel.load_bytes_spilled;
-  }
-  return spilled;
 }
 
 void registerAssemblyToBinaryPass(

@@ -132,6 +132,10 @@ archive_override(
         # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
         # (row 8372: a host step prepared without a GPU compiled other programs than its run).
         "//third_party:xla/compile_only_memory_spaces.patch",
+        # A spill warning's function is read whatever name ptxas quotes: a PTX name holding `$` (LLVM's NVPTX
+        # backend writes `_$_` into a name it makes valid) spilled with no stats recorded, read as no spill by
+        # Mosaic GPU's kernel facts (row 9649).
+        "//third_party:xla/ptxas_spill_function_names.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
