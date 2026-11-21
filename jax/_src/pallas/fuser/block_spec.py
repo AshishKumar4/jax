@@ -3642,6 +3642,38 @@ for _prim in (
 del _prim
 
 
+# A cast of a value's type along manual mesh axes (to vary, as JAX stages one
+# where a consumer under a shard_map checking variance reads an invariant value
+# beside a varying one; from reduced to varying): an element of its output is
+# its operand's at the same index. On values the map types (the check on) it is
+# bound, so what reads it is checked as written; on a kernel's tile, which
+# carries no mesh's types (the check off), it is the identity, as `pvary` is
+# where nothing checks variance. Read as scalar prefetch it is refused: an
+# index map replays its program on prefetched values, which carry no mesh's
+# types wherever it is traced, so a program typed by them cannot run there.
+def _manual_cast_usage_rule(
+    ctx: UsageRuleContext, used_out: set[Usage], **params
+) -> Sequence[set[Usage]]:
+  del params
+  if Usage.SCALAR_PREFETCH in used_out:
+    raise NotImplementedError(
+        f'{ctx.prim.name} read as scalar prefetch: a prefetched value carries'
+        ' no manual mesh axes to cast along')
+  return [used_out]
+
+
+def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
+  return ctx.prim.bind(x, **params) if config._check_vma.value else x
+
+
+for _prim in (core.pvary_p, core.reduced_vary_cast_p):
+  register_pull_block_spec_rule(_prim)(_eltwise_pull_rule)
+  register_usage_rule(_prim)(_manual_cast_usage_rule)
+  register_push_block_spec_rule(_prim)(_eltwise_push_rule)
+  register_eval_rule(_prim)(_manual_cast_eval_rule)
+del _prim
+
+
 # An optimization barrier: each output its operand as it is, a block of one the
 # same block of the other.
 @register_pull_block_spec_rule(lax.optimization_barrier_p)
