@@ -48,6 +48,47 @@ def plain(size, power, params, scale):
   return kernel
 
 
+def context_mesh(size, power, params, scale):
+  """A kernel that reads no mesh whose body's broadcast states the one it is
+  traced under as its output's sharding: replicated over a shard_map's manual
+  mesh, none alone."""
+  del power, params
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+  )
+  def kernel(x_ref, o_ref):
+    x = x_ref[...]
+    mesh = jax.sharding.get_abstract_mesh()
+    sharding = None if mesh.empty else jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec())
+    # The scalar read from the ref (a scalar load), not sliced from the loaded
+    # vector, whose layout a splat cannot take.
+    o_ref[...] = x * scale + lax.broadcast_in_dim(
+        x_ref[0], x.shape, (), out_sharding=sharding)
+
+  return kernel
+
+
+def fresh_axis(size, power, params, scale):
+  """A kernel that reads the index of the JAX mesh's axis "x" from the
+  hardware (`plgpu.fresh_axis_index`), whose lowering reads its size."""
+  del power, params
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+  )
+  def kernel(x_ref, o_ref):
+    o_ref[...] = x_ref[...] * scale + plgpu.fresh_axis_index("x").astype(
+        jnp.float32)
+
+  return kernel
+
+
 def mesh_axis(size, power, params, scale):
   """A kernel that reads the index of the JAX mesh's axis "x" it runs under."""
   del power, params
