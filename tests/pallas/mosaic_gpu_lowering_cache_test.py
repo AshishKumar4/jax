@@ -263,7 +263,10 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     # A process's own settings: its compilation cache, its client's
     # allocations, XLA's dumps, a profiler's injection and the devices it sees.
     # Processes differing in them alone share their lowerings.
-    base = self.lower()
+    # No IR dump of JAX's, whatever this process's: the dump case's own mode
+    # is then one the baseline did not run under.
+    undumped = {"JAX_DUMP_IR_TO": "", "JAX_DUMP_IR_MODES": "stablehlo"}
+    base = self.lower(env=undumped)
     self.assertEqual(base["events"], ["miss"])
     flags = os.environ.get("XLA_FLAGS", "")  # the children's own, kept
     unread = {
@@ -293,7 +296,7 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertEqual(self.lower(**change)["events"], ["hit"])
     # The dump was made, its mode not the default's: what it changed is no
     # input of the key.
-    self.assertNotEmpty(list((self.tmp / "ir").iterdir()))
+    self.assertNotEmpty(list((self.tmp / "ir").glob("*.jaxpr.txt")))
     # Another XLA flag beside the cache's directory is still read.
     read = self.lower(env={"XLA_FLAGS": (
         f"{flags} --xla_gpu_per_fusion_autotune_cache_dir=/tmp/picks"
