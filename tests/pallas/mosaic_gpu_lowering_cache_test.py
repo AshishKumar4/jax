@@ -280,7 +280,7 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
             f"{flags} --xla_dump_to=/tmp/dumps --xla_dump_hlo_as_text"
             " --xla_dump_hlo_module_re=.*step.*")}),
         "JAX's IR dumps": dict(env={
-            "JAX_DUMP_IR_TO": str(self.tmp / "ir"), "JAX_DUMP_IR_MODES": "stablehlo"}),
+            "JAX_DUMP_IR_TO": str(self.tmp / "ir"), "JAX_DUMP_IR_MODES": "jaxpr"}),
         "a profiler's injection": dict(env={
             "CUDA_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so",
             "NVTX_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so"}),
@@ -291,6 +291,9 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     for name, change in unread.items():
       with self.subTest(name):
         self.assertEqual(self.lower(**change)["events"], ["hit"])
+    # The dump was made, its mode not the default's: what it changed is no
+    # input of the key.
+    self.assertNotEmpty(list((self.tmp / "ir").iterdir()))
     # Another XLA flag beside the cache's directory is still read.
     read = self.lower(env={"XLA_FLAGS": (
         f"{flags} --xla_gpu_per_fusion_autotune_cache_dir=/tmp/picks"
