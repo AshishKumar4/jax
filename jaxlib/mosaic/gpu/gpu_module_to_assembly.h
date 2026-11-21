@@ -32,7 +32,8 @@ void registerGpuModuleToAssemblyPass();
 
 // The property of an assembly object (`gpu.object`'s properties) stating the
 // kernel entries its assembly defines, an integer: its LLVM module's functions
-// of the PTX kernel calling convention with a body, each an `.entry`.
+// of the PTX kernel calling convention that it defines for the linker (a body
+// NVPTX emits; an `available_externally` one it skips), each an `.entry`.
 inline constexpr char kKernelEntriesProperty[] = "kernel_entries";
 
 // Initializes the NVPTX target on first call.

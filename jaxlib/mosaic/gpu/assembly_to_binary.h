@@ -44,11 +44,11 @@ std::vector<PtxasNote> PtxasNotes(absl::string_view log);
 // The module attribute keeping the bytes ptxas spilled assembling the module's
 // one binary, an integer: its functions' spill stores and loads together (a
 // stack frame its functions' own locals take, libdevice's sinf range
-// reduction's, is none of them). Set only where they are known, the module
-// holding one binary whose assembly defines one kernel entry
-// (`kKernelEntriesProperty`),
-// every function of it then that entry or one it calls; the pass removes any
-// the module held before it.
+// reduction's, is none of them). Set only where they are known: the module
+// holds one binary, whose assembly defines one kernel entry
+// (`kKernelEntriesProperty`), so every function of it is that entry or one it
+// calls, and spills to local memory alone (no shared-memory spilling pragma).
+// The pass removes any the module held before it.
 inline constexpr char kSpilledBytesAttr[] = "mosaic_gpu.spilled_bytes";
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into

@@ -67,6 +67,10 @@ namespace se = ::stream_executor;
 // What precedes a performance-loss note's message, after its code.
 constexpr absl::string_view kLoss = ") Potential Performance Loss: ";
 
+// The PTX pragma letting ptxas spill registers to shared memory (CUDA 13),
+// spills `--warn-on-spills` does not report.
+constexpr llvm::StringLiteral kSharedMemorySpilling = "enable_smem_spilling";
+
 absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
     const se::cuda::CompilationProvider& compilation_provider,
     llvm::StringRef ptx_str) {
@@ -94,9 +98,14 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
 // defines one kernel entry (`kKernelEntriesProperty`), every function of it
 // then that entry or one it calls: its functions' spill stores and loads
 // (`stats`, read from the spill warnings Mosaic GPU's compilation providers ask
-// ptxas for, so a function it holds none of spilled nothing).
+// ptxas for, so a function it holds none of spilled nothing). Unknown where
+// `ptx` lets ptxas spill to shared memory, which no warning reports.
 std::optional<int64_t> EntrySpilledBytes(mlir::gpu::ObjectAttr object,
+                                         llvm::StringRef ptx,
                                          const ModuleStats& stats) {
+  if (ptx.contains(kSharedMemorySpilling)) {
+    return std::nullopt;
+  }
   mlir::IntegerAttr entries;
   if (mlir::DictionaryAttr properties = object.getProperties()) {
     entries = properties.getAs<mlir::IntegerAttr>(kKernelEntriesProperty);
@@ -222,7 +231,7 @@ class AssemblyToBinaryPass
                            dump_opts.dump_path);
       }
       ++binaries;
-      spilled = EntrySpilledBytes(object, sass_or->module_stats);
+      spilled = EntrySpilledBytes(object, ptx_str, sass_or->module_stats);
       for (const PtxasNote& note :
            PtxasNotes(*sass_or->compilation_log)) {
         notes.push_back(b.getDictionaryAttr(

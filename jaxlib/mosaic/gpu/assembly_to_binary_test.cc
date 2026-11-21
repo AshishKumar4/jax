@@ -170,6 +170,13 @@ TEST_F(AssemblyToBinaryTest, AnEntryShortOfRegistersStatesTheBytesItSpilled) {
   EXPECT_GT(*spilled, 0);
 }
 
+TEST_F(AssemblyToBinaryTest, AnEntrySpillingToSharedMemoryStatesNone) {
+  // ptxas's warnings report no spill to shared memory.
+  std::string ptx = PtxModule(1, 64, 16);
+  ptx.insert(ptx.find("{\n") + 2, ".pragma \"enable_smem_spilling\";\n");
+  EXPECT_EQ(SpilledBytes(*Assembled(ptx, 1)), std::nullopt);
+}
+
 TEST_F(AssemblyToBinaryTest, ABinaryOfTwoEntriesStatesNoneWhatTheModuleHeld) {
   // Neither entry spills, so a zero the module held before would read as one
   // measured.
