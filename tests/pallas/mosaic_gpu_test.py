@@ -337,6 +337,53 @@ class PredicateReductionLoweringTest(jtu.JaxTestCase):
           jax.ShapeDtypeStruct((128, 128), jnp.float32)
       ).lower(lowering_platforms=("cuda",))
 
+  @parameterized.product(
+      op=(jnp.any, jnp.all, jnp.sum, jnp.max),
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+          ("9.0", plgpu.Layout.WGMMA),
+          ("10.0", plgpu.Layout.TCGEN05),
+      ),
+      lowering_semantics=(
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      ),
+  )
+  def test_a_tiled_arrays_whole_reduction_lowers(
+      self, op, tile, lowering_semantics
+  ):
+    # Lowered for an abstract GPU on CPU: a 2D tile in its accumulator's tiled
+    # layout reduced whole to a scalar, as `pl.when` takes a predicate's.
+    capability, layout = tile
+    predicate = op in (jnp.any, jnp.all)
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      if predicate:
+        o_ref[...] = jnp.float32(0)
+
+        @pl.when(op(jnp.isfinite(tile)))
+        def _():
+          o_ref[...] = jnp.float32(1)
+      else:
+        o_ref[...] = op(tile)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
 
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
   LOWERING_SEMANTICS: ClassVar[plgpu.LoweringSemantics]
@@ -960,6 +1007,50 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     held = op(x > 0) if layout is None else op(x.max(axis=-1) > 0)
     self.assertEqual(int(kernel(jnp.asarray(x))), int(held))
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      layout=(plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+      marked=("none", "first", "last", "every", "every_but_first",
+              "every_but_last"),
+  )
+  def test_predicate_reduction_of_a_whole_tile_guards_a_branch(
+      self, op, layout, marked
+  ):
+    # Whether any or every element of a 2D tile in an accumulator's tiled
+    # layout holds, the tile reduced whole.
+    rows = {
+        "none": [], "first": [0], "last": [127], "every": range(128),
+        "every_but_first": range(1, 128), "every_but_last": range(127),
+    }[marked]
+    x = np.full((128, 128), -1.0, np.float32)
+    for r in rows:
+      x[r] = 1.0
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.int32))
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(tile > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    self.assertEqual(int(kernel(jnp.asarray(x))), int(op(x > 0)))
+
+  @parameterized.product(
+      op=(jnp.sum, jnp.max),
+      layout=(plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+  )
+  def test_a_whole_tiles_reduction(self, op, layout):
+    # A 2D tile in an accumulator's tiled layout reduced whole to a scalar.
+    x = jax.random.uniform(jax.random.key(0), (128, 128), jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.float32))
+    def kernel(x_ref, o_ref):
+      o_ref[...] = op(plgpu.load(x_ref, layout=layout, optimized=False))
+
+    np.testing.assert_allclose(kernel(x), op(x), rtol=1e-5)
 
   def test_reshape(self):
     shape1, shape2 = (128,), (2, 16, 4)
