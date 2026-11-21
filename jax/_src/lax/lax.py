@@ -12421,6 +12421,8 @@ def optimization_barrier(operand, /):
 
 optimization_barrier_p = core.Primitive('optimization_barrier')
 optimization_barrier_p.multiple_results = True
+# Each output is its operand's entries as they are: a rearrangement that moves none.
+optimization_barrier_p.rearranges = True
 optimization_barrier_p.def_impl(
     partial(dispatch.apply_primitive, optimization_barrier_p))
 
