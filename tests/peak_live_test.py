@@ -37,7 +37,9 @@ class PeakLiveTest(jtu.JaxTestCase):
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_compiles_peak_holds_its_parameters_and_the_temporaries_it_reads_at_once(self):
     # tanh(x @ w) @ w: at the second product's peak, x's and w's buffers and
-    # the first product's tanh, one temporary of a 256 x 256 f32 tile.
+    # the first product's tanh, one temporary of a 256 x 256 f32 tile, its rows
+    # x's and its columns w's (whichever fusion computes it: XLA:GPU's GEMM
+    # fusion takes the tanh into the product's epilogue).
     tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
     compiled = jax.jit(_step).lower(tile, tile).compile()
     live = compiled.peak_live()
@@ -50,7 +52,8 @@ class PeakLiveTest(jtu.JaxTestCase):
     temporaries = [buffer for buffer in live if buffer.kind == "temporary"]
     self.assertTrue(any(
         buffer.shape == (256, 256) and buffer.dtype == "f32"
-        and "tanh" in buffer.op_name for buffer in temporaries), live)
+        and buffer.dims == (frozenset({(0, 0)}), frozenset({(1, 1)}))
+        for buffer in temporaries), live)
     self.assertLessEqual(sum(buffer.bytes for buffer in temporaries),
                          compiled.memory_analysis().temp_size_in_bytes)
 
