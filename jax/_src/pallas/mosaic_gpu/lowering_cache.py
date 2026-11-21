@@ -150,6 +150,9 @@ _UNREAD_FLAGS = frozenset({
     "jax_platforms",
     "jax_platform_name",
     "jax_cuda_visible_devices",
+    # Where and what JAX dumps of a compile's IR, which change none of it.
+    "jax_dump_ir_to",
+    "jax_dump_ir_modes",
 })
 _UNREAD_VARIABLES = re.compile(
     r"^(XLA_PYTHON_CLIENT_|JAX_COMPILATION_CACHE_|JAX_PERSISTENT_CACHE_"
@@ -159,7 +162,9 @@ _UNREAD_VARIABLES = re.compile(
     # Which devices a process sees (`_UNREAD_FLAGS`'): a build on a host with
     # none hidden (CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS=cpu) lowers for its
     # compile-only GPU as the run on that GPU does.
-    r"|JAX_PLATFORMS$|JAX_PLATFORM_NAME$|CUDA_VISIBLE_DEVICES$|CUDA_DEVICE_ORDER$)")
+    r"|JAX_PLATFORMS$|JAX_PLATFORM_NAME$|CUDA_VISIBLE_DEVICES$|CUDA_DEVICE_ORDER$"
+    # JAX's IR dumps (`_UNREAD_FLAGS`'), as XLA's are (`_UNREAD_XLA_FLAGS`).
+    r"|JAX_DUMP_IR_)")
 # What a lowering dumps and where: none changes the lowering, and one that
 # dumps as it runs is not cached (`_eligible`).
 _DUMP_VARIABLES = re.compile(r"^MOSAIC_GPU_DUMP")

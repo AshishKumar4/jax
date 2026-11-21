@@ -279,6 +279,8 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         "XLA's dumps": dict(env={"XLA_FLAGS": (
             f"{flags} --xla_dump_to=/tmp/dumps --xla_dump_hlo_as_text"
             " --xla_dump_hlo_module_re=.*step.*")}),
+        "JAX's IR dumps": dict(env={
+            "JAX_DUMP_IR_TO": str(self.tmp / "ir"), "JAX_DUMP_IR_MODES": "stablehlo"}),
         "a profiler's injection": dict(env={
             "CUDA_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so",
             "NVTX_INJECTION64_PATH": "/opt/nsys/libToolsInjection64.so"}),
