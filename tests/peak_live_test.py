@@ -137,6 +137,27 @@ class DimensionProvenanceTest(jtu.JaxTestCase):
     self.assertEqual(descended["d"], (_of((0, 0), (1, 0)), _of((0, 1)),
                                       _of((1, 2))))
 
+  def test_each_elementwise_opcode_keeps_its_operands_dimensions(self):
+    # By HLO's own opcode names (a softmax's "exponential", not "exp"): a name
+    # the reader does not know leaves every value computed from it unknown.
+    unary = ("exponential", "exponential-minus-one", "log-plus-one", "cosine",
+             "sine", "tanh", "logistic", "rsqrt", "sqrt", "negate")
+    lines = "\n".join(f"        u{i} = f32[4,8] {opcode}(x)"
+                      for i, opcode in enumerate(unary))
+    descended = _descended(f"""
+      HloModule m
+      ENTRY e {{
+        x = f32[4,8] parameter(0)
+{lines}
+        held = (f32[4,8]) tuple(u0)
+        barrier = (f32[4,8]) opt-barrier(held)
+        b = f32[4,8] get-tuple-element(barrier), index=0
+        ROOT out = f32[4,8] add(b, u{len(unary) - 1})
+      }}""")
+    for i in range(len(unary)):
+      self.assertEqual(descended[f"u{i}"], (_of((0, 0)), _of((0, 1))), unary[i])
+    self.assertEqual(descended["out"], (_of((0, 0)), _of((0, 1))))
+
   def test_a_reshape_merges_and_splits_and_a_size_one_dimension_descends_from_none(self):
     descended = _descended("""
       HloModule m
