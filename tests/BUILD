@@ -2472,6 +2472,13 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "no_contract_test",
+    srcs = ["no_contract_test.py"],
+    enable_backends = ["cpu"],
+    deps = ["//jax/experimental:xla_metadata"] + py_deps("absl/testing"),
+)
+
+jax_multiplatform_test(
     name = "unary_ops_accuracy_test",
     srcs = ["unary_ops_accuracy_test.py"],
     enable_backends = [
