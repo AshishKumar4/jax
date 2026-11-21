@@ -198,12 +198,12 @@ cc_library(
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TargetLLVM",
         "@llvm-project//mlir:TransformUtils",
-        "@xla//xla/stream_executor:kernel_stats",
         "@llvm-project//mlir:VectorDialect",
         "@xla//xla/service/gpu/llvm_gpu_backend:load_ir_module",
         "@xla//xla/stream_executor/cuda:compilation_options",
         "@xla//xla/stream_executor/cuda:compilation_provider",
         "@xla//xla/stream_executor/cuda:cuda_compute_capability",
+        "@xla//xla/stream_executor:kernel_stats",
         "@xla//xla/tsl/platform:statusor",
     ],
 )
@@ -446,10 +446,20 @@ cc_test(
     # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against the
     # library's shared object finds none of its functions.
     linkstatic = True,
+    # Its kernels are assembled by NVIDIA's ptxas, as Mosaic GPU's compiles are; no device runs them.
+    tags = ["requires-gpu-nvidia"],
     deps = [
         ":passes",
+        ":target",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
-        "@xla//xla/stream_executor:kernel_stats",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:NVVMDialect",
+        "@llvm-project//mlir:Pass",
+        "@xla//xla/stream_executor/cuda:compilation_provider",
     ],
 )
 

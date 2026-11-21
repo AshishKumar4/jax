@@ -64,6 +64,20 @@ class MosaicGpuRecordsTest(jtu.JaxTestCase):
         (4, b"\x7fELF", "kernel", 1024, 2, b"launch"),
     )
 
+  def test_a_kernel_record_tells_a_measured_zero_spill_from_none_measured(self):
+    from jax._src.mosaic_gpu_records import _record_class
+
+    kernel = dict(gpu_binary=b"\x7fELF", kernel_name="kernel")
+    measured = mosaic_gpu.kernel_record(
+        _record_class()(**kernel, spilled_bytes=0).SerializeToString())
+    unmeasured = mosaic_gpu.kernel_record(
+        _record_class()(**kernel).SerializeToString())
+    self.assertEqual(
+        (measured.HasField("spilled_bytes"), measured.spilled_bytes,
+         unmeasured.HasField("spilled_bytes")),
+        (True, 0, False),
+    )
+
   def test_bytes_that_are_no_kernel_record_read_as_none(self):
     # Not a proto; a proto with a field the schema does not name; a record
     # naming no kernel.
