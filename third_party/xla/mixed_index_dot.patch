@@ -1,0 +1,216 @@
+From 8c2ec3d44d1804fb00f3c567af95dc60cfcf1052 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sat, 21 Nov 2026 07:56:03 -0600
+Subject: [PATCH 1/2] [XLA:GPU] ScatterDeterminismExpander flattens indices in
+ their own type
+
+FlattenIndices multiplied the index columns by an S64 strides constant
+whatever the indices' type, so S32 indices made an s32 x s64 -> s32 dot,
+which the elemental emitter multiplied as `arith.muli (i32, i64)`: LLVM IR
+translation fails ("Both operands to a binary operator are not of the same
+type", RET_CHECK mlir_kernel_emitter.cc) wherever nothing rewrote the dot
+first (the algebraic simplifier disabled). The strides are converted to the
+indices' type.
+---
+ .../scatter_determinism_expander.cc           |  8 +++-
+ .../scatter_determinism_expander_test.cc      | 47 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/xla/backends/gpu/transforms/scatter_determinism_expander.cc b/xla/backends/gpu/transforms/scatter_determinism_expander.cc
+index 649538a..ab4f767 100644
+--- a/xla/backends/gpu/transforms/scatter_determinism_expander.cc
++++ b/xla/backends/gpu/transforms/scatter_determinism_expander.cc
+@@ -161,8 +161,12 @@ HloInstruction* FlattenIndices(
+     int64_t operand_dim = scatter_dims_to_operand_dims[i];
+     strides(i, 0) = operand_strides[operand_dim];
+   }
+-  auto strides_tensor = parent->AddInstruction(HloInstruction::CreateConstant(
+-      LiteralUtil::CreateR2FromArray2D<int64_t>(strides)));
++  // The strides in the indices' type, so the dot multiplies one type.
++  auto strides_tensor = parent->AddInstruction(HloInstruction::CreateConvert(
++      ShapeUtil::MakeShape(indices->shape().element_type(),
++                           {num_index_cols, 1}),
++      parent->AddInstruction(HloInstruction::CreateConstant(
++          LiteralUtil::CreateR2FromArray2D<int64_t>(strides)))));
+ 
+   // Calculate the flattened indices via dot product
+   auto dot_shape = ShapeUtil::MakeShape(indices->shape().element_type(),
+diff --git a/xla/backends/gpu/transforms/scatter_determinism_expander_test.cc b/xla/backends/gpu/transforms/scatter_determinism_expander_test.cc
+index 6271334..01ba1f4 100644
+--- a/xla/backends/gpu/transforms/scatter_determinism_expander_test.cc
++++ b/xla/backends/gpu/transforms/scatter_determinism_expander_test.cc
+@@ -25,6 +25,7 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_computation.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/hlo/testlib/test.h"
+ #include "xla/literal.h"
+ #include "xla/primitive_util.h"
+@@ -331,6 +332,52 @@ TEST_P(ScatterDeterminismExpanderTest,
+   EXPECT_EQ(actual_result, expected_result);
+ }
+ 
++TEST_P(ScatterDeterminismExpanderTest,
++       FlattenedIndicesAreComputedInTheIndicesType) {
++  // Two index columns are flattened by a dot with their strides, which takes
++  // the indices' type: a mixed s32 x s64 dot left an elemental emitter
++  // multiplying an i32 by an i64.
++  auto index_type = GetParam();
++  const char* const kModuleTemplate = R"(
++    HloModule scatter_determinism_expander
++
++    scatter_computation {
++      arg1.173 = f32[] parameter(1)
++      arg0.172 = f32[] parameter(0)
++      ROOT add.48 = f32[] add(arg0.172, arg1.173)
++    }
++
++    ENTRY scatter_add_computation {
++      operand = f32[3, 3] parameter(0)
++      indices = $0[3, 2] parameter(1)
++      updates = f32[3] parameter(2)
++      ROOT scatter.48 = f32[3,3] scatter(operand, indices, updates),
++        update_window_dims={}, inserted_window_dims={0, 1},
++        scatter_dims_to_operand_dims={0, 1}, index_vector_dim=1,
++        to_apply=scatter_computation
++    })";
++
++  const std::string hlo = absl::Substitute(
++      kModuleTemplate, primitive_util::LowercasePrimitiveTypeName(index_type));
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
++  ASSERT_OK_AND_ASSIGN(bool result,
++                       RunScatterDeterminismExpander(module.get()));
++  ASSERT_TRUE(result);
++
++  int dots = 0;
++  for (HloComputation* computation : module->computations()) {
++    for (HloInstruction* instruction : computation->instructions()) {
++      if (instruction->opcode() != HloOpcode::kDot) {
++        continue;
++      }
++      ++dots;
++      EXPECT_EQ(instruction->operand(0)->shape().element_type(), index_type);
++      EXPECT_EQ(instruction->operand(1)->shape().element_type(), index_type);
++    }
++  }
++  EXPECT_EQ(dots, 1);
++}
++
+ TEST_P(ScatterDeterminismExpanderTest,
+        ScatterAddWithNonScalarUpdateCorrectnessTest) {
+   auto index_type = GetParam();
+-- 
+2.53.0
+
+
+From f7b0947e87aca156560206065272722b9bc88201 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sat, 21 Nov 2026 07:56:03 -0600
+Subject: [PATCH 2/2] [XLA] The elemental emitter multiplies a mixed precision
+ dot's operands in one type
+
+EmitDotLoop multiplied a dot's operands as they came, so a mixed precision
+dot (s32 x s64 -> s32, f16 x f32 -> f32) built an ill-typed arith.muli or
+arith.mulf. An integer dot's operands are converted to its accumulator type,
+a floating point one's narrower operand to the wider's (F32 for two types of
+one width).
+---
+ xla/codegen/emitters/elemental_hlo_to_mlir.cc | 29 ++++++++++++++++
+ .../emitters/elemental_hlo_to_mlir_test.cc    | 33 +++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.cc b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
+index 7c48f9e..92a0647 100644
+--- a/xla/codegen/emitters/elemental_hlo_to_mlir.cc
++++ b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
+@@ -14,6 +14,7 @@ limitations under the License.
+ ==============================================================================*/
+ #include "xla/codegen/emitters/elemental_hlo_to_mlir.h"
+ 
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -574,6 +575,34 @@ absl::StatusOr<SmallVector<Value, 1>> EmitDotLoop(
+                               /*operand_index=*/1, rhs_indices));
+     Value accum = iter_args[0];
+ 
++    // A mixed precision dot's operands: an integer one's are converted to its
++    // accumulator type (s32 x s64 -> s32), a floating point one's narrower
++    // operand to the wider's (f16 x f32 -> f32), as each is multiplied.
++    PrimitiveType result_type = instr->shape().element_type();
++    if (primitive_util::IsIntegralType(result_type)) {
++      for (auto [operand_index, value] :
++           llvm::enumerate(std::array<Value*, 2>{&lhs_value, &rhs_value})) {
++        if (value->getType() != accumulator_type) {
++          *value = mhlo::MhloOpToStdScalarOp::mapConvertOpToStdScalarOp(
++              b.getLoc(), PrimitiveTypeToMlirTypeWithSign(result_type, b),
++              accumulator_type,
++              {PrimitiveTypeToMlirTypeWithSign(
++                  instr->operand(operand_index)->shape().element_type(), b)},
++              {*value}, /*attributes=*/{}, &b);
++        }
++      }
++    } else if (primitive_util::IsFloatingPointType(result_type) &&
++               lhs_value.getType() != rhs_value.getType()) {
++      // Two types of one width (f16 x bf16) are multiplied in F32.
++      unsigned lhs_width = lhs_value.getType().getIntOrFloatBitWidth();
++      unsigned rhs_width = rhs_value.getType().getIntOrFloatBitWidth();
++      mlir::Type wider = lhs_width > rhs_width   ? lhs_value.getType()
++                         : rhs_width > lhs_width ? rhs_value.getType()
++                                                 : mlir::Type(b.getF32Type());
++      lhs_value = EmitFloatCast(lhs_value, wider, b);
++      rhs_value = EmitFloatCast(rhs_value, wider, b);
++    }
++
+     if (algorithm_util::IsBf16ToF32AlgorithmRequested(instr)) {
+       Value lhs_trunc = arith::TruncFOp::create(b, b.getBF16Type(), lhs_value);
+       lhs_value = arith::ExtFOp::create(b, b.getF32Type(), lhs_trunc);
+diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir_test.cc b/xla/codegen/emitters/elemental_hlo_to_mlir_test.cc
+index 2050ebf..f1b897e 100644
+--- a/xla/codegen/emitters/elemental_hlo_to_mlir_test.cc
++++ b/xla/codegen/emitters/elemental_hlo_to_mlir_test.cc
+@@ -749,6 +749,39 @@ TEST_F(ElementalHloToMlirTest, DotWithS32Type) {
+   )"));
+ }
+ 
++TEST_F(ElementalHloToMlirTest, DotWithMixedIntegerTypes) {
++  EXPECT_OK(Run(R"(
++    ENTRY main {
++      p0 = s32[3, 4] parameter(0)
++      p1 = s64[4, 5] parameter(1)
++      ROOT dot = s32[3, 5] dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    })",
++                R"(
++    // CHECK:      @main_dot(
++    // CHECK-SAME: %[[A:.*]]: tensor<3x4xi32>, %[[B:.*]]: tensor<4x5xi64>,
++    // CHECK-DAG:    %[[A_I_K:.*]] = tensor.extract %[[A]]
++    // CHECK-DAG:    %[[B_K_J:.*]] = tensor.extract %[[B]]
++    // CHECK:        %[[B_K_J_S32:.*]] = arith.trunci %[[B_K_J]] : i64 to i32
++    // CHECK:        arith.muli %[[A_I_K]], %[[B_K_J_S32]] : i32
++  )"));
++}
++
++TEST_F(ElementalHloToMlirTest, DotWithMixedFloatTypes) {
++  EXPECT_OK(Run(R"(
++    ENTRY main {
++      p0 = f16[3, 4] parameter(0)
++      p1 = f32[4, 5] parameter(1)
++      ROOT dot = f32[3, 5] dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    })",
++                R"(
++    // CHECK:      @main_dot(
++    // CHECK-DAG:    %[[A_I_K:.*]] = tensor.extract %{{.*}} : tensor<3x4xf16>
++    // CHECK-DAG:    %[[B_K_J:.*]] = tensor.extract %{{.*}} : tensor<4x5xf32>
++    // CHECK:        %[[A_I_K_F32:.*]] = arith.extf %[[A_I_K]] : f16 to f32
++    // CHECK:        arith.mulf %[[A_I_K_F32]], %[[B_K_J]] : f32
++  )"));
++}
++
+ TEST_F(ElementalHloToMlirTest, DotWithU32Type) {
+   EXPECT_OK(Run(R"(
+     ENTRY main {
+-- 
+2.53.0
+
