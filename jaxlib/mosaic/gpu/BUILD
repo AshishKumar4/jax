@@ -101,6 +101,9 @@ cc_test(
 cc_test(
     name = "gpu_module_to_assembly_test",
     srcs = ["gpu_module_to_assembly_test.cc"],
+    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against the
+    # library's shared object finds none of its functions.
+    linkstatic = True,
     deps = [
         ":passes",
         "//jaxlib/mosaic/dialect/gpu:mosaic_gpu",
