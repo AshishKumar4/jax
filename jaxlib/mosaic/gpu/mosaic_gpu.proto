@@ -25,6 +25,13 @@ message MosaicGpuKernelProto {
   // ignores (C7507). Read once from ptxas's report as it assembled the kernel,
   // so a reader of a compiled call finds them as data.
   repeated AssemblerNote assembler_notes = 13;
+  // The bytes ptxas states the kernel's launch spilled as it assembled it, its
+  // functions' spill stores and loads together (a stack frame its own locals
+  // take, libdevice's sinf range reduction's, is none of them). Absent where
+  // they were not measured: a kernel compiled before this field, or one whose
+  // binary's launch scope was not established. A number upstream's schema
+  // leaves unused.
+  optional int64 spilled_bytes = 100;
 
   reserved 6;
   reserved "init_func_name";

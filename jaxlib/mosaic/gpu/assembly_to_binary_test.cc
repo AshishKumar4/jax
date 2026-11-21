@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "jaxlib/mosaic/gpu/assembly_to_binary.h"
 
+#include <optional>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -54,6 +56,25 @@ TEST(PtxasNotesTest, EachLossNoteOfAReportIsItsCodeAndMessageInOrder) {
 TEST(PtxasNotesTest, AReportNotingNoLossHasNone) {
   EXPECT_THAT(PtxasNotes("ptxas info    : Used 32 registers\n"),
               testing::IsEmpty());
+}
+
+TEST(LaunchSpilledBytesTest, AnEntrysSpillsAreItsFunctionsStoresAndLoads) {
+  // The entry and a device function it calls spilled; a function holding no
+  // stats spilled nothing.
+  ModuleStats stats;
+  stats["kernel"] = KernelStats{192, 136};
+  stats["__internal_reduction"] = KernelStats{8, 8};
+  EXPECT_EQ(LaunchSpilledBytes(stats, /*entries=*/1), 344);
+}
+
+TEST(LaunchSpilledBytesTest, AnEntrySpillingNothingSpilledNoBytes) {
+  EXPECT_EQ(LaunchSpilledBytes(ModuleStats(), /*entries=*/1), 0);
+}
+
+TEST(LaunchSpilledBytesTest, ABinaryOfSeveralEntriesStatesNone) {
+  ModuleStats stats;
+  stats["unlaunched"] = KernelStats{64, 64};
+  EXPECT_EQ(LaunchSpilledBytes(stats, /*entries=*/2), std::nullopt);
 }
 
 }  // namespace

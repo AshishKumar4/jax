@@ -16,11 +16,14 @@ limitations under the License.
 #ifndef JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 #define JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/strings/string_view.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
+#include "xla/stream_executor/kernel_stats.h"
 
 namespace mosaic {
 namespace gpu {
@@ -40,6 +43,21 @@ inline constexpr char kAssemblerNotesAttr[] = "mosaic_gpu.assembler_notes";
 // assembly states, in order (`ptxas warning : (C7515) Potential Performance
 // Loss: <message>`).
 std::vector<PtxasNote> PtxasNotes(absl::string_view log);
+
+// The module attribute an assembled module's spilled bytes are kept in
+// (`LaunchSpilledBytes`), an integer, where they are known: absent where its
+// launch's scope is not established.
+inline constexpr char kSpilledBytesAttr[] = "mosaic_gpu.spilled_bytes";
+
+// The bytes ptxas spilled assembling a binary of `entries` kernel entries: its
+// functions' spill stores and loads (`stats`, StreamExecutor's, read from the
+// spill warnings every compilation provider asks ptxas for, so a function it
+// holds none of spilled nothing). Known where the binary has one entry, its
+// every function then that entry or one it calls; unknown otherwise. A stack
+// frame its functions' own locals take (libdevice's sinf range reduction) is
+// none of them.
+std::optional<int64_t> LaunchSpilledBytes(const ModuleStats& stats,
+                                          int64_t entries);
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
 // `gpu.binary` ops wrapping a CUBIN binary, each for the compute capability its
