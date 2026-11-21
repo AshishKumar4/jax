@@ -1,4 +1,4 @@
-From 6cf13fa34f11a08e9645f3971d532a0cca42eea6 Mon Sep 17 00:00:00 2001
+From 2cfd0274cd0ea499e06a10ca597a99444003d0f7 Mon Sep 17 00:00:00 2001
 From: Ashish Kumar Singh <ashishkmr472@gmail.com>
 Date: Fri, 20 Nov 2026 22:23:48 -0600
 Subject: [PATCH] [XLA] Operand-uses backport, pin adjustments: one operand-use
@@ -14,12 +14,12 @@ where Stream::Memcpy takes host memory StreamExecutor::HostMemoryAllocate
 allocates, and returned while its upload could still read the vector. It
 copies through an executor allocation and waits for the upload.
 ---
- xla/backends/gpu/tests/BUILD                    |  2 ++
- .../gpu/tests/dynamic_slice_fusion_v2_test.cc   | 17 ++++++++++++-----
- xla/hlo/analysis/hlo_dataflow_analysis.cc       | 16 ----------------
- xla/service/hlo_value.cc                        |  8 ++------
- xla/service/hlo_value.h                         |  6 ++++++
- 5 files changed, 22 insertions(+), 27 deletions(-)
+ xla/backends/gpu/tests/BUILD                   |  2 ++
+ .../gpu/tests/dynamic_slice_fusion_v2_test.cc  | 18 ++++++++++++------
+ xla/hlo/analysis/hlo_dataflow_analysis.cc      | 16 ----------------
+ xla/service/hlo_value.cc                       |  8 ++------
+ xla/service/hlo_value.h                        |  6 ++++++
+ 5 files changed, 22 insertions(+), 28 deletions(-)
 
 diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
 index 5e3a694ca6..9fa2af6f32 100644
@@ -36,10 +36,18 @@ index 5e3a694ca6..9fa2af6f32 100644
          "//xla/tsl/platform:test",
          "@com_google_absl//absl/base",
 diff --git a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
-index 64c4385061..32e3b0b017 100644
+index 64c4385061..b26ea2b50b 100644
 --- a/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
 +++ b/xla/backends/gpu/tests/dynamic_slice_fusion_v2_test.cc
-@@ -35,7 +35,9 @@ limitations under the License.
+@@ -20,7 +20,6 @@ limitations under the License.
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
+-#include <vector>
+ 
+ #include "absl/base/casts.h"
+ #include "absl/status/status.h"
+@@ -35,7 +34,9 @@ limitations under the License.
  #include "xla/literal_util.h"
  #include "xla/shape_util.h"
  #include "xla/stream_executor/device_address.h"
@@ -49,7 +57,7 @@ index 64c4385061..32e3b0b017 100644
  #include "xla/tests/literal_test_util.h"
  #include "xla/tsl/platform/test.h"
  #include "xla/xla.pb.h"
-@@ -113,13 +115,18 @@ static absl::Status InPlaceAddValue(se::Stream* stream,
+@@ -113,13 +114,18 @@ static absl::Status InPlaceAddValue(se::Stream* stream,
          "InPlaceAddValue: expected input and result buffers to alias");
    }
    size_t num_elements = input.element_count();
