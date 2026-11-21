@@ -258,7 +258,9 @@ TEST_F(GpuModuleToAssemblyTest, AnObjectStatesTheKernelEntriesItsPtxDefines) {
   auto void_ty = mlir::LLVM::LLVMFunctionType::get(
       mlir::LLVM::LLVMVoidType::get(&context_), {});
   builder_.setInsertionPointToEnd(gpu_module.getBody());
-  mlir::LLVM::LLVMFuncOp::create(builder_, loc, "declared", void_ty);
+  mlir::LLVM::LLVMFuncOp::create(builder_, loc, "declared", void_ty)
+      ->setAttr(mlir::NVVM::NVVMDialect::getKernelFuncAttrName(),
+                builder_.getUnitAttr());
   for (const char* name : {"first_kernel", "second_kernel"}) {
     builder_.setInsertionPointToEnd(gpu_module.getBody());
     auto kernel = mlir::LLVM::LLVMFuncOp::create(builder_, loc, name, void_ty);
@@ -282,6 +284,37 @@ TEST_F(GpuModuleToAssemblyTest, AnObjectStatesTheKernelEntriesItsPtxDefines) {
       GetOpsOfType<mlir::gpu::GPUModuleOp>(*one_kernel).front(),
       /*libraries_to_link=*/{})));
   EXPECT_EQ(ObjectKernelEntries(*one_kernel), 1);
+}
+
+TEST_F(GpuModuleToAssemblyTest,
+       AKernelAvailableExternallyIsNoEntryEvenUnoptimized) {
+  // At O0 no optimization strips the available_externally body; NVPTX emits
+  // none for it.
+  mlir::Location loc = builder_.getUnknownLoc();
+  mlir::gpu::GPUModuleOp gpu_module = mlir::gpu::GPUModuleOp::create(
+      builder_, loc, "gpu_module",
+      mlir::ArrayAttr::get(
+          &context_, {mlir::NVVM::NVVMTargetAttr::get(
+                         &context_, /*optLevel=*/0, "nvptx64-nvidia-cuda",
+                         "sm_90a", "+ptx87")}));
+  auto void_ty = mlir::LLVM::LLVMFunctionType::get(
+      mlir::LLVM::LLVMVoidType::get(&context_), {});
+  for (auto linkage : {mlir::LLVM::Linkage::External,
+                       mlir::LLVM::Linkage::AvailableExternally}) {
+    builder_.setInsertionPointToEnd(gpu_module.getBody());
+    auto kernel = mlir::LLVM::LLVMFuncOp::create(
+        builder_, loc,
+        linkage == mlir::LLVM::Linkage::External ? "kernel" : "elsewhere",
+        void_ty, linkage);
+    kernel->setAttr(mlir::NVVM::NVVMDialect::getKernelFuncAttrName(),
+                    builder_.getUnitAttr());
+    mlir::OpBuilder body =
+        mlir::OpBuilder::atBlockEnd(kernel.addEntryBlock(builder_));
+    mlir::LLVM::ReturnOp::create(body, loc, mlir::ValueRange());
+  }
+  ASSERT_TRUE(mlir::succeeded(mosaic::gpu::internal::LowerGpuModuleToAssembly(
+      gpu_module, /*libraries_to_link=*/{})));
+  EXPECT_EQ(ObjectKernelEntries(*module_), 1);
 }
 
 TEST_F(GpuModuleToAssemblyTest, AnObjectOfNoKernelStatesNoEntries) {

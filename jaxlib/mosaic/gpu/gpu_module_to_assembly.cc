@@ -113,7 +113,7 @@ FailureOr<SmallVector<char, 0>> ModuleToAssembly::moduleToObject(
   }
   kernel_entries_ = 0;
   for (const llvm::Function& function : llvm_module) {
-    if (!function.isDeclaration() &&
+    if (!function.isDeclarationForLinker() &&
         function.getCallingConv() == llvm::CallingConv::PTX_Kernel) {
       ++kernel_entries_;
     }
