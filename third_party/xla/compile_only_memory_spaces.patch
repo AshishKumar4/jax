@@ -11,15 +11,52 @@ on it was canonicalized to the default memory kind, and a program compiled for i
 program compiled on the device keeps. PjRtStreamExecutorDeviceDescription now holds the memory spaces a
 description states (memory_spaces, default_memory_space), and the topology's devices state the GPU client's:
 its HBM ("device", the default) and pinned_host, from one table every device shares, each kind id the kind's
-fingerprint as the client's memory spaces' are. The C API's PJRT_MemoryDescription_Kind reads its opaque handle
-back as the description it was handed out as, and the compile-only IFRT client attaches every device's memories
+fingerprint as the client's memory spaces' are. The C API hands each memory description out as an opaque handle that is its own pointer, cast one by one into
+an array of handles each C device description holds, and PJRT_MemoryDescription_Kind reads it back as that
+description, and the compile-only IFRT client attaches every device's memories
 whatever its process, so a sharding whose first device is another process's keeps its memory kind.
 
 ---
 diff --git a/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc b/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
 --- a/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
 +++ b/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
-@@ -1670,11 +1670,16 @@
+@@ -1624,6 +1624,19 @@
+   return nullptr;
+ }
+ 
++// The opaque handles of `description`'s memory spaces, each the
++// xla::PjRtMemorySpaceDescription's own pointer cast on its own
++// (PJRT_MemoryDescription_Kind casts it back).
++static std::vector<const PJRT_MemoryDescription*>
++PopulateMemoryDescriptions(const xla::PjRtDeviceDescription& description) {
++  std::vector<const PJRT_MemoryDescription*> handles;
++  for (const xla::PjRtMemorySpaceDescription* memory :
++       description.memory_spaces()) {
++    handles.push_back(reinterpret_cast<const PJRT_MemoryDescription*>(memory));
++  }
++  return handles;
++}
++
+ PJRT_Error* PJRT_DeviceDescription_MemoryDescriptions(
+     PJRT_DeviceDescription_MemoryDescriptions_Args* args) {
+   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+@@ -1634,11 +1647,11 @@
+   absl::Span<const xla::PjRtMemorySpaceDescription* const> memory_spaces =
+       args->device_description->device_description->memory_spaces();
+ 
+-  // We pass each xla::PjRtMemorySpaceDescriptions to the caller through an
+-  // opaque pointer.
++  // Each xla::PjRtMemorySpaceDescription goes to the caller through an opaque
++  // handle, its own pointer, held in an array of handles of the handle's type
++  // (PopulateMemoryDescriptions).
+   args->memory_descriptions =
+-      reinterpret_cast<const PJRT_MemoryDescription* const*>(
+-          memory_spaces.data());
++      args->device_description->memory_descriptions.data();
+ 
+   absl::StatusOr<const xla::PjRtMemorySpaceDescription*> default_memory =
+       args->device_description->device_description->default_memory_space();
+@@ -1670,11 +1683,16 @@
    PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
        "PJRT_MemoryDescription_Kind_Args",
        PJRT_MemoryDescription_Kind_Args_STRUCT_SIZE, args->struct_size));
@@ -39,6 +76,48 @@ diff --git a/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc b/xla/pjrt/c/pjrt_c_api_wrapp
    return nullptr;
  }
  
+@@ -3604,6 +3622,8 @@
+     c_device->client = c_client;
+     c_device->description.attributes =
+         PopulatePjrtAttributes(device->description().Attributes());
++    c_device->description.memory_descriptions =
++        PopulateMemoryDescriptions(device->description());
+     c_client->devices.push_back(c_device);
+     if (device->IsAddressable()) {
+       c_client->addressable_devices.push_back(c_device);
+@@ -3702,6 +3722,8 @@
+         &c_topology->descriptions.back());
+     c_topology->descriptions.back().attributes =
+         PopulatePjrtAttributes(description->Attributes());
++    c_topology->descriptions.back().memory_descriptions =
++        PopulateMemoryDescriptions(*description);
+   }
+   c_topology->attributes =
+       PopulatePjrtAttributes(c_topology->topology->Attributes());
+diff --git a/xla/pjrt/c/pjrt_c_api_wrapper_impl.h b/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
+--- a/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
++++ b/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
+@@ -88,9 +88,6 @@
+                        std::unique_ptr<xla::PjRtClient> cpp_client);
+ };
+ 
+-struct PJRT_MemoryDescription {
+-  xla::PjRtMemorySpaceDescription memory_space_description;
+-};
+ 
+ // PJRT_AsyncHostToDeviceTransferManager is owned by its corresponding
+ // PJRT_Client.
+@@ -107,6 +104,10 @@
+   const xla::PjRtDeviceDescription* device_description;
+   // The device specific attributes which are initialized once per device.
+   std::vector<PJRT_NamedValue> attributes;
++  // Its memory spaces' descriptions, each an opaque handle that is the
++  // xla::PjRtMemorySpaceDescription's own pointer
++  // (PJRT_DeviceDescription_MemoryDescriptions), initialized once per device.
++  std::vector<const PJRT_MemoryDescription*> memory_descriptions;
+ };
+ 
+ // PJRT_Devices are owned by their corresponding PJRT_Client.
 diff --git a/xla/pjrt/gpu/BUILD b/xla/pjrt/gpu/BUILD
 --- a/xla/pjrt/gpu/BUILD
 +++ b/xla/pjrt/gpu/BUILD
