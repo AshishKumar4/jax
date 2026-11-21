@@ -29,7 +29,7 @@ _version = "0.12.0.1"
 # (AshishKumar4/jax), over the release; it installs beside its own jaxlib (0.12.0.1.post101 on
 # Linux x86_64 and aarch64, stock 0.12.0.1 elsewhere) and
 # satisfies jax>=0.12.0.1.
-_release_version: str | None = "0.12.0.1.post117"
+_release_version: str | None = "0.12.0.1.post118"
 
 # The following line is overwritten by build scripts in distributions &
 # releases. Do not modify this manually, or jax/jaxlib build will fail.
