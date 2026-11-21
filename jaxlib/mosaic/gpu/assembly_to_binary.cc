@@ -23,6 +23,7 @@ limitations under the License.
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,6 +36,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -48,10 +50,12 @@ limitations under the License.
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/LLVM.h"
 #include "jaxlib/mosaic/gpu/dump.h"
+#include "jaxlib/mosaic/gpu/gpu_module_to_assembly.h"
 #include "xla/mosaic/pass_boilerplate.h"
 #include "xla/stream_executor/cuda/compilation_options.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/kernel_stats.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace mosaic {
@@ -63,6 +67,10 @@ namespace se = ::stream_executor;
 
 // What precedes a performance-loss note's message, after its code.
 constexpr absl::string_view kLoss = ") Potential Performance Loss: ";
+
+// The PTX pragma letting ptxas spill registers to shared memory (CUDA 13),
+// spills `--warn-on-spills` does not report.
+constexpr llvm::StringLiteral kSharedMemorySpilling = "\"enable_smem_spilling\"";
 
 absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
     const se::cuda::CompilationProvider& compilation_provider,
@@ -85,6 +93,37 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
       ptx_str.substr(0, start_pos).str(),
       absl::StrFormat(".version %d.%d", major_version, minor_version),
       ptx_str.substr(end_pos).str());
+}
+
+// The bytes ptxas spilled assembling `object`, known where its assembly
+// defines one kernel entry (`kKernelEntriesProperty`), every function of it
+// then that entry or one it calls: its functions' spill stores and loads
+// (`stats`, read from the spill warnings Mosaic GPU's compilation providers ask
+// ptxas for, so a function it holds none of spilled nothing). Unknown where
+// `ptx` lets ptxas spill to shared memory, which no warning reports.
+std::optional<int64_t> EntrySpilledBytes(mlir::gpu::ObjectAttr object,
+                                         llvm::StringRef ptx,
+                                         const ModuleStats& stats) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef line : lines) {
+    llvm::StringRef code = line.split("//").first;
+    if (code.contains(".pragma") && code.contains(kSharedMemorySpilling)) {
+      return std::nullopt;
+    }
+  }
+  mlir::IntegerAttr entries;
+  if (mlir::DictionaryAttr properties = object.getProperties()) {
+    entries = properties.getAs<mlir::IntegerAttr>(kKernelEntriesProperty);
+  }
+  if (!entries || entries.getInt() != 1) {
+    return std::nullopt;
+  }
+  int64_t spilled = 0;
+  for (const auto& [function, kernel] : stats) {
+    spilled += kernel.store_bytes_spilled + kernel.load_bytes_spilled;
+  }
+  return spilled;
 }
 
 // The compute capability an object's PTX is compiled for: its NVVM target's
@@ -136,6 +175,11 @@ class AssemblyToBinaryPass
     compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
     std::vector<mlir::Attribute> notes;
+    // The bytes the module's binaries spilled, each where it is known
+    // (`EntrySpilledBytes`); the attribute states them for one binary alone.
+    module->removeAttr(kSpilledBytesAttr);
+    int64_t binaries = 0;
+    std::optional<int64_t> spilled;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -192,6 +236,8 @@ class AssemblyToBinaryPass
                            dump_opts.module_basename + ".ptxas",
                            dump_opts.dump_path);
       }
+      ++binaries;
+      spilled = EntrySpilledBytes(object, ptx_str, sass_or->module_stats);
       for (const PtxasNote& note :
            PtxasNotes(*sass_or->compilation_log)) {
         notes.push_back(b.getDictionaryAttr(
@@ -221,6 +267,9 @@ class AssemblyToBinaryPass
       return;
     }
     module->setAttr(kAssemblerNotesAttr, b.getArrayAttr(notes));
+    if (binaries == 1 && spilled.has_value()) {
+      module->setAttr(kSpilledBytesAttr, b.getI64IntegerAttr(*spilled));
+    }
   }
 
  private:
