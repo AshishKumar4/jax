@@ -292,6 +292,17 @@ def _downcast_spec(
   )
 
 
+class Pipeline(Protocol):
+  """Protocol for a pipeline ``emit_pipeline`` emits: called on its GMEM refs,
+  and stating the buffers and barriers it scopes for them before it runs."""
+
+  def __call__(self, *gmem_refs: Any) -> Any:
+    ...
+
+  def get_allocations(self, *gmem_refs: Any) -> dict[str, Any]:
+    ...
+
+
 def emit_pipeline[T](
     body: Callable[..., T],
     *,
@@ -302,7 +313,7 @@ def emit_pipeline[T](
     init_carry: T | None = None,
     thread_axis: str | None = None,
     prefetch: Callable[..., Any] | None = None,
-):
+) -> Pipeline:
   r"""Creates a function to emit a manual pipeline within a Pallas kernel.
 
   Args:
@@ -867,7 +878,8 @@ def emit_pipeline[T](
       gpu_primitives.wait_smem_to_gmem(0)
     return final_carry if init_carry is not None else None
 
-  return pipeline
+  # Type checkers do not understand the get_allocations assignment above.
+  return pipeline  # pyrefly: ignore[bad-return]
 
 
 class ComputeContext(Protocol):
