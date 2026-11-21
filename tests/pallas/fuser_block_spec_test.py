@@ -308,6 +308,105 @@ class PullBlockSpecTest(jtu.JaxTestCase):
         fn(x),
     )
 
+  @parameterized.parameters([
+      lax.neg, lax.sign, lax.floor, lax.ceil, lax.log1p, lax.expm1, lax.exp2,
+      lax.tan, lax.atan, lax.asin, lax.acos, lax.sinh, lax.cosh, lax.asinh,
+      lax.atanh, lax.cbrt, lax.is_finite,
+      functools.partial(lax.reduce_precision, exponent_bits=5, mantissa_bits=2),
+      lax.erf, lax.erfc, lax.erf_inv,
+  ])
+  def test_a_unary_elementwise_primitive_tiles_by_its_operands_block(self, fn):
+    # In (-1, 1), where each is defined; lax.acosh's domain, the integer
+    # lax.bitwise_not's and the complex parts' have a cell of their own.
+    def f(x):
+      return fn(x)
+
+    in_type = jax.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (_, in_block_spec), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(0),
+    )(new_values, in_type)
+    self.assertEqual(in_block_spec.block_shape, (128, 128))
+    self.assertEqual(in_block_spec.index_map(0, 1, 2), (0, 1))
+    pushed = block_spec_lib.push_block_spec(f, block_spec)(in_type)
+    self.assertEqual(pushed.block_shape, (128, 128))
+    x = np.linspace(-0.9, 0.9, 128 * 128, dtype=np.float32).reshape(128, 128)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (), x), fn(x)
+    )
+
+  def test_a_unary_primitive_of_another_domain_tiles_by_its_operands_block(
+      self,
+  ):
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    complex_values = (
+        np.linspace(-1.0, 1.0, 128 * 128, dtype=np.float32) * (1 + 2j)
+    ).astype(np.complex64)
+    for fn, x in (
+        (lax.acosh, np.linspace(1.0, 3.0, 128 * 128, dtype=np.float32)),
+        (lax.bitwise_not, np.arange(128 * 128, dtype=np.int32)),
+        (lax.real, complex_values),
+        (lax.imag, complex_values),
+        (lax.conj, complex_values),
+    ):
+      with self.subTest(fn.__name__):
+        x = x.reshape(128, 128)
+        in_type = jax.ShapeDtypeStruct((512, 512), x.dtype)
+        f2, new_values, scalar_prefetch_values = (
+            block_spec_lib.get_fusion_values(fn, in_type)
+        )
+        kernel_fn, (_, in_block_spec), _ = block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(
+                0
+            ),
+        )(new_values, in_type)
+        self.assertEqual(in_block_spec.block_shape, (128, 128))
+        np.testing.assert_array_equal(
+            kernel_fn((0, 0, 0), scalar_prefetch_values, (), x), fn(x)
+        )
+
+  def test_an_optimization_barrier_passes_each_operands_block_through(self):
+    # A compensated sum's terms, kept apart by a barrier inside an epilogue.
+    def f(x, y):
+      product, kept = lax.optimization_barrier((x * y, -x))
+      return product + kept
+
+    x_type = jax.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, x_type, x_type
+    )
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (_, x_block_spec, y_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(
+                0
+            ),
+        )(new_values, x_type, x_type)
+    )
+    self.assertEqual(x_block_spec.index_map(0, 1, 2), (0, 1))
+    self.assertEqual(y_block_spec.index_map(0, 1, 2), (0, 1))
+    pushed = block_spec_lib.push_block_spec(f, block_spec, block_spec)(
+        x_type, x_type
+    )
+    self.assertEqual(pushed.block_shape, (128, 128))
+    x = np.full((128, 128), 2.0, np.float32)
+    y = np.full((128, 128), 3.0, np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (), x, y), f(x, y)
+    )
+
   @parameterized.parameters([jnp.exp, jnp.tanh])
   def test_elementwise_bias(self, fn):
 
