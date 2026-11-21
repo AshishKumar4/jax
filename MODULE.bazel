@@ -128,6 +128,10 @@ archive_override(
         # The backport at this pin: its sharing check reads HloValue's operand-use rule (kDomain transparent
         # here, removed upstream), and its tests' host copies use executor-allocated memory.
         "//third_party:xla/gpu_dynamic_slice_operand_uses_pin.patch",
+        # A compile-only GPU device states the client's memory spaces (device, pinned_host), so a program compiled
+        # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
+        # (row 8372: a host step prepared without a GPU compiled other programs than its run).
+        "//third_party:xla/compile_only_memory_spaces.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
