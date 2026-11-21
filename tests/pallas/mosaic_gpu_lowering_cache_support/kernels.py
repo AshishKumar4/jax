@@ -106,6 +106,26 @@ def lane(size, power, params, scale):
   return kernel
 
 
+def uncontracted(size, power, params, scale):
+  """The plain kernel, its product labeled to round on its own: an equation's
+  XLA metadata, which its lowering reads (`xla_no_contract`)."""
+  from jax.experimental.xla_metadata import set_xla_metadata  # pylint: disable=g-import-not-at-top
+  kwargs = {} if params is None else {"compiler_params": params}
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+      **kwargs,
+  )
+  def kernel(x_ref, o_ref):
+    with set_xla_metadata(xla_no_contract=True):
+      product = x_ref[...] ** power * scale
+    o_ref[...] = product + 1.0
+
+  return kernel
+
+
 @dataclasses.dataclass(frozen=True)
 class OwnLayout(gpu_core.SomeLayout):
   """A layout of a class this file (no sealed file) defines."""

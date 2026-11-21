@@ -103,6 +103,7 @@ from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing
 from jax._src.pallas.mosaic_gpu import lowering_cache_store as store_lib
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import core as mgpu_core
+from jax.experimental.mosaic.gpu import fragmented_array
 from jax.experimental.mosaic.gpu import lowering_inputs as mgpu_lowering_inputs
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import ml_dtypes
@@ -351,6 +352,9 @@ def _key(
       "physical mesh": enc.encode(mesh_lib.thread_resources.env.physical_mesh),
       "compute_on": enc.encode(config.compute_on_context_manager.value),
       "xla metadata": enc.encode(config.xla_metadata_context_manager.value),
+      # Whether its float arithmetic may be contracted (a caller's
+      # `fragmented_array.contracting` around the lowering).
+      "contracts": enc.encode(fragmented_array.contracts()),
       "no_collectives": enc.encode(config.no_collectives.value),
       "layout tracing mode": enc.encode(jax_layout.layout_tracing_mode.value),
       "interpreters": enc.encode((

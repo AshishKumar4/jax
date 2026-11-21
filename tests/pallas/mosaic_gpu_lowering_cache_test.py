@@ -203,6 +203,7 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         "a jax.config flag": dict(config={"jax_numpy_rank_promotion": "warn"}),
         "the shared memory bound": dict(smem_bound=200 * 1024),
         "an environment variable": dict(env={"MOSAIC_GPU_TEST_INPUT": "1"}),
+        "an equation's XLA metadata": dict(kernel="uncontracted"),
     }
     for name, change in changes.items():
       with self.subTest(name):

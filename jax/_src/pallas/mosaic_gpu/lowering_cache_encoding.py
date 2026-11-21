@@ -610,7 +610,14 @@ class Encoder:
         ) from e
       outvars = seq(b"eo", [bind(v) for v in eqn.outvars])
       effects = seq(b"ee", sorted(effect(e) for e in eqn.effects))
-      eqns.append(seq(b"eq", [prim, invars, params, outvars, effects]))
+      fields = [prim, invars, params, outvars, effects]
+      # The equation's XLA metadata, which its lowering reads (an operation
+      # labeled `xla_no_contract` rounds on its own): only where it has some,
+      # an equation without keeping the key it had.
+      if eqn.ctx.xla_metadata:
+        fields.append(self._mapping(
+            b"xm", sorted(eqn.ctx.xla_metadata.items()), depth))
+      eqns.append(seq(b"eq", fields))
     parts.append(seq(b"eqns", eqns))
     parts.append(seq(b"out", [atom(a) for a in jaxpr.outvars]))
     parts.append(seq(b"ef", sorted(effect(e) for e in jaxpr.effects)))
