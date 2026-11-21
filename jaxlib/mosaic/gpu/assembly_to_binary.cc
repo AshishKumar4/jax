@@ -23,6 +23,7 @@ limitations under the License.
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -136,6 +137,10 @@ class AssemblyToBinaryPass
     compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
     std::vector<mlir::Attribute> notes;
+    // The bytes the module's one binary spilled, where it has one and they are
+    // known (`LaunchSpilledBytes`).
+    int64_t binaries = 0;
+    std::optional<int64_t> spilled;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -192,6 +197,9 @@ class AssemblyToBinaryPass
                            dump_opts.module_basename + ".ptxas",
                            dump_opts.dump_path);
       }
+      ++binaries;
+      spilled = LaunchSpilledBytes(sass_or->module_stats,
+                                   ptx_str.count(".entry "));
       for (const PtxasNote& note :
            PtxasNotes(*sass_or->compilation_log)) {
         notes.push_back(b.getDictionaryAttr(
@@ -221,6 +229,9 @@ class AssemblyToBinaryPass
       return;
     }
     module->setAttr(kAssemblerNotesAttr, b.getArrayAttr(notes));
+    if (binaries == 1 && spilled.has_value()) {
+      module->setAttr(kSpilledBytesAttr, b.getI64IntegerAttr(*spilled));
+    }
   }
 
  private:
@@ -242,6 +253,18 @@ std::vector<PtxasNote> PtxasNotes(absl::string_view log) {
                          line.substr(loss + kLoss.size())))});
   }
   return notes;
+}
+
+std::optional<int64_t> LaunchSpilledBytes(const ModuleStats& stats,
+                                          int64_t entries) {
+  if (entries != 1) {
+    return std::nullopt;
+  }
+  int64_t spilled = 0;
+  for (const auto& [function, kernel] : stats) {
+    spilled += kernel.store_bytes_spilled + kernel.load_bytes_spilled;
+  }
+  return spilled;
 }
 
 void registerAssemblyToBinaryPass(

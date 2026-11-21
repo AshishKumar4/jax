@@ -198,6 +198,7 @@ cc_library(
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TargetLLVM",
         "@llvm-project//mlir:TransformUtils",
+        "@xla//xla/stream_executor:kernel_stats",
         "@llvm-project//mlir:VectorDialect",
         "@xla//xla/service/gpu/llvm_gpu_backend:load_ir_module",
         "@xla//xla/stream_executor/cuda:compilation_options",
@@ -448,6 +449,7 @@ cc_test(
     deps = [
         ":passes",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/stream_executor:kernel_stats",
     ],
 )
 
