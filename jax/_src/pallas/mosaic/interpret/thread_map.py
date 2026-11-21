@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 from concurrent import futures
 import contextlib
 import functools
+import sys
 import threading
 
 import jax
@@ -73,17 +75,59 @@ def _run(jaxpr, consts, *args):
   jax_core.eval_jaxpr(jaxpr, consts, *args)
 
 
-def _run_jaxpr(jaxpr, consts, *args):
-  # Every argument kept, so a role body's compiled signature is its jaxpr's:
-  # with its unused arguments pruned, a Blackwell causal forward's role thread
-  # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
-  # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
-  # Which pass drops the leaf is not established; keeping the arguments avoids
-  # it, at the cost of passing buffers the body does not read.
-  traced = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
-      jaxpr, consts, *args)
-  traced.lower().compile()(consts, *args)
-  return
+# The executables compiled for thread maps' bodies, by what decides one (`_key`),
+# each a future its first caller completes, so threads and callbacks asking for
+# one body at once compile it once. Bounded, oldest first out.
+_COMPILED: collections.OrderedDict[tuple, futures.Future] = (
+    collections.OrderedDict())
+_COMPILED_HELD = 256
+_compiled_lock = threading.Lock()
+
+
+def _key(jaxpr, consts, args) -> tuple:
+  """What decides a thread map body's executable: its jaxpr as printed in full
+  (an object whose meaning is its identity prints its address) and its
+  arguments' types and devices, each device the object of its own client (two
+  leased clients' first devices print alike). A kernel's forward, tangent and
+  transpose traces each make a new jaxpr of one text; keyed by the jaxpr
+  object, each compiled again (a recurrence test's 76 bodies were 44 texts)."""
+  with np.printoptions(threshold=sys.maxsize):
+    text = str(jaxpr)
+  types = tuple(
+      (np.shape(leaf), str(leaf.dtype), frozenset(leaf.devices()))
+      for leaf in jax.tree.leaves((consts, args)))
+  return text, types
+
+
+def _compiled(jaxpr, consts, args):
+  """`jaxpr`'s executable for `consts` and `args`, compiled once whoever asks."""
+  key = _key(jaxpr, consts, args)
+  with _compiled_lock:
+    held = _COMPILED.get(key)
+    compiling = held is None
+    if compiling:
+      held = _COMPILED[key] = futures.Future()
+      if len(_COMPILED) > _COMPILED_HELD:
+        _COMPILED.popitem(last=False)
+    else:
+      _COMPILED.move_to_end(key)
+  if not compiling:
+    return held.result()
+  try:
+    # Every argument kept, so a role body's compiled signature is its jaxpr's:
+    # with its unused arguments pruned, a Blackwell causal forward's role thread
+    # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
+    # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
+    # Which pass drops the leaf is not established; keeping the arguments
+    # avoids it, at the cost of passing buffers the body does not read.
+    held.set_result(jax.jit(_run, static_argnums=(0,), keep_unused=True)
+                    .trace(jaxpr, consts, *args).lower().compile())
+  except BaseException as error:
+    held.set_exception(error)
+    with _compiled_lock:
+      if _COMPILED.get(key) is held:
+        del _COMPILED[key]
+  return held.result()
 
 
 def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
@@ -101,6 +145,17 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
     # there reads those arrays rather than transferring them again (about 15%
     # of an interpreted kernel's time in one measured test).
     placed = [jax.device_put((consts, invals), d) for d in devices]
+    # One executable a device, compiled before any thread runs: each thread
+    # compiling its own raced the others to an empty cache, every one missing.
+    try:
+      executables = [
+          _compiled(jaxpr, thread_consts,
+                    jax.tree.leaves((jax.device_put(np.int32(0), device),
+                                     *thread_invals)))
+          for device, (thread_consts, thread_invals) in zip(devices, placed)]
+    except Exception as e:
+      on_exception(e, device_id=device_id, token=token)
+      raise
     for i in range(num_threads):
       # `jaxpr` is the traced representation of a function whose first argument
       # is the thread ID. Hence,
@@ -114,7 +169,7 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
       args = (jax.device_put(np.int32(i), devices[device]), *thread_invals)
       flat_args, _ = jax.tree.flatten(args)
       threads.append(
-          executor.submit(_run_jaxpr, jaxpr, thread_consts, *flat_args))
+          executor.submit(executables[device], thread_consts, *flat_args))
     exceptions = []
     for i in range(num_threads):
       try:
