@@ -1683,6 +1683,20 @@ class LaxTest(jtu.JaxTestCase):
       self.assertEqual(product.dtype, result_type)
       self.assertEqual(float(product), expected)
 
+  def testSmallF8DotRoundsOnlyItsResult(self):
+    # E5M2 operands under an F8 algorithm with an E4M3FN result: 512 is no
+    # E4M3FN value, so rounding the operands to the result type would lose the
+    # product 512 * 0.5 = 256, which is one.
+    if not jtu.test_device_matches(["gpu"]):
+      self.skipTest("XLA:GPU's small-dot rewrite")
+    lhs = jnp.array([512.0], dtypes.float8_e5m2)
+    rhs = jnp.array([0.5], dtypes.float8_e5m2)
+    product = jax.jit(lambda a, b: lax.dot(
+        a, b, precision=lax.DotAlgorithmPreset.ANY_F8_ANY_F8_F32,
+        preferred_element_type=dtypes.float8_e4m3fn))(lhs, rhs)
+    self.assertEqual(product.dtype, dtypes.float8_e4m3fn)
+    self.assertEqual(float(product), 256.0)
+
   def testDotAlgorithmInvalidFloat8Type(self):
     if jtu.test_device_matches(["cpu"]):
       raise SkipTest("Not supported on CPU.")

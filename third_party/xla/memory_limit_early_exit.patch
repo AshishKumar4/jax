@@ -25,6 +25,18 @@ index 83935d4bc7..c403d8187d 100644
      flag_list->push_back(tsl::Flag(
          "xla_gpu_print_compilation_stats",
          bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
+diff --git a/xla/pjrt/gpu/se_gpu_pjrt_client.cc b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+index e22b4de971..a5116f9567 100644
+--- a/xla/pjrt/gpu/se_gpu_pjrt_client.cc
++++ b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+@@ -2634,6 +2634,7 @@ static absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunGpuAsync(
+         param_no};
+   };
+ 
++  ABSL_RETURN_IF_ERROR(gpu_exec->Runnable());
+   ABSL_ASSIGN_OR_RETURN(
+       std::unique_ptr<gpu::GpuExecutableBufferAllocator::ExecutionScope>
+           allocation_scope,
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
 index 8ed5a15fce..8123ec5606 100644
 --- a/xla/service/gpu/BUILD
@@ -250,7 +262,7 @@ index 0000000000..4ae39ba021
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
-index 8e3fdad3e3..76787d0ef8 100644
+index 8e3fdad3e3..60f3147ca1 100644
 --- a/xla/service/gpu/gpu_executable.cc
 +++ b/xla/service/gpu/gpu_executable.cc
 @@ -75,6 +75,7 @@ limitations under the License.
@@ -274,23 +286,33 @@ index 8e3fdad3e3..76787d0ef8 100644
    if (has_module() && enable_debug_info_manager_) {
      XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                 buffer_assignment_proto_);
-@@ -1643,6 +1648,15 @@ absl::Status GpuExecutable::ExecuteThunks(
-         {{"module_name", module_name_}});
-   });
+@@ -1453,6 +1458,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
+         param_no};
+   };
  
-+  // Every execution reaches its thunks here, a PjRt client's directly.
-+  if (over_memory_limit_.has_value()) {
-+    return absl::FailedPreconditionError(absl::StrCat(
-+        "Module ", module_name_, " holds ", *over_memory_limit_,
-+        " bytes of device memory, over xla_gpu_memory_limit_early_exit_bytes's ",
-+        memory_limit_early_exit_bytes_,
-+        ": its compile stopped after buffer assignment and emitted no code"));
++  ABSL_RETURN_IF_ERROR(Runnable());
+   ABSL_ASSIGN_OR_RETURN(
+       std::unique_ptr<GpuExecutableBufferAllocator::ExecutionScope>
+           allocation_scope,
+@@ -1631,6 +1637,17 @@ void GpuExecutable::LogChangedAllocationsInBetweenExecutions(
+ const BufferAssignmentProto& GpuExecutable::buffer_assignment_proto() const {
+   return buffer_assignment_proto_;
+ }
++absl::Status GpuExecutable::Runnable() const {
++  if (!over_memory_limit_.has_value()) {
++    return absl::OkStatus();
 +  }
++  return absl::FailedPreconditionError(absl::StrCat(
++      "Module ", module_name_, " holds ", *over_memory_limit_,
++      " bytes of device memory, over xla_gpu_memory_limit_early_exit_bytes's ",
++      memory_limit_early_exit_bytes_,
++      ": its compile stopped after buffer assignment and emitted no code"));
++}
 +
-   if (VLOG_IS_ON(5)) {
-     LogChangedAllocationsInBetweenExecutions(buffer_allocations, run_options);
-   }
-@@ -1685,6 +1699,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
+ absl::Status GpuExecutable::ExecuteThunks(
+     const BufferAllocations& buffer_allocations,
+     const ServiceExecutableRunOptions* run_options,
+@@ -1685,6 +1702,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
    return size;
  }
  
@@ -318,7 +340,7 @@ index 8e3fdad3e3..76787d0ef8 100644
  absl::StatusOr<absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>>
  GetOutputInfo(const HloModule& hlo_module, const BufferAssignment& assignment) {
    const HloInstruction* root =
-@@ -1809,6 +1844,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+@@ -1809,6 +1847,7 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
  
    *proto.mutable_buffer_assignment() = buffer_assignment_proto_;
    proto.set_buffer_allocations_debug_summary(buffer_allocations_debug_summary_);
@@ -326,7 +348,7 @@ index 8e3fdad3e3..76787d0ef8 100644
  
    if (has_module()) {
      *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
-@@ -1891,6 +1927,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
+@@ -1891,6 +1930,8 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
      std::shared_ptr<HloModule> debug_module) {
    Params params;
    params.debug_options = std::move(debug_options);
@@ -336,10 +358,23 @@ index 8e3fdad3e3..76787d0ef8 100644
        params.debug_options.xla_gpu_executable_embed_debug_info();
    const std::string& binary = proto.binary();
 diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
-index 139cb4947f..c607360e42 100644
+index 139cb4947f..ed21be66f5 100644
 --- a/xla/service/gpu/gpu_executable.h
 +++ b/xla/service/gpu/gpu_executable.h
-@@ -518,11 +518,24 @@ class GpuExecutable : public Executable {
+@@ -232,6 +232,12 @@ class GpuExecutable : public Executable {
+       std::optional<absl::Span<const BufferAllocation::Index>>
+           persistent_alloc_indices = std::nullopt);
+ 
++  // OK where the executable runs; FailedPrecondition where its compile stopped
++  // after buffer assignment over its memory limit
++  // (xla_gpu_memory_limit_early_exit_bytes). Every execution asks it before
++  // allocating any of its buffers, a PjRt client's too.
++  absl::Status Runnable() const;
++
+   using BufferAllocToDeviceMemoryMap =
+       GpuModuleGlobals::BufferAllocToDeviceMemoryMap;
+ 
+@@ -518,11 +524,24 @@ class GpuExecutable : public Executable {
  
    // The GPU topology the executable was compiled for, if known.
    std::optional<GpuTopology> gpu_topology_;

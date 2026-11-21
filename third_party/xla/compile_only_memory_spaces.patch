@@ -133,18 +133,19 @@ index 72cb19a9d9..7d8feb7586 100644
          "//xla/pjrt:pjrt_compiler",
          "//xla/pjrt:pjrt_device_description",
 diff --git a/xla/pjrt/gpu/se_gpu_topology_description.cc b/xla/pjrt/gpu/se_gpu_topology_description.cc
-index 10d85c893b..5e1873ab22 100644
+index 10d85c893b..6828e7cd87 100644
 --- a/xla/pjrt/gpu/se_gpu_topology_description.cc
 +++ b/xla/pjrt/gpu/se_gpu_topology_description.cc
-@@ -54,6 +54,24 @@ limitations under the License.
+@@ -54,6 +54,28 @@ limitations under the License.
  
  namespace xla {
  
 +namespace {
 +// The memory spaces a StreamExecutor GPU client's device has (its HBM, the
-+// default, and pinned host memory, StreamExecutorGpuClient's), each kind id
-+// the kind's fingerprint as the client's are: one table every device of a
-+// topology states.
++// default, pinned host memory and unpinned host memory,
++// StreamExecutorGpuClient's), each kind id the kind's fingerprint as the
++// client's are: one table every device of a topology states, and the
++// topology's kind ids (`GetMemorySpaceKindIds`) in its order.
 +absl::Span<const PjRtMemorySpaceDescription* const> GpuMemorySpaces() {
 +  static const PjRtMemorySpaceDescription* const kDevice =
 +      new PjRtMemorySpaceDescription(
@@ -152,8 +153,11 @@ index 10d85c893b..5e1873ab22 100644
 +  static const PjRtMemorySpaceDescription* const kPinnedHost =
 +      new PjRtMemorySpaceDescription(PinnedHostMemorySpace::kKind,
 +                                     PinnedHostMemorySpace::kKindId);
-+  static const PjRtMemorySpaceDescription* const kSpaces[] = {kDevice,
-+                                                               kPinnedHost};
++  static const PjRtMemorySpaceDescription* const kUnpinnedHost =
++      new PjRtMemorySpaceDescription(UnpinnedHostMemorySpace::kKind,
++                                     UnpinnedHostMemorySpace::kKindId);
++  static const PjRtMemorySpaceDescription* const kSpaces[] = {
++      kDevice, kPinnedHost, kUnpinnedHost};
 +  return kSpaces;
 +}
 +}  // namespace
@@ -161,7 +165,7 @@ index 10d85c893b..5e1873ab22 100644
  REGISTER_PJRT_TOPOLOGY_DESERIALIZER(
      Cuda, xla::CudaId(), xla::CudaName(),
      [](const xla::PjRtTopologyDescriptionProto& proto) {
-@@ -153,6 +171,11 @@ StreamExecutorGpuTopologyDescription::CreateDeviceDescription(
+@@ -153,6 +175,11 @@ StreamExecutorGpuTopologyDescription::CreateDeviceDescription(
    auto description = std::make_unique<PjRtStreamExecutorDeviceDescription>(
        device_id, local_device_id, process_index, process_index_in_partition,
        partition_index, std::string(gpu_topology_->platform_version()));
@@ -173,8 +177,27 @@ index 10d85c893b..5e1873ab22 100644
    if (target_config_.has_value()) {
      std::string compute_capability = "<unknown compute-capability>";
      std::string gpu_vendor = "<unknown gpu vendor>";
+@@ -331,10 +358,14 @@ StreamExecutorGpuTopologyDescription::MakeCanonicalShapeForMemorySpace(
+ 
+ absl::Span<const int>
+ StreamExecutorGpuTopologyDescription::GetMemorySpaceKindIds() const {
+-  static const int kGpuMemorySpaceKindIds[] = {
+-      static_cast<int>(tsl::Fingerprint32("device")),
+-      PinnedHostMemorySpace::kKindId, UnpinnedHostMemorySpace::kKindId};
+-  return absl::MakeConstSpan(kGpuMemorySpaceKindIds);
++  static const std::vector<int>* const kGpuMemorySpaceKindIds = [] {
++    auto* ids = new std::vector<int>();
++    for (const PjRtMemorySpaceDescription* space : GpuMemorySpaces()) {
++      ids->push_back(space->kind_id());
++    }
++    return ids;
++  }();
++  return *kGpuMemorySpaceKindIds;
+ }
+ 
+ bool StreamExecutorGpuTopologyDescription::IsMemorySpaceOnCpu(
 diff --git a/xla/pjrt/gpu/se_gpu_topology_description_test.cc b/xla/pjrt/gpu/se_gpu_topology_description_test.cc
-index 9d31d364e2..ca4eadb7de 100644
+index 9d31d364e2..22a4bc1937 100644
 --- a/xla/pjrt/gpu/se_gpu_topology_description_test.cc
 +++ b/xla/pjrt/gpu/se_gpu_topology_description_test.cc
 @@ -20,6 +20,7 @@ limitations under the License.
@@ -193,7 +216,7 @@ index 9d31d364e2..ca4eadb7de 100644
  #include "xla/pjrt/pjrt_common.h"
  #include "xla/pjrt/pjrt_compiler.h"
  #include "xla/pjrt/pjrt_device_description.h"
-@@ -163,6 +165,28 @@ TEST(StreamExecutorGpuTopologyDescriptionTest,
+@@ -163,6 +165,30 @@ TEST(StreamExecutorGpuTopologyDescriptionTest,
    }
  }
  
@@ -210,12 +233,14 @@ index 9d31d364e2..ca4eadb7de 100644
 +    for (const PjRtMemorySpaceDescription* memory : device->memory_spaces()) {
 +      kinds.push_back(std::string(memory->kind()));
 +    }
-+    EXPECT_THAT(kinds, ElementsAre("device", "pinned_host"));
++    EXPECT_THAT(kinds, ElementsAre("device", "pinned_host", "unpinned_host"));
 +    TF_ASSERT_OK_AND_ASSIGN(const PjRtMemorySpaceDescription* default_memory,
 +                            device->default_memory_space());
 +    EXPECT_EQ(default_memory->kind(), "device");
 +    EXPECT_EQ(device->memory_spaces()[1]->kind_id(),
 +              PinnedHostMemorySpace::kKindId);
++    EXPECT_EQ(device->memory_spaces()[2]->kind_id(),
++              UnpinnedHostMemorySpace::kKindId);
 +  }
 +}
 +
