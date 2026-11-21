@@ -118,11 +118,15 @@ def _token() -> tuple[Any, ...]:
 
 @dataclasses.dataclass(frozen=True)
 class State:
-  """What the registries held, and the identity of it all."""
+  """What the registries held, and the identity of it all; and whether any
+  rule they hold runs an extension's code, a declared source package's,
+  however a sealed rule holds it (`extended`, as their encoding met it), which
+  a lowering may hand anything it holds, its mesh among it."""
   token: tuple[Any, ...]
   digest: bytes
   # Held so that no object of the token is freed (and its id reused) meanwhile.
   entries: tuple[Any, ...] = dataclasses.field(repr=False, compare=False)
+  extended: bool = False
 
 
 _lock = threading.Lock()
@@ -148,7 +152,8 @@ def current() -> State:
         b"".join(_encode_table(enc, table) for table in tables())).digest()
     entries = tuple(
         (live := table.get(), tuple(_entries(live))) for table in tables())
-    _last = State(token, digest, entries)
+    # Whatever code the rules run, as their encoding met it (`Encoder.extended`).
+    _last = State(token, digest, entries, enc.extended)
     return _last
 
 

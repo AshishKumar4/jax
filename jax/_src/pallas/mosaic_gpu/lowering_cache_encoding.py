@@ -33,7 +33,7 @@ import struct
 import sys
 import threading
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -168,11 +168,21 @@ class Encoder:
   encodes.
   """
 
-  def __init__(self, placed: bool = True):
+  def __init__(self, placed: bool = True,
+               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None):
     # Whether an aval's placement (its sharding and its manual axes) is
     # encoded: not for a kernel that reads no mesh (`lowering_cache`'s
     # `_reads_jax_mesh`), whose avals are a shard's or the whole's alike.
     self.placed = placed
+    # The params each primitive's equations key as None where not placed: its
+    # placement alone, which its audited lowering never reads
+    # (`lowering_cache`'s `_placement_ignored`).
+    self.ignored = {} if ignored is None else dict(ignored)
+    # Whether it met a function or a class of a declared source package (an
+    # extension's code, however a sealed function holds it: its closure, a
+    # partial's arguments), which a registry's snapshot reads
+    # (`lowering_cache_registries.State.extended`).
+    self.extended = False
     self.primitives: dict[jax_core.Primitive, bool] = {}
     self._callables: list[Any] = []
     # The bare `object()`s met (the axis name `warp_map` makes), by id, and the
@@ -362,6 +372,9 @@ class Encoder:
             f"{what} {cls.__module__}.{cls.__qualname__}: {e}"
         ) from e
       self._class_identities[cls] = identity
+    module = sys.modules.get(cls.__module__)
+    if sealing.seal().source(getattr(module, "__file__", None)) is not None:
+      self.extended = True
     return frame(b"K", identity)
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
@@ -524,6 +537,8 @@ class Encoder:
         identity = sealing.seal().function_identity(fn)
       except sealing.NotSealed as e:
         raise Uncacheable(str(e)) from e
+      if sealing.seal().source(fn.__code__.co_filename) is not None:
+        self.extended = True
       cells = []
       for cell in fn.__closure__ or ():
         try:
@@ -555,6 +570,17 @@ class Encoder:
     return seq(b"Di", [
         string(info.func_name), self._e(info.arg_names, depth + 1), string(source),
     ])
+
+  def _params(self, eqn: jax_core.JaxprEqn) -> list[tuple[str, Any]]:
+    """An equation's params as a key reads them: in a kernel that reads no
+    mesh (not `placed`), each placement field its primitive's audited lowering
+    ignores (`ignored`, by the primitive itself) as None, as an aval's
+    placement is not encoded (`_shaped_array`): the kernel traced alone and by
+    each shard of a manual mesh is one entry. Every other param, and every
+    param of a kernel that reads its mesh, as it is."""
+    ignored = () if self.placed else self.ignored.get(eqn.primitive, ())
+    return [(name, None if name in ignored else value)
+            for name, value in eqn.params.items()]
 
   def _jaxpr(self, jaxpr: jax_core.Jaxpr, depth: int) -> bytes:
     env: dict[jax_core.Var, int] = {}
@@ -607,7 +633,7 @@ class Encoder:
       prim = self._primitive(eqn.primitive, depth)
       invars = seq(b"ei", [atom(a) for a in eqn.invars])
       try:
-        params = self._mapping(b"pa", eqn.params.items(), depth)
+        params = self._mapping(b"pa", self._params(eqn), depth)
       except Uncacheable as e:
         if " (in the params of " in str(e):
           raise
@@ -640,6 +666,9 @@ class Encoder:
     module = sys.modules.get(held[0])
     source = sealing.seal().source(getattr(module, "__file__", None))
     tree = [] if source is None else [sealing.seal().source_identity(source[0])]
+    # A declared source package's primitive is an extension's, whatever rule it
+    # reuses (a stock one reading the mesh by its params among them).
+    self.extended |= source is not None
     return seq(b"Ph", [string(held[0]), string(held[1]), *tree])
 
   def _primitive(self, prim: jax_core.Primitive, depth: int) -> bytes:
