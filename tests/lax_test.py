@@ -1652,6 +1652,37 @@ class LaxTest(jtu.JaxTestCase):
       self.assertLess(err_x3, err_bf16)
       self.assertLess(err_x4, err_x3)
 
+  @parameterized.named_parameters(
+      # Each case: its algorithm, its operands' type, the one value both
+      # vectors hold, the result's type and the product its algorithm states.
+      ("F16_F16_F16", lax.DotAlgorithmPreset.F16_F16_F16, np.float16,
+       1 + 2.0**-10, np.float16, 1 + 2.0**-9),  # Rounded to F16.
+      ("F16_F16_F32", lax.DotAlgorithmPreset.F16_F16_F32, np.float16,
+       1 + 2.0**-10, np.float32, 1 + 2.0**-9 + 2.0**-20),  # Exact in F32.
+      ("BF16_BF16_BF16", lax.DotAlgorithmPreset.BF16_BF16_BF16,
+       dtypes.bfloat16, 1 + 2.0**-7, dtypes.bfloat16, 1 + 2.0**-6),
+      ("F64_F64_F64", lax.DotAlgorithmPreset.F64_F64_F64, np.float64,
+       1 + 2.0**-30, np.float64, (1 + 2.0**-30) ** 2),
+      ("ANY_F8_ANY_F8_F32", lax.DotAlgorithmPreset.ANY_F8_ANY_F8_F32,
+       dtypes.float8_e4m3fn, 1.125, np.float32, 1.265625),
+      ("ANY_F8_ANY_F8_F32_FAST_ACCUM",
+       lax.DotAlgorithmPreset.ANY_F8_ANY_F8_F32_FAST_ACCUM,
+       dtypes.float8_e4m3fn, 1.125, np.float32, 1.265625),
+  )
+  def testSmallDotComputesAsItsAlgorithmStates(
+      self, algorithm, dtype, value, result_type, expected):
+    # A dot of one-element vectors, which XLA:GPU rewrites to a multiply and a
+    # reduce (DotStrengthReduction), at each algorithm that rewrite once
+    # refused (INVALID_ARGUMENT "Unsupported dot precision algorithm").
+    if not jtu.test_device_matches(["gpu"]):
+      self.skipTest("XLA:GPU's small-dot rewrite")
+    with config.enable_x64(True):
+      x = jnp.full((1,), value, dtype)
+      product = jax.jit(lambda a, b: lax.dot(
+          a, b, precision=algorithm, preferred_element_type=result_type))(x, x)
+      self.assertEqual(product.dtype, result_type)
+      self.assertEqual(float(product), expected)
+
   def testDotAlgorithmInvalidFloat8Type(self):
     if jtu.test_device_matches(["cpu"]):
       raise SkipTest("Not supported on CPU.")
