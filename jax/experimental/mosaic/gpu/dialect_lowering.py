@@ -1653,6 +1653,11 @@ for _op, _unary_impl, _is_signed in [
   )
 
 
+UNCONTRACTED = "mosaic_gpu.uncontracted"
+"""A float add, subtract or multiply's unit attribute: it rounds on its own,
+never contracted into a fused multiply-add (`fragmented_array.contracting`)."""
+
+
 def _binary_op_lowering_rule(
     _: LoweringContext,
     op: Any,
@@ -1667,7 +1672,9 @@ def _binary_op_lowering_rule(
     raise ValueError("Layout mismatch")
   lhs = _fragmented_array_from_ir(op.lhs, layout, is_signed)
   rhs = _fragmented_array_from_ir(op.rhs, layout, is_signed)
-  return [fragmented_array_to_ir(impl(lhs, rhs), op.result.type)]
+  # An operation marked to round on its own is not contracted (`contracting`).
+  with fa.contracting(UNCONTRACTED not in op.attributes):
+    return [fragmented_array_to_ir(impl(lhs, rhs), op.result.type)]
 
 
 for _op, _binary_impl, _is_signed in [

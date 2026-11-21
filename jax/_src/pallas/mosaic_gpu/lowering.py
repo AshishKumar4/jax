@@ -72,6 +72,7 @@ from jax._src.state.types import TransposeTransform
 from jax._src.util import foreach
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import core as mgpu_core
+from jax.experimental.mosaic.gpu import dialect_lowering as mgpu_dialect_lowering
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.mosaic.gpu import lowering_inputs as mgpu_lowering_inputs
 from jax.experimental.mosaic.gpu import profiler as mgpu_profiler
@@ -1192,8 +1193,12 @@ def lower_jaxpr_to_mosaic_gpu(
           prim=eqn.primitive,
           out_layout_hint=out_layout_hint,
       )
+      # An equation under `xla_no_contract` metadata (an error-free transform's
+      # product and the sums reading it) emits arithmetic that rounds on its own.
+      contracts = not (eqn.ctx.xla_metadata or {}).get("xla_no_contract")
       try:
-        outvals = rule(rule_ctx, *invals, **eqn.params)
+        with fa.contracting(contracts):
+          outvals = rule(rule_ctx, *invals, **eqn.params)
       except LoweringError:
         raise  # We only add the extra info to the innermost exception.
       except Exception as e:
@@ -2801,7 +2806,11 @@ def _binary_op_lowering_rule_wg(
   elif jnp.issubdtype(out_aval, jnp.integer):
     return ui_impl(x, y)
   elif f_impl is not None and jnp.issubdtype(out_aval, jnp.floating):
-    return f_impl(x, y)
+    result = f_impl(x, y)
+    if not fa.contracts():
+      # Its dialect lowering emits it rounding on its own (`contracting`).
+      result.owner.attributes[mgpu_dialect_lowering.UNCONTRACTED] = ir.UnitAttr.get()
+    return result
   else:
     raise NotImplementedError(
         f"{ctx.prim} does not support {x_aval.dtype} and {y_aval.dtype}"
