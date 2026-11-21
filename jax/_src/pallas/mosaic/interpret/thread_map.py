@@ -140,8 +140,9 @@ def _value(value):
   bytes, a partial function's function and arguments, a frozen dataclass's
   fields (a host callback's function and argument tree), a source location as
   the place it names (it reports errors alone), a tuple's elements, a number
-  with its type and bits (True, 1 and 1.0 are equal, -0.0 and 0.0 too), any
-  other hashable immutable value itself (its own equality), else its identity
+  by its type and bits (True, 1 and 1.0, -0.0 and 0.0, two NaNs' payloads,
+  each equal as values, keyed apart), any other hashable immutable value
+  itself (its own equality), else its identity
   (a list or a tracer among them)."""
   if isinstance(value, core.Jaxpr):
     return _structure(value, consts=True)
@@ -166,9 +167,9 @@ def _value(value):
   if isinstance(value, tuple):
     return ("tuple", tuple(_value(element) for element in value))
   if isinstance(value, float):
-    return ("float", value.hex())
+    return ("float", np.float64(value).tobytes())
   if isinstance(value, complex):
-    return ("complex", value.real.hex(), value.imag.hex())
+    return ("complex", np.complex128(value).tobytes())
   if isinstance(value, (bool, int)):
     return (type(value).__name__, value)
   if isinstance(value, (list, dict, set)):
@@ -319,6 +320,10 @@ def thread_map(
 
   jaxpr = jax.make_jaxpr(_f)(jnp.int32(0), *args)
 
+  # Its constants go as operands, the jaxpr the callback holds bare: inside an
+  # outer trace (a warp-specialized kernel's block body) they are that trace's
+  # tracers, which a key holding the jaxpr would hold by identity, kept alive
+  # and never matching another trace's.
   return _call_threadmap_callback(
-      token, device_id, jaxpr, num_threads, jaxpr.consts, args,
+      token, device_id, jaxpr.with_consts(()), num_threads, jaxpr.consts, args,
       use_ordered_callback, on_exception)
