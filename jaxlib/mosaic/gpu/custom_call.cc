@@ -516,6 +516,8 @@ struct CompiledKernel {
   int32_t cluster_size = 1;
   // What ptxas noted of a loss of performance as it assembled the kernel.
   std::vector<mosaic::gpu::PtxasNote> assembler_notes;
+  // The bytes ptxas states its registers spilled, stores and loads together.
+  int64_t spilled_bytes = 0;
   // The following fields are used for de/serialization of CompiledKernel.
   std::string object_file;
   std::string host_func_name;
@@ -942,6 +944,10 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
                        use_nvshmem, multimem_used, std::move(gpu_binary),
                        std::move(kernel_name), smem_bytes, cluster_size));
   kernel->assembler_notes = std::move(assembler_notes);
+  if (auto spilled = (*module)->getAttrOfType<mlir::IntegerAttr>(
+          mosaic::gpu::kSpilledBytesAttr)) {
+    kernel->spilled_bytes = spilled.getInt();
+  }
   return kernel;
 }
 
@@ -1187,6 +1193,7 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
     stated->set_code(note.code);
     stated->set_message(note.message);
   }
+  kernel_proto.set_spilled_bytes(kernel->spilled_bytes);
   return kernel_proto.SerializeAsString();
 }
 
@@ -1234,6 +1241,7 @@ CustomCallResources::Deserialize(absl::string_view data) {
             for (const auto& note : kernel_proto.assembler_notes()) {
               kernel->assembler_notes.push_back({note.code(), note.message()});
             }
+            kernel->spilled_bytes = kernel_proto.spilled_bytes();
             return kernel;
           }));
   return resources;

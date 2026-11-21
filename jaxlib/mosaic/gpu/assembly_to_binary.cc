@@ -31,6 +31,8 @@ limitations under the License.
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
@@ -136,6 +138,7 @@ class AssemblyToBinaryPass
     compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
     std::vector<mlir::Attribute> notes;
+    int64_t spilled = 0;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -192,6 +195,7 @@ class AssemblyToBinaryPass
                            dump_opts.module_basename + ".ptxas",
                            dump_opts.dump_path);
       }
+      spilled += PtxasSpilledBytes(*sass_or->compilation_log);
       for (const PtxasNote& note :
            PtxasNotes(*sass_or->compilation_log)) {
         notes.push_back(b.getDictionaryAttr(
@@ -221,6 +225,7 @@ class AssemblyToBinaryPass
       return;
     }
     module->setAttr(kAssemblerNotesAttr, b.getArrayAttr(notes));
+    module->setAttr(kSpilledBytesAttr, b.getI64IntegerAttr(spilled));
   }
 
  private:
@@ -242,6 +247,26 @@ std::vector<PtxasNote> PtxasNotes(absl::string_view log) {
                          line.substr(loss + kLoss.size())))});
   }
   return notes;
+}
+
+int64_t PtxasSpilledBytes(absl::string_view log) {
+  constexpr absl::string_view kKinds[] = {" bytes spill stores",
+                                          " bytes spill loads"};
+  int64_t spilled = 0;
+  for (absl::string_view line : absl::StrSplit(log, '\n')) {
+    for (absl::string_view part : absl::StrSplit(line, ',')) {
+      part = absl::StripAsciiWhitespace(part);
+      for (absl::string_view kind : kKinds) {
+        int64_t bytes = 0;
+        if (absl::EndsWith(part, kind) &&
+            absl::SimpleAtoi(part.substr(0, part.size() - kind.size()),
+                             &bytes)) {
+          spilled += bytes;
+        }
+      }
+    }
+  }
+  return spilled;
 }
 
 void registerAssemblyToBinaryPass(

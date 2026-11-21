@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 #define JAXLIB_MOSAIC_GPU_ASSEMBLY_TO_BINARY_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,17 @@ inline constexpr char kAssemblerNotesAttr[] = "mosaic_gpu.assembler_notes";
 // assembly states, in order (`ptxas warning : (C7515) Potential Performance
 // Loss: <message>`).
 std::vector<PtxasNote> PtxasNotes(absl::string_view log);
+
+// The module attribute an assembled module's spilled bytes are kept in
+// (`PtxasSpilledBytes`), an integer.
+inline constexpr char kSpilledBytesAttr[] = "mosaic_gpu.spilled_bytes";
+
+// The bytes ptxas's report `log` of a module's assembly states its functions
+// spilled, stores and loads together (`<n> bytes stack frame, <s> bytes spill
+// stores, <l> bytes spill loads` under each `Function properties`): what its
+// registers spilled, apart from the stack frame a function's own locals take
+// (libdevice's sinf keeps its slow path's range reduction in a local array).
+int64_t PtxasSpilledBytes(absl::string_view log);
 
 // Registers a pass that converts `gpu.binary` ops wrapping PTX assembly into
 // `gpu.binary` ops wrapping a CUBIN binary, each for the compute capability its

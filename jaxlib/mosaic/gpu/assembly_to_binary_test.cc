@@ -56,5 +56,28 @@ TEST(PtxasNotesTest, AReportNotingNoLossHasNone) {
               testing::IsEmpty());
 }
 
+TEST(PtxasSpilledBytesTest, AReportsSpillsAreItsStoresAndLoadsNotItsFrame) {
+  // A kernel whose own locals take a stack frame (libdevice's sinf) and whose
+  // registers spill beside them, and a device function spilling none.
+  constexpr char kLog[] =
+      "ptxas info    : Compiling entry function 'kernel' for 'sm_90a'\n"
+      "ptxas info    : Function properties for kernel\n"
+      "    360 bytes stack frame, 192 bytes spill stores, 136 bytes spill "
+      "loads\n"
+      "ptxas info    : Used 248 registers, used 1 barriers\n"
+      "ptxas info    : Function properties for __internal_trig_reduction\n"
+      "    32 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads\n";
+  EXPECT_EQ(PtxasSpilledBytes(kLog), 328);
+}
+
+TEST(PtxasSpilledBytesTest, AFrameOfLocalsAloneSpillsNothing) {
+  EXPECT_EQ(PtxasSpilledBytes(
+                "ptxas info    : Function properties for kernel\n"
+                "    32 bytes stack frame, 0 bytes spill stores, 0 bytes "
+                "spill loads\n"
+                "ptxas info    : Used 168 registers\n"),
+            0);
+}
+
 }  // namespace
 }  // namespace mosaic::gpu
