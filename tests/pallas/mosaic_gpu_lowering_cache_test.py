@@ -846,6 +846,31 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     runs = self.run_child(tweaks=["foreign_primitive_rule"], repeat=2)["runs"]
     self.assertEqual([r["events"] for r in runs], [["miss"], ["hit"]], runs)
 
+  # -- what no lowering reaches is no part of a key
+
+  def test_a_rule_registered_late_that_no_lowering_reaches_keeps_every_key(self):
+    # A sealed module imported after the first lowering registers a discharge
+    # rule for a primitive of its own, which no Mosaic GPU rule lowers and no
+    # kernel holds (as jax's thunky does when it is imported): the lowering
+    # after it is the same key, and so is one in a process that imported it
+    # first, its rule replaced by code that is not sealed too.
+    warm, late = self.run_child(after=["registrant"])["runs"]
+    self.assertEqual(warm["events"], ["miss"], warm)
+    self.assertEqual(late["events"], ["hit"], late)
+    early = self.lower(tweaks=["registrant"])
+    self.assertEqual(early["events"], ["hit"], early)
+    unsealed = self.lower(tweaks=["registrant", "registrant_unsealed"])
+    self.assertEqual(unsealed["events"], ["hit"], unsealed)
+    self.assertLen(self.entries(), 1)
+
+  def test_a_kernel_reaches_its_own_primitives_rules_and_no_others(self):
+    # The identity of what a kernel's lowering reaches moves with the rule of a
+    # primitive it holds, and not with that of one it does not.
+    reach = self.run_child(mode="reach")["reach"]
+    self.assertEqual(
+        reach,
+        {"holder moved": True, "none moved": False, "holder apart": True})
+
   # -- a module loaded after the process was sealed is checked as the others were
 
   def test_a_module_loaded_after_sealing_is_checked_against_its_record(self):

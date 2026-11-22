@@ -50,6 +50,7 @@ SM80 = "8.0"
 _SITE_MODULES = {
     "sealed_classes.py": "jax/_src/lowering_cache_test_classes.py",
     "sealed_rules.py": "jax/_src/lowering_cache_test_rules.py",
+    "sealed_registrant.py": "jax/_src/lowering_cache_test_registrant.py",
 }
 
 

@@ -28,7 +28,8 @@ to the process made before the first lowering), `after` (made between the first 
 a second), `mutate` and `touch` (changes to the registries), `late_module` (a
 module imported between the two), `bug` (one of the cache's own), `direct` (the
 lowering with no cache around it), `report_seal`, and `mode` ("encoder": the
-canonicalizer's cases; "audit": what real lowerings read).
+canonicalizer's cases; "audit": what real lowerings read; "reach": what a
+kernel's lowering reaches of the registries).
 """
 
 import hashlib
@@ -55,6 +56,7 @@ from jax._src.pallas.mosaic_gpu import lowering_cache
 from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as cache_encoding
 from jax._src.pallas.mosaic_gpu import lowering_cache_seal as cache_seal
 from jax._src.state import discharge
+from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.experimental.mosaic.gpu import dialect_lowering
 from jax.experimental.mosaic.gpu import layout_inference
@@ -332,6 +334,15 @@ def apply_tweak(spec):
     table = lowering.mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS]
     table[jax_core.Primitive("lowering_cache_test_foreign")] = wrap(
         next(iter(table.values())))
+  elif name == "registrant":
+    # A sealed module that registers a discharge rule for a primitive of its
+    # own as it is imported, as a library's module a process imports late does.
+    importlib.import_module("jax._src.lowering_cache_test_registrant")
+  elif name == "registrant_unsealed":
+    # That primitive's rule replaced by code that is not sealed.
+    from jax._src import lowering_cache_test_registrant as registrant  # pylint: disable=g-import-not-at-top
+    discharge._discharge_rules[registrant.registered_p] = wrap(
+        discharge._discharge_rules[registrant.registered_p])
   elif name == "smem_alignment":
     gpu_core.SMEM_ALIGNMENT = int(arg)
   elif name == "smem_alignment_numpy":
@@ -371,7 +382,10 @@ def mutate_after_first(case):
   elif mutate == "dialect":
     table = dialect_lowering._lowerings
   elif mutate == "discharge":
-    table = discharge._discharge_rules
+    # A ref load's, which every kernel of the cases holds: a rule it reaches.
+    discharge._discharge_rules[state_primitives.get_p] = wrap(
+        discharge._discharge_rules[state_primitives.get_p])
+    return
   else:
     table = layout_inference._constraint_system_derivation_rules
   key = sorted(table, key=str)[0]
@@ -394,6 +408,27 @@ def import_late_module(case):
   assert name not in sys.modules, name
   importlib.invalidate_caches()
   importlib.import_module(name)
+
+
+def reach():
+  """What lowering a kernel reaches of the registries (`State.reached`): one
+  holding the sealed registrant's primitive and one holding none, before and
+  after that primitive's discharge rule is replaced by another sealed rule;
+  whether each one's identity moved."""
+  from jax._src import lowering_cache_test_registrant as registrant  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries  # pylint: disable=g-import-not-at-top
+
+  def identities():
+    state = registries.current()
+    return state.reached(()), state.reached((registrant.registered_p,))
+
+  (none_before, _), (holder_before, _) = identities()
+  discharge._discharge_rules[registrant.registered_p] = (
+      registrant.other_discharge_rule)
+  (none_after, _), (holder_after, _) = identities()
+  return {"holder moved": holder_before != holder_after,
+          "none moved": none_before != none_after,
+          "holder apart": holder_before != none_before}
 
 
 def configure(case, rec):
@@ -444,6 +479,8 @@ def run(case):
   if case.get("mode") == "jaxpr once":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"jaxpr once": encoder_cases.jaxpr_once()}
+  if case.get("mode") == "reach":
+    return {"reach": reach()}
   if case.get("mode") == "audit":
     from mosaic_gpu_lowering_cache_support import state_audit  # pylint: disable=g-import-not-at-top
     return {"audit": state_audit.run()}
