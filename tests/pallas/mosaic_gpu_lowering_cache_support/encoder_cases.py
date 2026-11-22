@@ -21,8 +21,10 @@ dataclasses, avals) are only encodable where the installation is sealed.
 
 import dataclasses
 import enum
+import functools
 import struct
 
+import jax
 from jax import lax
 import jax.numpy as jnp
 import jax.tree_util as tree_util
@@ -92,8 +94,29 @@ class nb_func:  # pylint: disable=invalid-name
   __module__ = "nanobind"
 
 
+def _primal(x):
+  return x * x
+
+
+def _other_primal(x):
+  return x * x * x
+
+
+def _calling(f, x):
+  return f(x)
+
+
+def _custom_jvp_jaxpr(primal, scale):
+  """A jaxpr calling `primal` as a custom_jvp whose JVP scales the tangent by
+  `scale`: kernels alike but in their derivative rules."""
+  f = jax.custom_jvp(primal)
+  f.defjvp(lambda primals, tangents: (f(*primals), scale * tangents[0]))
+  return jax.make_jaxpr(functools.partial(_calling, f))(1.0).jaxpr
+
+
 def cases():
   o1, o2, o3, o4 = object(), object(), object(), object()
+  device = jax.devices()[0]
   f32 = np.dtype(np.float32)
   ref = lambda space: state_types.AbstractRef(
       jax_core.ShapedArray((8,), f32), space)
@@ -152,6 +175,16 @@ def cases():
       ("a class named as nanobind's function", nb_func(), nb_func(), "uncacheable"),
       ("a class of an installed package jax does not require",
        _installed_layout(), _installed_layout(), "uncacheable"),
+      # A process's default device (a compile-ahead's target) is a device.
+      ("the same device", device, device, "equal"),
+      ("a device and none", device, None, "different"),
+      # A custom derivative's call is keyed by the body it lowers, not by its
+      # derivative rules, which are functions no lowering reads.
+      ("custom_jvp calls differing in their rule",
+       _custom_jvp_jaxpr(_primal, 2.0), _custom_jvp_jaxpr(_primal, 3.0), "equal"),
+      ("custom_jvp calls differing in their body",
+       _custom_jvp_jaxpr(_primal, 2.0), _custom_jvp_jaxpr(_other_primal, 2.0),
+       "different"),
   ]
 
 
