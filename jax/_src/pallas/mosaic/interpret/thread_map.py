@@ -18,8 +18,10 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import itertools
 import threading
 from typing import Any
+import weakref
 
 import jax
 from jax._src import callback
@@ -181,16 +183,49 @@ def _value(value):
   return value
 
 
+# Each body structure's id (`_structure`), the oldest dropped past
+# `_STRUCTURES_HELD`; ids are never reused, so a dropped one only compiles again.
+_STRUCTURES: collections.OrderedDict[tuple, int] = collections.OrderedDict()
+_STRUCTURES_HELD = 1024
+# Each body jaxpr object's structure id, found once an object: a kernel's thread
+# map runs its body once a block, and walking its structure each time cost an
+# interpreted kernel's test three to four times its run.
+_BODIES: weakref.WeakKeyDictionary[core.Jaxpr, int] = (
+    weakref.WeakKeyDictionary())
+
+
+def _body(jaxpr) -> int:
+  """`jaxpr`'s structure id, equal for two jaxprs of one structure."""
+  with _compiled_lock:
+    found = _BODIES.get(jaxpr)
+  if found is not None:
+    return found
+  structure = _structure(jaxpr, consts=False)
+  with _compiled_lock:
+    found = _STRUCTURES.get(structure)
+    if found is None:
+      found = _STRUCTURES[structure] = next(_ids)
+      if len(_STRUCTURES) > _STRUCTURES_HELD:
+        _STRUCTURES.popitem(last=False)
+    else:
+      _STRUCTURES.move_to_end(structure)
+    _BODIES[jaxpr] = found
+  return found
+
+
+_ids = itertools.count()
+
+
 def _key(jaxpr, args) -> tuple:
   """What decides a thread map body's executable: its jaxpr's structure
-  (`_structure`) and its arguments' (its constants', its thread ID's and its
+  (`_body`) and its arguments' (its constants', its thread ID's and its
   inputs') types and devices, each device the object of its own client (two
   leased clients' first devices print alike). A kernel's forward, tangent and
   transpose traces each make a new jaxpr of one structure; keyed by the jaxpr
   object, each compiled again (a recurrence test's 76 bodies were 44 texts)."""
   types = tuple((np.shape(leaf), str(leaf.dtype), frozenset(leaf.devices()))
                 for leaf in args)
-  return _structure(jaxpr, consts=False), types
+  return _body(jaxpr), types
 
 
 def _compiled(jaxpr, consts, args):
