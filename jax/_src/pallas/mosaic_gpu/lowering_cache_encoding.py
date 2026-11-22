@@ -38,6 +38,7 @@ from typing import Any
 
 import jax
 from jax._src import core as jax_core
+from jax._src import custom_derivatives
 from jax._src import effects as jax_effects
 from jax._src import flattree
 from jax._src import frozen_dict
@@ -54,6 +55,15 @@ from jax._src.state import types as state_types
 import numpy as np
 
 _NB_FUNCTION = type(_jax.add_exclude_path)
+
+# The params a primitive's every lowering reads, where that is fewer than it
+# holds: a custom derivative's call lowers its body (`call_jaxpr`, MLIR's
+# `_custom_jvp_vjp_call_lowering` and Mosaic GPU's `_eval_jaxpr_lowering_rule`),
+# never its derivative rules, which are functions no encoding names.
+_LOWERED_PARAMS: dict[jax_core.Primitive, tuple[str, ...]] = {
+    custom_derivatives.custom_jvp_call_p: ("call_jaxpr",),
+    custom_derivatives.custom_vjp_call_p: ("call_jaxpr",),
+}
 """nanobind's function type, every function jaxlib's extension exports: a value is
 one by its exact type, never by its class's name, which any class can take."""
 
@@ -305,6 +315,14 @@ class Encoder:
       ])
     if isinstance(x, (mesh_lib.Mesh, mesh_lib.AbstractMesh)):
       return self._mesh(x, depth)
+    if isinstance(x, _jax.Device):
+      # A device, as a mesh names its devices and by what a lowering could
+      # read of it (a compile-only GPU's kind among them): a process's
+      # `jax.default_device` is one, which a compile-ahead sets to its target.
+      return seq(b"Dv", [
+          string(x.platform), string(x.device_kind),
+          self._e(int(x.id), depth + 1), self._e(int(x.process_index), depth + 1),
+      ])
     if isinstance(x, jax_core.AxisEnv):
       return seq(b"ax", [
           self._e(tuple(x.axis_sizes.items()), depth + 1),
@@ -572,12 +590,16 @@ class Encoder:
     ])
 
   def _params(self, eqn: jax_core.JaxprEqn) -> list[tuple[str, Any]]:
-    """An equation's params as a key reads them: in a kernel that reads no
+    """An equation's params as a key reads them: a custom derivative's call
+    by the body it lowers alone (`_LOWERED_PARAMS`); in a kernel that reads no
     mesh (not `placed`), each placement field its primitive's audited lowering
     ignores (`ignored`, by the primitive itself) as None, as an aval's
     placement is not encoded (`_shaped_array`): the kernel traced alone and by
     each shard of a manual mesh is one entry. Every other param, and every
     param of a kernel that reads its mesh, as it is."""
+    lowered = _LOWERED_PARAMS.get(eqn.primitive)
+    if lowered is not None:
+      return [(name, eqn.params[name]) for name in lowered]
     ignored = () if self.placed else self.ignored.get(eqn.primitive, ())
     return [(name, None if name in ignored else value)
             for name, value in eqn.params.items()]
