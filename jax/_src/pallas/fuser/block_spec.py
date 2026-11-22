@@ -3647,20 +3647,16 @@ del _prim
 # A cast of a value's type along manual mesh axes (to vary, as JAX stages one
 # where a consumer under a shard_map checking variance reads an invariant value
 # beside a varying one; from reduced to varying): an element of its output is
-# its operand's at the same index. On values the map types (the check on) it is
-# bound, so what reads it is checked as written; on a kernel's tile, which
-# carries no mesh's types (the check off), it is the identity, as `pvary` is
-# where nothing checks variance. Read as scalar prefetch it is refused: an
-# index map replays its program on prefetched values, which carry no mesh's
-# types wherever it is traced, so a program typed by them cannot run there.
+# its operand's at the same index, used as its output is. On values the map
+# types (the check on) it is bound, so what reads it is checked as written; on
+# a kernel's tile or a prefetched scalar an index map replays its program on,
+# which carry no mesh's types (the check off), it is the identity, as upstream's
+# `pvary` eval rule makes it: a shard_map's slice offset staged from an
+# invariant scalar and `axis_index` fuses (upstream's centered-slice prologue).
 def _manual_cast_usage_rule(
     ctx: UsageRuleContext, used_out: set[Usage], **params
 ) -> Sequence[set[Usage]]:
-  del params
-  if Usage.SCALAR_PREFETCH in used_out:
-    raise NotImplementedError(
-        f'{ctx.prim.name} read as scalar prefetch: a prefetched value carries'
-        ' no manual mesh axes to cast along')
+  del ctx, params
   return [used_out]
 
 
