@@ -458,6 +458,8 @@ class JaxprInterpreter:
     """What a `run_scoped` allocates for one of its refs, its first allocation
     `first` among the scope's: a buffer (at its logical shape), a buffer a
     `RefUnion`'s member, or its barriers."""
+    if not isinstance(aval, state_types.AbstractRef):
+      raise ValueError(f"Unsupported aval: {aval}")
     _raise_if_unsupported_memory_space(aval.memory_space)
 
     def buffer(shape, dtype, memory_space, union=None):
