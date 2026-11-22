@@ -23,7 +23,10 @@ from typing import Any
 
 
 @functools.cache
-def _record_class() -> Any:
+def kernel_record_class() -> Any:
+  """The class of a Mosaic GPU kernel's record (`MosaicGpuKernelProto`), built
+  from the schema the CUDA plugin is built from: what `kernel_record` returns,
+  and what a writer of one (a test's) constructs."""
   from google.protobuf import descriptor_pb2
   from google.protobuf import descriptor_pool
   from google.protobuf import message_factory
@@ -46,7 +49,7 @@ def kernel_record(serialized: bytes) -> Any | None:
   from google.protobuf.message import DecodeError
   from google.protobuf.unknown_fields import UnknownFieldSet
 
-  record = _record_class()()
+  record = kernel_record_class()()
   try:
     record.ParseFromString(serialized)
   except DecodeError:
