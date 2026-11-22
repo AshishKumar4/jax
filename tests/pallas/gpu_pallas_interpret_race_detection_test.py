@@ -337,7 +337,10 @@ class InterpretTest(jtu.JaxTestCase):
     if released:
       self.assertEqual(_kernel(jnp.int32(42)), (100, 42))
     else:
-      with self.assertRaisesRegex(jax.errors.JaxRuntimeError, 'RACE DETECTED'):
+      # The report names each access's clock by its counts.
+      with self.assertRaisesRegex(
+          jax.errors.JaxRuntimeError,
+          r'RACE DETECTED[\s\S]*clock: NpVectorClock\(\[\d'):
         jax.block_until_ready(_kernel(jnp.int32(42)))
 
   @jtu.parameterized.product(
