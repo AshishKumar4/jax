@@ -51,9 +51,7 @@ class MosaicGpuRecordsTest(jtu.JaxTestCase):
 
   def test_a_kernel_record_reads_every_field_the_writer_sets(self):
     # A record as the plugin writes one, every field the reader names set.
-    from jax._src.mosaic_gpu_records import _record_class
-
-    record = _record_class()(
+    record = mosaic_gpu.kernel_record_class()(
         version=4, gpu_binary=b"\x7fELF", kernel_name="kernel",
         smem_bytes=1024, cluster_size=2, caller_metadata=b"launch",
     )
@@ -65,13 +63,11 @@ class MosaicGpuRecordsTest(jtu.JaxTestCase):
     )
 
   def test_a_kernel_record_tells_a_measured_zero_spill_from_none_measured(self):
-    from jax._src.mosaic_gpu_records import _record_class
-
     kernel = dict(gpu_binary=b"\x7fELF", kernel_name="kernel")
     measured = mosaic_gpu.kernel_record(
-        _record_class()(**kernel, spilled_bytes=0).SerializeToString())
+        mosaic_gpu.kernel_record_class()(**kernel, spilled_bytes=0).SerializeToString())
     unmeasured = mosaic_gpu.kernel_record(
-        _record_class()(**kernel).SerializeToString())
+        mosaic_gpu.kernel_record_class()(**kernel).SerializeToString())
     self.assertEqual(
         (measured.HasField("spilled_bytes"), measured.spilled_bytes,
          unmeasured.HasField("spilled_bytes")),
