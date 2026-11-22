@@ -578,9 +578,10 @@ class ConstraintSystemTest(parameterized.TestCase):
     self.assertEqual(smem_to_reg.holds(), holds)
 
   @parameterized.parameters(
-      # Works for some tiled layouts.
-      (mgpu.WGMMA_LAYOUT, False),
-      (mgpu.TCGEN05_LAYOUT, False),
+      # Works for some tiled layouts: WGMMA's and TCGEN05's, their rows' lanes
+      # meeting four to a bank, through four staggered lane groups.
+      (mgpu.WGMMA_LAYOUT, True),
+      (mgpu.TCGEN05_LAYOUT, True),
       (mgpu.WGMMA_TRANSPOSED_LAYOUT, False),
       (mgpu.TCGEN05_TRANSPOSED_LAYOUT, False),
       (mgpu.WGMMA_ROW_LAYOUT, True),
