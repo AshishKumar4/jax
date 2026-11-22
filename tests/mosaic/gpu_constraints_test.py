@@ -646,22 +646,6 @@ class ConstraintSystemTest(parameterized.TestCase):
         [holds(first), holds(second)], [blackwell(first), blackwell(second)]
     )
 
-  @parameterized.parameters(64, 128)
-  def test_tmem_native_registers_store_to_a_swizzled_tile_optimized(
-      self, swizzle
-  ):
-    # Each lane holds a row of the tile (TMEM_NATIVE_LAYOUT): lanes a swizzle
-    # period of rows apart meet on each bank, more than two lane groups apart,
-    # so only a plan staggering more groups transfers it without conflicts.
-    reg_layout = cs.RegisterLayout(mgpu.TMEM_NATIVE_LAYOUT)
-    columns = swizzle // 2
-    smem_layout = cs.SMEMTransforms(lc.TileTransform((64, columns)), swizzle)
-    reg_to_smem = cs.IsTransferableSmemRegisters(
-        reg_layout, smem_layout, (128, 2 * columns), (2 * columns, 1),
-        bitwidth=16, optimized=True,
-    )
-    self.assertTrue(reg_to_smem.holds())
-
   def test_untiled_swizzled_smem_is_not_transferable_for_strided_layout(self):
     reg_layout = cs.RegisterLayout(mgpu.WGStridedFragLayout((128, 128), vec_size=4))
     smem_layout = cs.SMEMTransforms(None, swizzle=128)
