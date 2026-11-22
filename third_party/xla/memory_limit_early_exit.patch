@@ -25,90 +25,18 @@ index 83935d4bc7..4f1700c86a 100644
      flag_list->push_back(
          tsl::Flag("xla_gpu_enable_pdl",
                    bool_setter_for(&DebugOptions::set_xla_gpu_enable_pdl),
-diff --git a/xla/pjrt/common_pjrt_client.cc b/xla/pjrt/common_pjrt_client.cc
-index 8d9fd86d6e..1918d072b3 100644
---- a/xla/pjrt/common_pjrt_client.cc
-+++ b/xla/pjrt/common_pjrt_client.cc
-@@ -3700,6 +3700,12 @@ absl::Status CommonPjRtLoadedExecutable::ExecutePrepare(
-   // Fill in device to launch_args so it will be present even if ExecutePrepare
-   // fails with OOM.
-   launch_args.device = device;
-+  // An executable that cannot run (its compile emitted no code) fails before
-+  // its arguments are prepared or its outputs allocated, which could otherwise
-+  // fail first, out of memory.
-+  if (executable_.IsConcrete()) {
-+    ABSL_RETURN_IF_ERROR(load_state_->CheckRunnable(&executable_.get()));
-+  }
-   DeviceAndAssignment device_and_assign;
-   if (absl::StatusOr<PjRtMemorySpace*> default_memory_space =
-           device->default_memory_space();
-diff --git a/xla/pjrt/raw_pjrt_client.h b/xla/pjrt/raw_pjrt_client.h
-index 868a5a4a7b..d3e34364fe 100644
---- a/xla/pjrt/raw_pjrt_client.h
-+++ b/xla/pjrt/raw_pjrt_client.h
-@@ -150,6 +150,13 @@ class PjRtExecutableLoadState
-     return absl::OkStatus();
-   }
+diff --git a/xla/pjrt/gpu/se_gpu_pjrt_client.cc b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+index e22b4de971..a5116f9567 100644
+--- a/xla/pjrt/gpu/se_gpu_pjrt_client.cc
++++ b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
+@@ -2634,6 +2634,7 @@ static absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunGpuAsync(
+         param_no};
+   };
  
-+  // OK where `executable` can run; an error where it cannot (a compile that
-+  // emitted no code), asked before an execution prepares its arguments or
-+  // allocates its outputs.
-+  virtual absl::Status CheckRunnable(PjRtExecutable* executable) const {
-+    return absl::OkStatus();
-+  }
-+
-   virtual absl::Status SetupMultiSliceConfig(
-       PjRtExecutable* executable,
-       const MultiSliceConfig* multi_slice_config) const {
-diff --git a/xla/pjrt/se/pjrt_stream_executor_client.cc b/xla/pjrt/se/pjrt_stream_executor_client.cc
-index 2897fdd2f5..bc64c1ef72 100644
---- a/xla/pjrt/se/pjrt_stream_executor_client.cc
-+++ b/xla/pjrt/se/pjrt_stream_executor_client.cc
-@@ -668,6 +668,15 @@ PjRtStreamExecutorRawClient::CreateDeviceEventForStream(
-   return PjRtDeviceEventRef(std::move(definition_event));
- }
- 
-+absl::Status PjRtStreamExecutorExecutableLoadState::CheckRunnable(
-+    PjRtExecutable* executable) const {
-+  auto* se_executable = absl::down_cast<StreamExecutorExecutable*>(executable);
-+  ABSL_ASSIGN_OR_RETURN(
-+      std::shared_ptr<LocalExecutable> local_exec,
-+      se_executable->GetOrLoadExecutable(raw_client()->client()));
-+  return local_exec->executable()->Runnable();
-+}
-+
- absl::StatusOr<std::unique_ptr<PjRtRawLoadedExecutable>>
- PjRtStreamExecutorExecutableLoadState::LoadRawExecutable(
-     tsl::AsyncValueRef<PjRtExecutable> executable,
-diff --git a/xla/pjrt/se/pjrt_stream_executor_client.h b/xla/pjrt/se/pjrt_stream_executor_client.h
-index a7a5353e3e..c351de0494 100644
---- a/xla/pjrt/se/pjrt_stream_executor_client.h
-+++ b/xla/pjrt/se/pjrt_stream_executor_client.h
-@@ -479,6 +479,8 @@ class PjRtStreamExecutorExecutableLoadState : public PjRtExecutableLoadState {
- 
-   absl::Status Preload(PjRtExecutable* executable) override;
- 
-+  absl::Status CheckRunnable(PjRtExecutable* executable) const override;
-+
-   absl::StatusOr<std::unique_ptr<PjRtRawLoadedExecutable>> LoadRawExecutable(
-       tsl::AsyncValueRef<PjRtExecutable> executable,
-       const ExecuteOptions& options, size_t host_callback_idx,
-diff --git a/xla/service/executable.h b/xla/service/executable.h
-index 0a9ac663e7..484ad06ea0 100644
---- a/xla/service/executable.h
-+++ b/xla/service/executable.h
-@@ -268,6 +268,11 @@ class Executable {
-       : hlo_module_(std::move(hlo_module)) {}
-   virtual ~Executable() = default;
- 
-+  // OK where the executable runs; an error where it cannot (a compile that
-+  // stopped before emitting code), which a runtime asks before preparing an
-+  // execution's arguments or allocating its outputs.
-+  virtual absl::Status Runnable() const { return absl::OkStatus(); }
-+
-   // Enqueues the compilation result on the provided stream, passing the given
-   // arguments. This call is blocking and returns after the execution is done.
-   //
++  ABSL_RETURN_IF_ERROR(gpu_exec->Runnable());
+   ABSL_ASSIGN_OR_RETURN(
+       std::unique_ptr<gpu::GpuExecutableBufferAllocator::ExecutionScope>
+           allocation_scope,
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
 index 8ed5a15fce..ddfcc18983 100644
 --- a/xla/service/gpu/BUILD
@@ -182,10 +110,10 @@ index b870e75992..70cc19bc03 100644
  
 diff --git a/xla/service/gpu/gpu_compiler_memory_limit_test.cc b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
 new file mode 100644
-index 0000000000..d99425f194
+index 0000000000..4ae39ba021
 --- /dev/null
 +++ b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,147 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -331,33 +259,6 @@ index 0000000000..d99425f194
 +  EXPECT_TRUE(LiteralTestUtil::Equal(reference, ran));
 +}
 +
-+TEST_F(GpuCompilerMemoryLimitTest,
-+       AStoppedCompileIsRefusedBeforeItsOutputsAreAllocated) {
-+  // A program whose output (128 GiB) no GPU's memory holds, compiled under a
-+  // limit it is over: its compile stops after buffer assignment, and its run
-+  // through PjRt fails as stopped, before allocating that output fails it out
-+  // of memory.
-+  HloModuleConfig config = GetModuleConfigForTest();
-+  DebugOptions options = config.debug_options();
-+  options.set_xla_gpu_memory_limit_early_exit_bytes(1 << 20);
-+  config.set_debug_options(options);
-+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-+                          ParseAndReturnVerifiedModule(R"hlo(
-+    HloModule too_large
-+    ENTRY main {
-+      p0 = f32[] parameter(0)
-+      ROOT out = f32[34359738368] broadcast(p0), dimensions={}
-+    }
-+  )hlo",
-+                                                       config));
-+  Literal x = LiteralUtil::CreateR0<float>(0.5f);
-+  absl::StatusOr<Literal> ran = Execute(std::move(module), {&x});
-+  EXPECT_EQ(ran.status().code(), absl::StatusCode::kFailedPrecondition)
-+      << ran.status();
-+  EXPECT_THAT(ran.status().message(),
-+              HasSubstr("stopped after buffer assignment"));
-+}
-+
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
@@ -457,18 +358,18 @@ index 8e3fdad3e3..60f3147ca1 100644
        params.debug_options.xla_gpu_executable_embed_debug_info();
    const std::string& binary = proto.binary();
 diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
-index 139cb4947f..468fca5092 100644
+index 139cb4947f..ed21be66f5 100644
 --- a/xla/service/gpu/gpu_executable.h
 +++ b/xla/service/gpu/gpu_executable.h
 @@ -232,6 +232,12 @@ class GpuExecutable : public Executable {
        std::optional<absl::Span<const BufferAllocation::Index>>
            persistent_alloc_indices = std::nullopt);
  
-+  // FailedPrecondition where its compile stopped after buffer assignment over
-+  // its memory limit (xla_gpu_memory_limit_early_exit_bytes). Every execution
-+  // asks it before allocating any of its buffers: a PjRt client's before
-+  // preparing its arguments (PjRtExecutableLoadState::CheckRunnable).
-+  absl::Status Runnable() const override;
++  // OK where the executable runs; FailedPrecondition where its compile stopped
++  // after buffer assignment over its memory limit
++  // (xla_gpu_memory_limit_early_exit_bytes). Every execution asks it before
++  // allocating any of its buffers, a PjRt client's too.
++  absl::Status Runnable() const;
 +
    using BufferAllocToDeviceMemoryMap =
        GpuModuleGlobals::BufferAllocToDeviceMemoryMap;
