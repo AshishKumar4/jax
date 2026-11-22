@@ -5709,35 +5709,61 @@ class TrivialTransferPlan(TransferPlan):
 
 @dataclasses.dataclass(frozen=True)
 class StaggeredTransferPlan(TransferPlan):
+  """Lanes split into `groups` groups, each `group_stride` lanes in turn, the
+  g-th transferring at each step the tile `g * stagger` past the first group's
+  along `dim` (of `size` tiles)."""
   stagger: int
   dim: int
   size: int
   group_stride: int
+  groups: int = 2
+
+  @functools.cached_property
+  def group_idx(self) -> ir.Value:
+    c32 = lambda x: arith.constant(ir.IntegerType.get_signless(32), x)
+    lane_idx = arith.remui(utils.thread_idx(), c32(WARP_SIZE))
+    return arith.remui(arith.divui(lane_idx, c32(self.group_stride)), c32(self.groups))
 
   @functools.cached_property
   def group_pred(self) -> ir.Value:
+    """Whether this lane is not in the first group."""
     c32 = lambda x: arith.constant(ir.IntegerType.get_signless(32), x)
-    lane_idx = arith.remui(utils.thread_idx(), c32(WARP_SIZE))
-    group_idx = arith.remui(arith.divui(lane_idx, c32(self.group_stride)), c32(2))
-    return arith.cmpi(arith.CmpIPredicate.ne, group_idx, c32(0))
+    return arith.cmpi(arith.CmpIPredicate.ne, self.group_idx, c32(0))
+
+  @functools.cached_property
+  def in_groups(self) -> tuple[ir.Value, ...]:
+    """Whether this lane is in each group, by its index (more than two)."""
+    c32 = lambda x: arith.constant(ir.IntegerType.get_signless(32), x)
+    return tuple(
+        arith.cmpi(arith.CmpIPredicate.eq, self.group_idx, c32(group_idx))
+        for group_idx in range(self.groups))
 
   @property
   def tile_index_transforms(self):
     dim = self.dim
-    def rotate(idx: tuple[int, ...]) -> tuple[int, ...]:
-      return (
-          *idx[:dim], (idx[dim] + self.stagger) % self.size, *idx[dim + 1 :],
-      )
-    return (lambda x: x, rotate)
+    def rotate(shift: int):
+      def rotated(idx: tuple[int, ...]) -> tuple[int, ...]:
+        return (*idx[:dim], (idx[dim] + shift) % self.size, *idx[dim + 1 :])
+      return rotated
+    return (lambda x: x,) + tuple(
+        rotate(group * self.stagger) for group in range(1, self.groups))
 
   def select(self, group_elems: Sequence[ir.Value]) -> ir.Value:
-    assert len(group_elems) == 2
-    return arith.select(self.group_pred, group_elems[1], group_elems[0])
+    assert len(group_elems) == self.groups
+    if self.groups == 2:
+      return arith.select(self.group_pred, group_elems[1], group_elems[0])
+    selected = group_elems[0]
+    for group_idx in range(1, self.groups):
+      selected = arith.select(
+          self.in_groups[group_idx], group_elems[group_idx], selected)
+    return selected
 
   def select_if_group(self, group_idx: int, old: ir.Value, new: ir.Value) -> ir.Value:
-    assert 0 <= group_idx <= 1
-    sides = [old, new] if group_idx == 0 else [new, old]
-    return arith.select(self.group_pred, *sides)
+    assert 0 <= group_idx < self.groups
+    if self.groups == 2:
+      sides = [old, new] if group_idx == 0 else [new, old]
+      return arith.select(self.group_pred, *sides)
+    return arith.select(self.in_groups[group_idx], new, old)
 
 
 class TransferPlanDerivationError(Exception):
@@ -6042,34 +6068,38 @@ def plan_tiled_transfer(
   if not has_bank_conflicts(lambda tile_idx: tile_idx):
     return TrivialTransferPlan()
 
-  # Otherwise, we will try to partition the lanes into two groups and have
-  # each group store to different tile. The only tile dimensions that can help
-  # us with bank conflicts are those that have multiple elements and a stride
+  # Otherwise, we will try to partition the lanes into groups and have each
+  # group store to a different tile. The only tile dimensions that can help us
+  # with bank conflicts are those that have multiple elements and a stride
   # that's not a multiple of the number of banks.
   #
-  # Note that the code is set up so that we could also consider partitioning
-  # the lanes into more groups, but the selects will become more expensive if
-  # we do that. It's a possibility we have if we need it.
-  candidate_dims = (
+  # Two groups are tried first, then four, then eight: each group past the
+  # first adds a select a transferred register. Lanes that each hold a row of
+  # a swizzled tile (TMEM_NATIVE_LAYOUT's) meet in fours on each bank, which
+  # only four groups or more spread.
+  candidate_dims = [
       i for i, (s, d) in enumerate(zip(tiles_strides, tiles_shape))
       if d > 1 and s % (SMEM_BANKS * elems_per_bank)
-  )
-  for dim in candidate_dims:
-    for group_stride in (1, 2, 4, 8, 16):
-      # We change the group assignment each group_stride lanes.
-      lane_id = np.arange(WARP_SIZE)[:, None]
-      lane_group = (lane_id // group_stride) % 2
-      # We only consider a transformation where the second group stores to a
-      # tile that's a constant offset (modulo dim size) from the first one.
-      for stagger in range(1, tiles_shape[dim]):
-        offset = np.zeros(len(tiles_shape), np.int64)
-        offset[dim] = stagger
-        transform = lambda idx: (idx + offset * lane_group) % tiles_shape
-        if not has_bank_conflicts(transform):
-          # We've found a strategy that avoids bank conflicts!
-          return StaggeredTransferPlan(
-              stagger, dim, tiles_shape[dim], group_stride
-          )
+  ]
+  for groups in (2, 4, 8):
+    for dim in candidate_dims:
+      for group_stride in (1, 2, 4, 8, 16):
+        if group_stride * groups > WARP_SIZE:
+          continue
+        # We change the group assignment each group_stride lanes.
+        lane_id = np.arange(WARP_SIZE)[:, None]
+        lane_group = (lane_id // group_stride) % groups
+        # We only consider a transformation where each group stores to a tile
+        # that's a constant offset (modulo dim size) from the previous one.
+        for stagger in range(1, tiles_shape[dim]):
+          offset = np.zeros(len(tiles_shape), np.int64)
+          offset[dim] = stagger
+          transform = lambda idx: (idx + offset * lane_group) % tiles_shape
+          if not has_bank_conflicts(transform):
+            # We've found a strategy that avoids bank conflicts!
+            return StaggeredTransferPlan(
+                stagger, dim, tiles_shape[dim], group_stride, groups
+            )
   raise TransferPlanDerivationError(
       "Failed to synthesize a transfer pattern that avoids bank conflicts"
   )
