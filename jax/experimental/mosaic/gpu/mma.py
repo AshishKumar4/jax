@@ -383,14 +383,20 @@ def mma(
   # Do not modify the accumualtor itself.
   acc = acc.copy()
   s = lambda idx, length: slice(idx * length, (idx + 1) * length)
+
+  def stepped(rows_acc, m_idx, k_idx):
+    # One K tile's products into an M tile's accumulator rows, N tile by N tile.
+    ms, ks = s(m_idx, m_tile), s(k_idx, k_tile)
+    for n_idx in range(num_n_tiles):
+      ns = s(n_idx, n_tile)
+      rows_acc[:, ns] = _mma_single_tile(rows_acc[:, ns], a[ms, ks], b[ks, ns])
+    return rows_acc
+
   if rows is None:
     for k_idx in range(num_k_tiles):
       for m_idx in range(num_m_tiles):
-        for n_idx in range(num_n_tiles):
-          ms = s(m_idx, m_tile)
-          ns = s(n_idx, n_tile)
-          ks = s(k_idx, k_tile)
-          acc[ms, ns] = _mma_single_tile(acc[ms, ns], a[ms, ks], b[ks, ns])
+        ms = s(m_idx, m_tile)
+        acc[ms, :] = stepped(acc[ms, :], m_idx, k_idx)
     return acc
 
   if rows.type != i32:
@@ -413,23 +419,14 @@ def mma(
         arith.addi(first_row, utils.c(m_idx * m_tile, i32)),
         rows,
     )
-    registers = list(held.registers.flat)
+    registers, tree = held.tree_flatten()
     branch = scf.IfOp(issued, [r.type for r in registers], has_else=True)
     with ir.InsertionPoint(branch.then_block):
       summed = held.copy()
       for k_idx in range(num_k_tiles):
-        for n_idx in range(num_n_tiles):
-          ns = s(n_idx, n_tile)
-          ks = s(k_idx, k_tile)
-          summed[:, ns] = _mma_single_tile(summed[:, ns], a[ms, ks], b[ks, ns])
-      scf.yield_(list(summed.registers.flat))
+        summed = stepped(summed, m_idx, k_idx)
+      scf.yield_(summed.tree_flatten()[0])
     with ir.InsertionPoint(branch.else_block):  # pyrefly: ignore[no-matching-overload]
       scf.yield_(registers)
-    acc[ms, :] = fa.FragmentedArray(
-        _registers=np.asarray(list(branch.results), dtype=object).reshape(
-            held.registers.shape
-        ),
-        _layout=held.layout,
-        _is_signed=held.is_signed,
-    )
+    acc[ms, :] = fa.FragmentedArray.tree_unflatten(tree, list(branch.results))
   return acc
