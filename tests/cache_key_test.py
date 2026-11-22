@@ -124,7 +124,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     # executable from a host of another CPU is not this host's to read.
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
     cpu = xla_bridge.get_backend("cpu")
-    devices = np.array([[cpu.local_devices()[0]]])
+    devices = xla_client.DeviceList((cpu.local_devices()[0],))
     compile_options = compiler.get_compile_options(
         num_replicas=1, num_partitions=1
     )
@@ -148,7 +148,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     # A patch stack's releases over one jaxlib are builds of their own: one's
     # cache entries are not another's to read.
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    devices = np.array([[jax.local_devices()[0]]])
+    devices = xla_client.DeviceList((jax.local_devices()[0],))
     compile_options = compiler.get_compile_options(
         num_replicas=1, num_partitions=1
     )
