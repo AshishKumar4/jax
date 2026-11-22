@@ -36,9 +36,9 @@ The contract is the one of JAX's persistent compilation cache:
 * *What can be detected to differ from the installed code makes the lowering
   bypass the cache, counted as ``unsealed``:* an installed file that is not its
   wheel's, a missing ``RECORD`` (an editable or source install), a jax module
-  loaded later that no ``RECORD`` lists, a rule registered in, or replaced in, a
-  registry a lowering dispatches through (``lowering_cache_registries``) that is not
-  sealed code, a registry that changes after the key was made, and a constant of
+  loaded later that no ``RECORD`` lists, a rule the lowering reaches, registered
+  in or replaced in a registry it dispatches through (``lowering_cache_registries``),
+  that is not sealed code, a registry that changes after the key was made, and a constant of
   the lowering's packages that is gone or holds what the key cannot hold
   (``lowering_cache_constants``).
 * *A value the encoder cannot encode exactly bypasses the cache, counted as
@@ -335,7 +335,7 @@ def _placement() -> dict[jax_core.Primitive, tuple[str, ...]]:
   a nested jit's context mesh (the jit rule lowers its jaxpr), a broadcast's
   output sharding and a reshard's destination (each lowered as the values it
   holds). Audited rule by rule, read only where every rule a lowering
-  dispatches through is JAX's own (`registries_lib.State.extended`): a
+  reaches is JAX's own (`registries_lib.State.reached`): a
   primitive whose lowering reads a sharding (a reshape refusing an explicit
   one) is not listed, so its params key as they are."""
   return {
@@ -482,15 +482,21 @@ def _key(
     dispatch: registries_lib.State,
     constants: bytes,
 ) -> str:
-  # Placed where it reads its mesh, or where a rule a lowering dispatches
-  # through is an extension's, which may read the mesh by any of its inputs.
+  # Placed where it reads its mesh, or where a rule it reaches is an
+  # extension's, which may read the mesh by any of its inputs.
   placed = dispatch.extended or _reads_jax_mesh(jaxpr, jax_mesh)
   enc, jaxpr_enc = _jaxpr_encoded(jaxpr, placed)
   registries_lib.check_primitives(enc.primitives)
+  # The rules its lowering reaches (`State.reached`): its jaxpr's primitives'
+  # are the same whether it is placed.
+  reached, extended = dispatch.reached(enc.primitives)
+  if extended and not placed:
+    placed = True
+    enc, jaxpr_enc = _jaxpr_encoded(jaxpr, placed)
   parts = {
       "version": b"mosaic-gpu-lowering-cache-key-v1",
       "installation": code.digest or b"",
-      "what it dispatches through": dispatch.digest,
+      "what it dispatches through": reached,
       "constants": constants,
       "jaxpr": jaxpr_enc,
       # The rule's arguments.
