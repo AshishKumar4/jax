@@ -14,7 +14,6 @@
 
 """Thread map test for TPU-specific interpret mode."""
 
-from concurrent import futures
 import subprocess
 import sys
 import textwrap
@@ -195,9 +194,10 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
     self.assertLen(compiles, 1, compiles)
 
   def test_thread_maps_running_at_once_compile_their_body_once(self):
-    # Four callers' thread maps of one body, each of two threads, all in
-    # flight at once (their eight threads meet at one barrier): the body
-    # compiles once for all of them.
+    # An outer map of four threads, each running an inner map of two threads
+    # over one body, the eight inner threads all in flight at once (they meet
+    # at one barrier), as a kernel's warpgroups each run their warps' map: the
+    # inner body compiles once for the four maps, the outer once.
     from jax._src import dispatch
     from jax._src import monitoring
 
@@ -211,22 +211,22 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
 
     barrier = threading.Barrier(8)
 
-    def f(thread, token):
+    def inner(thread, token):
       del thread
       io_callback(barrier.wait, None)
       return token
 
-    mapped = jax.jit(lambda token: thread_map(f, 2, token))
-    mapped.lower(jnp.int32(0)).compile()
+    def outer(thread, token):
+      del thread
+      return thread_map(inner, 2, token)
+
     monitoring.register_event_duration_secs_listener(counted)
     try:
-      with futures.ThreadPoolExecutor(4) as callers:
-        for done in [callers.submit(mapped, jnp.int32(i)) for i in range(4)]:
-          jax.block_until_ready(done.result())
+      jax.block_until_ready(thread_map(outer, 4, jnp.int32(0)))
     finally:
       monitoring.unregister_event_duration_listener(counted)
     self.assertEqual(barrier.n_waiting, 0)
-    self.assertLen(compiles, 1, compiles)
+    self.assertLen(compiles, 2, compiles)
 
   def test_a_body_run_again_is_keyed_without_walking_it_again(self):
     # An interpreted kernel's thread map runs its body once a block: the body's
