@@ -14,4 +14,5 @@
 
 from jax._src.mosaic_gpu_records import (
     kernel_record as kernel_record,
+    kernel_record_class as kernel_record_class,
 )
