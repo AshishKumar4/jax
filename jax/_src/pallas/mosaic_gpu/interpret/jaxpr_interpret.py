@@ -40,6 +40,7 @@ from jax._src.state import primitives as state_primitives
 from jax._src.state import types as state_types
 from jax._src.util import (safe_zip, split_list)
 import jax.numpy as jnp
+import numpy as np
 
 
 @dataclasses.dataclass(init=False, frozen=True)
@@ -213,42 +214,6 @@ def resolve_ref(
   assert isinstance(extract, mosaic_gpu_core.ExtractAliasedRef), transforms
   slot = [m.transforms[0] for m in union_members(aval)].index(extract)
   return allocation_key_as_array[slot], tuple(rest)
-
-
-def allocate_ref_union(
-    token: jax.Array,
-    aval: mosaic_gpu_core.AbstractRefUnion,
-    allocate_buffer: Callable[..., tuple[jax.Array, jax.Array]],
-) -> tuple[jax.Array, jax.Array]:
-  """Allocates a `RefUnion` as one independent buffer per member.
-
-  `allocate_buffer(token, shape, dtype, memory_space)` allocates each member
-  at its logical shape, and the buffers are then tagged as members of one
-  union so race detection knows they share storage. Returns the members' keys
-  stacked in `union_members` order (see `resolve_ref`).
-  """
-  members = union_members(aval)
-  keys = []
-  for member in members:
-    member_aval = _member_inner_aval(member)
-    token, key = allocate_buffer(
-        token, member_aval.shape, member_aval.dtype, aval.memory_space
-    )
-    keys.append(key)
-  keys = jnp.stack(keys)
-  def ensure_alias_transform(member) -> mosaic_gpu_core.ExtractAliasedRef:
-    assert isinstance(member, mosaic_gpu_core.ExtractAliasedRef)
-    return member
-
-  token = gpu_callbacks.call_tag_ref_union(
-      token,
-      keys,
-      [
-          ensure_alias_transform(m.transforms[0]).alias_group_idx
-          for m in members
-      ],
-  )
-  return token, keys
 
 
 def get_uninitialized_array(
@@ -487,172 +452,86 @@ class JaxprInterpreter:
       )
     return token, outs
 
+  def _scoped_allocations(
+      self, aval: jax_core.AbstractValue, first: int
+  ) -> tuple[gpu_callbacks.ScopedAllocation, ...]:
+    """What a `run_scoped` allocates for one of its refs, its first allocation
+    `first` among the scope's: a buffer (at its logical shape), a buffer a
+    `RefUnion`'s member, or its barriers."""
+    _raise_if_unsupported_memory_space(aval.memory_space)
+
+    def buffer(shape, dtype, memory_space, union=None):
+      uninitialized = self.interpret_params.uninitialized_memory
+      if memory_space == mosaic_gpu_core.MemorySpace.REGS:
+        uninitialized = "zero"
+      return gpu_callbacks.ScopedBuffer(
+          shape=tuple(shape),
+          dtype=np.dtype(dtype),
+          memory_space_id=memory.get_memory_space_idx(memory_space),
+          fill=interpret_utils.get_uninitialized_value(dtype, uninitialized),
+          union=union,
+      )
+
+    match aval:
+      # Must precede the `AbstractRef` case below, which this subclasses.
+      case mosaic_gpu_core.AbstractRefUnion():
+        # One buffer a member, at its logical shape, each tagged a member of
+        # the union its first member's key names, so race detection knows they
+        # share storage. Their keys stack in `union_members` order (see
+        # `resolve_ref`).
+        allocations = []
+        for member in union_members(aval):
+          extract = member.transforms[0]
+          assert isinstance(extract, mosaic_gpu_core.ExtractAliasedRef)
+          inner = _member_inner_aval(member)
+          allocations.append(buffer(
+              inner.shape, inner.dtype, aval.memory_space,
+              union=(first, extract.alias_group_idx),
+          ))
+        return tuple(allocations)
+      case state_types.AbstractRef(
+          inner_aval=inner, memory_space=memory_space, kind=_
+      ):
+        match inner:
+          case jax_core.ShapedArray(shape=shape, dtype=dtype):
+            if isinstance(
+                dtype,
+                (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
+            ):
+              # A CTA barrier's arrive and arrive-and-wait are an mbarrier's
+              # arrive and its arrive then wait at the phase arrived in.
+              return (gpu_callbacks.ScopedBarriers(
+                  shape=tuple(shape),
+                  num_arrivals=dtype.num_arrivals,
+                  orders_tensor_core=getattr(
+                      dtype, "orders_tensor_core", False
+                  ),
+              ),)
+            if isinstance(dtype, mosaic_gpu_core.ClusterBarrierType):
+              if dtype.leader_tracked:
+                raise NotImplementedError(
+                    "Cluster barriers with `leader_tracked` are not yet"
+                    " supported in GPU kernel interpret mode."
+                )
+              return (gpu_callbacks.ScopedBarriers(
+                  shape=tuple(shape),
+                  num_arrivals=dtype.num_arrivals,
+                  cluster=(
+                      tuple(self.thread_cluster_shape),
+                      tuple(self.are_thread_cluster_axes_collective(
+                          dtype.collective_axes
+                      )),
+                  ),
+              ),)
+            return (buffer(shape, dtype, memory_space),)
+          case _:
+            raise ValueError(f"Unsupported inner aval: {inner}")
+      case _:
+        raise ValueError(f"Unsupported aval: {aval}")
+
   def _interpret_run_scoped_p(
       self, eqn, token, get_invals: Callable[[], Sequence[Any]]
   ):
-    assert eqn.primitive is primitives.run_scoped_p
-
-    def _allocate_for_aval(
-        token,
-        aval,
-        is_thread_block_axis_collective: bool,
-    ):
-      _raise_if_unsupported_memory_space(aval.memory_space)
-      ref_count = _get_num_threads_sharing_collective_allocation(
-          self.thread_cluster_shape,
-          is_thread_block_axis_collective,
-      )
-
-      def _allocate_buffer(token, shape, dtype, memory_space):
-        memory_space_idx = memory.get_memory_space_idx(memory_space)
-        compute_unit = self.thread
-        if is_thread_block_axis_collective:
-          compute_unit = dataclasses.replace(self.thread, warpgroup_id=0)
-        token, allocation_request = (
-            gpu_callbacks.call_make_allocation_request_array(
-                token=token,
-                compute_unit=compute_unit,
-                memory_space_id=memory_space_idx,
-                initial_ref_count=ref_count,
-            )
-        )
-        return gpu_callbacks.call_allocate_buffer(
-            token=token,
-            mesh_location=self.mesh_location,
-            thread=self.thread,
-            allocation_request_as_array=allocation_request,
-            value=get_uninitialized_array(
-                shape,
-                dtype,
-                memory_space,
-                self.interpret_params.uninitialized_memory,
-            ),
-            source_info=eqn.source_info,
-        )
-
-      match aval:
-        # Must precede the `AbstractRef` case below, which this subclasses.
-        case mosaic_gpu_core.AbstractRefUnion():
-          return allocate_ref_union(token, aval, _allocate_buffer)
-        case state_types.AbstractRef(
-            inner_aval=inner, memory_space=memory_space, kind=_
-        ):
-          match inner:
-            case jax_core.ShapedArray(shape=shape, dtype=dtype):
-              if isinstance(
-                  dtype,
-                  (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
-              ):
-                # A barrier is shared between the threads in a block. Hence its
-                # ref count, when computed based on the collective axes, should
-                # equal the number of threads in a block. A CTA barrier's arrive
-                # and arrive-and-wait are an mbarrier's arrive and its arrive
-                # then wait at the phase arrived in.
-                assert ref_count == self.num_threads_per_block
-                # TODO(nrink): Simplify the interface to
-                # `call_allocate_barriers`. Consider making it similar to
-                # `call_allocate_buffer`, see below.
-                token, keys = gpu_callbacks.call_allocate_barriers(
-                    token=token,
-                    mesh_location=self.mesh_location,
-                    thread=self.thread,
-                    num_arrivals=jnp.int32(dtype.num_arrivals),
-                    orders_tensor_core=getattr(
-                        dtype, "orders_tensor_core", False
-                    ),
-                    flat_num_barriers=math.prod(shape),
-                    ref_count=jnp.int32(ref_count),
-                    source_info=eqn.source_info,
-                )
-                keys = keys.reshape((*shape, -1))
-                assert (
-                    keys.shape[-1:]
-                    == gpu_callbacks.HostAllocationKey.shape_and_dtype().shape
-                )
-                return token, keys
-              elif isinstance(dtype, mosaic_gpu_core.ClusterBarrierType):
-                if dtype.leader_tracked:
-                  raise NotImplementedError(
-                      "Cluster barriers with `leader_tracked` are not yet"
-                      " supported in GPU kernel interpret mode."
-                  )
-                token, keys = gpu_callbacks.call_allocate_cluster_barriers(
-                    token=token,
-                    thread=self.thread,
-                    mesh_location=self.mesh_location,
-                    axes_dims=self.thread_cluster_shape,
-                    is_axis_collective=self.are_thread_cluster_axes_collective(
-                        dtype.collective_axes
-                    ),
-                    num_arrivals=jnp.int32(dtype.num_arrivals),
-                    flat_num_barriers=math.prod(shape),
-                    ref_count=jnp.int32(self.num_concurrent_threads),
-                    source_info=eqn.source_info,
-                )
-                keys = keys.reshape((*shape, -1))
-                assert (
-                    keys.shape[-1:]
-                    == gpu_callbacks.HostAllocationKey.shape_and_dtype().shape
-                )
-                return token, keys
-              else:
-                return _allocate_buffer(token, shape, dtype, memory_space)
-            case _:
-              raise ValueError(f"Unsupported inner aval: {inner}")
-
-    def _deallocate_for_aval(token, allocation, aval):
-      match aval:
-        # One buffer per member was allocated above; free them all.
-        case mosaic_gpu_core.AbstractRefUnion():
-          _raise_if_unsupported_memory_space(aval.memory_space)
-          for slot in range(len(union_members(aval))):
-            token = gpu_callbacks.call_deallocate_buffer(
-                token=token,
-                mesh_location=self.mesh_location,
-                thread=self.thread,
-                allocation_key_as_array=allocation[slot],
-                source_info=eqn.source_info,
-            )
-          return token
-        case state_types.AbstractRef(inner_aval=inner, memory_space=_, kind=_):
-          match inner:
-            case jax_core.ShapedArray(shape=_, dtype=dtype):
-              is_barrier = isinstance(
-                  dtype,
-                  (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
-              )
-              is_cluster_barrier = isinstance(
-                  dtype, mosaic_gpu_core.ClusterBarrierType
-              )
-              if is_barrier or is_cluster_barrier:
-                return gpu_callbacks.call_deallocate_barrier(
-                    token=token,
-                    mesh_location=self.mesh_location,
-                    thread=self.thread,
-                    allocation_key_as_array=allocation,
-                    source_info=eqn.source_info,
-                    cluster_barrier=is_cluster_barrier,
-                )
-              else:
-                _raise_if_unsupported_memory_space(aval.memory_space)
-                return gpu_callbacks.call_deallocate_buffer(
-                    token=token,
-                    mesh_location=self.mesh_location,
-                    thread=self.thread,
-                    allocation_key_as_array=allocation,
-                    source_info=eqn.source_info,
-                )
-
-              # TODO(nrink): For sempahores, check that they have value zero at
-              # the end of their lifetimes. (If semaphores are never explicitly
-              # deallocated, this check could take place at the end of kernel
-              # interpretation.)
-            case _:
-              assert False, (
-                  f"Unsupported inner aval: {inner} (should have been"
-                  " caught before)"
-              )
-
     assert eqn.primitive is primitives.run_scoped_p
     collective_axes = eqn.params["collective_axes"]
 
@@ -661,7 +540,6 @@ class JaxprInterpreter:
     # sequence of `run_scoped`s (except for allocations of MemorySpace.REGS,
     # which are WGMMA accumulators).
     invars = eqn.params["jaxpr"].invars
-    allocs = []
     memory_spaces = {v.aval.memory_space for v in invars}
     if mosaic_gpu_core.MemorySpace.REGS in memory_spaces:
       if len(memory_spaces) > 1:
@@ -676,22 +554,66 @@ class JaxprInterpreter:
       _raise_if_unsupported_collective_axes(
           self.mesh, self.are_thread_cluster_axes_collective(collective_axes)
       )
+    if not invars:
+      return self.interpret(eqn.params["jaxpr"], token, *get_invals())
 
+    # The scope's allocations, a tuple a ref, made in one callback and released
+    # in one: a kernel's scopes are entered on every thread for every program,
+    # and a callback a buffer or barrier was most of an interpreted kernel's
+    # callbacks.
+    per_ref = []
+    first = 0
     for v in invars:
-      token, alloc = _allocate_for_aval(
-          token,
-          v.aval,
-          self.is_thread_block_axis_collective(collective_axes),
-      )
-
-      allocs.append(alloc)
+      allocations = self._scoped_allocations(v.aval, first)
+      per_ref.append(allocations)
+      first += gpu_callbacks._num_keys(allocations)
+    allocations = tuple(a for ref in per_ref for a in ref)
+    collective = self.is_thread_block_axis_collective(collective_axes)
+    ref_count = _get_num_threads_sharing_collective_allocation(
+        self.thread_cluster_shape, collective
+    )
+    if any(
+        isinstance(a, gpu_callbacks.ScopedBarriers) and a.cluster is None
+        for a in allocations
+    ):
+      # A barrier is shared between the threads in a block. Hence its ref
+      # count, when computed based on the collective axes, should equal the
+      # number of threads in a block.
+      assert ref_count == self.num_threads_per_block
+    token, keys = gpu_callbacks.call_allocate_scope(
+        token=token,
+        mesh_location=self.mesh_location,
+        thread=self.thread,
+        allocations=allocations,
+        collective=collective,
+        ref_count=ref_count,
+        cluster_ref_count=self.num_concurrent_threads,
+        source_info=eqn.source_info,
+    )
+    refs = []
+    at = 0
+    for ref_allocations in per_ref:
+      count = gpu_callbacks._num_keys(ref_allocations)
+      ref_keys = keys[at:at + count]
+      at += count
+      match ref_allocations:
+        case (gpu_callbacks.ScopedBarriers(shape=shape),):
+          ref_keys = ref_keys.reshape((*shape, -1))
+        case (gpu_callbacks.ScopedBuffer(union=None),):
+          ref_keys = ref_keys[0]
+      refs.append(ref_keys)
 
     token, out = self.interpret(
-        eqn.params["jaxpr"], token, *get_invals(), *allocs)
+        eqn.params["jaxpr"], token, *get_invals(), *refs)
 
-    for a, v in safe_zip(allocs, invars):
-      token = _deallocate_for_aval(token, a, v.aval)
-
+    token = gpu_callbacks.call_deallocate_scope(
+        token=token,
+        mesh_location=self.mesh_location,
+        thread=self.thread,
+        keys=keys,
+        allocations=allocations,
+        source_info=eqn.source_info,
+    )
     return token, out
 
   def _interpret_mpmd_map_p(
