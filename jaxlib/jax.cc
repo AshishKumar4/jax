@@ -1211,7 +1211,10 @@ NB_MODULE(_jax, m) {
   // The frontend attribute under which a float add, subtract or multiply rounds
   // on its own, never contracted into a fused multiply-add: this build's
   // compilers honour it (jax.extend.backend.no_contract_attribute).
-  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = xla::kXlaNoContractAttr;
+  // Cast as a string: nanobind has no caster for `const char[]` of unknown
+  // bound (XLA's extern declaration), and assigning it raised std::bad_cast at
+  // import.
+  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = nb::str(xla::kXlaNoContractAttr);
 
   m.def("approx_top_k_reduction_output_size",
         xla::ValueOrThrowWrapper(xla::ApproxTopKReductionOutputSize),
