@@ -6868,6 +6868,15 @@ def _handle_dot_precision(ctx, lhs, rhs, precision, platform):
   return lhs, rhs, accumulation_aval, algorithm_kwarg
 
 
+def _algorithm_over_complex(precision, avals_in) -> bool:
+  """Whether a dot names an algorithm, whose operand types are real, over a
+  complex operand."""
+  return (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
+          precision != DotAlgorithmPreset.DEFAULT and
+          any(dtypes.issubdtype(aval.dtype, np.complexfloating)
+              for aval in avals_in))
+
+
 def _complex_dot_by_parts(lhs, rhs, *, dimension_numbers, precision,
                           out_dtype, out_sharding):
   """A dot of complex operands under an algorithm, whose operand types are real,
@@ -6894,10 +6903,7 @@ def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
                        precision, preferred_element_type: np.dtype | None,
                        out_sharding, platform: str = "default"):
   del preferred_element_type  # Implied by the output aval
-  if (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
-      precision != DotAlgorithmPreset.DEFAULT and
-      any(dtypes.issubdtype(aval.dtype, np.complexfloating)
-          for aval in ctx.avals_in)):
+  if _algorithm_over_complex(precision, ctx.avals_in):
     # An algorithm's operand types are real: a complex operand cast to them
     # would lose its imaginary part, so its real products are taken at it.
     return mlir.lower_fun(
