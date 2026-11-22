@@ -2165,6 +2165,19 @@ class LaxTest(jtu.JaxTestCase):
     numpy_op = lambda x: lax_reference.transpose(x, perm)
     self._CheckAgainstNumpy(numpy_op, op, args_maker)
 
+  def testReduceUnusedWithCalledCombiner(self):
+    # A reduce whose result is unused and whose combiner calls a jitted function (jnp.where's
+    # `func.call @_where`) is kept by dead code elimination, a call declaring no effects; it compiles, and
+    # the program computes what it returns.
+    @jax.jit
+    def f(x):
+      r = lax.reduce(x, np.float32(0), lambda a, b: jnp.where(a > b, a, b), (1,))
+      return jnp.pad(r[:0], (1, 0)), x.sum()
+
+    padded, total = f(jnp.ones((2, 2), np.float32))
+    self.assertArraysEqual(padded, np.zeros(1, np.float32))
+    self.assertEqual(float(total), 4.0)
+
   @jtu.sample_product(
       [
           dict(
