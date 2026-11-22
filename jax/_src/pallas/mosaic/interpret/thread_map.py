@@ -14,7 +14,6 @@
 
 import collections
 from concurrent import futures
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -27,7 +26,6 @@ import jax
 from jax._src import callback
 from jax._src import core
 from jax._src import source_info_util
-from jax._src.lib import xla_client
 import jax.core as jax_core
 import jax.numpy as jnp
 import numpy as np
@@ -37,45 +35,20 @@ TOP_LEVEL_TOKEN_VALUE = 42
 NESTED_TOKEN_VALUE = 1337
 
 
-# The executions a CPU client's device holds in flight at once
-# (cpu_client.h's LocalDeviceState, max_inflight_computations default): a
-# leased client runs this many threads on each of its devices.
-_THREADS_PER_DEVICE = 32
-
-_free_clients: list[xla_client.Client] = []
-_clients_lock = threading.Lock()
-
-
-@contextlib.contextmanager
-def _leased_devices(num_threads: int):
-  """The devices of a CPU client of the interpreter's own, held by this thread
-  map alone: one for every `_THREADS_PER_DEVICE` of its `num_threads` threads.
+def _device() -> jax.Device:
+  """The device a thread map's threads run their programs on: the CPU
+  backend's first, whatever backend calls the map.
 
   A thread map runs inside a host callback of the computation that calls it,
-  and runs its threads' programs from threads of its own: off the callback's
-  thread, each execution takes a unit of its client's in-flight semaphore,
-  which the callback's thread alone is exempt from (cpu_client.cc's
-  ThisThreadIsInsideHostCallback). On the caller's client, computations queued
-  behind the one running the callback can hold every unit, so the threads'
-  programs wait for units that free only when the callback returns: a
-  deadlock. On a client no other computation uses, the thread map's own
-  executions are all that hold its units, at most `_THREADS_PER_DEVICE` on each
-  of its devices (a cluster of blocks maps 36 threads, a test's six blocks of
-  six)."""
-  devices = -(-num_threads // _THREADS_PER_DEVICE)
-  with _clients_lock:
-    fitting = [i for i, held in enumerate(_free_clients)
-               if len(held.local_devices()) >= devices]
-    # The most recently returned first: a map after another runs on its
-    # client, whose devices the bodies compiled for it name.
-    client = _free_clients.pop(fitting[-1]) if fitting else None
-  if client is None:
-    client = xla_client.make_cpu_client(asynchronous=False, num_devices=devices)
-  try:
-    yield client.local_devices()[:devices]
-  finally:
-    with _clients_lock:
-      _free_clients.append(client)
+  and runs its threads' programs from threads of its own, on the caller's CPU
+  client. None of them waits for a unit of that client's in-flight semaphore
+  held by computations queued behind the one running the callback: XLA:CPU runs
+  a program with host callbacks synchronously, taking no unit, and a program
+  without completes on its own (openxla/xla 9935144dd3, "Complete synchronous
+  executions before returning"). So threads of any number, and thread maps
+  nested in a thread's callbacks or running at once from several callers, all
+  run there, and a body compiles once for all of them (`_compiled`)."""
+  return jax.local_devices(backend="cpu")[0]
 
 
 # top-level function so that caching works properly
@@ -84,11 +57,13 @@ def _run(jaxpr, consts, *args):
 
 
 # The executables compiled for thread maps' bodies, by what decides one (`_key`),
-# most recently used last, the oldest dropped past `_COMPILED_HELD`. A key names
-# a leased client's devices, which one map holds at a time, so no two maps ask
-# for one key at once.
+# most recently used last, the oldest dropped past `_COMPILED_HELD`; and each key
+# being compiled, whose executable the maps that ask for it meanwhile wait for:
+# maps running at once (a sharded caller's, those nested in one map's threads)
+# compile a body once.
 _COMPILED: collections.OrderedDict[tuple, Any] = collections.OrderedDict()
 _COMPILED_HELD = 256
+_COMPILING: dict[tuple, futures.Future] = {}
 _compiled_lock = threading.Lock()
 
 
@@ -219,10 +194,9 @@ _ids = itertools.count()
 def _key(jaxpr, args) -> tuple:
   """What decides a thread map body's executable: its jaxpr's structure
   (`_body`) and its arguments' (its constants', its thread ID's and its
-  inputs') types and devices, each device the object of its own client (two
-  leased clients' first devices print alike). A kernel's forward, tangent and
-  transpose traces each make a new jaxpr of one structure; keyed by the jaxpr
-  object, each compiled again (a recurrence test's 76 bodies were 44 texts)."""
+  inputs') types and devices. A kernel's forward, tangent and transpose traces
+  each make a new jaxpr of one structure; keyed by the jaxpr object, each
+  compiled again (a recurrence test's 76 bodies were 44 texts)."""
   types = tuple((np.shape(leaf), str(leaf.dtype), frozenset(leaf.devices()))
                 for leaf in args)
   return _body(jaxpr), types
@@ -236,18 +210,34 @@ def _compiled(jaxpr, consts, args):
     if executable is not None:
       _COMPILED.move_to_end(key)
       return executable
-  # Every argument kept, so a role body's compiled signature is its jaxpr's:
-  # with its unused arguments pruned, a Blackwell causal forward's role thread
-  # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
-  # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
-  # Which pass drops the leaf is not established; keeping the arguments avoids
-  # it, at the cost of passing buffers the body does not read.
-  executable = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
-      jaxpr, consts, *args).lower().compile()
+    compiling = _COMPILING.get(key)
+    if compiling is None:
+      compiling = _COMPILING[key] = futures.Future()
+      compiles = True
+    else:
+      compiles = False
+  if not compiles:
+    return compiling.result()
+  try:
+    # Every argument kept, so a role body's compiled signature is its jaxpr's:
+    # with its unused arguments pruned, a Blackwell causal forward's role thread
+    # under Mosaic GPU's interpreter met XLA's verifier with a parameter tuple a
+    # leaf short of its shardings (9 leaves against 10, hlo_sharding.cc:819).
+    # Which pass drops the leaf is not established; keeping the arguments
+    # avoids it, at the cost of passing buffers the body does not read.
+    executable = jax.jit(_run, static_argnums=(0,), keep_unused=True).trace(
+        jaxpr, consts, *args).lower().compile()
+  except BaseException as e:
+    with _compiled_lock:
+      del _COMPILING[key]
+    compiling.set_exception(e)
+    raise
   with _compiled_lock:
     _COMPILED[key] = executable
     if len(_COMPILED) > _COMPILED_HELD:
       _COMPILED.popitem(last=False)
+    del _COMPILING[key]
+  compiling.set_result(executable)
   return executable
 
 
@@ -259,21 +249,17 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
   device_id = int(device_id) if device_id is not None else None
   num_threads = int(num_threads)
   threads = []
-  with _leased_devices(num_threads) as devices, futures.ThreadPoolExecutor(
-      max_workers=num_threads
-  ) as executor:
-    # The constants and inputs go to each leased device once, and every thread
-    # there reads those arrays rather than transferring them again (about 15%
-    # of an interpreted kernel's time in one measured test).
-    placed = [jax.device_put((consts, invals), d) for d in devices]
-    # One executable a device, compiled before any thread runs: each thread
-    # compiling its own raced the others to an empty cache, every one missing.
+  device = _device()
+  with futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+    # The constants and inputs go to the device once, and every thread reads
+    # those arrays rather than transferring them again (about 15% of an
+    # interpreted kernel's time in one measured test).
+    thread_consts, thread_invals = jax.device_put((consts, invals), device)
+    # Compiled before any thread runs: each thread compiling its own raced the
+    # others to an empty cache, every one missing.
     try:
-      executables = [
-          _compiled(jaxpr, thread_consts,
-                    jax.tree.leaves((jax.device_put(np.int32(0), device),
-                                     *thread_invals)))
-          for device, (thread_consts, thread_invals) in zip(devices, placed)]
+      executable = _compiled(jaxpr, thread_consts, jax.tree.leaves(
+          (jax.device_put(np.int32(0), device), *thread_invals)))
     except Exception as e:
       on_exception(e, device_id=device_id, token=token)
       raise
@@ -285,12 +271,9 @@ def _thread_map_callback(jaxpr, token, device_id, num_threads, consts, invals,
       #     evaluation of `jaxpr`.
       # The thread ID is placed there too: a body with no other operand runs
       # where its arguments are committed, which would otherwise be nowhere.
-      device = i // _THREADS_PER_DEVICE
-      thread_consts, thread_invals = placed[device]
-      args = (jax.device_put(np.int32(i), devices[device]), *thread_invals)
+      args = (jax.device_put(np.int32(i), device), *thread_invals)
       flat_args, _ = jax.tree.flatten(args)
-      threads.append(
-          executor.submit(executables[device], thread_consts, *flat_args))
+      threads.append(executor.submit(executable, thread_consts, *flat_args))
     exceptions = []
     for i in range(num_threads):
       try:

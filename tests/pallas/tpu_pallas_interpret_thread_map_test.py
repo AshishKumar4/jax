@@ -14,6 +14,7 @@
 
 """Thread map test for TPU-specific interpret mode."""
 
+from concurrent import futures
 import subprocess
 import sys
 import textwrap
@@ -193,6 +194,40 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
       monitoring.unregister_event_duration_listener(counted)
     self.assertLen(compiles, 1, compiles)
 
+  def test_thread_maps_running_at_once_compile_their_body_once(self):
+    # Four callers' thread maps of one body, each of two threads, all in
+    # flight at once (their eight threads meet at one barrier): the body
+    # compiles once for all of them.
+    from jax._src import dispatch
+    from jax._src import monitoring
+
+    compiles = []
+
+    def counted(event, duration, **kwargs):
+      del duration
+      if event == dispatch.BACKEND_COMPILE_EVENT and "_run" in kwargs.get(
+          "fun_name", ""):
+        compiles.append(kwargs["fun_name"])
+
+    barrier = threading.Barrier(8)
+
+    def f(thread, token):
+      del thread
+      io_callback(barrier.wait, None)
+      return token
+
+    mapped = jax.jit(lambda token: thread_map(f, 2, token))
+    mapped.lower(jnp.int32(0)).compile()
+    monitoring.register_event_duration_secs_listener(counted)
+    try:
+      with futures.ThreadPoolExecutor(4) as callers:
+        for done in [callers.submit(mapped, jnp.int32(i)) for i in range(4)]:
+          jax.block_until_ready(done.result())
+    finally:
+      monitoring.unregister_event_duration_listener(counted)
+    self.assertEqual(barrier.n_waiting, 0)
+    self.assertLen(compiles, 1, compiles)
+
   def test_a_body_run_again_is_keyed_without_walking_it_again(self):
     # An interpreted kernel's thread map runs its body once a block: the body's
     # structure is walked once a jaxpr object, not once a run.
@@ -311,11 +346,12 @@ class InterpretThreadMapSaturationTest(jtu.JaxTestCase):
   def test_thread_map_runs_inside_callbacks_holding_every_unit(
       self, count, inputs):
     # Each callback's thread map runs its threads' programs off the callback's
-    # thread. With every unit of the caller's client held by the computations
-    # running those callbacks (32), a thread's program waiting for a unit there
-    # would wait for ever; one fewer (31) leaves it one. A thread map runs its
-    # threads on a client of its own, so all finish: a body with no input
-    # besides its thread ID too.
+    # thread, on the caller's client. With every unit of its in-flight
+    # semaphore held by the computations running those callbacks (32), a
+    # thread's program waiting for a unit there would wait for ever; one fewer
+    # (31) leaves it one. XLA:CPU runs a program with host callbacks
+    # synchronously, taking no unit, and the threads' programs take none they
+    # wait for, so all finish: a body with no input besides its thread ID too.
     try:
       ran = subprocess.run(
           [sys.executable, "-c", _SATURATED, str(count), str(inputs)],
@@ -342,9 +378,8 @@ class InterpretThreadMapSaturationTest(jtu.JaxTestCase):
     self.assertEqual(barrier.n_waiting, 0)
 
   def test_thread_map_computes_as_its_callers_client_does(self):
-    # A thread's program, run on the thread map's own client, gives what the
-    # caller's client gives bit for bit: a reduction XLA:CPU may split across
-    # its intra-op threads included.
+    # A thread's program gives what the caller's own program gives bit for
+    # bit: a reduction XLA:CPU may split across its intra-op threads included.
     x = np.random.default_rng(0).standard_normal((257, 1031)).astype(np.float32)
     seen = []
 
