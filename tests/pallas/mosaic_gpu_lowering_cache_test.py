@@ -27,6 +27,7 @@ import pathlib
 import shutil
 
 import sys
+import tempfile
 import types
 from unittest import mock
 
@@ -43,7 +44,9 @@ class SourceSealingBoundaryTest(absltest.TestCase):
   def test_unreadable_source_returns_an_unsealed_diagnostic(self):
     from jax._src.pallas.mosaic_gpu import lowering_cache_seal
 
-    root = pathlib.Path(self.create_tempdir().full_path)
+    # The standard library's directory: absl's create_tempdir reads a flag that
+    # is parsed only under absltest's own main, not under pytest.
+    root = pathlib.Path(self.enter_context(tempfile.TemporaryDirectory()))
     source = root / "__init__.py"
     source.write_text("")
     unrelated = root / "unrelated.py"
