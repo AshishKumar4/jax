@@ -18,6 +18,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,7 @@ limitations under the License.
 #include "jaxlib/py_client.h"
 #include "jaxlib/py_device_list.h"
 #include "jaxlib/py_executable.h"
+#include "jaxlib/python_ref_manager.h"
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/status_casters.h"
@@ -102,7 +104,11 @@ absl::StatusOr<nb_class_ptr<PyExecutable>>
 CompileOnlyPyClient::DeserializeUnloaded(
     nb::bytes serialized, xla::ifrt::DeviceListRef executable_devices,
     std::optional<xla::CompileOptions> options) {
-  absl::Cord cord(std::string(serialized.c_str(), serialized.size()));
+  absl::Cord cord = absl::MakeCordFromExternal(
+      std::string_view(serialized.c_str(), serialized.size()),
+      [serialized]() mutable {
+        GlobalPyRefManager()->AddGarbage(std::move(serialized));
+      });
   ifrt::ExecutableRef ifrt_executable;
   {
     nb::gil_scoped_release gil_release;

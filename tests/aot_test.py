@@ -231,7 +231,9 @@ class JaxAotTest(jtu.JaxTestCase):
     # A compile-only client's compile writes its entry and, compiling again,
     # reads it back as an unloaded executable (the plugin's
     # PJRT_ExecutableDeserialize_Extension): a second compile is a hit, its
-    # executable the first's; the attached GPU's run reads the entry too.
+    # optimized program the first's; the attached GPU's run reads the entry
+    # too. An early-exit compile (a peak-memory probe's) neither reads nor
+    # writes an entry.
     compilation_cache.reset_cache()
     self.addCleanup(compilation_cache.reset_cache)
     cache_dir = self.create_tempdir().full_path
@@ -259,14 +261,19 @@ class JaxAotTest(jtu.JaxTestCase):
       x_shape = jax.ShapeDtypeStruct(
           shape=(16, 16), dtype=jnp.float32,
           sharding=jax.sharding.NamedSharding(aot_mesh, P("x")))
-      serialized = []
+      texts = []
       for _ in range(2):
         fn.clear_cache()
-        compiled = fn.lower(x_shape).compile()
-        serialized.append(compiled.runtime_executable().serialize())
+        texts.append(fn.lower(x_shape).compile().as_text())
       self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
       self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
-      self.assertEqual(serialized[0], serialized[1])
+      self.assertEqual(texts[0], texts[1])
+
+      fn.clear_cache()
+      fn.lower(x_shape).compile({"xla_gpu_experimental_early_exit":
+                                 "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
+      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
 
       # The attached GPU's run of the same program (its operand sharded alike
       # over a mesh of its device) reads the entry.

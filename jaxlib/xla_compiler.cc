@@ -251,6 +251,12 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .def_ro("executable_build_options",
               &CompileOptions::executable_build_options)
       .def_rw("env_option_overrides", &CompileOptions::env_option_overrides)
+      // Whether XLA stops the compile after a pass (an early exit, by its
+      // debug options or their overrides), its executable no runnable one.
+      .def_prop_ro("is_early_exit",
+                   [](const CompileOptions& options) {
+                     return xla::IsEarlyExitCompilation(options);
+                   })
       .def_prop_rw(
           "num_replicas",
           [](const CompileOptions& options) {

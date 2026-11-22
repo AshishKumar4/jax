@@ -480,7 +480,10 @@ def compile_or_get_cached(
     module_name,
   )
 
-  if cache_key is None:
+  # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
+  # serializes its options alone, which deserialize as no executable: it is
+  # neither read from the persistent cache nor written to it.
+  if cache_key is None or compile_options.is_early_exit:
     return backend_compile_and_load(
         backend, computation, executable_devices, compile_options,
         host_callbacks)
@@ -833,6 +836,12 @@ def _cache_read(
         cache_key, compile_options, backend, executable_devices,
         host_callbacks)
   except Exception as ex:
+    # A compile-only client whose plugin deserializes no unloaded executable
+    # (it has no PJRT_ExecutableDeserialize_Extension) reads nothing back.
+    if (isinstance(backend, _jax.CompileOnlyPyClient)
+        and isinstance(ex, _jax.JaxRuntimeError)
+        and str(ex).startswith("UNIMPLEMENTED")):
+      return None, None
     if _should_raise_persistent_cache_error(ex):
       raise
     warnings.warn(

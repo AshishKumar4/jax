@@ -1,12 +1,13 @@
 diff --git a/xla/pjrt/c/BUILD b/xla/pjrt/c/BUILD
-index 2b17fce1b9..40fb30085b 100644
+index 2b17fce1b9..27c8684b58 100644
 --- a/xla/pjrt/c/BUILD
 +++ b/xla/pjrt/c/BUILD
-@@ -702,6 +702,7 @@ cc_library(
+@@ -702,6 +702,8 @@ cc_library(
          "//xla/pjrt:pjrt_executable",
          "//xla/pjrt/extensions/abi_version:gpu_abi_version_extension",
          "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
 +        "//xla/pjrt/extensions/executable_deserialize:executable_deserialize_extension",
++        "//xla/pjrt/extensions/executable_deserialize:executable_deserialize_extension_hdrs",
          "//xla/pjrt/extensions/executable_metadata:executable_metadata_extension",
          "//xla/pjrt/gpu:allocator_config",
          "//xla/pjrt/gpu:gpu_helpers",
@@ -309,7 +310,7 @@ index 0000000000..dc07ff7163
 +}  // namespace pjrt
 diff --git a/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h
 new file mode 100644
-index 0000000000..04332bb158
+index 0000000000..dc0e3385f6
 --- /dev/null
 +++ b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h
 @@ -0,0 +1,74 @@
@@ -331,7 +332,7 @@ index 0000000000..04332bb158
 +#ifndef XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
 +#define XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
 +
-+#include <cstddef>
++#include <stddef.h>
 +
 +#include "xla/pjrt/c/pjrt_c_api.h"
 +
@@ -372,7 +373,6 @@ index 0000000000..04332bb158
 +
 +#ifdef __cplusplus
 +}
-+#endif
 +
 +namespace pjrt {
 +
@@ -385,6 +385,7 @@ index 0000000000..04332bb158
 +    PJRT_Extension_Base* next);
 +
 +}  // namespace pjrt
++#endif
 +
 +#endif  // XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
 diff --git a/xla/python/ifrt/compiler.h b/xla/python/ifrt/compiler.h
