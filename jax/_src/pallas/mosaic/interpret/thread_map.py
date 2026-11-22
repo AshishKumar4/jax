@@ -157,8 +157,8 @@ def _value(value):
             tuple(_value(argument) for argument in value.args),
             tuple(sorted((name, _value(argument))
                          for name, argument in value.keywords.items())))
-  if (dataclasses.is_dataclass(value) and not isinstance(value, type)
-      and value.__dataclass_params__.frozen):
+  params = getattr(type(value), "__dataclass_params__", None)
+  if params is not None and params.frozen and not isinstance(value, type):
     return ("dataclass", type(value),
             tuple(_value(getattr(value, field.name))
                   for field in dataclasses.fields(value)))
