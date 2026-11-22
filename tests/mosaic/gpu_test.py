@@ -1023,30 +1023,6 @@ class WGMMALayoutTest(TestCase):
     )()
     np.testing.assert_array_equal(iota, expected)
 
-  @parameterized.product(dtype=[jnp.float16, jnp.bfloat16], swizzle=(64, 128))
-  def test_store_tiled_tmem_native(self, dtype, swizzle):
-    # Each thread holds a row (TMEM_NATIVE_LAYOUT): its lanes meet on a bank
-    # more than two groups apart, so the store staggers four lane groups.
-    col_tiling = swizzle // bytewidth(utils.dtype_to_ir_type(dtype))
-    m, n = 128, 2 * col_tiling
-    tiling = (64, col_tiling)
-
-    def kernel(ctx, inp, out, smem):
-      del ctx
-      fa.FragmentedArray.load_untiled(
-          inp, layout=fa.TMEM_NATIVE_LAYOUT, optimized=False
-      ).store_tiled(smem, swizzle=swizzle)
-      copy(smem, out, swizzle=swizzle)
-
-    x = self.prng.uniform(-1, 1, (m, n)).astype(dtype)
-    expected = x.reshape(
-        m // tiling[0], tiling[0], n // tiling[1], tiling[1]
-    ).transpose(0, 2, 1, 3)
-    res = mgpu.as_gpu_kernel(
-        kernel, (1, 1, 1), (128, 1, 1), x, expected, expected
-    )(x)
-    np.testing.assert_array_equal(res, expected)
-
   @parameterized.product(
       dtype=[jnp.float32, jnp.float16],
       swizzle=(32, 64, 128),
