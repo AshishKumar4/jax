@@ -7720,6 +7720,15 @@ def _linear_dot(out_dtype, lhs, rhs, *, dimension_numbers):
   prod = lambda i: optimization_barrier(mul(la_at(i), ra_at(i)))
   return control_flow.fori_loop(1, k, lambda i, acc: add(acc, prod(i)), prod(0))
 
+def _algorithm_over_complex(precision, avals_in) -> bool:
+  """Whether a dot names an algorithm, whose operand types are real, over a
+  complex operand."""
+  return (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
+          precision != DotAlgorithmPreset.DEFAULT and
+          any(dtypes.issubdtype(aval.dtype, np.complexfloating)
+              for aval in avals_in))
+
+
 def _complex_dot_by_parts(lhs, rhs, *, dimension_numbers, precision,
                           out_dtype, out_sharding):
   """A dot of complex operands under an algorithm, whose operand types are real,
@@ -7753,10 +7762,7 @@ def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
         dict(dimension_numbers=dimension_numbers, preferred_element_type=dt),
         lhs, rhs)
   del preferred_element_type  # Implied by the output aval
-  if (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
-      precision != DotAlgorithmPreset.DEFAULT and
-      any(dtypes.issubdtype(aval.dtype, np.complexfloating)
-          for aval in ctx.avals_in)):
+  if _algorithm_over_complex(precision, ctx.avals_in):
     # An algorithm's operand types are real: a complex operand cast to them
     # would lose its imaginary part, so its real products are taken at it.
     return mlir.lower_fun(
