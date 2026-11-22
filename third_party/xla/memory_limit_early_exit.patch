@@ -1,5 +1,5 @@
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index 83935d4bc7..c403d8187d 100644
+index 83935d4bc7..4f1700c86a 100644
 --- a/xla/debug_options_flags.cc
 +++ b/xla/debug_options_flags.cc
 @@ -581,6 +581,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
@@ -10,10 +10,10 @@ index 83935d4bc7..c403d8187d 100644
    opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
    opts.set_xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl(true);
    opts.set_xla_gpu_ragged_all_to_all_mode(
-@@ -4319,6 +4320,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
-         "Exits compilation early at the specified point. Available options: "
-         "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT, "
-         "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT."));
+@@ -4325,6 +4326,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+         debug_options->xla_gpu_print_compilation_stats(),
+         "Prints statistics about the HLO passes: how many times each pass was "
+         "run, and how long it took."));
 +    flag_list->push_back(tsl::Flag(
 +        "xla_gpu_memory_limit_early_exit_bytes",
 +        int64_setter_for(
@@ -22,9 +22,9 @@ index 83935d4bc7..c403d8187d 100644
 +        "If positive, a compile whose buffer assignment holds more device "
 +        "bytes (argument + output - alias + temp) than this stops after buffer "
 +        "assignment: no code is emitted and executing it fails."));
-     flag_list->push_back(tsl::Flag(
-         "xla_gpu_print_compilation_stats",
-         bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),
+     flag_list->push_back(
+         tsl::Flag("xla_gpu_enable_pdl",
+                   bool_setter_for(&DebugOptions::set_xla_gpu_enable_pdl),
 diff --git a/xla/pjrt/gpu/se_gpu_pjrt_client.cc b/xla/pjrt/gpu/se_gpu_pjrt_client.cc
 index e22b4de971..a5116f9567 100644
 --- a/xla/pjrt/gpu/se_gpu_pjrt_client.cc
@@ -38,7 +38,7 @@ index e22b4de971..a5116f9567 100644
        std::unique_ptr<gpu::GpuExecutableBufferAllocator::ExecutionScope>
            allocation_scope,
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 8ed5a15fce..8123ec5606 100644
+index 8ed5a15fce..ddfcc18983 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -863,6 +863,7 @@ cc_library(
@@ -49,7 +49,7 @@ index 8ed5a15fce..8123ec5606 100644
          "//xla/pjrt/proto:compile_options_proto_cc",
          "//xla/runtime:device_id",
          "//xla/runtime:hang_watchdog",
-@@ -2316,6 +2317,32 @@ xla_test(
+@@ -2444,6 +2445,32 @@ xla_test(
      ],
  )
  
@@ -80,8 +80,8 @@ index 8ed5a15fce..8123ec5606 100644
 +)
 +
  xla_test(
-     name = "instantiate_concurrently_test",
-     srcs = ["instantiate_concurrently_test.cc"],
+     name = "gpu_compiler_legacy_hlo_runner_test",
+     srcs = ["gpu_compiler_legacy_hlo_runner_test.cc"],
 diff --git a/xla/service/gpu/compile_module_to_llvm_ir.cc b/xla/service/gpu/compile_module_to_llvm_ir.cc
 index b870e75992..70cc19bc03 100644
 --- a/xla/service/gpu/compile_module_to_llvm_ir.cc

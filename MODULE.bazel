@@ -94,19 +94,24 @@ archive_override(
         # A float add, subtract or multiply labeled xla_no_contract (jax.experimental.xla_metadata) rounds on its
         # own on the CPU, fenced (llvm.arithmetic.fence) where XLA:CPU makes its arithmetic contractible, its
         # unlabeled twins kept apart by CSE and contracted as before; LLVM widens the fence (row 7953: Dew's
-        # error-free transforms' products contracted into fused multiply-adds, their compensations lost).
+        # error-free transforms' products contracted into fused multiply-adds, their compensations lost). Delete
+        # when upstream XLA honours a no-contract mark on an op (an upstream issue, not yet filed).
         "//third_party:xla/no_contract_mark.patch",
         # A small dot strength-reduces as its precision algorithm states, each multiplied and summed as it says
         # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
-        # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554).
+        # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554). At this pin
+        # upstream keeps such a dot a dot (StrengthReduceAlgorithmSupports): delete when an A100 build without it
+        # compiles and computes lax_test's testSmallDotComputesAsItsAlgorithmStates and SmallF8 cases as stated.
         "//third_party:xla/dot_algorithm_multiply.patch",
         # A compile-only GPU device states the client's memory spaces (device, pinned_host), so a program compiled
         # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
-        # (row 8372: a host step prepared without a GPU compiled other programs than its run).
+        # (row 8372: a host step prepared without a GPU compiled other programs than its run). Delete when
+        # upstream's StreamExecutorGpuTopologyDescription states its devices' memory spaces.
         "//third_party:xla/compile_only_memory_spaces.patch",
         # A spill warning's function is read whatever name ptxas quotes: a PTX name holding `$` (LLVM's NVPTX
         # backend writes `_$_` into a name it makes valid) spilled with no stats recorded, read as no spill by
-        # Mosaic GPU's kernel facts (row 9649).
+        # Mosaic GPU's kernel facts (row 9649). Delete when upstream's ExtractModuleStatsFromLog reads a quoted
+        # function name of any characters.
         "//third_party:xla/ptxas_spill_function_names.patch",
         # A reduce over degenerate dimensions alone is its inputs, each result its own: ReductionDegenerateDimRemover
         # replaced a variadic one with one bitcast of its first input and failed the compile (RET_CHECK
@@ -117,7 +122,9 @@ archive_override(
         # indices an s32 x s64 dot, which the elemental emitter multiplied as `arith.muli (i32, i64)` and LLVM IR
         # translation refused (RET_CHECK mlir_kernel_emitter.cc:705) under deterministic ops with the algebraic
         # simplifier off, an accuracy check's reference as written (row 10741); and the emitter multiplies any
-        # mixed precision dot's operands in one type.
+        # mixed precision dot's operands in one type. Delete the scatter half when upstream's FlattenIndices
+        # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
+        # converts a mixed dot's operands (no other pass makes one at this pin).
         "//third_party:xla/mixed_index_dot.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
