@@ -915,5 +915,50 @@ def matmul(x, y, *, bm, bn, gm, bk, interpret, debug=False):
   return matmul_kernel(x, y)
 
 
+class TritonDialectLookupTest(jtu.JaxTestCase):
+
+  def test_a_triton_operation_finds_its_class_without_searching(self):
+    # MLIR finds a `tt` operation's Python class under a dialect search prefix
+    # and keeps the module: lowering a Triton kernel imports nothing more, at
+    # its first operation or its thousandth.
+    try:
+      from jax._src.lib import triton  # pytype: disable=import-error
+    except ImportError:
+      self.skipTest("this jaxlib has no Triton dialect")
+    from jax._src.interpreters import mlir
+    from jax._src.lib.mlir import ir
+    from jax._src.pallas.triton import lowering
+
+    searched = []
+
+    class Recorder:
+
+      def find_spec(self, fullname, path=None, target=None):
+        searched.append(fullname)
+        return None
+
+    def build():
+      with lowering._new_ir_context(), ir.Location.unknown():
+        module = ir.Module.parse(
+            "module {\n"
+            "  tt.func @kernel(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n"
+            "    tt.return %arg0 : tensor<4xf32>\n"
+            "  }\n"
+            "}\n")
+        # Each operation's view is its class's, which MLIR looks up.
+        return [type(op.operation.opview) for op in module.body.operations]
+
+    del mlir, triton
+    first = build()
+    sys.meta_path.insert(0, Recorder())
+    try:
+      again = [build() for _ in range(3)]
+    finally:
+      sys.meta_path.pop(0)
+    self.assertEqual(searched, [])
+    self.assertEqual(first[0].__name__, "FuncOp")
+    self.assertTrue(all(views == first for views in again))
+
+
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
