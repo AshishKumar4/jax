@@ -35,7 +35,6 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
-from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 import jax.numpy as jnp
@@ -181,39 +180,6 @@ class BufferedRef:
         oob_mode=oob_mode,
     )
 
-  def copy_in_share(self, slot, grid_indices, thread, threads: int):
-    """``copy_in`` by cp.async of the ``thread``'s share of the block's first
-    axis, one of ``threads`` equal shares: of a tiled block, whole 8-row tiles
-    for each of a warpgroup's four warps, over which its copy spreads them; of
-    a vector, whole 16-byte chunks."""
-    if not _in_smem(self.spec):
-      return
-    assert self.smem_ref is not None
-    smem = self.smem_ref.at[slot]
-    rows = smem.shape[0]
-    granule = 4 * 8 if len(smem.shape) > 1 else 16 // smem.dtype.itemsize
-    if rows % (threads * granule):
-      raise NotImplementedError(
-          f"A block of {rows} rows splits into no {threads} shares of whole"
-          f" {granule}-row chunks"
-      )
-    part = rows // threads
-    # `.at`'s indexer, which the type checker cannot read through AbstractRef's
-    # `aval_property`.
-    gmem = state_types.RefIndexer(self.gmem_ref)[
-        self.compute_gmem_slice(grid_indices)
-    ]
-    oob_mode = getattr(self.spec, "oob_fill_mode", None)
-    for share in range(threads):
-      @pl.when(thread == share)
-      def _(share=share):
-        gpu_primitives.copy_gmem_to_smem(
-            gmem.at[pl.ds(share * part, part)],
-            smem.at[pl.ds(share * part, part)],
-            None,
-            oob_mode=oob_mode,
-        )
-
   def copy_out(self, slot, grid_indices, predicate=None):
     if not _in_smem(self.spec):
       return
@@ -311,7 +277,6 @@ def emit_pipeline[T](
     out_specs: Sequence[pallas_core.BlockSpec] = (),
     max_concurrent_steps: int = 1,
     init_carry: T | None = None,
-    thread_axis: str | None = None,
     prefetch: Callable[..., Any] | None = None,
 ) -> Pipeline:
   r"""Creates a function to emit a manual pipeline within a Pallas kernel.
@@ -335,19 +300,6 @@ def emit_pipeline[T](
     init_carry: Optional initial carry. If provided, ``body`` handles
       carry-over state between iterations, and the pipeline returns the
       final carry.
-    thread_axis: Optional name of the kernel's thread axis (``thread_name`` of
-      :func:`~jax.experimental.pallas.mosaic_gpu.kernel`) whose threads all run
-      the pipeline together, each calling it with the same arguments and each
-      running ``body`` on the same slots. Its buffers are allocated once for
-      all of them. On pre-Hopper GPUs each thread copies an equal share of
-      every input block's first axis by cp.async (of a tiled block, whole
-      8-row tiles for each of a warpgroup's four warps; of a vector, whole
-      16-byte chunks) and waits for its own
-      copies, then the threads meet before ``body`` reads the slot; with TMA
-      the first thread issues the copies and every thread waits on their
-      barrier. Either way the threads meet again after ``body``, before the
-      slot is refilled, so no thread overwrites a slot another still reads.
-      Only input pipelines take a thread axis.
     prefetch: Optional. ``prefetch(indices, *input_refs)`` reads a step's first
       values from its input slots into registers (a matrix product's first
       fragments). With it, ``body`` takes two more arguments after the carry
@@ -414,10 +366,6 @@ def emit_pipeline[T](
       raise NotImplementedError(
           "emit_pipeline on pre-Hopper GPUs only supports input-only pipelines"
       )
-  if thread_axis is not None and out_specs:
-    raise NotImplementedError(
-        "emit_pipeline with a thread_axis only supports input-only pipelines"
-    )
   if prefetch is not None and (out_specs or delay_release_levels != [0]):
     raise NotImplementedError(
         "emit_pipeline's prefetch takes an input-only pipeline whose specs"
@@ -439,25 +387,14 @@ def emit_pipeline[T](
               " provably in bounds, or oob_fill_mode="
               "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
           )
-    threads = (
-        1 if thread_axis is None
-        else core.get_axis_env().axis_size(thread_axis)
-    )
     return pl.run_scoped(
         functools.partial(
             scoped_pipeline,
             in_specs=effective_in_specs,
             in_gmem_refs=in_gmem_refs,
             out_gmem_refs=out_gmem_refs,
-            threads=threads,
         ),
         **get_allocations(*gmem_refs),
-        # Two barriers the threads meet at in turn, so that no thread arrives
-        # at a barrier's next phase before every thread has seen its last.
-        meet_ref=None
-        if threads == 1
-        else gpu_core.Barrier(num_arrivals=threads, num_barriers=2),
-        collective_axes=() if thread_axis is None else thread_axis,
     )
 
   def get_allocations(*gmem_refs: Any) -> dict[str, Any]:
@@ -507,29 +444,7 @@ def emit_pipeline[T](
       in_smem_refs,
       out_smem_refs,
       barrier_ref,
-      meet_ref,
-      threads,
   ):
-    def meet():
-      if meet_ref is None:
-        return
-      for barrier in (meet_ref.at[0], meet_ref.at[1]):
-        gpu_primitives.barrier_arrive(barrier)
-        gpu_primitives.barrier_wait(barrier)
-
-    def copy_in(bref, slot, fetch_indices):
-      if meet_ref is None:
-        bref.copy_in(slot, fetch_indices, barrier_ref)
-      elif is_cp_async:
-        bref.copy_in_share(
-            slot, fetch_indices, lax.axis_index(thread_axis), threads
-        )
-      else:
-        # One thread issues the TMA copies; every thread waits on the barrier.
-        @pl.when(lax.axis_index(thread_axis) == 0)
-        def _():
-          bref.copy_in(slot, fetch_indices, barrier_ref)
-
     in_brefs: Sequence[BufferedRef] = [
         BufferedRef(spec, _is_index_invariant(spec, grid), gmem_ref, smem_ref)
         for spec, gmem_ref, smem_ref in zip(
@@ -571,7 +486,7 @@ def emit_pipeline[T](
 
     def prologue(step, fetch_indices):
       for bref in in_brefs:
-        copy_in(bref, step, fetch_indices)
+        bref.copy_in(step, fetch_indices, barrier_ref)
       return _inc_grid_by_1(fetch_indices, grid)
     jax.lax.fori_loop(0, prologue_steps, prologue, indices, unroll=not has_dynamic_grid)
 
@@ -600,7 +515,7 @@ def emit_pipeline[T](
         def do_fetch(fetch_slot=fetch_slot):
           for bref in in_brefs:
             if getattr(bref.spec, "delay_release", 0) == delay_release:
-              copy_in(bref, fetch_slot, fetch_indices)
+              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
 
         jax.lax.cond(
             lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
@@ -614,11 +529,8 @@ def emit_pipeline[T](
         gpu_primitives.barrier_wait(barrier_ref.at[slot])
       elif is_cp_async and copies_per_step > 0:
         # Pre-Hopper: await cp.async copies. The wait-group count must be a
-        # compile-time constant, so it is threaded in via ``wait_count``. With
-        # a thread axis each thread waits for its own share, then they meet:
-        # past it, every share of the slot has landed.
+        # compile-time constant, so it is threaded in via ``wait_count``.
         gpu_primitives.wait_gmem_to_smem(wait_count)
-        meet()
 
     def prefetched_at(indices, slot):
       assert prefetch is not None
@@ -701,10 +613,6 @@ def emit_pipeline[T](
 
       if copies_out_in_loop:
         gpu_primitives.commit_smem()
-
-      # Every thread has read the slot before any refills it (below), and
-      # before the pipeline's buffers go out of scope after its last step.
-      meet()
 
       # Copy the output from SMEM to GMEM.
       new_store_indices = last_store_indices[:]
