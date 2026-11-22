@@ -132,6 +132,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/python/ifrt/rtti.h"
 #include "xla/python/logging.h"  // IWYU pragma: keep
+#include "xla/side_effect_util.h"
 #include "xla/python/nb_absl_flat_hash_map.h"  // IWYU pragma: keep
 #include "xla/python/nb_absl_span.h"  // IWYU pragma: keep
 #include "xla/python/pjrt_ifrt/pjrt_client.h"
@@ -1210,7 +1211,7 @@ NB_MODULE(_jax, m) {
   // The frontend attribute under which a float add, subtract or multiply rounds
   // on its own, never contracted into a fused multiply-add: this build's
   // compilers honour it (jax.extend.backend.no_contract_attribute).
-  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = "xla_no_contract";
+  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = xla::kXlaNoContractAttr;
 
   m.def("approx_top_k_reduction_output_size",
         xla::ValueOrThrowWrapper(xla::ApproxTopKReductionOutputSize),
