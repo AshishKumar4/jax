@@ -211,9 +211,12 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
 
     barrier = threading.Barrier(8)
 
+    def meet():
+      barrier.wait()
+
     def inner(thread, token):
       del thread
-      io_callback(barrier.wait, None)
+      io_callback(meet, None)
       return token
 
     def outer(thread, token):
