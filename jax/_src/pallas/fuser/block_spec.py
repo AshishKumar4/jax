@@ -3668,12 +3668,13 @@ def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
   return ctx.prim.bind(x, **params) if config._check_vma.value else x
 
 
-for _prim in (core.pvary_p, core.reduced_vary_cast_p):
-  register_pull_block_spec_rule(_prim)(_eltwise_pull_rule)
-  register_usage_rule(_prim)(_manual_cast_usage_rule)
-  register_push_block_spec_rule(_prim)(_eltwise_push_rule)
-  register_eval_rule(_prim)(_manual_cast_eval_rule)
-del _prim
+# pvary's eval, pull and push rules are upstream's (its eval casts only along the
+# axes the value does not already vary over); its usage rule is this one.
+register_usage_rule(core.pvary_p)(_manual_cast_usage_rule)
+register_pull_block_spec_rule(core.reduced_vary_cast_p)(_eltwise_pull_rule)
+register_usage_rule(core.reduced_vary_cast_p)(_manual_cast_usage_rule)
+register_push_block_spec_rule(core.reduced_vary_cast_p)(_eltwise_push_rule)
+register_eval_rule(core.reduced_vary_cast_p)(_manual_cast_eval_rule)
 
 
 # An optimization barrier: each output its operand as it is, a block of one the
@@ -3681,9 +3682,9 @@ del _prim
 @register_pull_block_spec_rule(lax.optimization_barrier_p)
 def _optimization_barrier_pull_rule(
     ctx: PullRuleContext,
-    block_transforms: Sequence[BlockIndexTransform | NoBlockIndexTransform],
+    block_transforms: Sequence[BlockIndexTransform | None],
     **params,
-) -> Sequence[BlockIndexTransform | NoBlockIndexTransform]:
+) -> Sequence[BlockIndexTransform | None]:
   del ctx, params
   return list(block_transforms)
 
