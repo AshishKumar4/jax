@@ -203,9 +203,10 @@ def _lowered() -> set[jax_core.Primitive]:
   the state primitives, the only ones holding a ref that JAX's own code makes,
   so the only ones a body a discharge rule makes could hold for a later
   discharge."""
-  lowered: set[jax_core.Primitive] = set(eval_jaxpr_lib.call_primitives)
+  lowered: set[jax_core.Primitive] = set(list(eval_jaxpr_lib.call_primitives))
+  # Each table copied before it is read: a rule may be registered meanwhile.
   for rules in list(lowering.mosaic_lowering_rules.values()):
-    lowered.update(rules)
+    lowered.update(list(rules))
   lowered.update(value for value in vars(state_primitives).values()
                  if isinstance(value, jax_core.Primitive))
   return lowered
@@ -264,9 +265,9 @@ def check_primitives(primitives: dict[jax_core.Primitive, bool]) -> None:
   the registry holds (a primitive of the same name that is another object has
   none).
   """
-  known: set[jax_core.Primitive] = set(discharge._discharge_rules)
+  known: set[jax_core.Primitive] = set(list(discharge._discharge_rules))
   for rules in list(lowering.mosaic_lowering_rules.values()):
-    known.update(rules)
+    known.update(list(rules))
   for primitive, is_call in primitives.items():
     if not is_call and primitive not in known:
       raise sealing.Unsealed(
