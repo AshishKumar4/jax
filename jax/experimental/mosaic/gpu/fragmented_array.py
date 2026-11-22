@@ -6073,15 +6073,17 @@ def plan_tiled_transfer(
   # with bank conflicts are those that have multiple elements and a stride
   # that's not a multiple of the number of banks.
   #
-  # Two groups are tried first, then four, then eight: each group past the
-  # first adds a select a transferred register. Lanes that each hold a row of
-  # a swizzled tile (TMEM_NATIVE_LAYOUT's) meet in fours on each bank, which
-  # only four groups or more spread.
+  # Two groups are tried first, then four: each group past the first adds a
+  # select a transferred register. Lanes that each hold a row of a swizzled
+  # tile (TMEM_NATIVE_LAYOUT's) meet in fours on each bank, which only four
+  # groups spread. Eight are not tried: where eight lanes meet on a bank (a
+  # WGMMA tile's rows in untiled memory), seven selects a register cost more
+  # than the layout another transfer takes.
   candidate_dims = [
       i for i, (s, d) in enumerate(zip(tiles_strides, tiles_shape))
       if d > 1 and s % (SMEM_BANKS * elems_per_bank)
   ]
-  for groups in (2, 4, 8):
+  for groups in (2, 4):
     for dim in candidate_dims:
       for group_stride in (1, 2, 4, 8, 16):
         if group_stride * groups > WARP_SIZE:
