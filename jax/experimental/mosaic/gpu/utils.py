@@ -1182,14 +1182,16 @@ def warpgroup_barrier_idx(sync: bool = True) -> ir.Value[ir.IntegerType]:
   return arith.addi(warpgroup_idx(sync=sync), c(1, i32))
 
 
-WARPGROUP_BARRIER_PTX = f"bar.sync $0, {WARPGROUP_SIZE};"
-"""The inline PTX of a warpgroup's sync (`warpgroup_barrier`), as a lowered
-module holds it: a reader of the module names a warpgroup sync by it."""
-
-
 def warpgroup_barrier():
-  wg_idx = warpgroup_barrier_idx(sync=False)
-  inline_ptx(WARPGROUP_BARRIER_PTX, wg_idx, has_side_effects=True)
+  """A sync of the warpgroup's threads on its own barrier
+  (`warpgroup_barrier_idx`): a typed `nvvm.barrier` of its id and of
+  `WARPGROUP_SIZE` threads, `bar.sync id, 128` in PTX, which a reader of a
+  lowered module finds as an operation."""
+  i32 = ir.IntegerType.get_signless(32)
+  nvvm.barrier(
+      barrier_id=warpgroup_barrier_idx(sync=False),
+      number_of_threads=c(WARPGROUP_SIZE, i32),
+  )
 
 
 def warpgroup_reduce_pred(pred: ir.Value, op: Literal["or", "and"]) -> ir.Value:
