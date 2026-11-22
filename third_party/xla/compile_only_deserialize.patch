@@ -1,0 +1,524 @@
+diff --git a/xla/pjrt/c/BUILD b/xla/pjrt/c/BUILD
+index 2b17fce1b9..40fb30085b 100644
+--- a/xla/pjrt/c/BUILD
++++ b/xla/pjrt/c/BUILD
+@@ -702,6 +702,7 @@ cc_library(
+         "//xla/pjrt:pjrt_executable",
+         "//xla/pjrt/extensions/abi_version:gpu_abi_version_extension",
+         "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
++        "//xla/pjrt/extensions/executable_deserialize:executable_deserialize_extension",
+         "//xla/pjrt/extensions/executable_metadata:executable_metadata_extension",
+         "//xla/pjrt/gpu:allocator_config",
+         "//xla/pjrt/gpu:gpu_helpers",
+diff --git a/xla/pjrt/c/pjrt_c_api.h b/xla/pjrt/c/pjrt_c_api.h
+index a34dedc129..fbc8126b9b 100644
+--- a/xla/pjrt/c/pjrt_c_api.h
++++ b/xla/pjrt/c/pjrt_c_api.h
+@@ -84,6 +84,9 @@ typedef enum {
+   PJRT_Extension_Type_MultiSlice,
+   PJRT_Extension_Type_HostMemoryAllocator,
+   PJRT_Extension_Type_XlaTransform,
++  // Not upstream: Dew's fork. A value of its own, far from the sequence, so
++  // that a type upstream adds next does not take it.
++  PJRT_Extension_Type_ExecutableDeserialize = 1000,
+ } PJRT_Extension_Type;
+ 
+ // PJRT_Extension_Base contains a type and a pointer to next
+diff --git a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
+index 3365f54bb5..30a765727a 100644
+--- a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
++++ b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
+@@ -57,6 +57,7 @@ limitations under the License.
+ #include "xla/pjrt/c/pjrt_c_api_xla_transform_internal.h"
+ #include "xla/pjrt/extensions/abi_version/gpu_abi_version_extension.h"
+ #include "xla/pjrt/extensions/cross_host_transfers/pjrt_c_api_cross_host_transfers_extension.h"
++#include "xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h"
+ #include "xla/pjrt/extensions/executable_metadata/executable_metadata_extension.h"
+ #include "xla/pjrt/gpu/allocator_config.h"
+ #include "xla/pjrt/gpu/gpu_helpers.h"
+@@ -706,11 +707,14 @@ const PJRT_Api* GetGpuPjrtApi() {
+   static PJRT_AbiVersion_Extension abi_version_extension =
+       pjrt::CreateGpuAbiVersionExtension(&executable_metadata_extension.base);
+ 
++  static PJRT_ExecutableDeserialize_Extension executable_deserialize_extension =
++      pjrt::CreateExecutableDeserializeExtension(&abi_version_extension.base);
++
+   static const PJRT_Api pjrt_api = pjrt::CreatePjrtApi(
+       pjrt::gpu_plugin::PJRT_Client_Create,
+       pjrt::gpu_plugin::PJRT_ExecuteContext_Create,
+       pjrt::gpu_plugin::PJRT_GpuDeviceTopology_Create,
+-      pjrt::PJRT_Plugin_Initialize_NoOp, &abi_version_extension.base,
++      pjrt::PJRT_Plugin_Initialize_NoOp, &executable_deserialize_extension.base,
+       pjrt::gpu_plugin::PJRT_Plugin_Attributes_Gpu);
+ 
+   return &pjrt_api;
+diff --git a/xla/pjrt/c_api_client/BUILD b/xla/pjrt/c_api_client/BUILD
+index 5492517dea..35d6685b7d 100644
+--- a/xla/pjrt/c_api_client/BUILD
++++ b/xla/pjrt/c_api_client/BUILD
+@@ -100,6 +100,7 @@ cc_library(
+         "//xla/pjrt/distributed:key_value_store_interface",
+         "//xla/pjrt/distributed/coordination:coordination_service_proto_cc",
+         "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
++        "//xla/pjrt/extensions/executable_deserialize:executable_deserialize_extension_hdrs",
+         "//xla/pjrt/extensions/executable_metadata:executable_metadata_extension",
+         "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_extension",
+         "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_interface_impl",
+@@ -147,6 +148,9 @@ cc_library(
+         "@tsl//tsl/profiler/lib:connected_traceme",
+         "@tsl//tsl/profiler/lib:context_types_hdrs",
+         "@tsl//tsl/profiler/lib:traceme",
++        "@riegeli//riegeli/base:any",
++        "@riegeli//riegeli/bytes:read_all",
++        "@riegeli//riegeli/bytes:reader",
+     ],
+ )
+ 
+diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.cc b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
+index 18ea0501f8..10e756a1ed 100644
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client.cc
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
+@@ -13,6 +13,9 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
++#include "riegeli/base/any.h"
++#include "riegeli/bytes/read_all.h"
++#include "riegeli/bytes/reader.h"
+ #include "xla/pjrt/c_api_client/pjrt_c_api_client.h"
+ 
+ #include <cstddef>
+@@ -78,6 +81,7 @@ limitations under the License.
+ #include "xla/pjrt/c_api_client/pjrt_c_api_phase_compiler.h"
+ #include "xla/pjrt/distributed/key_value_store_interface.h"
+ #include "xla/pjrt/extensions/cross_host_transfers/pjrt_c_api_cross_host_transfers_extension.h"
++#include "xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h"
+ #include "xla/pjrt/extensions/executable_metadata/executable_metadata_extension.h"
+ #include "xla/pjrt/extensions/host_memory_allocator/host_memory_allocator_extension.h"
+ #include "xla/pjrt/extensions/host_memory_allocator/host_memory_allocator_interface_impl.h"
+@@ -5047,6 +5051,48 @@ PjRtCApiCompiler::DeserializePjRtTopologyDescription(
+                                                        /*owned=*/true);
+ }
+ 
++absl::StatusOr<std::unique_ptr<PjRtExecutable>>
++PjRtCApiCompiler::DeserializeExecutable(
++    const PjRtTopologyDescription& topology,
++    riegeli::Any<riegeli::Reader*> reader,
++    std::optional<CompileOptions>&& options,
++    const DeserializeExecutableOptions& deserialize_options) {
++  PJRT_ExecutableDeserialize_Extension* extension =
++      pjrt::FindExtension<PJRT_ExecutableDeserialize_Extension>(
++          c_api_,
++          PJRT_Extension_Type::PJRT_Extension_Type_ExecutableDeserialize);
++  if (extension == nullptr) {
++    return absl::UnimplementedError(absl::StrCat(
++        "DeserializeExecutable is not implemented for: ",
++        topology.platform_name(),
++        " (its plugin has no PJRT_ExecutableDeserialize_Extension)."));
++  }
++  std::string serialized;
++  ABSL_RETURN_IF_ERROR(riegeli::ReadAll(std::move(reader), serialized));
++  std::string options_str;
++  if (options.has_value()) {
++    ABSL_ASSIGN_OR_RETURN(const CompileOptionsProto options_proto,
++                          options->ToProto());
++    options_str = options_proto.SerializeAsString();
++  }
++
++  PJRT_ExecutableDeserialize_Deserialize_Args args;
++  args.struct_size = PJRT_ExecutableDeserialize_Deserialize_Args_STRUCT_SIZE;
++  args.extension_start = nullptr;
++  args.topology = absl::down_cast<const PjRtCApiTopologyDescription*>(&topology)
++                      ->c_topology();
++  args.serialized_executable = serialized.data();
++  args.serialized_executable_size = serialized.size();
++  args.overridden_serialized_compile_options =
++      options.has_value() ? options_str.data() : nullptr;
++  args.overridden_serialized_compile_options_size = options_str.size();
++  args.executable = nullptr;
++  RETURN_STATUS_IF_PJRT_ERROR(extension->deserialize(&args), c_api_);
++  std::unique_ptr<PjRtExecutable> executable =
++      std::make_unique<PjRtCApiExecutable>(c_api_, args.executable);
++  return executable;
++}
++
+ // -------------------------------- API access ---------------------------------
+ 
+ absl::StatusOr<std::unique_ptr<PjRtClient>> GetCApiClient(
+diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.h b/xla/pjrt/c_api_client/pjrt_c_api_client.h
+index 58bb50c700..d217f52768 100644
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client.h
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client.h
+@@ -241,6 +241,14 @@ class PjRtCApiCompiler : public PjRtCompiler {
+   DeserializePjRtTopologyDescription(
+       const std::string& serialized_topology) override;
+ 
++  // Through the plugin's PJRT_ExecutableDeserialize_Extension: Unimplemented
++  // for a plugin without it.
++  absl::StatusOr<std::unique_ptr<PjRtExecutable>> DeserializeExecutable(
++      const PjRtTopologyDescription& topology,
++      riegeli::Any<riegeli::Reader*> reader,
++      std::optional<CompileOptions>&& options,
++      const DeserializeExecutableOptions& deserialize_options) override;
++
+  private:
+   const PJRT_Api* c_api_;
+ };
+diff --git a/xla/pjrt/extensions/executable_deserialize/BUILD b/xla/pjrt/extensions/executable_deserialize/BUILD
+new file mode 100644
+index 0000000000..d55ea405f7
+--- /dev/null
++++ b/xla/pjrt/extensions/executable_deserialize/BUILD
+@@ -0,0 +1,47 @@
++# Copyright 2026 The OpenXLA Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
++
++package(
++    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
++    default_visibility = ["//visibility:public"],
++)
++
++# The extension's C API, for a client that looks it up.
++cc_library(
++    name = "executable_deserialize_extension_hdrs",
++    hdrs = ["executable_deserialize_extension.h"],
++    deps = ["//xla/pjrt/c:pjrt_c_api_hdrs"],
++)
++
++# Its implementation, for a plugin built on pjrt_c_api_wrapper_impl.
++cc_library(
++    name = "executable_deserialize_extension",
++    srcs = ["executable_deserialize_extension.cc"],
++    deps = [
++        ":executable_deserialize_extension_hdrs",
++        "//xla/pjrt:pjrt_compiler",
++        "//xla/pjrt:pjrt_executable",
++        "//xla/pjrt/c:pjrt_c_api_hdrs",
++        "//xla/pjrt/c:pjrt_c_api_helpers",
++        "//xla/pjrt/c:pjrt_c_api_status_utils",
++        "//xla/pjrt/c:pjrt_c_api_wrapper_impl",
++        "//xla/pjrt/proto:compile_options_proto_cc",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/strings:string_view",
++        "@riegeli//riegeli/bytes:string_reader",
++    ],
++)
+diff --git a/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.cc b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.cc
+new file mode 100644
+index 0000000000..dc07ff7163
+--- /dev/null
++++ b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.cc
+@@ -0,0 +1,84 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "absl/status/status.h"
++#include "absl/strings/string_view.h"
++#include "riegeli/bytes/string_reader.h"
++#include "xla/pjrt/c/pjrt_c_api.h"
++#include "xla/pjrt/c/pjrt_c_api_helpers.h"
++#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
++#include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
++#include "xla/pjrt/pjrt_compiler.h"
++#include "xla/pjrt/pjrt_executable.h"
++#include "xla/pjrt/proto/compile_options.pb.h"
++
++namespace pjrt {
++
++PJRT_Error* PJRT_ExecutableDeserialize_DeserializeExecutable(
++    PJRT_ExecutableDeserialize_Deserialize_Args* args) {
++  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
++      "PJRT_ExecutableDeserialize_Deserialize_Args",
++      PJRT_ExecutableDeserialize_Deserialize_Args_STRUCT_SIZE,
++      args->struct_size));
++  if (args->topology == nullptr) {
++    return StatusToPjRtError(
++        absl::InvalidArgumentError("Deserializing an executable needs the "
++                                   "topology it was compiled for."));
++  }
++  std::optional<xla::CompileOptions> options;
++  if (args->overridden_serialized_compile_options != nullptr &&
++      args->overridden_serialized_compile_options_size > 0) {
++    xla::CompileOptionsProto proto;
++    if (!proto.ParseFromString(
++            std::string(args->overridden_serialized_compile_options,
++                        args->overridden_serialized_compile_options_size))) {
++      return StatusToPjRtError(absl::InvalidArgumentError(
++          "PJRT_ExecutableDeserialize_Deserialize: failed to parse the "
++          "overridden CompileOptionsProto."));
++    }
++    PJRT_ASSIGN_OR_RETURN(options, xla::CompileOptions::FromProto(proto));
++  }
++  PJRT_ASSIGN_OR_RETURN(
++      std::unique_ptr<xla::PjRtExecutable> executable,
++      xla::PjRtDeserializeExecutable(
++          *args->topology->topology,
++          std::make_unique<riegeli::StringReader<>>(
++              absl::string_view(args->serialized_executable,
++                                args->serialized_executable_size)),
++          std::move(options)));
++  args->executable = new PJRT_Executable(std::move(executable));
++  return nullptr;
++}
++
++PJRT_ExecutableDeserialize_Extension CreateExecutableDeserializeExtension(
++    PJRT_Extension_Base* next) {
++  return PJRT_ExecutableDeserialize_Extension{
++      PJRT_Extension_Base{
++          /*struct_size=*/PJRT_ExecutableDeserialize_Extension_STRUCT_SIZE,
++          /*type=*/PJRT_Extension_Type_ExecutableDeserialize,
++          /*next=*/next,
++      },
++      /*deserialize=*/PJRT_ExecutableDeserialize_DeserializeExecutable,
++  };
++}
++
++}  // namespace pjrt
+diff --git a/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h
+new file mode 100644
+index 0000000000..04332bb158
+--- /dev/null
++++ b/xla/pjrt/extensions/executable_deserialize/executable_deserialize_extension.h
+@@ -0,0 +1,74 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
++#define XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
++
++#include <cstddef>
++
++#include "xla/pjrt/c/pjrt_c_api.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Deserializes an executable for a topology without loading it, as
++// PJRT_Compile compiles one: a compile-only client's counterpart of
++// PJRT_Executable_DeserializeAndLoad, which needs a client.
++
++#define PJRT_API_EXECUTABLE_DESERIALIZE_EXTENSION_VERSION 1
++
++struct PJRT_ExecutableDeserialize_Deserialize_Args {
++  size_t struct_size;
++  PJRT_Extension_Base* extension_start;
++  PJRT_TopologyDescription* topology;
++  // As PJRT_Executable_Serialize serializes one.
++  const char* serialized_executable;
++  size_t serialized_executable_size;
++  // Serialized CompileOptionsProto or null (to use the options from the
++  // serialized executable).
++  const char* overridden_serialized_compile_options;
++  size_t overridden_serialized_compile_options_size;
++  PJRT_Executable* executable;  // out
++};
++PJRT_DEFINE_STRUCT_TRAITS(PJRT_ExecutableDeserialize_Deserialize_Args,
++                          executable);
++
++typedef PJRT_Error* (*PJRT_ExecutableDeserialize_Deserialize)(
++    PJRT_ExecutableDeserialize_Deserialize_Args* args);
++
++typedef struct PJRT_ExecutableDeserialize_Extension {
++  PJRT_Extension_Base base;
++  PJRT_ExecutableDeserialize_Deserialize deserialize;
++} PJRT_ExecutableDeserialize_Extension;
++PJRT_DEFINE_STRUCT_TRAITS(PJRT_ExecutableDeserialize_Extension, deserialize);
++
++#ifdef __cplusplus
++}
++#endif
++
++namespace pjrt {
++
++// Deserializes through the compiler of `args->topology`'s platform
++// (xla::PjRtDeserializeExecutable), as PJRT_Compile compiles through it.
++PJRT_Error* PJRT_ExecutableDeserialize_DeserializeExecutable(
++    PJRT_ExecutableDeserialize_Deserialize_Args* args);
++
++PJRT_ExecutableDeserialize_Extension CreateExecutableDeserializeExtension(
++    PJRT_Extension_Base* next);
++
++}  // namespace pjrt
++
++#endif  // XLA_PJRT_EXTENSIONS_EXECUTABLE_DESERIALIZE_EXECUTABLE_DESERIALIZE_EXTENSION_H_
+diff --git a/xla/python/ifrt/compiler.h b/xla/python/ifrt/compiler.h
+index 477f110191..c13a7e0479 100644
+--- a/xla/python/ifrt/compiler.h
++++ b/xla/python/ifrt/compiler.h
+@@ -98,6 +98,16 @@ class Compiler : public RTTIExtends<Compiler, RTTIRoot> {
+       const absl::Cord& serialized,
+       absl_nullable std::unique_ptr<DeserializeExecutableOptions> options) = 0;
+ 
++  // Deserializes a serialized executable as produced by
++  // `Executable::Serialize()` for `topology`, without loading it: a
++  // compile-only client's counterpart of `DeserializeLoadedExecutable`.
++  virtual tsl::Future<ExecutableRef> DeserializeExecutable(
++      const absl::Cord& serialized, const Topology& topology,
++      absl_nullable std::unique_ptr<DeserializeExecutableOptions> options) {
++    return absl::UnimplementedError(
++        "DeserializeExecutable is not implemented.");
++  }
++
+   static char ID;  // NOLINT
+ };
+ 
+diff --git a/xla/python/pjrt_ifrt/BUILD b/xla/python/pjrt_ifrt/BUILD
+index e279b58c91..b2801fdc9a 100644
+--- a/xla/python/pjrt_ifrt/BUILD
++++ b/xla/python/pjrt_ifrt/BUILD
+@@ -687,6 +687,7 @@ cc_library(
+         "@llvm-project//mlir:IR",
+         "@tsl//tsl/platform",
+         "@tsl//tsl/platform:protobuf",
++        "@riegeli//riegeli/bytes:cord_reader",
+     ],
+ )
+ 
+diff --git a/xla/python/pjrt_ifrt/pjrt_compiler.cc b/xla/python/pjrt_ifrt/pjrt_compiler.cc
+index 77f0457a6a..10ef2d03f7 100644
+--- a/xla/python/pjrt_ifrt/pjrt_compiler.cc
++++ b/xla/python/pjrt_ifrt/pjrt_compiler.cc
+@@ -29,6 +29,7 @@ limitations under the License.
+ #include "absl/strings/cord.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/string_view.h"
++#include "riegeli/bytes/cord_reader.h"
+ #include "xla/pjrt/pjrt_client.h"
+ #include "xla/pjrt/pjrt_compiler.h"
+ #include "xla/pjrt/pjrt_executable.h"
+@@ -190,6 +191,35 @@ tsl::Future<ExecutableRef> PjRtCompiler::Compile(
+       std::move(xla_compile_options->outputs_bundle_slice_sizes));
+ }
+ 
++tsl::Future<ExecutableRef> PjRtCompiler::DeserializeExecutable(
++    const absl::Cord& serialized, const Topology& topology,
++    absl_nullable std::unique_ptr<DeserializeExecutableOptions> options) {
++  const auto* pjrt_topology = dyn_cast<PjRtTopology>(&topology);
++  if (pjrt_topology == nullptr) {
++    return absl::InvalidArgumentError("PjRtCompiler requires a PjRtTopology");
++  }
++  ABSL_ASSIGN_OR_RETURN(auto xla_deserialize_options,
++                        GetXlaDeserializeExecutableOptions(std::move(options)));
++  // An unloaded executable's device IDs are its topology's, as `Compile`'s
++  // are when it cross-compiles: none is translated to a client's.
++  ABSL_ASSIGN_OR_RETURN(
++      auto common_metadata_and_serialized_pjrt_executable,
++      PjRtExecutable::CommonMetadata::Deserialize(
++          serialized,
++          absl::bind_front(&PjRtCompiler::IsExecutableVersionCompatible, this),
++          *xla_deserialize_options));
++  ABSL_ASSIGN_OR_RETURN(
++      std::unique_ptr<xla::PjRtExecutable> pjrt_executable,
++      xla::PjRtDeserializeExecutable(
++          *pjrt_topology->description(),
++          std::make_unique<riegeli::CordReader<>>(
++              &common_metadata_and_serialized_pjrt_executable.second),
++          std::move(xla_deserialize_options->compile_options)));
++  return PjRtExecutable::Create(
++      std::shared_ptr<xla::PjRtExecutable>(std::move(pjrt_executable)),
++      std::move(common_metadata_and_serialized_pjrt_executable.first));
++}
++
+ tsl::Future<LoadedExecutableRef> PjRtCompiler::DeserializeLoadedExecutable(
+     const absl::Cord& serialized,
+     absl_nullable std::unique_ptr<DeserializeExecutableOptions> options) {
+diff --git a/xla/python/pjrt_ifrt/pjrt_compiler.h b/xla/python/pjrt_ifrt/pjrt_compiler.h
+index 3fd40019b3..34b2dcde98 100644
+--- a/xla/python/pjrt_ifrt/pjrt_compiler.h
++++ b/xla/python/pjrt_ifrt/pjrt_compiler.h
+@@ -66,6 +66,11 @@ class PjRtCompiler final : public RTTIExtends<PjRtCompiler, Compiler> {
+       absl_nullable std::unique_ptr<DeserializeExecutableOptions> options)
+       override;
+ 
++  tsl::Future<ExecutableRef> DeserializeExecutable(
++      const absl::Cord& serialized, const Topology& topology,
++      absl_nullable std::unique_ptr<DeserializeExecutableOptions> options)
++      override;
++
+   static char ID;  // NOLINT
+ 
+  private:
+diff --git a/xla/python/pjrt_ifrt/pjrt_executable.cc b/xla/python/pjrt_ifrt/pjrt_executable.cc
+index a6359ab04c..f1947eb697 100644
+--- a/xla/python/pjrt_ifrt/pjrt_executable.cc
++++ b/xla/python/pjrt_ifrt/pjrt_executable.cc
+@@ -662,6 +662,16 @@ absl::StatusOr<ExecutableRef> PjRtExecutable::Create(
+                                           std::move(common_metadata)));
+ }
+ 
++absl::StatusOr<ExecutableRef> PjRtExecutable::Create(
++    std::shared_ptr<xla::PjRtExecutable> pjrt_executable,
++    CommonMetadata common_metadata) {
++  if (pjrt_executable == nullptr) {
++    return absl::InvalidArgumentError("pjrt_executable must not be null.");
++  }
++  return ExecutableRef(new PjRtExecutable(std::move(pjrt_executable),
++                                          std::move(common_metadata)));
++}
++
+ PjRtExecutable::PjRtExecutable(
+     std::shared_ptr<xla::PjRtExecutable> pjrt_executable,
+     CommonMetadata common_metadata)
+diff --git a/xla/python/pjrt_ifrt/pjrt_executable.h b/xla/python/pjrt_ifrt/pjrt_executable.h
+index 247612d4d5..7e57cee92a 100644
+--- a/xla/python/pjrt_ifrt/pjrt_executable.h
++++ b/xla/python/pjrt_ifrt/pjrt_executable.h
+@@ -230,6 +230,12 @@ class PjRtExecutable final
+             xla_deserialize_executable_options);
+   };
+ 
++  // Creates PjRtExecutable from a deserialized `xla::PjRtExecutable` and the
++  // metadata serialized with it (`CommonMetadata::Deserialize`).
++  static absl::StatusOr<ExecutableRef> Create(
++      std::shared_ptr<xla::PjRtExecutable> pjrt_executable,
++      CommonMetadata common_metadata);
++
+   const CommonMetadata& common_metadata() const { return common_metadata_; }
+ 
+  protected:

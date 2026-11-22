@@ -16,18 +16,22 @@ limitations under the License.
 #include "jaxlib/py_compile_only_client.h"
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/check.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/cord.h"
 #include "mlir-c/IR.h"
 #include "mlir/Bindings/Python/IRCore.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/stl/optional.h"  // IWYU pragma: keep
 #include "nanobind/stl/shared_ptr.h"  // IWYU pragma: keep
 #include "nanobind/stl/string_view.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
@@ -94,6 +98,30 @@ absl::StatusOr<nb_class_ptr<PyExecutable>> CompileOnlyPyClient::CompileUnloaded(
   return make_nb_class<PyExecutable>(ifrt_executable);
 }
 
+absl::StatusOr<nb_class_ptr<PyExecutable>>
+CompileOnlyPyClient::DeserializeUnloaded(
+    nb::bytes serialized, xla::ifrt::DeviceListRef executable_devices,
+    std::optional<xla::CompileOptions> options) {
+  absl::Cord cord(std::string(serialized.c_str(), serialized.size()));
+  ifrt::ExecutableRef ifrt_executable;
+  {
+    nb::gil_scoped_release gil_release;
+    auto* ifrt_client = xla::ifrt::dyn_cast_or_null<xla::CompileOnlyIfRtClient>(
+        this->ifrt_client());
+    CHECK(ifrt_client) << "CompileOnlyPyClient requires ifrt_client be a "
+                          "xla::CompileOnlyIfRtClient";
+    auto ifrt_options = std::make_unique<ifrt::XlaDeserializeExecutableOptions>(
+        std::move(options), std::move(executable_devices));
+    ABSL_ASSIGN_OR_RETURN(
+        ifrt_executable,
+        ifrt_client->GetDefaultCompiler()
+            ->DeserializeExecutable(std::move(cord), ifrt_client->topology(),
+                                    std::move(ifrt_options))
+            .Await());
+  }
+  return make_nb_class<PyExecutable>(ifrt_executable);
+}
+
 void CompileOnlyPyClient::Initialize(nb_class_ptr<PyClient> client) {
   PyClient::Initialize(client);
 }
@@ -121,6 +149,34 @@ void CompileOnlyPyClient::Register(nb::module_& m) {
               "computation: object, "
               "executable_devices: DeviceList, "
               "compile_options: CompileOptions = ..., "
+              "host_callbacks: Sequence[types.CapsuleType] = ..."
+              ") -> Executable"
+              // clang-format on
+              ))
+      .def(
+          "deserialize_executable",
+          // Host callbacks, which an unloaded executable cannot run, are
+          // taken and dropped, as `compile` drops them.
+          [](CompileOnlyPyClient& self, nb::bytes serialized,
+             PyDeviceList& py_executable_devices,
+             std::optional<xla::CompileOptions> options,
+             std::vector<nb::capsule> host_callbacks) {
+            ifrt::DeviceListRef executable_devices =
+                xla::ValueOrThrow(py_executable_devices.ifrt_device_list());
+            return xla::ValueOrThrow(self.DeserializeUnloaded(
+                std::move(serialized), std::move(executable_devices),
+                std::move(options)));
+          },
+          nb::arg("serialized"), nb::arg("executable_devices"),
+          nb::arg("compile_options").none() = nb::none(),
+          nb::arg("host_callbacks") = std::vector<nb::capsule>(),
+          nb::sig(
+              // clang-format off
+              "def deserialize_executable("
+              "self, "
+              "serialized: bytes, "
+              "executable_devices: DeviceList, "
+              "compile_options: CompileOptions | None = ..., "
               "host_callbacks: Sequence[types.CapsuleType] = ..."
               ") -> Executable"
               // clang-format on

@@ -126,6 +126,11 @@ archive_override(
         # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
         # converts a mixed dot's operands (no other pass makes one at this pin).
         "//third_party:xla/mixed_index_dot.patch",
+        # A compile-only client deserializes an unloaded executable (the GPU plugin's
+        # PJRT_ExecutableDeserialize_Extension, PjRtCApiCompiler and IFRT's Compiler::DeserializeExecutable), so
+        # jaxlib's CompileOnlyPyClient reads the persistent cache back (row 5403: two compile-only processes that
+        # met one program both compiled it). Delete when upstream's PJRT C API deserializes without a client.
+        "//third_party:xla/compile_only_deserialize.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],

@@ -1404,6 +1404,13 @@ class CompileOnlyPyClient(Client):
       compile_options: CompileOptions = ...,
       host_callbacks: Sequence[CapsuleType] = ...,
   ) -> Executable: ...
+  def deserialize_executable(  # type: ignore[override]
+      self,
+      serialized: bytes,
+      executable_devices: DeviceList,
+      compile_options: CompileOptions | None = ...,
+      host_callbacks: Sequence[CapsuleType] = ...,
+  ) -> Executable: ...
 
 class DeviceTopology:
   def _make_compile_only_devices(self) -> list[Device]: ...

@@ -227,11 +227,11 @@ class JaxAotTest(jtu.JaxTestCase):
 
   @jtu.run_on_devices('cuda')
   @jtu.thread_unsafe_test()
-  def test_a_compile_only_client_writes_the_cache_and_reads_nothing_back(self):
+  def test_a_compile_only_client_reads_back_the_entry_it_wrote(self):
     # A compile-only client's compile writes its entry and, compiling again,
-    # reads none back (an entry deserializes only as a loaded executable, which
-    # needs a client with devices): a second compile is a miss, never an
-    # error; the attached GPU's run reads the entry.
+    # reads it back as an unloaded executable (the plugin's
+    # PJRT_ExecutableDeserialize_Extension): a second compile is a hit, its
+    # executable the first's; the attached GPU's run reads the entry too.
     compilation_cache.reset_cache()
     self.addCleanup(compilation_cache.reset_cache)
     cache_dir = self.create_tempdir().full_path
@@ -259,11 +259,14 @@ class JaxAotTest(jtu.JaxTestCase):
       x_shape = jax.ShapeDtypeStruct(
           shape=(16, 16), dtype=jnp.float32,
           sharding=jax.sharding.NamedSharding(aot_mesh, P("x")))
+      serialized = []
       for _ in range(2):
         fn.clear_cache()
-        fn.lower(x_shape).compile()
-      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 2)
-      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 0)
+        compiled = fn.lower(x_shape).compile()
+        serialized.append(compiled.runtime_executable().serialize())
+      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
+      self.assertEqual(serialized[0], serialized[1])
 
       # The attached GPU's run of the same program (its operand sharded alike
       # over a mesh of its device) reads the entry.
@@ -272,7 +275,7 @@ class JaxAotTest(jtu.JaxTestCase):
       x_np = np.arange(256, dtype=np.float32).reshape(16, 16)
       result = fn(jax.device_put(
           x_np, jax.sharding.NamedSharding(gpu_mesh, P("x"))))
-      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 2)
       self.assertArraysEqual(result, x_np * x_np + 1.0)
 
   def test_lower_as_text_with_and_without_debug_info(self):
