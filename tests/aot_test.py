@@ -236,6 +236,12 @@ class JaxAotTest(jtu.JaxTestCase):
     # writes an entry.
     compilation_cache.reset_cache()
     self.addCleanup(compilation_cache.reset_cache)
+    # The cache's initialization under a minimum entry size of 0 sets the
+    # global value to its default (`compilation_cache._initialize_cache`): it is
+    # restored before the suite's check that a test changes no global config.
+    entry_size = "jax_persistent_cache_min_entry_size_bytes"
+    self.addCleanup(config.config.update, entry_size,
+                    config.config.values[entry_size])
     cache_dir = self.create_tempdir().full_path
     target_config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
     with (
