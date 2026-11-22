@@ -269,9 +269,11 @@ class JaxAotTest(jtu.JaxTestCase):
       self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
       self.assertEqual(texts[0], texts[1])
 
-      fn.clear_cache()
-      fn.lower(x_shape).compile({"xla_gpu_experimental_early_exit":
-                                 "EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT"})
+      # By its enum's name or its number (2), as XLA parses either.
+      for early_exit in ("EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT", 2):
+        fn.clear_cache()
+        fn.lower(x_shape).compile(
+            {"xla_gpu_experimental_early_exit": early_exit})
       self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
       self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
 

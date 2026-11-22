@@ -453,6 +453,17 @@ def register_xla_runtime_error_handler(
   _XLA_RUNTIME_ERROR_HANDLERS.append(handler_fn)
 
 
+# Dew fork (compile-only-deserialize): features of a jaxlib built with the fork's
+# compile_only_deserialize, detected by its bindings, so this jax runs on
+# jaxlib releases without them. Delete with the family.
+_COMPILE_ONLY_DESERIALIZES = "deserialize_executable" in vars(
+    _jax.CompileOnlyPyClient)
+
+
+def _is_early_exit(compile_options: xc.CompileOptions) -> bool:
+  return getattr(compile_options, "is_early_exit", False)
+
+
 def compile_or_get_cached(
     backend: xc.Client,
     computation: ir.Module,
@@ -469,6 +480,15 @@ def compile_or_get_cached(
 
   is_multi_process = len(executable_devices.process_indices) > 1
 
+  # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
+  # serializes its options alone, which deserialize as no executable: it reads
+  # nothing of the persistent cache (a PGLE profile's entry included) and
+  # writes nothing to it.
+  if _is_early_exit(compile_options):
+    return backend_compile_and_load(
+        backend, computation, executable_devices, compile_options,
+        host_callbacks)
+
   # cache_key: may be None if compilation caching is disabled
   cache_key, compile_options = _resolve_compilation_strategy(
     computation,
@@ -480,20 +500,23 @@ def compile_or_get_cached(
     module_name,
   )
 
-  # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
-  # serializes its options alone, which deserialize as no executable: it is
-  # neither read from the persistent cache nor written to it.
-  if cache_key is None or compile_options.is_early_exit:
+  if cache_key is None:
     return backend_compile_and_load(
         backend, computation, executable_devices, compile_options,
         host_callbacks)
 
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
+  # A compile-only client reads an entry back as an unloaded executable, where
+  # its jaxlib deserializes one; with an older jaxlib it reads nothing back.
   cache_retrieval_start = time.monotonic()
-  retrieved_executable, retrieved_compile_time = _cache_read(
-      module_name, cache_key, compile_options, backend, executable_devices,
-      host_callbacks)
+  if (isinstance(backend, _jax.CompileOnlyPyClient)
+      and not _COMPILE_ONLY_DESERIALIZES):
+    retrieved_executable, retrieved_compile_time = None, None
+  else:
+    retrieved_executable, retrieved_compile_time = _cache_read(
+        module_name, cache_key, compile_options, backend, executable_devices,
+        host_callbacks)
   cache_retrieval_time = time.monotonic() - cache_retrieval_start
 
   if retrieved_executable is not None:
@@ -840,7 +863,7 @@ def _cache_read(
     # (it has no PJRT_ExecutableDeserialize_Extension) reads nothing back.
     if (isinstance(backend, _jax.CompileOnlyPyClient)
         and isinstance(ex, _jax.JaxRuntimeError)
-        and str(ex).startswith("UNIMPLEMENTED")):
+        and ex.error_code_string == "UNIMPLEMENTED"):
       return None, None
     if _should_raise_persistent_cache_error(ex):
       raise
