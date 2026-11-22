@@ -456,7 +456,7 @@ class _Interpreter:
       aval = var.aval
       if isinstance(aval, mosaic_gpu_core.AbstractRefUnion):
         # A buffer a member, each at its logical shape, as the simulated memory
-        # allocates a union (`jaxpr_interpret.allocate_ref_union`).
+        # allocates a union (`JaxprInterpreter._scoped_allocations`).
         members = jaxpr_interpret.union_members(aval)
         slots = []
         for member in members:
