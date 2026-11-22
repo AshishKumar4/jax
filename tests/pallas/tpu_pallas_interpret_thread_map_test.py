@@ -18,6 +18,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -147,6 +148,29 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
     finally:
       monitoring.unregister_event_duration_listener(counted)
     self.assertLen(compiles, 1, compiles)
+
+  def test_a_body_run_again_is_keyed_without_walking_it_again(self):
+    # An interpreted kernel's thread map runs its body once a block: the body's
+    # structure is walked once a jaxpr object, not once a run.
+    from jax._src.pallas.mosaic.interpret import thread_map as thread_map_lib
+
+    walked = []
+    structure = thread_map_lib._structure
+
+    def counted(jaxpr, **kwargs):
+      walked.append(jaxpr)
+      return structure(jaxpr, **kwargs)
+
+    def f(thread, token, x):
+      del token
+      return jnp.sin(x * 0.75 + thread.astype(jnp.float32))
+
+    mapped = jax.jit(lambda x: thread_map(f, 4, jnp.int32(0), x))
+    x = jnp.arange(5, dtype=jnp.float32)
+    with mock.patch.object(thread_map_lib, "_structure", counted):
+      for _ in range(3):
+        jax.block_until_ready(mapped(x))
+    self.assertLen(walked, 1)
 
   def test_bodies_alike_but_for_their_callbacks_each_run_their_own(self):
     # Two closures of one factory print alike in a jaxpr; each body still
