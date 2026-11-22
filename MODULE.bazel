@@ -118,6 +118,10 @@ archive_override(
         # hlo_computation.cc: reduce ((f32[32], f32[32])) vs bitcast (f32[32]), a compensated (hi, lo) sum over a
         # one-element axis on an A100, row 10742), and bitcast a mixed precision one across element types.
         "//third_party:xla/reduce_degenerate_variadic.patch",
+        # A reduce no result of which is used, kept by dead code elimination for its reducer's function call,
+        # is left as it is: StableHLO's ReduceOpUnusedResultCanon rebuilt it with no inputs, and type inference
+        # read the first input's type of none, a SIGSEGV converting the program to HLO on every backend.
+        "//third_party:xla/stablehlo_reduce_unused_results.patch",
         # A scatter's indices are flattened in their own type: ScatterDeterminismExpander's S64 strides made S32
         # indices an s32 x s64 dot, which the elemental emitter multiplied as `arith.muli (i32, i64)` and LLVM IR
         # translation refused (RET_CHECK mlir_kernel_emitter.cc:705) under deterministic ops with the algebraic
