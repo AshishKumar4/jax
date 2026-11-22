@@ -108,6 +108,9 @@ ACCEPTED = {
     # Immutable objects of the installation: values, singletons and sentinels.
     "jax._src.config.no_default": "a sentinel",
     "jax._src.core.empty_mat": "an immutable value",
+    "jax.experimental.mosaic.gpu.utils.HOPPER": "an immutable value (a frozen Arch of two ints)",
+    "jax.experimental.mosaic.gpu.utils.BLACKWELL": "an immutable value (a frozen Arch of two ints)",
+    "jax.experimental.mosaic.gpu.utils.RUBIN": "an immutable value (a frozen Arch of two ints)",
     "jax._src.mesh.empty_abstract_mesh": "an immutable value",
     "jax._src.core.internal_mutable_array_effect": "a stateless effect: the key holds effects by class",
     "jax._src.pallas.mosaic_gpu.core._memory_effect": "a stateless effect: the key holds effects by class",
@@ -139,6 +142,8 @@ ACCEPTED.update({name: _DEFINED_BY_THE_INSTALLED_CODE for name in (
     "jax._src.core.literalable_types",
     "jax._src.core.pytype_aval_mappings",
     "jax._src.dtypes._DEFAULT_TYPEMAP",
+    "jax._src.dtypes._custom_complex_dtypes",
+    "jax._src.dtypes._custom_complex_scalar_types",
     "jax._src.dtypes._custom_float_dtypes",
     "jax._src.dtypes._custom_float_scalar_types",
     "jax._src.dtypes._dtype_to_32bit_dtype",
