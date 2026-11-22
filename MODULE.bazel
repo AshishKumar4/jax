@@ -131,6 +131,10 @@ archive_override(
         # jaxlib's CompileOnlyPyClient reads the persistent cache back (row 5403: two compile-only processes that
         # met one program both compiled it). Delete when upstream's PJRT C API deserializes without a client.
         "//third_party:xla/compile_only_deserialize.patch",
+        # The HLO reader states a collective's device groups (its device list flattened: listed, iota or over a
+        # mesh's axes) and a collective permute's pairs, so a reader of a compiled module takes XLA's groups rather
+        # than decoding replica_groups itself (row 5856). Delete when upstream's HloInstruction binding states them.
+        "//third_party:xla/instruction_device_groups.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],
