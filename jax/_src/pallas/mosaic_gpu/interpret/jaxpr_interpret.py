@@ -413,6 +413,8 @@ class JaxprInterpreter:
     """What a `run_scoped` allocates for one of its refs, its first allocation
     `first` among the scope's: a buffer (at its logical shape), a buffer a
     `RefUnion`'s member, or its barriers."""
+    if not isinstance(aval, state_types.AbstractRef):
+      raise ValueError(f"Unsupported aval: {aval}")
     _raise_if_unsupported_memory_space(aval.memory_space)
 
     def buffer(shape, dtype, memory_space, union=None):
@@ -427,76 +429,67 @@ class JaxprInterpreter:
           union=union,
       )
 
-    match aval:
-      # Must precede the `AbstractRef` case below, which this subclasses.
-      case mosaic_gpu_core.AbstractRefUnion():
-        if transforms:
-          raise NotImplementedError(
-              f"Unsupported transforms on a `RefUnion`: {transforms}"
-          )
-        # One buffer a member, at its logical shape, each tagged a member of
-        # the union its first member's key names, so race detection knows they
-        # share storage. Their keys stack in `union_members` order (see
-        # `resolve_ref`).
-        allocations = []
-        for member in union_members(aval):
-          extract = member.transforms[0]
-          assert isinstance(extract, mosaic_gpu_core.ExtractAliasedRef)
-          inner = _member_inner_aval(member)
-          allocations.append(buffer(
-              inner.shape, inner.dtype, aval.memory_space,
-              union=(first, extract.alias_group_idx),
-          ))
-        return tuple(allocations)
-      case state_types.AbstractRef(
-          inner_aval=inner, memory_space=memory_space, kind=_
-      ):
-        if transforms:
-          # The invar/aval's shape in the jaxpr may be the tiled shape, after
-          # tiling and/or swizzling transforms have been applied.  The
-          # elements of `transforms` -- to undo the swizzling and/or tiling --
-          # are applied any time the variable is used in the jaxpr.
-          #
-          # We want to allocate a buffer with the logical shape, instead of
-          # the tiled shape, so we undo the swizzing and/or tiling here to get
-          # the logical shape.
-          inner = apply_layout_transforms(transforms, inner)
-        match inner:
-          case jax_core.ShapedArray(shape=shape, dtype=dtype):
-            if isinstance(
-                dtype,
-                (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
-            ):
-              # A CTA barrier's arrive and arrive-and-wait are an mbarrier's
-              # arrive and its arrive then wait at the phase arrived in.
-              return (gpu_callbacks.ScopedBarriers(
-                  shape=tuple(shape),
-                  num_arrivals=dtype.num_arrivals,
-                  orders_tensor_core=getattr(
-                      dtype, "orders_tensor_core", False
-                  ),
-              ),)
-            if isinstance(dtype, mosaic_gpu_core.ClusterBarrierType):
-              if dtype.leader_tracked:
-                raise NotImplementedError(
-                    "Cluster barriers with `leader_tracked` are not yet"
-                    " supported in GPU kernel interpret mode."
-                )
-              return (gpu_callbacks.ScopedBarriers(
-                  shape=tuple(shape),
-                  num_arrivals=dtype.num_arrivals,
-                  cluster=(
-                      tuple(self.thread_cluster_shape),
-                      tuple(self.are_thread_cluster_axes_collective(
-                          dtype.collective_axes
-                      )),
-                  ),
-              ),)
-            return (buffer(shape, dtype, memory_space),)
-          case _:
-            raise ValueError(f"Unsupported inner aval: {inner}")
+    if isinstance(aval, mosaic_gpu_core.AbstractRefUnion):
+      if transforms:
+        raise NotImplementedError(
+            f"Unsupported transforms on a `RefUnion`: {transforms}"
+        )
+      # One buffer a member, at its logical shape, each tagged a member of the
+      # union its first member's key names, so race detection knows they share
+      # storage. Their keys stack in `union_members` order (see `resolve_ref`).
+      allocations = []
+      for member in union_members(aval):
+        extract = member.transforms[0]
+        assert isinstance(extract, mosaic_gpu_core.ExtractAliasedRef)
+        inner = _member_inner_aval(member)
+        allocations.append(buffer(
+            inner.shape, inner.dtype, aval.memory_space,
+            union=(first, extract.alias_group_idx),
+        ))
+      return tuple(allocations)
+    inner = aval.inner_aval
+    if transforms:
+      # The invar/aval's shape in the jaxpr may be the tiled shape, after
+      # tiling and/or swizzling transforms have been applied.  The elements of
+      # `transforms` -- to undo the swizzling and/or tiling -- are applied any
+      # time the variable is used in the jaxpr.
+      #
+      # We want to allocate a buffer with the logical shape, instead of the
+      # tiled shape, so we undo the swizzing and/or tiling here to get the
+      # logical shape.
+      inner = apply_layout_transforms(transforms, inner)
+    match inner:
+      case jax_core.ShapedArray(shape=shape, dtype=dtype):
+        if isinstance(
+            dtype,
+            (mosaic_gpu_core.BarrierType, mosaic_gpu_core.CtaBarrierType),
+        ):
+          # A CTA barrier's arrive and arrive-and-wait are an mbarrier's
+          # arrive and its arrive then wait at the phase arrived in.
+          return (gpu_callbacks.ScopedBarriers(
+              shape=tuple(shape),
+              num_arrivals=dtype.num_arrivals,
+              orders_tensor_core=getattr(dtype, "orders_tensor_core", False),
+          ),)
+        if isinstance(dtype, mosaic_gpu_core.ClusterBarrierType):
+          if dtype.leader_tracked:
+            raise NotImplementedError(
+                "Cluster barriers with `leader_tracked` are not yet"
+                " supported in GPU kernel interpret mode."
+            )
+          return (gpu_callbacks.ScopedBarriers(
+              shape=tuple(shape),
+              num_arrivals=dtype.num_arrivals,
+              cluster=(
+                  tuple(self.thread_cluster_shape),
+                  tuple(self.are_thread_cluster_axes_collective(
+                      dtype.collective_axes
+                  )),
+              ),
+          ),)
+        return (buffer(shape, dtype, aval.memory_space),)
       case _:
-        raise ValueError(f"Unsupported aval: {aval}")
+        raise ValueError(f"Unsupported inner aval: {inner}")
 
   def _interpret_run_scoped_p(
       self, eqn, token, get_invals: Callable[[], Sequence[Any]]
