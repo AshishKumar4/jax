@@ -150,8 +150,7 @@ _SAME_POSITIONS = frozenset((
     "set-dimension-size", "add-dependency", "domain", "reduce-window",
     "select-and-scatter", "all-reduce", "all-reduce-start", "all-reduce-done",
     "all-gather", "reduce-scatter", "all-to-all", "collective-permute",
-    "collective-broadcast", "all-gather-done", "collective-permute-done",
-    "copy-done", "async-update",
+    "collective-broadcast", "async-update",
 ))
 """Ops each of whose output dimensions descends from its array operands'
 dimensions at the same position (every operand of the output's rank): those
@@ -275,7 +274,9 @@ def _of(instruction: Any, operands: list[Any], operand_shapes: list[Any],
     head = operands[0] if len(operands) == 1 else list(operands)
     return [head, head, *(_filled(element, frozenset())
                           for element in shape.tuple_shapes[2:])]
-  if opcode == "async-done":
+  if opcode in ("async-done", "all-gather-done", "collective-permute-done",
+                "copy-done"):
+    # Its start's output: (operands, output, context...), the output second.
     return operands[0][1]
   if opcode == "custom-call":
     return _custom(instruction, operands, shape)

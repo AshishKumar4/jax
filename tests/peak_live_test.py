@@ -158,6 +158,27 @@ class DimensionProvenanceTest(jtu.JaxTestCase):
     self.assertEqual(descended["d"], (_of((0, 0), (1, 0)), _of((0, 1)),
                                       _of((1, 2))))
 
+  def test_an_async_collectives_done_holds_its_starts_output(self):
+    # all-gather-start, collective-permute-start and copy-start each output
+    # (operand, output, context...); their done is the output, its dimensions
+    # the operand's.
+    descended = _descended("""
+      HloModule m, num_partitions=2
+      ENTRY e {
+        x = f32[4,8] parameter(0)
+        gathering = (f32[4,8], f32[8,8]) all-gather-start(x), channel_id=1,
+            replica_groups={{0,1}}, dimensions={0}, use_global_device_ids=true
+        gathered = f32[8,8] all-gather-done(gathering)
+        permuting = (f32[4,8], f32[4,8]) collective-permute-start(x),
+            channel_id=2, source_target_pairs={{0,1},{1,0}}
+        permuted = f32[4,8] collective-permute-done(permuting)
+        copying = (f32[4,8], f32[4,8], u32[]) copy-start(x)
+        copied = f32[4,8] copy-done(copying)
+        ROOT out = (f32[8,8], f32[4,8], f32[4,8]) tuple(gathered, permuted, copied)
+      }""")
+    for name in ("gathered", "permuted", "copied"):
+      self.assertEqual(descended[name], (_of((0, 0)), _of((0, 1))), name)
+
   def test_each_elementwise_opcode_keeps_its_operands_dimensions(self):
     # By HLO's own opcode names (a softmax's "exponential", not "exp"): a name
     # the reader does not know leaves every value computed from it unknown.
