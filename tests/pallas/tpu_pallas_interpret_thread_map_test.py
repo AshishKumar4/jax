@@ -24,6 +24,7 @@ from absl.testing import parameterized
 import jax
 from jax._src import test_util as jtu
 from jax._src.pallas.mosaic.interpret.thread_map import thread_map
+from jax.experimental import io_callback
 import jax.numpy as jnp
 import numpy as np
 
@@ -146,6 +147,50 @@ class InterpretThreadMapCompileTest(jtu.JaxTestCase):
     finally:
       monitoring.unregister_event_duration_listener(counted)
     self.assertLen(compiles, 1, compiles)
+
+  def test_bodies_alike_but_for_their_callbacks_each_run_their_own(self):
+    # Two closures of one factory print alike in a jaxpr; each body still
+    # calls its own.
+    def recording(seen):
+      def record(thread):
+        seen.append(int(thread))
+      return record
+
+    def body(record):
+      def f(thread, token):
+        del token
+        io_callback(record, None, thread)
+      return f
+
+    first, second = [], []
+    for seen in (first, second):
+      jax.block_until_ready(
+          thread_map(body(recording(seen)), 2, jnp.int32(0)))
+    self.assertEqual((sorted(first), sorted(second)), ([0, 1], [0, 1]))
+
+  def test_bodies_alike_but_for_a_nested_constant_each_compute_their_own(self):
+    # A nested jit's closed-over vector is its own jaxpr's constant, which a
+    # printed jaxpr does not show; each body computes with its own.
+    seen = []
+
+    def record(value):
+      seen.append(np.asarray(value).tolist())
+
+    def body(vector):
+      @jax.jit
+      def shifted(thread):
+        return thread.astype(jnp.float32) + vector
+
+      def f(thread, token):
+        del token
+        io_callback(record, None, shifted(thread))
+      return f
+
+    for offset in (10.0, 20.0):
+      jax.block_until_ready(thread_map(
+          body(np.full((2,), offset, np.float32)), 2, jnp.int32(0)))
+    self.assertCountEqual(seen, [[10.0, 10.0], [11.0, 11.0],
+                                 [20.0, 20.0], [21.0, 21.0]])
 
 
 # A process whose CPU client holds every unit of its in-flight semaphore (32,
