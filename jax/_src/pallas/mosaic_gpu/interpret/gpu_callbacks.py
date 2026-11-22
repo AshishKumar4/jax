@@ -314,38 +314,6 @@ def _make_allocation_request_array(
   ).as_np_array
 
 
-@fail_on_exception
-def _tag_ref_union(
-    token: jax.Array,
-    member_keys_as_array: np.ndarray,
-    alias_group_idxs: tuple[int, ...],
-) -> jax.Array:
-  """Tells race detection that `member_keys_as_array` names one `RefUnion`.
-
-  The union is identified by its first member's key.
-  """
-  races = get_races()
-  keys = [HostAllocationKey.from_array(k) for k in member_keys_as_array]
-  for key, alias_group_idx in zip(keys, alias_group_idxs, strict=True):
-    races.tag_ref_union_member(key, keys[0], alias_group_idx)
-  return token
-
-
-def call_tag_ref_union(
-    token: jax.Array,
-    member_keys_as_array: jax.Array,
-    alias_group_idxs: Sequence[int],
-) -> jax.Array:
-  return callback.io_callback_numpy_inputs(
-      functools.partial(
-          _tag_ref_union, alias_group_idxs=tuple(alias_group_idxs)
-      ),
-      TOKEN_SHAPE_DTYPE,
-      token,
-      member_keys_as_array,
-  )
-
-
 def call_make_allocation_request_array(
     *,
     token: jax.Array,
@@ -464,118 +432,6 @@ def call_allocate_buffer_for_all_threads(
       device,
       allocation_request_as_array,
       value,
-  )
-
-
-@fail_on_exception
-def _allocate_buffer(
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    allocation_request_as_array: jax.Array,
-    value: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, np.ndarray]:
-  """Allocates a buffer for the given `allocation_request`.
-
-  Args:
-    allocation_reques_as_array: Array that converts into a
-      `HostAllocationRequest`.
-    value: Array of values to initialize the allocated buffer with.
-    source_info: Information about the source code location of the allocation.
-
-  Returns:
-    `AllocationKey` to refer to the allocated buffer.
-  """
-  allocation_request = HostAllocationRequest.from_array(
-      allocation_request_as_array
-  )
-  del allocation_request_as_array
-
-  shared_memory = _get_shared_memory()
-
-  if allocation_request.memory_space_id == memory.get_memory_space_idx(
-      mosaic_gpu_core.MemorySpace.REGS
-  ):
-    # For barrier and buffer identifiers to line up across threads, we rely on
-    # each thread making the same sequence of allocations.  But threads are
-    # permitted to make different REGS allocations, so we use a different
-    # sequence of integer identifiers for REGS allocations.
-    buffer_id = shared_memory.get_next_wgmma_accumulator_id(thread)
-  else:
-    buffer_id = shared_memory.get_next_buffer_id(thread)
-
-  key = HostAllocationKey(
-      memory_space_id=allocation_request.memory_space_id,
-      device_id=allocation_request.device_id,
-      block_id=allocation_request.block_id,
-      thread_id=allocation_request.thread_id,
-      initial_ref_count=allocation_request.initial_ref_count,
-      buffer_id=buffer_id,
-  )
-  ref_count = allocation_request.initial_ref_count
-  shared_memory.allocate_buffer(
-      key,
-      ref_count=ref_count,
-      value=np.array(value),
-      logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info,),
-  )
-  return token, key.as_np_array
-
-
-def call_allocate_buffer(
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    allocation_request_as_array: jax.Array,
-    value: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback_numpy_inputs(
-      functools.partial(_allocate_buffer, source_info=source_info),
-      (TOKEN_SHAPE_DTYPE, HostAllocationKey.shape_and_dtype()),
-      token,
-      mesh_location,
-      thread,
-      allocation_request_as_array,
-      value,
-  )
-
-
-@fail_on_exception
-def _deallocate_buffer(
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-):
-  """Decreases the reference count of the buffer with `allocation_key` (Deallocates the buffer if its reference count becomes zero)."""
-  allocation_key = HostAllocationKey.from_array(allocation_key_as_array)
-  del allocation_key_as_array
-  shared_memory = _get_shared_memory()
-
-  shared_memory.deallocate_buffer(
-      allocation_key,
-      logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
-  )
-  return token
-
-
-def call_deallocate_buffer(
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-):
-  return callback.io_callback_numpy_inputs(
-      functools.partial(_deallocate_buffer, source_info=source_info),
-      TOKEN_SHAPE_DTYPE,
-      token,
-      mesh_location,
-      thread,
-      allocation_key_as_array,
   )
 
 
@@ -928,151 +784,240 @@ def call_swap(
   )
 
 
+@dataclasses.dataclass(frozen=True)
+class ScopedBuffer:
+  """A buffer a `run_scoped` allocates (`call_allocate_scope`): its logical
+  shape and dtype, its memory space's index, the value every element starts
+  at (uninitialized memory's), and, for a `RefUnion`'s member, the position of
+  the union's first member among the scope's allocations and its alias group."""
+  shape: tuple[int, ...]
+  dtype: np.dtype
+  memory_space_id: int
+  fill: Any
+  union: tuple[int, int] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopedBarriers:
+  """An array of barriers of `shape` a `run_scoped` allocates
+  (`call_allocate_scope`), each of `num_arrivals` arrivals: a block's, or a
+  cluster's, shared over the cluster's axes `cluster` names (its dimensions and
+  which of them are collective)."""
+  shape: tuple[int, ...]
+  num_arrivals: int
+  orders_tensor_core: bool = False
+  cluster: tuple[tuple[int, ...], tuple[bool, ...]] | None = None
+
+  @property
+  def count(self) -> int:
+    return math.prod(self.shape)
+
+
+ScopedAllocation = ScopedBuffer | ScopedBarriers
+
+
+def _num_keys(allocations: Sequence[ScopedAllocation]) -> int:
+  return sum(
+      a.count if isinstance(a, ScopedBarriers) else 1 for a in allocations
+  )
+
+
 @fail_on_exception
-def _allocate_barriers(
-    *,
+def _allocate_scope(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    num_arrivals: jax.Array,
-    orders_tensor_core: jax.Array,
-    flat_num_barriers: jax.Array,
-    ref_count: jax.Array,
+    *,
+    allocations: tuple[ScopedAllocation, ...],
+    collective: bool,
+    ref_count: int,
+    cluster_ref_count: int,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, np.ndarray]:
-  num_arrivals_as_int = int(num_arrivals)
-  orders_tensor_core_as_bool = bool(orders_tensor_core)
-  flat_num_barriers_as_int = int(flat_num_barriers)
-  ref_count_as_int = int(ref_count)
-  del num_arrivals, flat_num_barriers, ref_count
+  """Allocates a `run_scoped`'s buffers and barriers, in their order.
 
+  Each thread makes the same sequence of allocations, so the buffer IDs (and
+  with them the keys) of a buffer or barrier its threads share agree, as they
+  did when each was its own callback; a `MemorySpace.REGS` buffer, which
+  threads may allocate differently, takes its ID from a sequence of its own.
+
+  Returns the allocations' keys, a row a buffer or barrier, in their order.
+  """
   shared_memory = _get_shared_memory()
-
+  logging_info = memory.GPULoggingInfo(mesh_location, thread, source_info)
+  regs_id = memory.get_memory_space_idx(mosaic_gpu_core.MemorySpace.REGS)
+  smem_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
   keys = []
-  for _ in range(flat_num_barriers_as_int):
-    # Advance `shared_memory`'s internal buffer id counter for all threads that
-    # call into this function.
-    barrier_id = shared_memory.get_next_buffer_id(thread)
-    smem_space_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
+  for allocation in allocations:
+    if isinstance(allocation, ScopedBuffer):
+      if allocation.memory_space_id == regs_id:
+        buffer_id = shared_memory.get_next_wgmma_accumulator_id(thread)
+      else:
+        buffer_id = shared_memory.get_next_buffer_id(thread)
+      key = HostAllocationKey(
+          memory_space_id=allocation.memory_space_id,
+          device_id=int(thread.device_id),
+          block_id=int(thread.block_id),
+          # A buffer the block's threads share is its first thread's.
+          thread_id=0 if collective else int(thread.warpgroup_id),
+          initial_ref_count=ref_count,
+          buffer_id=buffer_id,
+      )
+      shared_memory.allocate_buffer(
+          key,
+          ref_count=ref_count,
+          value=np.full(allocation.shape, allocation.fill, allocation.dtype),
+          logging_info=logging_info,
+      )
+      keys.append(key.as_np_array)
+      if allocation.union is not None:
+        first, alias_group_idx = allocation.union
+        get_races().tag_ref_union_member(
+            key, HostAllocationKey.from_array(keys[first]), alias_group_idx
+        )
+      continue
+    for _ in range(allocation.count):
+      # Barriers advance the buffer IDs as buffers do.
+      buffer_id = shared_memory.get_next_buffer_id(thread)
+      if allocation.cluster is None:
+        # A block's barrier is shared by its threads.
+        key = HostAllocationKey(
+            memory_space_id=smem_id,
+            device_id=int(thread.device_id),
+            block_id=int(thread.block_id),
+            thread_id=0,
+            initial_ref_count=ref_count,
+            buffer_id=buffer_id,
+        )
+        shared_memory.allocate_barrier(
+            key,
+            thread,
+            ref_count=ref_count,
+            num_arrivals=allocation.num_arrivals,
+            orders_tensor_core=allocation.orders_tensor_core,
+            logging_info=logging_info,
+        )
+      else:
+        # A cluster barrier is shared by the cluster's threads. Its key names
+        # SMEM, where each of the blocks' barriers it is made of lives on a GPU.
+        axes_dims, is_axis_collective = allocation.cluster
+        key = HostAllocationKey(
+            memory_space_id=smem_id,
+            device_id=int(thread.device_id),
+            block_id=0,
+            thread_id=0,
+            initial_ref_count=cluster_ref_count,
+            buffer_id=buffer_id,
+        )
+        shared_memory.allocate_cluster_barrier(
+            key,
+            thread,
+            axes_dims=axes_dims,
+            is_axis_collective=is_axis_collective,
+            ref_count=cluster_ref_count,
+            num_arrivals=allocation.num_arrivals,
+            logging_info=logging_info,
+        )
+      keys.append(key.as_np_array)
+  return token, np.array(keys, dtype=np.int32).reshape(
+      len(keys), *HostAllocationKey.shape_and_dtype().shape
+  )
 
-    # Barriers are shared between threads. For each group of threads that share
-    # a barrier, we compute the thread ID to be used for the allocation key.
-    # Invariant: `thread_id` is the same for all threads in a group that
-    # shares the barrier.
-    key = HostAllocationKey(
-        memory_space_id=smem_space_id,
-        device_id=thread.device_id,
-        block_id=thread.block_id,
-        thread_id=0,
-        initial_ref_count=ref_count_as_int,
-        buffer_id=barrier_id,
-    )
 
-    shared_memory.allocate_barrier(
-        key,
-        thread,
-        ref_count=ref_count_as_int,
-        num_arrivals=num_arrivals_as_int,
-        orders_tensor_core=orders_tensor_core_as_bool,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
-    )
-    keys.append(key.as_np_array)
-
-  assert len(keys) == flat_num_barriers_as_int
-  return token, np.array(keys, dtype=np.int32)
-
-
-def call_allocate_barriers(
+def call_allocate_scope(
     *,
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    num_arrivals: jax.Array,
-    orders_tensor_core: bool,
-    flat_num_barriers: int | jax.Array,
-    ref_count: jax.Array,
+    allocations: Sequence[ScopedAllocation],
+    collective: bool,
+    ref_count: int,
+    cluster_ref_count: int,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  shape_and_dtype = HostAllocationKey.shape_and_dtype()
-  result_shape = (flat_num_barriers, *shape_and_dtype.shape)
-  result_shape_and_dtype = jax.ShapeDtypeStruct(
-      result_shape, shape_and_dtype.dtype
+  """Allocates a `run_scoped`'s buffers and barriers in one callback.
+
+  Returns the token and the allocations' keys, `[n, key size]` (`_num_keys`).
+  """
+  keys_shape = (
+      _num_keys(allocations), *HostAllocationKey.shape_and_dtype().shape
   )
   return callback.io_callback_numpy_inputs(
       functools.partial(
-          _allocate_barriers,
+          _allocate_scope,
+          allocations=tuple(allocations),
+          collective=collective,
+          ref_count=ref_count,
+          cluster_ref_count=cluster_ref_count,
           source_info=source_info,
       ),
-      (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
-      token=token,
-      mesh_location=mesh_location,
-      thread=thread,
-      num_arrivals=num_arrivals,
-      orders_tensor_core=orders_tensor_core,
-      flat_num_barriers=flat_num_barriers,
-      ref_count=ref_count,
+      (TOKEN_SHAPE_DTYPE, jax.ShapeDtypeStruct(keys_shape, jnp.int32)),
+      token,
+      mesh_location,
+      thread,
   )
 
 
 @fail_on_exception
-def _deallocate_barrier(
+def _deallocate_scope(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
+    keys: np.ndarray,
+    *,
+    allocations: tuple[ScopedAllocation, ...],
     source_info: source_info_util.SourceInfo | None = None,
-    cluster_barrier: bool = False,
-):
+) -> jax.Array:
+  """Releases a `run_scoped`'s buffers and barriers (`_allocate_scope`'s), in
+  their order: each buffer's reference count drops, and the buffer goes once
+  no thread holds it."""
   # TODO(paulbib): Add race-check validation on deallocation, i.e.: make sure
   # there are no outstanding async copies from or to the deallocated buffer.
-
-  flat_allocation_keys = np.reshape(
-      allocation_key_as_array, (-1, *HostAllocationKey.shape_and_dtype().shape)
-  )
-  num_barriers = flat_allocation_keys.shape[0]
-
-  keys_to_deallocate = []
-  for i in range(num_barriers):
-    keys_to_deallocate.append(flat_allocation_keys[i, :])
-
   shared_memory = _get_shared_memory()
-
-  # TODO(nrink): If we had a dedicated memory space for cluster barriers
-  # (and/or for 'normal' barriers too), we could select the deallocation
-  # function based on the memory space of the allocation key (instead of needing
-  # the `deallocate_cluster_barrier` argument).
-  deallocate_fn = (
-      shared_memory.deallocate_cluster_barrier
-      if cluster_barrier
-      else shared_memory.deallocate_barrier
-  )
-
-  for key in keys_to_deallocate:
-    barrier_allocation_key = HostAllocationKey.from_array(key)
-    deallocate_fn(
-        barrier_allocation_key,
-        thread,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
+  logging_info = memory.GPULoggingInfo(mesh_location, thread, source_info)
+  rows = iter(keys)
+  for allocation in allocations:
+    if isinstance(allocation, ScopedBuffer):
+      shared_memory.deallocate_buffer(
+          HostAllocationKey.from_array(next(rows)), logging_info=logging_info
+      )
+      continue
+    release = (
+        shared_memory.deallocate_barrier
+        if allocation.cluster is None
+        else shared_memory.deallocate_cluster_barrier
     )
+    for _ in range(allocation.count):
+      release(
+          HostAllocationKey.from_array(next(rows)),
+          thread,
+          logging_info=logging_info,
+      )
   return token
 
 
-def call_deallocate_barrier(
+def call_deallocate_scope(
+    *,
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
+    keys: jax.Array,
+    allocations: Sequence[ScopedAllocation],
     source_info: source_info_util.SourceInfo | None = None,
-    cluster_barrier: bool = False,
-):
+) -> jax.Array:
+  """Releases a `run_scoped`'s allocations (`call_allocate_scope`'s) in one
+  callback."""
   return callback.io_callback_numpy_inputs(
-      functools.partial(_deallocate_barrier, source_info=source_info),
+      functools.partial(
+          _deallocate_scope,
+          allocations=tuple(allocations),
+          source_info=source_info,
+      ),
       TOKEN_SHAPE_DTYPE,
       token,
       mesh_location,
       thread,
-      allocation_key_as_array,
-      cluster_barrier=cluster_barrier,
+      keys,
   )
 
 
@@ -1246,99 +1191,6 @@ def _assert_no_barriers_allocated(token, device: memory.Device):
 def call_assert_no_barriers_allocated(token, device: memory.Device):
   return callback.io_callback_numpy_inputs(
       _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token, device
-  )
-
-
-@fail_on_exception
-def _allocate_cluster_barriers(
-    *,
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    axes_dims: tuple[int, ...],
-    is_axis_collective: tuple[bool, ...],
-    num_arrivals: jax.Array,
-    flat_num_barriers: jax.Array,
-    ref_count: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, np.ndarray]:
-  num_arrivals_as_int = int(num_arrivals)
-  flat_num_barriers_as_int = int(flat_num_barriers)
-  ref_count_as_int = int(ref_count)
-  del num_arrivals, flat_num_barriers, ref_count
-
-  shared_memory = _get_shared_memory()
-
-  keys = []
-  for _ in range(flat_num_barriers_as_int):
-    # Advance `shared_memory`'s internal buffer id counter for all threads that
-    # call into this function.
-    barrier_id = shared_memory.get_next_buffer_id(thread)
-
-    # Use `SMEM` for the cluster barrier's allocation key below. Note that on
-    # real GPUs, there is not a single cluster barrier object that resides in
-    # SMEM (or any other memory space). We nonetheless use `SMEM` here to
-    # indicate that the (per thread-block) `Barrier`s that the `ClusterBarrier`
-    # is composed of are each allocated in `SMEM` (on a real GPU).
-    smem_space_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
-
-    # Cluster barriers are shared between all threads in a cluster. Hence use 0
-    # for the thread/block ID in the allocation `key` below.
-    key = HostAllocationKey(
-        memory_space_id=smem_space_id,
-        device_id=thread.device_id,
-        block_id=0,
-        thread_id=0,
-        initial_ref_count=ref_count_as_int,
-        buffer_id=barrier_id,
-    )
-
-    shared_memory.allocate_cluster_barrier(
-        key,
-        thread,
-        axes_dims=axes_dims,
-        is_axis_collective=is_axis_collective,
-        ref_count=ref_count_as_int,
-        num_arrivals=num_arrivals_as_int,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
-    )
-    keys.append(key.as_np_array)
-
-  assert len(keys) == flat_num_barriers_as_int
-  return token, np.array(keys, dtype=np.int32)
-
-
-def call_allocate_cluster_barriers(
-    *,
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    axes_dims: tuple[int, ...],
-    is_axis_collective: tuple[bool, ...],
-    num_arrivals: jax.Array,
-    flat_num_barriers: int | jax.Array,
-    ref_count: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, jax.Array]:
-  shape_and_dtype = HostAllocationKey.shape_and_dtype()
-  result_shape = (flat_num_barriers, *shape_and_dtype.shape)
-  result_shape_and_dtype = jax.ShapeDtypeStruct(
-      result_shape, shape_and_dtype.dtype
-  )
-  return callback.io_callback_numpy_inputs(
-      functools.partial(
-          _allocate_cluster_barriers,
-          source_info=source_info,
-          axes_dims=axes_dims,
-          is_axis_collective=is_axis_collective,
-      ),
-      (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
-      token=token,
-      mesh_location=mesh_location,
-      thread=thread,
-      num_arrivals=num_arrivals,
-      flat_num_barriers=flat_num_barriers,
-      ref_count=ref_count,
   )
 
 
