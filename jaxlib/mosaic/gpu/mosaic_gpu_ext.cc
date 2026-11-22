@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/str_cat.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
 #include "nanobind/stl/tuple.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "jaxlib/absl_status_casters.h"
