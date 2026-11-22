@@ -1884,7 +1884,7 @@ def _mgpu_mma_op_lowering_rule(
   a = _fragmented_array_from_ir(mma_op.a, a_layout, is_signed=is_signed)
   b = _fragmented_array_from_ir(mma_op.b, b_layout, is_signed=is_signed)
 
-  new_acc = do_mma(acc, a, b)
+  new_acc = do_mma(acc, a, b, rows=mma_op.rows)  # pyrefly: ignore[missing-attribute]
   return [fragmented_array_to_ir(new_acc, mma_op.result.type)]
 
 

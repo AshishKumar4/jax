@@ -2532,24 +2532,38 @@ def _wgmma_effectful_abstract_eval(acc, lhs_ref, *args, **kwargs):
 
 
 def mma(
-    acc: jax.Array, a: jax.Array, b: jax.Array, /, *, m_warps: int | None = None
+    acc: jax.Array,
+    a: jax.Array,
+    b: jax.Array,
+    /,
+    *,
+    m_warps: int | None = None,
+    rows: jax.Array | int | None = None,
 ) -> jax.Array:
   """Computes ``acc + a @ b`` synchronously using Ampere MMA instructions.
 
   ``m_warps`` (1, 2 or 4) is how many of the warpgroup's four warps split the
   accumulator's rows, the rest its columns (``MMALayouts``); by default the most
   whose tile divides the accumulator. The operands' layouts must be that split's.
+
+  ``rows``, an int32 scalar uniform across the warpgroup: a warp issues no
+  instruction for a 16-row block of the accumulator that begins at or past it,
+  and those rows of the result are ``acc``'s (a ragged group's rows past its end,
+  padded to whole tiles). None issues every instruction.
   """
   if m_warps not in (None, 1, 2, 4):
     raise ValueError(f"m_warps must be 1, 2 or 4, got {m_warps}")
-  return mma_p.bind(acc, a, b, m_warps=m_warps)
+  bound = () if rows is None else (jnp.asarray(rows, jnp.int32),)
+  return mma_p.bind(acc, a, b, *bound, m_warps=m_warps)
 
 
 mma_p = jax_core.Primitive("mma")
 
 
 @mma_p.def_abstract_eval
-def _mma_abstract_eval(acc, a, b, *, m_warps):
+def _mma_abstract_eval(acc, a, b, *rows, m_warps):
+  if len(rows) > 1 or any(r.shape or r.dtype != jnp.int32 for r in rows):
+    raise TypeError(f"rows must be one int32 scalar, got {rows}")
   m, n = acc.shape
   m2, k = a.shape
   k2, n2 = b.shape
@@ -2590,18 +2604,26 @@ def _mma_abstract_eval(acc, a, b, *, m_warps):
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Lane)
-def _mma_lowering(ctx: lowering.LoweringRuleContext, acc, a, b, *, m_warps):
+def _mma_lowering(
+    ctx: lowering.LoweringRuleContext, acc, a, b, *rows, m_warps
+):
   # The operands' layouts carry their split, which `mgpu.mma` reads.
   del ctx, m_warps
-  return mgpu.mma(acc, a, b)
+  bound = None
+  if rows:
+    bound = lowering._ensure_ir_value(rows[0], jnp.int32)
+  return mgpu.mma(acc, a, b, rows=bound)
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Warpgroup)
 def _mma_warpgroup_lowering(
-    ctx: lowering.LoweringRuleContext, acc, a, b, *, m_warps
+    ctx: lowering.LoweringRuleContext, acc, a, b, *rows, m_warps
 ):
-  del ctx  # Unused.
-  result = mgpu.dialect.mma(acc, a, b)
+  del ctx
+  bound = None
+  if rows:
+    bound = lowering._ensure_ir_value(rows[0], jnp.int32)
+  result = mgpu.dialect.mma(acc, a, b, rows=bound)  # pyrefly: ignore[unexpected-keyword]
   if m_warps is not None:
     result.owner.attributes[MMA_M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
         ir.IntegerType.get_signless(32), m_warps
