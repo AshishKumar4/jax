@@ -574,7 +574,9 @@ class CompilationCacheTest(CompilationCacheTestCase):
       with (
         config.compilation_cache_dir(path),
         config.persistent_cache_min_compile_time_secs(0),
-        config.persistent_cache_min_entry_size_bytes(0),
+        # Any entry kept, the cache's own minimum left alone (a minimum of 0
+        # is replaced at the cache's first use, a global change).
+        config.persistent_cache_min_entry_size_bytes(1),
       ):
         f = jit(lambda x: (x @ x.T).sum())
         x = jax.device_put(np.ones((256, 256), np.float32))
@@ -603,7 +605,9 @@ class CompilationCacheTest(CompilationCacheTestCase):
         self.assertEqual(entries(), 1)
     finally:
       cc.reset_cache()
-    # A process given its limit by XLA_FLAGS reads the same entry.
+    # Processes given their limits by XLA_FLAGS read one another's entry: the
+    # second, its limit of 2 bytes one no compile fits, reads the first's
+    # finished compile and runs it.
     script = (
         "import jax, numpy as np\n"
         "from jax._src import monitoring\n"
@@ -611,17 +615,20 @@ class CompilationCacheTest(CompilationCacheTestCase):
         "monitoring.register_event_listener(\n"
         "    lambda event, **kwargs: hits.append(event))\n"
         "jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)\n"
-        "jax.config.update('jax_persistent_cache_min_entry_size_bytes', 0)\n"
+        "jax.config.update('jax_persistent_cache_min_entry_size_bytes', 1)\n"
         "f = jax.jit(lambda x: (x @ x.T).sum())\n"
         "print(float(f(jax.device_put(np.ones((256, 256), np.float32)))),\n"
         "      hits.count('/jax/compilation_cache/cache_hits'))\n")
-    ran = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True,
-        check=True, env={
-            **os.environ, "JAX_COMPILATION_CACHE_DIR": path,
-            "XLA_FLAGS": "--xla_gpu_memory_limit_early_exit_bytes=4294967296"})
-    value, hits = ran.stdout.split()[-2:]
-    self.assertEqual((float(value), int(hits), entries()), (256.0 ** 3, 1, 1))
+    found = []
+    for limit in (8 << 30, 2):
+      ran = subprocess.run(
+          [sys.executable, "-c", script], capture_output=True, text=True,
+          check=True, env={
+              **os.environ, "JAX_COMPILATION_CACHE_DIR": path,
+              "XLA_FLAGS": f"--xla_gpu_memory_limit_early_exit_bytes={limit}"})
+      value, hits = ran.stdout.split()[-2:]
+      found.append((float(value), int(hits), entries()))
+    self.assertEqual(found[1], (256.0 ** 3, 1, found[0][2]))
 
   def test_min_compile_time(self):
     with (
