@@ -7,6 +7,7 @@ VERS_1.0 {
       MosaicGpuUnload;
       XlaNvJitLinkBuildId;
       XlaNvJitLinkLibrary;
+      XlaNvJitLinkResolve;
     };
 
   local:
