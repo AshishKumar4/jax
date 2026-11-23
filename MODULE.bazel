@@ -163,6 +163,11 @@ archive_override(
         # build id of its mapping (XlaNvJitLinkLibrary, XlaNvJitLinkBuildId),
         # which the CUDA plugin exports.
         "//third_party:xla/nvjitlink_library.patch",
+        # A rank whose collective kernel fails before its local clique's
+        # rendezvous (its scratch past the device's memory) joins it carrying
+        # the failure, which its peers return rather than wait for it; and a
+        # local clique's rendezvous ends at the termination timeout.
+        "//third_party:xla/collective_peer_failure.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
