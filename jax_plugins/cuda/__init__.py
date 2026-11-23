@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import _ctypes
 import ctypes
 import functools
 import importlib
@@ -59,6 +60,49 @@ def _build() -> str | None:
     return importlib.metadata.version(f"jax-{name.removeprefix('xla_')}-pjrt")
   except importlib.metadata.PackageNotFoundError:
     return None
+
+
+def _stub_string(symbol: str) -> str | None:
+  """What the loaded plugin's nvJitLink stub says by `symbol`, an exported C
+  string function (the XLA patch nvjitlink_library): None where the plugin is
+  not loaded, from before the export, or the stub says none. Opens the plugin
+  RTLD_NOLOAD, already loaded, and closes it again: no reference kept."""
+  path = _get_library_path()
+  if path is None:
+    return None
+  try:
+    plugin = ctypes.CDLL(str(path), mode=os.RTLD_NOLOAD)
+  except OSError:
+    return None
+  try:
+    named = getattr(plugin, symbol, None)
+    if named is None:
+      return None
+    named.argtypes = []
+    named.restype = ctypes.c_char_p
+    found = named()
+    return None if found is None else os.fsdecode(found)
+  finally:
+    _ctypes.dlclose(plugin._handle)
+
+
+def nvjitlink_build_id() -> str | None:
+  """The GNU build id, in hex, of the nvJitLink library XLA's nvJitLink stub in
+  this plugin loaded, read from its mapping in this process: the identity of
+  the linker code XLA runs, whatever became of its file since. None where the
+  stub has loaded none (every PTX compile so far ptxas's), the plugin states no
+  such export, or the library states no build id. That the stub loaded the
+  library is no proof every kernel linked with it: XLA's automatic mode loads
+  it to read its version, and compiles by ptxas below 12.5."""
+  return _stub_string("XlaNvJitLinkBuildId")
+
+
+def nvjitlink_library() -> str | None:
+  """The absolute path XLA's nvJitLink stub in this plugin loaded its library
+  from, for a reader: no identity, as the file may have been replaced since it
+  mapped (`nvjitlink_build_id` is). None as `nvjitlink_build_id` is, or where
+  the loader names no absolute file."""
+  return _stub_string("XlaNvJitLinkLibrary")
 
 
 def _get_library_path():
