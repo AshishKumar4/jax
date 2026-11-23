@@ -699,7 +699,9 @@ class BlockSpec:
         fake_index_map_args,
         fake_index_map_kwargs,
     )
-    with tracing_grid_env(grid, vmapped_dims):
+    # An index map lowers inside the kernel too (Triton's lowering emits it in
+    # the kernel's body), so it is traced as one.
+    with tracing_grid_env(grid, vmapped_dims), kernel_trace():
       closed_jaxpr, out_avals = pe.trace_to_jaxpr(
           index_map_func,
           ft.FTPyTree(index_map_avals, index_map_tree),
