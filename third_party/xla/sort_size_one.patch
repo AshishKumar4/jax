@@ -1,28 +1,52 @@
 diff --git a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
-index 4a8fbc3a17..9f39ecd8d7 100644
+index 4a8fbc3a17..fecc138b79 100644
 --- a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
 +++ b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
-@@ -776,10 +776,18 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
+@@ -776,10 +776,26 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
    int64_t dimension_to_sort = sort->sort_dimension();
    const Shape& keys_shape = sort->operand(0)->shape();
    uint64_t dimension_to_sort_bound = keys_shape.dimensions(dimension_to_sort);
 -  int64_t num_stages = Log2Ceiling(dimension_to_sort_bound);
-+  // A dimension of one element (or none) still takes one stage: its compare
-+  // reaches past the bound and is skipped, as for any size short of a power
-+  // of two, and the stage's kernel writes the sort's iota operands. With no
-+  // stage, `1 << (num_stages - 1)` shifted by -1 (a sort algsimp would have
-+  // removed, compiled without it).
++  // A sort over a dimension of one element (or none) orders nothing: a sort
++  // algsimp removes, which a compile without it reaches here. Its stage count
++  // is one (with none, `1 << (num_stages - 1)` shifted by -1), and it runs no
++  // stage: where it is fused with an iota operand, one copy pass writes that
++  // iota (`copies_iota`, below); else its outputs are its operands, which its
++  // caller copied already (or aliased), and it emits no kernel.
++  const bool orders_nothing = dimension_to_sort_bound <= 1;
++  const bool copies_iota =
++      orders_nothing && !ShapeUtil::IsZeroElementArray(keys_shape) &&
++      sort->parent()->IsFusionComputation() &&
++      absl::c_any_of(sort->operands(), [](const HloInstruction* operand) {
++        return operand->opcode() == HloOpcode::kIota;
++      });
 +  int64_t num_stages =
-+      std::max<int64_t>(1, Log2Ceiling(dimension_to_sort_bound));
++      orders_nothing ? 1 : Log2Ceiling(dimension_to_sort_bound);
    VLOG(2) << op_name << " requires " << num_stages << " stages.";
    CHECK_GE(1ULL << num_stages, dimension_to_sort_bound);
 -  CHECK_LT(1ULL << (num_stages - 1), dimension_to_sort_bound);
-+  if (dimension_to_sort_bound > 1) {
++  if (!orders_nothing) {
 +    CHECK_LT(1ULL << (num_stages - 1), dimension_to_sort_bound);
 +  }
  
    // Naive C++ code for the outer loops:
    //
+@@ -909,8 +925,14 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
+ 
+     return absl::OkStatus();
+   };
++  if (copies_iota) {
++    // The tiled kernel reads each operand (an iota emitted) into shared
++    // memory and writes it back; its compares, each block of one element
++    // with none beside it, return at once: an iota copy, the rest as copied.
++    ABSL_RETURN_IF_ERROR(emit_thunk({1, 1}));
++  }
+   std::vector<int64_t> xor_masks;
+-  for (int64_t stage = 0; stage < num_stages; ++stage) {
++  for (int64_t stage = 0; !orders_nothing && stage < num_stages; ++stage) {
+     for (int64_t mask = stage; mask >= 0; --mask) {
+       int64_t xor_mask;
+       if (mask == stage) {
 diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
 index 9fa2af6f32..ab52063453 100644
 --- a/xla/backends/gpu/tests/BUILD
