@@ -22,7 +22,6 @@ import copy
 import enum
 from functools import partial
 import logging
-import os
 import time
 from typing import Any
 import warnings
@@ -786,19 +785,15 @@ def _shared_key(cache_key: str, compile_options: xc.CompileOptions) -> str:
 
 def _memory_limit(compile_options: xc.CompileOptions) -> int:
   """The xla_gpu_memory_limit_early_exit_bytes a compile takes, as XLA reads it:
-  its last override, else its debug option, else XLA_FLAGS' last; 0 for none."""
+  its last override, else its debug option, which XLA_FLAGS set as the options
+  were made and an explicit 0 (no limit) replaces; 0 on a jaxlib without it."""
   overridden = [
       value for name, value in compile_options.env_option_overrides
       if name.lstrip("-") == "xla_gpu_memory_limit_early_exit_bytes"]
   if overridden:
     return int(overridden[-1])
   debug_options = compile_options.executable_build_options.debug_options
-  if debug_options.xla_gpu_memory_limit_early_exit_bytes:
-    return int(debug_options.xla_gpu_memory_limit_early_exit_bytes)
-  flagged = [flag.partition("=")[2]
-             for flag in os.environ.get("XLA_FLAGS", "").split()
-             if flag.startswith("--xla_gpu_memory_limit_early_exit_bytes=")]
-  return int(flagged[-1]) if flagged else 0
+  return int(getattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes", 0))
 
 
 _compile_and_share_module.modules_cache = {}  # pyrefly: ignore[missing-attribute]
