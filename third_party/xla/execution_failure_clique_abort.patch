@@ -1,0 +1,189 @@
+diff --git a/xla/backends/gpu/collectives/abort_collectives_on_task_failure_test.cc b/xla/backends/gpu/collectives/abort_collectives_on_task_failure_test.cc
+index 4698cdf83d..baa9f42bcd 100644
+--- a/xla/backends/gpu/collectives/abort_collectives_on_task_failure_test.cc
++++ b/xla/backends/gpu/collectives/abort_collectives_on_task_failure_test.cc
+@@ -237,6 +237,59 @@ TEST(AbortCollectivesOnTaskFailureTest, AbortsAcquiredGpuCliqueOnTaskFailure) {
+   }
+ }
+ 
++// An execution that fails holding its cliques aborts them while its peers
++// still hold them (their locks taken, as a peer's running collective holds
++// them), and only them: a clique of other devices stands.
++TEST(AbortCollectivesOnTaskFailureTest, AbortsTheCliquesOfAFailedExecution) {
++  auto cleanup = absl::MakeCleanup([] { internal::DestroyAcquiredCliques(); });
++  ResetProcessTaskState();
++
++  ASSERT_OK_AND_ASSIGN(auto platform_name,
++                       xla::PlatformUtil::CanonicalPlatformName("gpu"));
++  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
++                       se::PlatformManager::PlatformWithName(
++                           absl::AsciiStrToUpper(platform_name)));
++  if (platform->VisibleDeviceCount() < 2) {
++    GTEST_SKIP() << "Test requires at least 2 GPUs";
++  }
++
++  tsl::thread::ThreadPool pool(tsl::Env::Default(), "abort-collectives", 2);
++  tsl::Executor& exec = *pool.AsExecutor();
++  ASSERT_OK_AND_ASSIGN(std::vector<se::StreamExecutor*> executors,
++                       CreateExecutors(platform, 2));
++  GpuCollectives* collectives = GpuCollectives::Default("GPU");
++
++  GpuCliqueKey pair({kD0, kD1}, /*num_local_participants=*/2);
++  GpuCliqueKey alone({kD1}, /*num_local_participants=*/1);
++  std::vector<std::vector<GlobalDeviceId>> groups = {{kD0, kD1}};
++  std::vector<std::vector<GlobalDeviceId>> alone_groups = {{kD1}};
++  std::vector<AcquiredCliquesMap> acquired_cliques(3);
++  std::vector<Future<std::shared_ptr<LockableGpuClique::Lock>>> futures(2);
++  for (size_t i = 0; i < 2; ++i) {
++    futures[i] = MakeFutureOn(exec, [=, &acquired_cliques] {
++      return AcquireClique(collectives, executors.at(i), RunId(0), pair,
++                           groups, DefaultCliqueId(), RankId(i),
++                           acquired_cliques.at(i));
++    });
++  }
++  std::vector<std::shared_ptr<LockableGpuClique::Lock>> locks(2);
++  for (size_t i = 0; i < 2; ++i) {
++    ASSERT_OK_AND_ASSIGN(locks[i], futures[i].Await());
++  }
++  ASSERT_OK_AND_ASSIGN(
++      std::shared_ptr<LockableGpuClique::Lock> other,
++      AcquireClique(collectives, executors.at(1), RunId(1), alone, alone_groups,
++                    DefaultCliqueId(), RankId(0), acquired_cliques.at(2)));
++  ASSERT_FALSE((*locks[0])->IsCancelled());
++
++  ASSERT_OK(AbortFailedExecutionCliques(
++      {pair}, absl::ResourceExhaustedError("Failed to allocate scratch")));
++
++  EXPECT_TRUE((*locks[0])->IsCancelled());
++  EXPECT_TRUE((*locks[1])->IsCancelled());
++  EXPECT_FALSE((*other)->IsCancelled());
++}
++
+ // A clique that is still being initialized is not in the process cliques
+ // cache yet. AbortAllCliques must cancel its initialization through the pending
+ // cancellation token.
+diff --git a/xla/backends/gpu/collectives/gpu_cliques.cc b/xla/backends/gpu/collectives/gpu_cliques.cc
+index 59699eea6e..18f60a5752 100644
+--- a/xla/backends/gpu/collectives/gpu_cliques.cc
++++ b/xla/backends/gpu/collectives/gpu_cliques.cc
+@@ -1169,6 +1169,22 @@ absl::Status AbortAllCliques() {
+   return s;
+ }
+ 
++absl::Status AbortFailedExecutionCliques(
++    absl::Span<const GpuCliqueKey> clique_keys, const absl::Status& error) {
++  if (clique_keys.empty()) {
++    return absl::OkStatus();
++  }
++  LOG(ERROR) << "Aborting " << clique_keys.size()
++             << " GPU cliques of an execution that failed: " << error;
++  absl::flat_hash_set<GpuCliqueKey> keys(clique_keys.begin(),
++                                         clique_keys.end());
++  ProcessGpuCliques& state = GetProcessGpuCliques();
++  absl::MutexLock lock(state.mu);
++  return AbortCliques(state, [&](const GpuCliqueKey& key) {
++    return keys.contains(key);
++  });
++}
++
+ absl::Status AbortTaskCliques(int failed_task_id, absl::Status error) {
+   ProcessGpuCliques& state = GetProcessGpuCliques();
+   absl::MutexLock lock(state.mu);
+diff --git a/xla/backends/gpu/collectives/gpu_cliques.h b/xla/backends/gpu/collectives/gpu_cliques.h
+index f2cc6de4cf..657877a48f 100644
+--- a/xla/backends/gpu/collectives/gpu_cliques.h
++++ b/xla/backends/gpu/collectives/gpu_cliques.h
+@@ -108,6 +108,13 @@ absl::Status UpdateGlobalProcessInfo(
+ // return immediately.
+ absl::Status AbortAllCliques();
+ 
++// Aborts and invalidates the GPU cliques of `clique_keys` this process
++// acquired: an execution that failed holding them (`error`), so the
++// collectives its peers run on them end with an error rather than wait for a
++// rank that will never take part.
++absl::Status AbortFailedExecutionCliques(
++    absl::Span<const GpuCliqueKey> clique_keys, const absl::Status& error);
++
+ // Marks `failed_task_id` as failed in the global task state and aborts all
+ // cliques that include its incarnation. No-op if the global task state is not
+ // known yet.
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index c210904d40..1cf566dfbd 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -848,6 +848,7 @@ cc_library(
+         "//xla:xla_proto_cc",
+         "//xla/backends/cpu:target_machine_options",
+         "//xla/backends/gpu/collectives:gpu_clique_key",
++        "//xla/backends/gpu/collectives:gpu_cliques",
+         "//xla/backends/gpu/runtime:annotation",
+         "//xla/backends/gpu/runtime:async_thunk",
+         "//xla/backends/gpu/runtime:collective_clique_requests",
+@@ -914,6 +915,7 @@ cc_library(
+         "@com_google_absl//absl/algorithm:container",
+         "@com_google_absl//absl/base:core_headers",
+         "@com_google_absl//absl/base:nullability",
++        "@com_google_absl//absl/cleanup",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/container:flat_hash_set",
+         "@com_google_absl//absl/log",
+diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
+index 1848c2f54e..b75383bfe4 100644
+--- a/xla/service/gpu/gpu_executable.cc
++++ b/xla/service/gpu/gpu_executable.cc
+@@ -29,6 +29,7 @@ limitations under the License.
+ 
+ #include "absl/algorithm/container.h"
+ #include "absl/base/nullability.h"
++#include "absl/cleanup/cleanup.h"
+ #include "absl/container/flat_hash_map.h"
+ #include "absl/container/flat_hash_set.h"
+ #include "absl/log/check.h"
+@@ -48,6 +49,7 @@ limitations under the License.
+ #include "tsl/profiler/lib/traceme.h"
+ #include "xla/backends/cpu/target_machine_options.h"
+ #include "xla/backends/gpu/collectives/gpu_clique_key.h"
++#include "xla/backends/gpu/collectives/gpu_cliques.h"
+ #include "xla/backends/gpu/runtime/annotation.h"
+ #include "xla/backends/gpu/runtime/async_thunk.h"
+ #include "xla/backends/gpu/runtime/collective_clique_requests.h"
+@@ -846,6 +848,24 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+                                                    collective_clique_requests));
+   }
+ 
++  // An execution that fails once it holds its cliques aborts them: its peers'
++  // collectives on them then end with an error, where they would wait for
++  // ever for this rank (at a rendezvous it never reaches, or in an NCCL kernel
++  // waiting on the device for its part).
++  std::vector<GpuCliqueKey> held_cliques;
++  if (!collective_cliques.empty()) {
++    held_cliques = collective_clique_requests.RequestedCliques();
++  }
++  absl::Status failed =
++      Internal("the execution returned an error before it finished");
++  absl::Cleanup abort_held_cliques = [&held_cliques, &failed] {
++    absl::Status aborted = AbortFailedExecutionCliques(held_cliques, failed);
++    if (!aborted.ok()) {
++      LOG(WARNING) << "Failed to abort a failed execution's cliques: "
++                   << aborted;
++    }
++  };
++
+   // Acquire collective memories requested by thunks.
+   ABSL_ASSIGN_OR_RETURN(
+       CollectiveMemory collective_memory,
+@@ -963,8 +983,12 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+         }));
+   }
+ 
+-  return MaybeSyncAndProfile(run_options, execution_timer.get(),
+-                             block_host_until_done ? main_stream : nullptr);
++  failed = MaybeSyncAndProfile(run_options, execution_timer.get(),
++                               block_host_until_done ? main_stream : nullptr);
++  if (failed.ok()) {
++    std::move(abort_held_cliques).Cancel();
++  }
++  return failed;
+ }
+ 
+ namespace {
