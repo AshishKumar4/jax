@@ -100,7 +100,9 @@ def nvjitlink_build_id(resolve: bool = False) -> str | None:
   has not yet (the loader's own search, whatever it finds), so the build id
   names the library XLA would link with before its first compile: None where no
   library loads (ptxas assembles). Idempotent and cheap after the first call.
-  Either way, the plugin must be loaded (a CUDA backend initialized)."""
+  Either way, the plugin must be loaded: a CUDA backend initialized, or a
+  compile-only CUDA topology made (`jax.experimental.topologies`), which loads
+  it without a device or a driver; None where it is not."""
   return _stub_string(
       "XlaNvJitLinkResolve" if resolve else "XlaNvJitLinkBuildId")
 
