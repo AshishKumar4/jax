@@ -1,0 +1,120 @@
+diff --git a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
+index 4a8fbc3a17..9f39ecd8d7 100644
+--- a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
++++ b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
+@@ -776,10 +776,18 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
+   int64_t dimension_to_sort = sort->sort_dimension();
+   const Shape& keys_shape = sort->operand(0)->shape();
+   uint64_t dimension_to_sort_bound = keys_shape.dimensions(dimension_to_sort);
+-  int64_t num_stages = Log2Ceiling(dimension_to_sort_bound);
++  // A dimension of one element (or none) still takes one stage: its compare
++  // reaches past the bound and is skipped, as for any size short of a power
++  // of two, and the stage's kernel writes the sort's iota operands. With no
++  // stage, `1 << (num_stages - 1)` shifted by -1 (a sort algsimp would have
++  // removed, compiled without it).
++  int64_t num_stages =
++      std::max<int64_t>(1, Log2Ceiling(dimension_to_sort_bound));
+   VLOG(2) << op_name << " requires " << num_stages << " stages.";
+   CHECK_GE(1ULL << num_stages, dimension_to_sort_bound);
+-  CHECK_LT(1ULL << (num_stages - 1), dimension_to_sort_bound);
++  if (dimension_to_sort_bound > 1) {
++    CHECK_LT(1ULL << (num_stages - 1), dimension_to_sort_bound);
++  }
+ 
+   // Naive C++ code for the outer loops:
+   //
+diff --git a/xla/backends/gpu/tests/BUILD b/xla/backends/gpu/tests/BUILD
+index 9fa2af6f32..ab52063453 100644
+--- a/xla/backends/gpu/tests/BUILD
++++ b/xla/backends/gpu/tests/BUILD
+@@ -711,6 +711,7 @@ xla_test(
+         "//xla:shape_util",
+         "//xla:types",
+         "//xla:xla_data_proto_cc",
++        "//xla:xla_proto_cc",
+         "//xla/backends/gpu/transforms:sort_rewriter",
+         "//xla/hlo/ir:hlo",
+         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+diff --git a/xla/backends/gpu/tests/sorting_test.cc b/xla/backends/gpu/tests/sorting_test.cc
+index fa61317bff..55b07b39d3 100644
+--- a/xla/backends/gpu/tests/sorting_test.cc
++++ b/xla/backends/gpu/tests/sorting_test.cc
+@@ -45,6 +45,7 @@ limitations under the License.
+ #include "xla/tests/hlo_pjrt_interpreter_reference_mixin.h"
+ #include "xla/tests/hlo_pjrt_test_base.h"
+ #include "xla/types.h"
++#include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
+ 
+ namespace xla {
+@@ -125,6 +126,70 @@ ENTRY TestComputation {
+   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
+ }
+ 
++TEST_F(SortingTest, ASortOverASizeOneDimensionReturnsItsOperands) {
++  // A key, a value and an iota sorted over one element: no pass removes the
++  // sort, so the emitter takes a dimension of one (it aborted shifting by -1).
++  const char* hlo_text = R"(
++HloModule TestModule
++
++compare {
++  p.0.lhs = s32[] parameter(0)
++  p.0.rhs = s32[] parameter(1)
++  p.1.lhs = s32[] parameter(2)
++  p.1.rhs = s32[] parameter(3)
++  p.2.lhs = s32[] parameter(4)
++  p.2.rhs = s32[] parameter(5)
++  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
++}
++
++ENTRY TestComputation {
++  keys = s32[1] parameter(0)
++  values = s32[1] parameter(1)
++  iota = s32[1] iota(), iota_dimension=0
++  ROOT sort = (s32[1], s32[1], s32[1]) sort(keys, values, iota),
++    dimensions={0}, to_apply=compare
++}
++)";
++  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{0, 0}));
++}
++
++class SortingWithoutSimplificationTest : public SortingTest {
++ protected:
++  // As a reference twin compiles: no simplifier to remove a trivial sort.
++  DebugOptions GetDebugOptionsForTest() const override {
++    DebugOptions options = SortingTest::GetDebugOptionsForTest();
++    options.add_xla_disable_hlo_passes("algsimp");
++    options.add_xla_disable_hlo_passes("constant_folding");
++    return options;
++  }
++};
++
++TEST_F(SortingWithoutSimplificationTest,
++       ASortedFusionOverASizeOneDimensionWritesItsIota) {
++  // Sorted over a dimension of one, its iota counting the other dimension:
++  // the sort's fusion writes the iota through its one stage, the keys and
++  // values as they came.
++  const char* hlo_text = R"(
++HloModule TestModule
++
++compare {
++  p.0.lhs = f32[] parameter(0)
++  p.0.rhs = f32[] parameter(1)
++  p.1.lhs = s32[] parameter(2)
++  p.1.rhs = s32[] parameter(3)
++  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
++}
++
++ENTRY TestComputation {
++  keys = f32[4, 1] parameter(0)
++  iota = s32[4, 1] iota(), iota_dimension=0
++  ROOT sort = (f32[4, 1], s32[4, 1]) sort(keys, iota), dimensions={1},
++    to_apply=compare
++}
++)";
++  EXPECT_TRUE(RunAndCompare(hlo_text, ErrorSpec{0, 0}));
++}
++
+ TEST_F(SortingTest, PackedElementType) {
+   const char* hlo_text = R"(
+     HloModule module

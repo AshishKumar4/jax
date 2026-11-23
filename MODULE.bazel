@@ -168,6 +168,10 @@ archive_override(
         # the failure, which its peers return rather than wait for it; and a
         # local clique's rendezvous ends at the termination timeout.
         "//third_party:xla/collective_peer_failure.patch",
+        # A GPU sort over a dimension of one element runs one guarded stage, not
+        # none: with none its stage count shifted by -1 and a CHECK aborted
+        # (a sort algsimp would have removed, compiled without it).
+        "//third_party:xla/sort_size_one.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
