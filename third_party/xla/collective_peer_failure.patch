@@ -192,7 +192,7 @@ index 4d963ac922..f77b2079ae 100644
                        absl::btree_map<RankId, tsl::UniqueAny> values);
  
 diff --git a/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc b/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
-index e12d81ae20..fb4ec7ca02 100644
+index e12d81ae20..a345ccab07 100644
 --- a/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
 +++ b/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
 @@ -16,10 +16,14 @@ limitations under the License.
@@ -210,6 +210,33 @@ index e12d81ae20..fb4ec7ca02 100644
  #include "xla/backends/gpu/collectives/gpu_clique_key.h"
  #include "xla/core/collectives/rank_id.h"
  #include "xla/runtime/device_id.h"
+@@ -42,7 +46,7 @@ TEST(GpuCliqueRendezvousTest, TwoParticipants) {
+   auto task = [&](int32_t id) {
+     return [&, id] {
+       auto rendezvous = GpuCliqueRendezvous::Join(key, RankId(id), int32_t{id});
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(data.clique_key(), key);
+@@ -68,7 +72,7 @@ TEST(GpuCliqueRendezvousTest, MoveOnlyType) {
+     return [&, id] {
+       auto rendezvous = GpuCliqueRendezvous::Join(
+           key, RankId(id), std::make_unique<int32_t>(id * 10));
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(*data.at<MoveOnly>(RankId(0))->get(), 0);
+@@ -92,7 +96,7 @@ TEST(GpuCliqueRendezvousTest, ThreeParticipants) {
+     return [&, id] {
+       auto rendezvous =
+           GpuCliqueRendezvous::Join(key, RankId(id), std::string(1, 'a' + id));
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(data.at<std::string>(RankId(0))->get(), "a");
 @@ -107,6 +111,88 @@ TEST(GpuCliqueRendezvousTest, ThreeParticipants) {
    thread_pool.Schedule(task(2));
  }
@@ -228,7 +255,7 @@ index e12d81ae20..fb4ec7ca02 100644
 +    thread_pool.Schedule([&] {
 +      absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> rendezvous =
 +          GpuCliqueRendezvous::Join(key, RankId(0), int32_t{0});
-+      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
 +      read = (*rendezvous)->at<int32_t>(RankId(1)).status();
 +      ready = (*rendezvous)->PeersReady();
 +    });
@@ -259,13 +286,13 @@ index e12d81ae20..fb4ec7ca02 100644
 +      thread_pool.Schedule([&, id] {
 +        absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> rendezvous =
 +            GpuCliqueRendezvous::Join(key, RankId(id), int32_t{id});
-+        ASSERT_OK(rendezvous);
++        ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
 +        ready[id] = (*rendezvous)->PeersReady();
 +      });
 +    }
 +  }
-+  EXPECT_OK(ready[0]);
-+  EXPECT_OK(ready[1]);
++  EXPECT_TRUE(ready[0].ok()) << ready[0];
++  EXPECT_TRUE(ready[1].ok()) << ready[1];
 +}
 +
 +TEST(GpuCliqueRendezvousDeathTest, AMissingRankEndsAtTheTerminationTimeout) {
