@@ -500,6 +500,49 @@ class CompilationCacheTest(CompilationCacheTestCase):
       jit(lambda x: x + 1)(1)
       self.assertEqual(count_cache_items(), 0)
 
+  def test_a_compile_stopped_at_its_memory_limit_is_not_written(self):
+    # Its key leaves the limit out, so a stopped executable, which refuses to
+    # run, must not be read by a run under a larger limit: it is told apart by
+    # its memory stats past the limit, as XLA compares them.
+    class Stats:
+      argument_size_in_bytes = 600
+      output_size_in_bytes = 300
+      alias_size_in_bytes = 100
+      temp_size_in_bytes = 200
+
+    class Executable:
+      def get_compiled_memory_stats(self):
+        return Stats()
+
+    def options(limit):
+      found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      if limit is not None:
+        found.env_option_overrides = [
+            ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+      return found
+
+    self.assertEqual(
+        [compiler._stopped_by_memory_limit(Executable(), options(limit))
+         for limit in (None, 999, 1000, 1 << 30)],
+        [False, True, False, False])
+
+  @jtu.run_on_devices("gpu")
+  def test_a_finished_compile_is_read_under_any_limit_it_fits(self):
+    with (
+      config.persistent_cache_min_compile_time_secs(0),
+      config.persistent_cache_min_entry_size_bytes(0),
+    ):
+      f = jit(lambda x: (x @ x.T).sum())
+      x = jnp.ones((256, 256), jnp.float32)
+      lowered = f.lower(x)
+      lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 1})
+      self.assertEqual(count_cache_items(), 0)
+      lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 4 << 30})
+      self.assertEqual(count_cache_items(), 1)
+      with jtu.count_compilation_after_persistent_cache_miss() as missed:
+        lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
+      self.assertEqual((count_cache_items(), missed()), (1, 0))
+
   def test_min_compile_time(self):
     with (
       config.persistent_cache_min_compile_time_secs(2),

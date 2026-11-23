@@ -80,6 +80,25 @@ class CacheKeyTest(jtu.JaxTestCase):
     )
     self.assertEqual(hash1, hash2)
 
+  def test_a_compile_keys_alike_whatever_its_memory_limit(self):
+    # The limit stops a compile past it and changes none that finishes; a
+    # stopped one is never cached (compiler._stopped_by_memory_limit).
+    keyed = []
+    for limit in (None, 6 << 30, 12 << 30):
+      options = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      if limit is not None:
+        options.env_option_overrides = [
+            ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+      keyed.append(self.get_hashed_value(
+          cache_key._hash_serialized_compile_options, options))
+    flagged = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    debug_options = flagged.executable_build_options.debug_options
+    if hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+      debug_options.xla_gpu_memory_limit_early_exit_bytes = 3 << 30
+      keyed.append(self.get_hashed_value(
+          cache_key._hash_serialized_compile_options, flagged))
+    self.assertLen(set(keyed), 1)
+
   def test_a_compile_requiring_its_autotune_results_keys_as_one_without(self):
     plain = compiler.get_compile_options(num_replicas=1, num_partitions=1)
     required = compiler.get_compile_options(num_replicas=1, num_partitions=1)
