@@ -21,7 +21,9 @@ from collections.abc import Sequence
 import copy
 import enum
 from functools import partial
+import hashlib
 import logging
+import os
 import time
 from typing import Any
 import warnings
@@ -733,9 +735,13 @@ def _compile_and_share_module(
     first_process_id: int
 ) -> xc.LoadedExecutable:
   share_timeout = config.share_binary_between_hosts_timeout_ms.value
+  # What the hosts share is keyed by the whole compile, its memory limit with
+  # it: a compile stopped at a smaller limit serves no request at a larger one,
+  # as the disk cache, which writes no stopped compile, can key without it.
+  shared = _shared_key(cache_key, compile_options)
 
-  if cache_key in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
-    return _compile_and_share_module.modules_cache[cache_key]  # pyrefly: ignore[missing-attribute]
+  if shared in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
+    return _compile_and_share_module.modules_cache[shared]  # pyrefly: ignore[missing-attribute]
 
   if distributed.global_state.process_id == first_process_id:
     logger.debug("Process %d compiling and sharing module: %s",
@@ -753,12 +759,12 @@ def _compile_and_share_module(
     serialized_executable = compilation_cache.compress_executable(
         serialized_executable
     )
-    global_client.key_value_set_bytes(cache_key, serialized_executable)
+    global_client.key_value_set_bytes(shared, serialized_executable)
   else:
     logger.debug("Waiting for module: %s from process %d", module_name,
                  first_process_id)
     serialized_executable = global_client.blocking_key_value_get_bytes(
-        cache_key, share_timeout
+        shared, share_timeout
     )
     serialized_executable = compilation_cache.decompress_executable(
         serialized_executable
@@ -767,8 +773,18 @@ def _compile_and_share_module(
         serialized_executable, executable_devices, compile_options,
         host_callbacks)
 
-  _compile_and_share_module.modules_cache[cache_key] = executable  # pyrefly: ignore[missing-attribute]
+  _compile_and_share_module.modules_cache[shared] = executable  # pyrefly: ignore[missing-attribute]
   return executable
+
+
+def _shared_key(cache_key: str, compile_options: xc.CompileOptions) -> str:
+  """`cache_key` with the whole of `compile_options` and XLA_FLAGS hashed
+  beside it: what hosts sharing a compile, and a process keeping one, key it
+  by, so options the disk cache's key leaves out (a GPU memory limit) part
+  what they share."""
+  whole = hashlib.sha256(compile_options.SerializeAsString())
+  whole.update(os.environ.get("XLA_FLAGS", "").encode())
+  return f"{cache_key}-{whole.hexdigest()[:16]}"
 
 
 _compile_and_share_module.modules_cache = {}  # pyrefly: ignore[missing-attribute]
@@ -788,7 +804,7 @@ def _compile_and_write_cache(
       backend, computation, executable_devices, compile_options, host_callbacks
   )
   compile_time = time.monotonic() - start_time
-  if _stopped_by_memory_limit(executable, compile_options):
+  if _stopped_by_memory_limit(executable, backend):
     logger.log(
         logging.WARNING if config.explain_cache_misses.value else logging.DEBUG,
         "Not writing persistent cache entry for '%s': its compile stopped at "
@@ -798,33 +814,23 @@ def _compile_and_write_cache(
   return executable
 
 
-def _memory_limit(compile_options: xc.CompileOptions) -> int:
-  """The xla_gpu_memory_limit_early_exit_bytes `compile_options` state, as an
-  override or a debug option; 0 where they state none."""
-  for name, value in compile_options.env_option_overrides:
-    if name.strip("-") == "xla_gpu_memory_limit_early_exit_bytes":
-      return int(value)
-  debug_options = compile_options.executable_build_options.debug_options
-  # A jaxlib without Dew's xla-memory-limit-early-exit states no such option.
-  return int(getattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes", 0))
-
-
-def _stopped_by_memory_limit(executable: Any,
-                             compile_options: xc.CompileOptions) -> bool:
-  """Whether `executable`'s compile stopped at its memory limit
+def _stopped_by_memory_limit(executable: Any, backend: xc.Client) -> bool:
+  """Whether `executable`'s compile stopped at its GPU memory limit
   (xla_gpu_memory_limit_early_exit_bytes), as XLA states it in its memory stats
-  (`stopped_at_memory_limit`). Its cache key leaves the limit out, so such an
+  (`stopped_at_memory_limit`, however the limit was given: an option, an
+  override, XLA_FLAGS). Its cache key leaves the limit out, so such an
   executable, which refuses to run, is never written: a run under a larger
-  limit would read it. Where its stats cannot say (they raise, or a jaxlib
-  states no such field), a compile under a limit is read as stopped: written
-  never, rather than wrongly."""
-  if _memory_limit(compile_options) <= 0:
+  limit would read it. On a GPU, stats that cannot say (they raise, or state no
+  verdict) read as stopped: written never, rather than wrongly. No other
+  backend takes the limit."""
+  if backend.platform not in ("cuda", "rocm", "gpu"):
     return False
   try:
     stats = executable.get_compiled_memory_stats()
   except (xc.XlaRuntimeError, NotImplementedError):
     return True
-  return bool(getattr(stats, "stopped_at_memory_limit", True))
+  stopped = getattr(stats, "stopped_at_memory_limit", None)
+  return True if stopped is None else bool(stopped)
 
 
 def _should_raise_persistent_cache_error(ex: Exception) -> bool:

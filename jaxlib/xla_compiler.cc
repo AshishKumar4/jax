@@ -291,6 +291,9 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                    [](DebugOptions* self, std::string value) {
                      self->set_xla_gpu_load_autotune_results_from(value);
                    })
+      .def_prop_rw("xla_gpu_memory_limit_early_exit_bytes",
+                   &DebugOptions::xla_gpu_memory_limit_early_exit_bytes,
+                   &DebugOptions::set_xla_gpu_memory_limit_early_exit_bytes)
       .def_prop_rw("xla_gpu_cuda_data_dir",
                    &DebugOptions::xla_gpu_cuda_data_dir,
                    [](DebugOptions* self, std::string value) {
