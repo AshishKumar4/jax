@@ -12,7 +12,7 @@ index 12b161e31a..314a852146 100644
              "@tsl//tsl/platform:dso_loader",
              "@tsl//tsl/platform:load_library",
 diff --git a/xla/tsl/cuda/nvjitlink_stub.cc b/xla/tsl/cuda/nvjitlink_stub.cc
-index 6757ae9dd1..5d1d52f708 100644
+index 6757ae9dd1..7b48428d5e 100644
 --- a/xla/tsl/cuda/nvjitlink_stub.cc
 +++ b/xla/tsl/cuda/nvjitlink_stub.cc
 @@ -13,7 +13,20 @@ See the License for the specific language governing permissions and
@@ -55,7 +55,7 @@ index 6757ae9dd1..5d1d52f708 100644
      return handle_or.value();
    }();
    return handle;
-@@ -71,3 +89,113 @@ void _nvjitlink_tramp_resolve(int i) {
+@@ -71,3 +89,123 @@ void _nvjitlink_tramp_resolve(int i) {
  }
  
  }  // extern "C"
@@ -105,12 +105,22 @@ index 6757ae9dd1..5d1d52f708 100644
 +          const char* at = reinterpret_cast<const char*>(object->dlpi_addr +
 +                                                         segment.p_vaddr);
 +          const char* end = at + segment.p_memsz;
-+          while (at + sizeof(ElfW(Nhdr)) <= end) {
++          // Notes align to their segment's alignment, 4 or 8 (a property note).
++          const size_t align = segment.p_align == 8 ? 8 : 4;
++          auto aligned = [align](size_t size) {
++            return (size + align - 1) & ~(align - 1);
++          };
++          while (static_cast<size_t>(end - at) >= sizeof(ElfW(Nhdr))) {
 +            const auto* note = reinterpret_cast<const ElfW(Nhdr)*>(at);
 +            const char* name = at + sizeof(ElfW(Nhdr));
-+            const char* desc = name + ((note->n_namesz + 3) & ~3u);
-+            const char* next = desc + ((note->n_descsz + 3) & ~3u);
-+            if (next > end) break;
++            if (aligned(note->n_namesz) > static_cast<size_t>(end - name)) {
++              break;
++            }
++            const char* desc = name + aligned(note->n_namesz);
++            if (aligned(note->n_descsz) > static_cast<size_t>(end - desc)) {
++              break;
++            }
++            const char* next = desc + aligned(note->n_descsz);
 +            if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 &&
 +                std::memcmp(name, "GNU", 4) == 0 && note->n_descsz > 0) {
 +              static constexpr char kHex[] = "0123456789abcdef";
@@ -155,7 +165,7 @@ index 6757ae9dd1..5d1d52f708 100644
 +XlaNvJitLinkBuildId() {
 +  static absl::Mutex mu(absl::kConstInit);
 +  static std::string* id = nullptr;
-+  absl::MutexLock lock(&mu);
++  absl::MutexLock lock(mu);
 +  if (id == nullptr) {
 +    Dl_info info;
 +    if (!LoadedObject(info)) {
