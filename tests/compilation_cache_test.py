@@ -502,17 +502,19 @@ class CompilationCacheTest(CompilationCacheTestCase):
 
   def test_a_compile_stopped_at_its_memory_limit_is_not_written(self):
     # Its key leaves the limit out, so a stopped executable, which refuses to
-    # run, must not be read by a run under a larger limit: it is told apart by
-    # its memory stats past the limit, as XLA compares them.
-    class Stats:
-      argument_size_in_bytes = 600
-      output_size_in_bytes = 300
-      alias_size_in_bytes = 100
-      temp_size_in_bytes = 200
+    # run, must not be read by a run under a larger limit: XLA's memory stats
+    # say it stopped; stats that cannot say read as stopped, under a limit.
+    def executable(stopped):
+      class Stats:
+        pass
+      stats = Stats()
+      if stopped is not None:
+        stats.stopped_at_memory_limit = stopped
 
-    class Executable:
-      def get_compiled_memory_stats(self):
-        return Stats()
+      class Executable:
+        def get_compiled_memory_stats(self):
+          return stats
+      return Executable()
 
     def options(limit):
       found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
@@ -522,9 +524,10 @@ class CompilationCacheTest(CompilationCacheTestCase):
       return found
 
     self.assertEqual(
-        [compiler._stopped_by_memory_limit(Executable(), options(limit))
-         for limit in (None, 999, 1000, 1 << 30)],
-        [False, True, False, False])
+        [compiler._stopped_by_memory_limit(executable(stopped), options(limit))
+         for stopped, limit in ((True, None), (True, 1000), (False, 1000),
+                                (None, 1000), (None, None))],
+        [False, True, False, True, False])
 
   @jtu.run_on_devices("gpu")
   def test_a_finished_compile_is_read_under_any_limit_it_fits(self):
@@ -535,7 +538,8 @@ class CompilationCacheTest(CompilationCacheTestCase):
       f = jit(lambda x: (x @ x.T).sum())
       x = jnp.ones((256, 256), jnp.float32)
       lowered = f.lower(x)
-      lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 1})
+      stopped = lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 1})
+      self.assertTrue(stopped.memory_analysis().stopped_at_memory_limit)
       self.assertEqual(count_cache_items(), 0)
       lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 4 << 30})
       self.assertEqual(count_cache_items(), 1)

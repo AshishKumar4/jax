@@ -1,0 +1,246 @@
+diff --git a/xla/pjrt/compiled_memory_stats.h b/xla/pjrt/compiled_memory_stats.h
+index 1b715c0567..2a375b6c99 100644
+--- a/xla/pjrt/compiled_memory_stats.h
++++ b/xla/pjrt/compiled_memory_stats.h
+@@ -55,6 +55,11 @@ struct CompiledMemoryStats {
+ 
+   std::string serialized_buffer_assignment;
+ 
++  // Whether the compile stopped at its device memory limit
++  // (DebugOptions::xla_gpu_memory_limit_early_exit_bytes): its executable
++  // states its memory and refuses to run. A compile that finished never is.
++  bool stopped_at_memory_limit = false;
++
+   std::string DebugString() const;
+ 
+   CompiledMemoryStatsProto ToProto() const;
+diff --git a/xla/pjrt/pjrt_client.cc b/xla/pjrt/pjrt_client.cc
+index 8d5ddb1aab..94859fe3cb 100644
+--- a/xla/pjrt/pjrt_client.cc
++++ b/xla/pjrt/pjrt_client.cc
+@@ -170,7 +170,8 @@ std::string CompiledMemoryStats::DebugString() const {
+       output_size_in_bytes, alias_size_in_bytes, temp_size_in_bytes,
+       host_generated_code_size_in_bytes, host_argument_size_in_bytes,
+       host_output_size_in_bytes, host_alias_size_in_bytes,
+-      host_temp_size_in_bytes);
++      host_temp_size_in_bytes) +
++         (stopped_at_memory_limit ? " stopped at its memory limit" : "");
+ }
+ 
+ // Defining the first virtual non-pure method, which is usually the virtual
+diff --git a/xla/pjrt/pjrt_executable.cc b/xla/pjrt/pjrt_executable.cc
+index 231e703971..8bd74d2c57 100644
+--- a/xla/pjrt/pjrt_executable.cc
++++ b/xla/pjrt/pjrt_executable.cc
+@@ -300,6 +300,7 @@ CompiledMemoryStatsProto CompiledMemoryStats::ToProto() const {
+   proto.set_total_allocation_bytes(total_allocation_bytes);
+   proto.set_indefinite_allocations(indefinite_allocations);
+   proto.set_peak_unpadded_heap_bytes(peak_unpadded_heap_bytes);
++  proto.set_stopped_at_memory_limit(stopped_at_memory_limit);
+   return proto;
+ }
+ 
+@@ -323,6 +324,7 @@ CompiledMemoryStats CompiledMemoryStats::FromProto(
+   stats.total_allocation_bytes = proto.total_allocation_bytes();
+   stats.indefinite_allocations = proto.indefinite_allocations();
+   stats.peak_unpadded_heap_bytes = proto.peak_unpadded_heap_bytes();
++  stats.stopped_at_memory_limit = proto.stopped_at_memory_limit();
+   return stats;
+ }
+ 
+diff --git a/xla/pjrt/proto/executable_metadata.proto b/xla/pjrt/proto/executable_metadata.proto
+index 3429008d5f..f1b1bbf13b 100644
+--- a/xla/pjrt/proto/executable_metadata.proto
++++ b/xla/pjrt/proto/executable_metadata.proto
+@@ -42,6 +42,10 @@ message CompiledMemoryStatsProto {
+ 
+   bytes serialized_buffer_assignment = 13;
+ 
++  // Whether the compile stopped at its device memory limit
++  // (DebugOptions.xla_gpu_memory_limit_early_exit_bytes).
++  bool stopped_at_memory_limit = 19;
++
+   reserved 6, 12;
+ 
+   // Next ID: 16
+diff --git a/xla/pjrt/se/stream_executor_executable.cc b/xla/pjrt/se/stream_executor_executable.cc
+index d49d121c69..fd7bcff76a 100644
+--- a/xla/pjrt/se/stream_executor_executable.cc
++++ b/xla/pjrt/se/stream_executor_executable.cc
+@@ -69,6 +69,21 @@ namespace xla {
+ namespace {
+ constexpr absl::string_view kPjRtStreamExecutorClientName =
+     "PjRtStreamExecutorClient";
++
++// `options` as a finished compile serializes them: with no
++// xla_gpu_memory_limit_early_exit_bytes, as an override or a debug option, so
++// its bytes are the same under any limit it fits, as its persistent cache key
++// is. A compile stopped at its limit keeps it.
++CompileOptionsProto WithoutMemoryLimit(CompileOptionsProto options) {
++  options.mutable_executable_build_options()
++      ->mutable_debug_options()
++      ->clear_xla_gpu_memory_limit_early_exit_bytes();
++  for (absl::string_view name : {"xla_gpu_memory_limit_early_exit_bytes",
++                                 "--xla_gpu_memory_limit_early_exit_bytes"}) {
++    options.mutable_env_option_overrides()->erase(std::string(name));
++  }
++  return options;
++}
+ }  // namespace
+ 
+ absl::StatusOr<std::string> StreamExecutorExecutable::SerializeExecutable()
+@@ -85,6 +100,7 @@ absl::StatusOr<std::string> StreamExecutorExecutable::SerializeExecutable()
+     return result;
+   }
+   std::string serialized;
++  bool stopped = false;
+   if (std::holds_alternative<std::unique_ptr<CompiledModule>>(executables_)) {
+     const auto& aot_executable =
+         std::get<std::unique_ptr<CompiledModule>>(executables_);
+@@ -92,6 +108,9 @@ absl::StatusOr<std::string> StreamExecutorExecutable::SerializeExecutable()
+       return absl::InternalError("No local executable");
+     }
+     ABSL_ASSIGN_OR_RETURN(serialized, aot_executable->SerializeAsString());
++    absl::StatusOr<CompiledMemoryStats> stats =
++        aot_executable->GetCompiledMemoryStats();
++    stopped = stats.ok() && stats->stopped_at_memory_limit;
+   } else {
+     const auto& local_executable =
+         std::get<std::shared_ptr<LocalExecutable>>(executables_);
+@@ -99,6 +118,7 @@ absl::StatusOr<std::string> StreamExecutorExecutable::SerializeExecutable()
+       return absl::InternalError("No local executable");
+     }
+     Executable* built_executable = local_executable->executable();
++    stopped = built_executable->BytesPastMemoryLimit().has_value();
+     CHECK(local_client_ != nullptr);
+     ABSL_ASSIGN_OR_RETURN(
+         std::unique_ptr<CompiledModule> aot_result,
+@@ -113,8 +133,10 @@ absl::StatusOr<std::string> StreamExecutorExecutable::SerializeExecutable()
+   }
+   ExecutableAndOptionsProto proto;
+   *proto.mutable_serialized_executable() = std::move(serialized);
+-  ABSL_ASSIGN_OR_RETURN(*proto.mutable_compile_options(),
++  ABSL_ASSIGN_OR_RETURN(CompileOptionsProto options,
+                         compile_options_.ToProto());
++  *proto.mutable_compile_options() =
++      stopped ? std::move(options) : WithoutMemoryLimit(std::move(options));
+   *proto.mutable_pjrt_client_name() = kPjRtStreamExecutorClientName;
+   std::string result;
+   ABSL_RETURN_IF_ERROR(WriteSplitExecutableAndOptions(
+@@ -233,6 +255,8 @@ StreamExecutorExecutable::GetCompiledMemoryStats() const {
+       local_exec->executable()->GetAllocations());
+   memory_stats.generated_code_size_in_bytes =
+       SizeOfGeneratedCodeInBytesLocked();
++  memory_stats.stopped_at_memory_limit =
++      local_exec->executable()->BytesPastMemoryLimit().has_value();
+   return memory_stats;
+ }
+ 
+diff --git a/xla/service/executable.h b/xla/service/executable.h
+index 0a9ac663e7..dcd9a6c7d0 100644
+--- a/xla/service/executable.h
++++ b/xla/service/executable.h
+@@ -18,6 +18,7 @@ limitations under the License.
+ 
+ #include <cstdint>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -369,6 +370,14 @@ class Executable {
+   // Does not include the size of used libraries (e.g. cuDNN, Eigen, etc.).
+   virtual int64_t SizeOfGeneratedCodeInBytes() const;
+ 
++  // The device bytes its allocations hold where its compile stopped at its
++  // memory limit (DebugOptions::xla_gpu_memory_limit_early_exit_bytes): such
++  // an executable states its memory and refuses to run. nullopt for one that
++  // finished, and for a backend with no such limit.
++  virtual std::optional<int64_t> BytesPastMemoryLimit() const {
++    return std::nullopt;
++  }
++
+   // Dumping helpers.
+   void set_hlo_proto(std::unique_ptr<xla::HloProto> hlo_proto) {
+     // Despite the mutex lock, this function is NOT thread-safe.
+diff --git a/xla/service/gpu/gpu_aot_compilation_result.cc b/xla/service/gpu/gpu_aot_compilation_result.cc
+index 9462e41347..6da4d60ac7 100644
+--- a/xla/service/gpu/gpu_aot_compilation_result.cc
++++ b/xla/service/gpu/gpu_aot_compilation_result.cc
+@@ -143,9 +143,20 @@ const GpuExecutableProto& GpuAotCompilationResult::GetExecutableProto() const {
+ 
+ absl::StatusOr<CompiledMemoryStats>
+ GpuAotCompilationResult::GetCompiledMemoryStats() const {
+-  return CompiledMemoryStats::FromBufferAssignment(
+-      GetExecutableProto().buffer_assignment(),
+-      GetExecutableProto().hlo_module_with_config().hlo_module());
++  ABSL_ASSIGN_OR_RETURN(
++      CompiledMemoryStats stats,
++      CompiledMemoryStats::FromBufferAssignment(
++          GetExecutableProto().buffer_assignment(),
++          GetExecutableProto().hlo_module_with_config().hlo_module()));
++  // Stopped at its memory limit as GpuExecutable reads it
++  // (DeviceBytesOverMemoryLimit): its device bytes past a positive limit.
++  const int64_t limit = GetExecutableProto().memory_limit_early_exit_bytes();
++  stats.stopped_at_memory_limit =
++      limit > 0 && stats.argument_size_in_bytes + stats.output_size_in_bytes -
++                           stats.alias_size_in_bytes +
++                           stats.temp_size_in_bytes >
++                       limit;
++  return stats;
+ }
+ 
+ }  // namespace xla::gpu
+diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
+index 60950cabbb..1848c2f54e 100644
+--- a/xla/service/gpu/gpu_executable.cc
++++ b/xla/service/gpu/gpu_executable.cc
+@@ -1567,11 +1567,21 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+ 
+   *proto.mutable_buffer_assignment() = buffer_assignment_proto_;
+   proto.set_buffer_allocations_debug_summary(buffer_allocations_debug_summary_);
+-  proto.set_memory_limit_early_exit_bytes(memory_limit_early_exit_bytes_);
++  // A finished executable is the same under any limit it fits: it states
++  // none, so its bytes are too (a stopped one keeps its own, which refuses it).
++  const bool stopped = over_memory_limit_.has_value();
++  proto.set_memory_limit_early_exit_bytes(
++      stopped ? memory_limit_early_exit_bytes_ : 0);
+ 
+   if (has_module()) {
+     *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
+         HloProtoOptions{/*deduplicate_backend_config=*/true});
++    if (!stopped) {
++      proto.mutable_hlo_module_with_config()
++          ->mutable_config()
++          ->mutable_debug_options()
++          ->clear_xla_gpu_memory_limit_early_exit_bytes();
++    }
+   }
+ 
+   proto.mutable_output_info_map()->Reserve(output_info_.size());
+diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
+index c3d37208f3..1d1f11b6c1 100644
+--- a/xla/service/gpu/gpu_executable.h
++++ b/xla/service/gpu/gpu_executable.h
+@@ -141,6 +141,10 @@ class GpuExecutable : public Executable {
+   static absl::StatusOr<std::unique_ptr<GpuExecutable>> Create(Params params);
+   ~GpuExecutable() override;
+ 
++  std::optional<int64_t> BytesPastMemoryLimit() const override {
++    return over_memory_limit_;
++  }
++
+   int64_t SizeOfGeneratedCodeInBytes() const override;
+ 
+   absl::string_view name() const override { return module_name_; }
+@@ -437,7 +441,9 @@ class GpuExecutable : public Executable {
+ 
+   // The xla_gpu_memory_limit_early_exit_bytes it was compiled under, and the
+   // device bytes its allocations hold where they exceed it: its compile stopped
+-  // after buffer assignment, and executing it fails.
++  // after buffer assignment, and executing it fails. A finished executable
++  // serializes no limit (`ToProto`): its bytes are the same under any limit it
++  // fits, as its persistent cache key is.
+   const int64_t memory_limit_early_exit_bytes_;
+   const std::optional<int64_t> over_memory_limit_;
+ };

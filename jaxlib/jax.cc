@@ -681,6 +681,8 @@ NB_MODULE(_jax, m) {
               &xla::CompiledMemoryStats::indefinite_allocations)
       .def_rw("peak_unpadded_heap_bytes",
               &xla::CompiledMemoryStats::peak_unpadded_heap_bytes)
+      .def_rw("stopped_at_memory_limit",
+              &xla::CompiledMemoryStats::stopped_at_memory_limit)
       .def("__str__", &xla::CompiledMemoryStats::DebugString);
 
   m.def("get_execution_stream_id", []() { return GetExecutionStreamId(); });

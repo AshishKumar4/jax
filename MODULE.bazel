@@ -155,6 +155,10 @@ archive_override(
         # bump): a while loop's thunk returns before its collective starts, so the next loops' collectives took
         # every worker and a multi-device CPU program hung (row 5397: 11 of 12 processes of a plain JAX program).
         "//third_party:xla/cpu_collective_execution_edges.patch",
+        # A finished GPU compile serializes no memory limit and its memory stats
+        # say whether it stopped at one, so its bytes are one under any limit it
+        # fits and jax writes no stopped compile to its cache.
+        "//third_party:xla/memory_limit_canonical.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
