@@ -21,7 +21,6 @@ from collections.abc import Sequence
 import copy
 import enum
 from functools import partial
-import hashlib
 import logging
 import os
 import time
@@ -735,9 +734,9 @@ def _compile_and_share_module(
     first_process_id: int
 ) -> xc.LoadedExecutable:
   share_timeout = config.share_binary_between_hosts_timeout_ms.value
-  # What the hosts share is keyed by the whole compile, its memory limit with
-  # it: a compile stopped at a smaller limit serves no request at a larger one,
-  # as the disk cache, which writes no stopped compile, can key without it.
+  # What the hosts share is keyed by its memory limit too: a compile stopped at
+  # a smaller limit serves no request at a larger one, as the disk cache, which
+  # writes no stopped compile, can key without it.
   shared = _shared_key(cache_key, compile_options)
 
   if shared in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
@@ -778,13 +777,28 @@ def _compile_and_share_module(
 
 
 def _shared_key(cache_key: str, compile_options: xc.CompileOptions) -> str:
-  """`cache_key` with the whole of `compile_options` and XLA_FLAGS hashed
-  beside it: what hosts sharing a compile, and a process keeping one, key it
-  by, so options the disk cache's key leaves out (a GPU memory limit) part
-  what they share."""
-  whole = hashlib.sha256(compile_options.SerializeAsString())
-  whole.update(os.environ.get("XLA_FLAGS", "").encode())
-  return f"{cache_key}-{whole.hexdigest()[:16]}"
+  """`cache_key` and the GPU memory limit the compile takes (`_memory_limit`):
+  what hosts sharing a compile, and a process keeping one, key it by, so a
+  compile stopped at a smaller limit serves no request at a larger one, every
+  other option as the disk key reads it, alike across hosts."""
+  return f"{cache_key}-limit{_memory_limit(compile_options)}"
+
+
+def _memory_limit(compile_options: xc.CompileOptions) -> int:
+  """The xla_gpu_memory_limit_early_exit_bytes a compile takes, as XLA reads it:
+  its last override, else its debug option, else XLA_FLAGS' last; 0 for none."""
+  overridden = [
+      value for name, value in compile_options.env_option_overrides
+      if name.lstrip("-") == "xla_gpu_memory_limit_early_exit_bytes"]
+  if overridden:
+    return int(overridden[-1])
+  debug_options = compile_options.executable_build_options.debug_options
+  if debug_options.xla_gpu_memory_limit_early_exit_bytes:
+    return int(debug_options.xla_gpu_memory_limit_early_exit_bytes)
+  flagged = [flag.partition("=")[2]
+             for flag in os.environ.get("XLA_FLAGS", "").split()
+             if flag.startswith("--xla_gpu_memory_limit_early_exit_bytes=")]
+  return int(flagged[-1]) if flagged else 0
 
 
 _compile_and_share_module.modules_cache = {}  # pyrefly: ignore[missing-attribute]
