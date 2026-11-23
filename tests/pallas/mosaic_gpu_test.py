@@ -39,6 +39,7 @@ from jax.extend import core as jex_core
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import dtypes
+from jax._src import hijax
 from jax._src import test_util as jtu
 from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
@@ -384,6 +385,168 @@ class PredicateReductionLoweringTest(jtu.JaxTestCase):
       jax.jit(kernel).trace(
           jax.ShapeDtypeStruct((128, 128), jnp.float32)
       ).lower(lowering_platforms=("cuda",))
+
+
+class _HiSquare(hijax.HiPrim):
+  """Minimal HiPrim for testing call_hi_primitive_p in Mosaic GPU kernels."""
+
+  def __init__(self, in_aval):
+    self.in_avals = (in_aval,)
+    self.out_aval = in_aval
+    self.params = {}
+    super().__init__()
+
+  def expand(self, x):
+    return x * x
+
+
+class WarpgroupLoweringRulesTest(jtu.JaxTestCase):
+  """CPU-runnable lowering tests for Warpgroup semantics primitives:
+  stop_gradient, split, nextafter, call_hi_primitive, unit-stride slice, and
+  partial-axis reduce_or."""
+
+  @staticmethod
+  def _lower_for(capability: str, kernel, *specs):
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      return jax.jit(kernel).trace(*specs).lower(lowering_platforms=("cuda",))
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_stop_gradient_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      plgpu.store(o_ref, lax.stop_gradient(x) + 1.0, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_split_lowers_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      left, right = lax.split(x, (32, 32), axis=1)
+      plgpu.store(o_ref, left + right, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_nextafter_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, y_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      y = plgpu.load(y_ref, optimized=False)
+      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
+
+    spec = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+    self._lower_for(capability, kernel, spec, spec)
+
+  def test_nextafter_rejects_non_float32_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float16),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, y_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      y = plgpu.load(y_ref, optimized=False)
+      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
+
+    spec = jax.ShapeDtypeStruct((64, 64), jnp.float16)
+    with self.assertRaisesRegex(NotImplementedError, "float32"):
+      self._lower_for("9.0", kernel, spec, spec)
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_call_hi_primitive_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      sq = _HiSquare(jax_core.typeof(x))(x)
+      plgpu.store(o_ref, sq, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_unit_stride_slice_lowers_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      sliced = lax.slice(x, (0, 32), (128, 64), strides=(1, 1))
+      plgpu.store(o_ref, sliced, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  def test_non_unit_stride_slice_rejected_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      sliced = lax.slice(x, (0, 0), (64, 64), strides=(2, 1))
+      plgpu.store(o_ref, sliced, optimized=False)
+
+    with self.assertRaisesRegex(NotImplementedError, "Strides are not supported"):
+      self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_partial_reduce_or_lowers_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128,), jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      any_pos = lax.reduce_or(x > 0, axes=(1,))
+      plgpu.store(o_ref, any_pos.astype(jnp.int32), optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
 
 
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
@@ -6600,6 +6763,94 @@ class PallasCallWGTest(
     )
     self.assertLen(kernel_hashes, 2)
     self.assertLen(set(kernel_hashes), 1)
+
+  @run_on_sm80
+  def test_stop_gradient_wg(self):
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      plgpu.store(o_ref, lax.stop_gradient(x) + 1.0, optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), x + 1.0)
+
+  @run_on_sm80
+  def test_split_and_unit_stride_slice_wg(self):
+    layout = plgpu.Layout.MMA_ACC(jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 32), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      left, right = lax.split(x, (32, 32), axis=1)
+      tail = lax.slice(x, (0, 32), (64, 64), strides=(1, 1))
+      plgpu.store(o_ref, left + right + tail, optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), x[:, :32] + 2.0 * x[:, 32:])
+
+  @run_on_sm80
+  def test_nextafter_f32_wg(self):
+    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
+    def kernel(x_ref, y_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      y = plgpu.load(y_ref, optimized=False)
+      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
+
+    specials_x = np.array([
+        0.0, 0.0, -0.0, -0.0, -0.0, 0.0,
+        1.0, 1.0, -1.0, -1.0, 1.0,
+        np.float32(np.ldexp(1.0, -149)), -np.float32(np.ldexp(1.0, -149)),
+        np.finfo(np.float32).max, -np.finfo(np.float32).max,
+        np.inf, -np.inf, np.inf, np.nan, 1.0,
+    ], dtype=np.float32)
+    specials_y = np.array([
+        1.0, -1.0, 1.0, -1.0, 0.0, -0.0,
+        2.0, 0.0, -2.0, 0.0, 1.0,
+        0.0, 0.0,
+        np.inf, -np.inf,
+        0.0, 0.0, np.inf, 1.0, np.nan,
+    ], dtype=np.float32)
+    rng = np.random.default_rng(0)
+    pad = 128 - len(specials_x)
+    x = np.concatenate([specials_x, rng.standard_normal(pad).astype(np.float32)])
+    y = np.concatenate([specials_y, rng.standard_normal(pad).astype(np.float32)])
+    got = np.asarray(kernel(jnp.asarray(x), jnp.asarray(y)))
+    ref = np.nextafter(x, y)
+    nan_mask = np.isnan(ref)
+    np.testing.assert_array_equal(np.isnan(got), nan_mask)
+    np.testing.assert_array_equal(
+        got[~nan_mask].view(np.uint32), ref[~nan_mask].view(np.uint32)
+    )
+
+  @run_on_sm80
+  def test_call_hi_primitive_wg(self):
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      plgpu.store(o_ref, _HiSquare(jax_core.typeof(x))(x), optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), x * x)
+
+  @run_on_sm80
+  def test_partial_reduce_or_wg(self):
+    layout = plgpu.Layout.MMA_ACC(jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64,), jnp.int32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      plgpu.store(
+          o_ref, lax.reduce_or(x > 0, axes=(1,)).astype(jnp.int32),
+          optimized=False,
+      )
+
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-1.0, 0.02, (64, 64)).astype(np.float32)
+    x[0, :] = -1.0
+    x[1, 37] = 1.0
+    np.testing.assert_array_equal(
+        kernel(jnp.asarray(x)), np.any(x > 0, axis=1).astype(np.int32)
+    )
 
 
 class PallasCallSm90ATest(PallasSm90ATest):
