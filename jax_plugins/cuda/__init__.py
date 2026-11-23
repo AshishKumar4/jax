@@ -87,15 +87,22 @@ def _stub_string(symbol: str) -> str | None:
     _ctypes.dlclose(plugin._handle)
 
 
-def nvjitlink_build_id() -> str | None:
+def nvjitlink_build_id(resolve: bool = False) -> str | None:
   """The GNU build id, in hex, of the nvJitLink library XLA's nvJitLink stub in
   this plugin loaded, read from its mapping in this process: the identity of
   the linker code XLA runs, whatever became of its file since. None where the
   stub has loaded none (every PTX compile so far ptxas's), the plugin states no
   such export, or the library states no build id. That the stub loaded the
   library is no proof every kernel linked with it: XLA's automatic mode loads
-  it to read its version, and compiles by ptxas below 12.5."""
-  return _stub_string("XlaNvJitLinkBuildId")
+  it to read its version, and compiles by ptxas below 12.5.
+
+  With `resolve`, the stub first loads the library as a compile does, where it
+  has not yet (the loader's own search, whatever it finds), so the build id
+  names the library XLA would link with before its first compile: None where no
+  library loads (ptxas assembles). Idempotent and cheap after the first call.
+  Either way, the plugin must be loaded (a CUDA backend initialized)."""
+  return _stub_string(
+      "XlaNvJitLinkResolve" if resolve else "XlaNvJitLinkBuildId")
 
 
 def nvjitlink_library() -> str | None:

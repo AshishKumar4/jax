@@ -55,7 +55,7 @@ index 6757ae9dd1..7b48428d5e 100644
      return handle_or.value();
    }();
    return handle;
-@@ -71,3 +89,123 @@ void _nvjitlink_tramp_resolve(int i) {
+@@ -71,3 +89,138 @@ void _nvjitlink_tramp_resolve(int i) {
  }
  
  }  // extern "C"
@@ -178,4 +178,19 @@ index 6757ae9dd1..7b48428d5e 100644
 +    id = new std::string(std::move(found));
 +  }
 +  return id->c_str();
++}
++
++// The GNU build id, in hex, of the nvJitLink library this stub loads, loading
++// it first as a compile does where it has not yet (the loader's one search,
++// whatever it finds), so a caller keys by the library XLA would link with
++// before its first compile: null where no library loads (ptxas assembles) or
++// it states no build id. Idempotent and cheap after the first call: the stub
++// loads once and keeps its handle, and its build id is kept
++// (`XlaNvJitLinkBuildId`).
++extern "C" __attribute__((visibility("default"))) const char*
++XlaNvJitLinkResolve() {
++  if (GetDsoHandle() == nullptr) {
++    return nullptr;
++  }
++  return XlaNvJitLinkBuildId();
 +}
