@@ -1,0 +1,253 @@
+diff --git a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
+index 4a8fbc3a17..2f4a46e5e0 100644
+--- a/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
++++ b/xla/backends/gpu/codegen/llvm/llvm_emitter.cc
+@@ -714,6 +714,140 @@ absl::StatusOr<LlvmKernelSource> EmitModuleForBitonicSortStage(
+   return LlvmKernelSource(std::move(llvm_context), std::move(llvm_module));
+ }
+ 
++// The elements of a sort's output each thread of its iota copy writes: a
++// packed output's whole bytes (two s4 elements to a byte), so no two threads
++// read, change and write one byte.
++int64_t IotaCopyElementsPerThread(const HloSortInstruction* sort) {
++  int64_t elements = 1;
++  for (const HloInstruction* operand : sort->operands()) {
++    PrimitiveType type = operand->shape().element_type();
++    if (operand->opcode() == HloOpcode::kIota &&
++        primitive_util::IsSubByteNonPredType(type)) {
++      elements =
++          std::max<int64_t>(elements, 8 / primitive_util::BitWidth(type));
++    }
++  }
++  return elements;
++}
++
++// The kernel writing a fused sort's iota outputs, where its sorted dimension
++// holds one element: one elementwise pass, each thread writing
++// `elements_per_thread` consecutive elements of each iota output.
++absl::StatusOr<LlvmKernelSource> EmitModuleForSortIotaCopy(
++    const HloSortInstruction* sort, IrEmitterContext* ir_emitter_context,
++    const std::string& sanitized_kernel_name,
++    const emitters::KernelArguments& kernel_arguments,
++    const LaunchDimensions& launch_dimensions, const Shape& threads_shape,
++    int64_t elements_per_thread) {
++  auto llvm_context = std::make_unique<llvm::LLVMContext>();
++  std::string op_name(sort->name());
++  std::unique_ptr<llvm::Module> llvm_module =
++      ir_emitter_context->CreateLLVMModule(op_name, *llvm_context);
++  IrEmitter ir_emitter(ir_emitter_context, llvm_module.get(),
++                       /*is_nested=*/false);
++  llvm::IRBuilderBase* b = ir_emitter.builder();
++  const HloInstruction* fusion = sort->parent()->FusionInstruction();
++  ABSL_ASSIGN_OR_RETURN(
++      llvm::Function * kernel,
++      BuildKernelPrototype(llvm_module.get(),
++                           ir_emitter_context->gpu_device_info(),
++                           std::string(fusion->name()), sanitized_kernel_name,
++                           kernel_arguments, launch_dimensions, b));
++  std::vector<llvm_ir::IrArray> ir_arrays =
++      IrArraysFor(kernel, kernel_arguments);
++  auto outputs = absl::Span<const llvm_ir::IrArray>(ir_arrays).subspan(
++      fusion->operand_count());
++  const int64_t num_elements = ShapeUtil::ElementsIn(sort->operand(0)->shape());
++  llvm::Type* index_ty = GetIndexTypeForKernel(
++      fusion, launch_dimensions.launch_bound() * elements_per_thread, b);
++  llvm_ir::BodyEmitter write_iotas =
++      [&](const llvm_ir::IrArray::Index& thread) -> absl::Status {
++    for (int64_t offset = 0; offset < elements_per_thread; ++offset) {
++      llvm::Value* element = b->CreateAdd(
++          b->CreateMul(thread.linear(),
++                       llvm::ConstantInt::get(index_ty, elements_per_thread)),
++          llvm::ConstantInt::get(index_ty, offset));
++      // The last thread's bytes may hold fewer elements than the others'.
++      llvm_ir::LlvmIfData in_bounds = llvm_ir::EmitIfThenElse(
++          b->CreateICmpULT(element,
++                           llvm::ConstantInt::get(index_ty, num_elements)),
++          llvm_ir::IrName(op_name, "element_in_bounds"), b,
++          /*emit_else=*/false);
++      llvm_ir::SetToFirstInsertPoint(in_bounds.true_block, b);
++      for (int64_t i = 0; i < sort->operand_count(); ++i) {
++        if (sort->operand(i)->opcode() != HloOpcode::kIota) {
++          continue;
++        }
++        llvm_ir::IrArray::Index index(element, outputs[i].GetShape(), b);
++        ABSL_ASSIGN_OR_RETURN(
++            llvm::Value * value,
++            EmitIota(sort->operand(i), index, llvm_module.get(), b));
++        outputs[i].EmitWriteArrayElement(index, value, b);
++      }
++      llvm_ir::SetToFirstInsertPoint(in_bounds.after_block, b);
++    }
++    return absl::OkStatus();
++  };
++  ABSL_RETURN_IF_ERROR(
++      ParallelLoopEmitter(write_iotas, threads_shape, launch_dimensions, b)
++          .EmitLoop(op_name, index_ty));
++  return LlvmKernelSource(std::move(llvm_context), std::move(llvm_module));
++}
++
++// A sort over a dimension of one element (or none) orders nothing (algsimp
++// removes it; a compile without algsimp reaches here, where a bitonic sort's
++// geometry, Log2Ceiling of the bound, is no stage). Its outputs are its
++// operands, which its caller copied (or aliased), but for an iota fused into
++// it, which one elementwise kernel writes. Newer XLA's sort emitter does the
++// same (BitonicSortKernelSpec::Kind::kIotaCopy): a rebase onto it drops this.
++AsyncThunkSequence EmitSortOverSizeOne(const HloSortInstruction* sort,
++                                       IrEmitterContext* ir_emitter_context) {
++  const Shape& keys_shape = sort->operand(0)->shape();
++  bool fused_iota =
++      sort->parent()->IsFusionComputation() &&
++      absl::c_any_of(sort->operands(), [](const HloInstruction* operand) {
++        return operand->opcode() == HloOpcode::kIota;
++      });
++  if (!fused_iota || ShapeUtil::IsZeroElementArray(keys_shape)) {
++    return ThunkSequence::Empty();
++  }
++  const HloInstruction* fusion = sort->parent()->FusionInstruction();
++  const auto& device_info = ir_emitter_context->gpu_device_info();
++  int64_t elements_per_thread = IotaCopyElementsPerThread(sort);
++  Shape threads_shape = ShapeUtil::MakeShape(
++      U8,
++      {CeilOfRatio(ShapeUtil::ElementsIn(keys_shape), elements_per_thread)});
++  LaunchDimensions launch_dimensions =
++      CalculateLaunchDimensions(threads_shape, device_info);
++  // Blocks past the x grid's limit go to y, which ParallelLoopEmitter takes
++  // none of: the x grid at its limit, its loop strides over the rest.
++  if (launch_dimensions.block_counts().y > 1) {
++    launch_dimensions =
++        LaunchDimensions(device_info.block_dim_limit().x,
++                         launch_dimensions.thread_counts_per_block().x);
++  }
++  std::string sanitized_kernel_name =
++      ir_emitter_context->GetSanitizedUniqueName(std::string(sort->name()));
++  ABSL_ASSIGN_OR_RETURN(auto kernel_arguments,
++                        emitters::KernelArguments::Create(
++                            ir_emitter_context->buffer_assignment(),
++                            GetDefaultBufferAlignment(), fusion));
++  ABSL_ASSIGN_OR_RETURN(
++      LlvmKernelSource llvm_kernel_source,
++      EmitModuleForSortIotaCopy(sort, ir_emitter_context,
++                                sanitized_kernel_name, kernel_arguments,
++                                launch_dimensions, threads_shape,
++                                elements_per_thread));
++  return ir_emitter_context->kernel_compiler()
++      ->Compile(Thunk::ThunkInfo::WithProfileAnnotation(
++                    fusion, ir_emitter_context->GetNextThunkId()),
++                std::move(llvm_kernel_source), sanitized_kernel_name,
++                kernel_arguments, launch_dimensions)
++      .Map([](std::unique_ptr<Thunk> thunk) {
++        return ThunkSequence::Of(std::move(thunk));
++      });
++}
++
+ }  // namespace
+ 
+ void AppendGlobalConstant(llvm::Module* module, int64_t num_elements,
+@@ -776,6 +910,9 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
+   int64_t dimension_to_sort = sort->sort_dimension();
+   const Shape& keys_shape = sort->operand(0)->shape();
+   uint64_t dimension_to_sort_bound = keys_shape.dimensions(dimension_to_sort);
++  if (dimension_to_sort_bound <= 1) {
++    return EmitSortOverSizeOne(sort, ir_emitter_context);
++  }
+   int64_t num_stages = Log2Ceiling(dimension_to_sort_bound);
+   VLOG(2) << op_name << " requires " << num_stages << " stages.";
+   CHECK_GE(1ULL << num_stages, dimension_to_sort_bound);
+diff --git a/xla/backends/gpu/tests/sorting_test.cc b/xla/backends/gpu/tests/sorting_test.cc
+index fa61317bff..e16c486092 100644
+--- a/xla/backends/gpu/tests/sorting_test.cc
++++ b/xla/backends/gpu/tests/sorting_test.cc
+@@ -125,6 +125,93 @@ ENTRY TestComputation {
+   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
+ }
+ 
++TEST_F(SortingTest, ASortOverASizeOneDimensionReturnsItsOperands) {
++  // A key, a value and an iota sorted over one element: no pass removes the
++  // sort, so the emitter takes a dimension of one (it aborted shifting by -1).
++  const char* hlo_text = R"(
++HloModule TestModule
++
++compare {
++  p.0.lhs = s32[] parameter(0)
++  p.0.rhs = s32[] parameter(1)
++  p.1.lhs = s32[] parameter(2)
++  p.1.rhs = s32[] parameter(3)
++  p.2.lhs = s32[] parameter(4)
++  p.2.rhs = s32[] parameter(5)
++  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
++}
++
++ENTRY TestComputation {
++  keys = s32[1] parameter(0)
++  values = s32[1] parameter(1)
++  iota = s32[1] iota(), iota_dimension=0
++  ROOT sort = (s32[1], s32[1], s32[1]) sort(keys, values, iota),
++    dimensions={0}, to_apply=compare
++}
++)";
++  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{0, 0}));
++}
++
++TEST_F(SortingTest, ASortFusionOverASizeOneDimensionWritesItsIota) {
++  // Sorted over a dimension of one, its iota counting the other dimension:
++  // the fusion writes the iota, its keys as they came.
++  const char* hlo_text = R"(
++HloModule TestModule
++
++compare {
++  p.0.lhs = f32[] parameter(0)
++  p.0.rhs = f32[] parameter(1)
++  p.1.lhs = s32[] parameter(2)
++  p.1.rhs = s32[] parameter(3)
++  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
++}
++
++sort_fusion {
++  keys = f32[4,1]{1,0} parameter(0)
++  iota = s32[4,1]{1,0} iota(), iota_dimension=0
++  ROOT sort = (f32[4,1]{1,0}, s32[4,1]{1,0}) sort(keys, iota), dimensions={1},
++    to_apply=compare
++}
++
++ENTRY TestComputation {
++  keys = f32[4,1]{1,0} parameter(0)
++  ROOT fusion = (f32[4,1]{1,0}, s32[4,1]{1,0}) fusion(keys), kind=kCustom,
++    calls=sort_fusion
++}
++)";
++  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{0, 0}));
++}
++
++TEST_F(SortingTest, ASortFusionOverASizeOneDimensionWritesItsPackedIota) {
++  // Its s4 iota packs two rows to a byte, an odd count of them leaving the
++  // last byte half used: each byte is written whole by one thread.
++  const char* hlo_text = R"(
++HloModule TestModule
++
++compare {
++  p.0.lhs = s32[] parameter(0)
++  p.0.rhs = s32[] parameter(1)
++  p.1.lhs = s4[] parameter(2)
++  p.1.rhs = s4[] parameter(3)
++  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
++}
++
++sort_fusion {
++  keys = s32[5,1]{1,0} parameter(0)
++  iota = s4[5,1]{1,0} iota(), iota_dimension=0
++  ROOT sort = (s32[5,1]{1,0}, s4[5,1]{1,0}) sort(keys, iota), dimensions={1},
++    to_apply=compare
++}
++
++ENTRY TestComputation {
++  keys = s32[5,1]{1,0} parameter(0)
++  ROOT fusion = (s32[5,1]{1,0}, s4[5,1]{1,0}) fusion(keys), kind=kCustom,
++    calls=sort_fusion
++}
++)";
++  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{0, 0}));
++}
++
+ TEST_F(SortingTest, PackedElementType) {
+   const char* hlo_text = R"(
+     HloModule module
