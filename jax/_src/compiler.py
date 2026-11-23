@@ -812,20 +812,19 @@ def _memory_limit(compile_options: xc.CompileOptions) -> int:
 def _stopped_by_memory_limit(executable: Any,
                              compile_options: xc.CompileOptions) -> bool:
   """Whether `executable`'s compile stopped at its memory limit
-  (xla_gpu_memory_limit_early_exit_bytes): the device bytes its memory stats
-  state at once (argument + output - alias + temp, as XLA compares them) past
-  the limit. Its cache key leaves the limit out, so such an executable, which
-  refuses to run, is never written: a run under a larger limit would read it."""
-  limit = _memory_limit(compile_options)
-  if limit <= 0:
+  (xla_gpu_memory_limit_early_exit_bytes), as XLA states it in its memory stats
+  (`stopped_at_memory_limit`). Its cache key leaves the limit out, so such an
+  executable, which refuses to run, is never written: a run under a larger
+  limit would read it. Where its stats cannot say (they raise, or a jaxlib
+  states no such field), a compile under a limit is read as stopped: written
+  never, rather than wrongly."""
+  if _memory_limit(compile_options) <= 0:
     return False
   try:
     stats = executable.get_compiled_memory_stats()
   except (xc.XlaRuntimeError, NotImplementedError):
-    return False
-  held = (stats.argument_size_in_bytes + stats.output_size_in_bytes
-          - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
-  return held > limit
+    return True
+  return bool(getattr(stats, "stopped_at_memory_limit", True))
 
 
 def _should_raise_persistent_cache_error(ex: Exception) -> bool:
