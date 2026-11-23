@@ -487,9 +487,7 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   # here.
   debug_options.xla_gpu_cuda_data_dir = ""
   debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
-  # A jaxlib without Dew's xla-memory-limit-early-exit states no such option.
-  if hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
-    debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
+  debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
   # LINT.ThenChange(:xla_flags)
 
   compile_options_copy.env_option_overrides = [

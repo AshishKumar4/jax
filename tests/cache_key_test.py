@@ -20,6 +20,7 @@ import sys
 import io
 import types
 import unittest
+from unittest import mock
 from typing import cast as type_cast
 
 import numpy as np
@@ -93,11 +94,16 @@ class CacheKeyTest(jtu.JaxTestCase):
           cache_key._hash_serialized_compile_options, options))
     flagged = compiler.get_compile_options(num_replicas=1, num_partitions=1)
     debug_options = flagged.executable_build_options.debug_options
-    if hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
-      debug_options.xla_gpu_memory_limit_early_exit_bytes = 3 << 30
-      keyed.append(self.get_hashed_value(
-          cache_key._hash_serialized_compile_options, flagged))
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 3 << 30
+    keyed.append(self.get_hashed_value(
+        cache_key._hash_serialized_compile_options, flagged))
     self.assertLen(set(keyed), 1)
+    flagged_keys = []
+    for flags in ("", "--xla_gpu_memory_limit_early_exit_bytes=6442450944"):
+      with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
+        flagged_keys.append(
+            self.get_hashed_value(cache_key._hash_xla_flags, []))
+    self.assertLen(set(flagged_keys), 1)
 
   def test_a_compile_requiring_its_autotune_results_keys_as_one_without(self):
     plain = compiler.get_compile_options(num_replicas=1, num_partitions=1)

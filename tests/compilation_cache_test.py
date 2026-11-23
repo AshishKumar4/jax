@@ -22,6 +22,8 @@ import math
 import os
 import platform
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -503,8 +505,8 @@ class CompilationCacheTest(CompilationCacheTestCase):
   def test_a_compile_stopped_at_its_memory_limit_is_not_written(self):
     # Its key leaves the limit out, so a stopped executable, which refuses to
     # run, must not be read by a run under a larger limit: XLA's memory stats
-    # say it stopped; stats that cannot say read as stopped, under a limit.
-    def executable(stopped):
+    # say whether it stopped; on a GPU, stats that cannot say read as stopped.
+    def executable(stopped, raises=False):
       class Stats:
         pass
       stats = Stats()
@@ -513,21 +515,46 @@ class CompilationCacheTest(CompilationCacheTestCase):
 
       class Executable:
         def get_compiled_memory_stats(self):
+          if raises:
+            raise NotImplementedError("no stats")
           return stats
       return Executable()
 
-    def options(limit):
-      found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
-      if limit is not None:
-        found.env_option_overrides = [
-            ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+    def backend(platform):
+      class Backend:
+        pass
+      found = Backend()
+      found.platform = platform
       return found
 
     self.assertEqual(
-        [compiler._stopped_by_memory_limit(executable(stopped), options(limit))
-         for stopped, limit in ((True, None), (True, 1000), (False, 1000),
-                                (None, 1000), (None, None))],
-        [False, True, False, True, False])
+        [compiler._stopped_by_memory_limit(executable(stopped, raises),
+                                           backend(platform))
+         for stopped, raises, platform in (
+             (True, False, "cuda"), (False, False, "cuda"),
+             (None, False, "cuda"), (None, True, "rocm"),
+             (True, False, "cpu"), (None, True, "tpu"))],
+        [True, False, True, True, False, False])
+
+  def test_hosts_share_a_compile_by_its_whole_options_and_its_limit_with_it(
+      self):
+    # The disk cache keys a compile without its limit; what hosts share, and a
+    # process keeps, is keyed by the limit too: a compile stopped at a smaller
+    # limit serves no request at a larger one.
+    def options(limit):
+      found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      found.env_option_overrides = [
+          ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+      return found
+
+    shared = {compiler._shared_key("key", options(limit))
+              for limit in (1, 4 << 30)}
+    self.assertLen(shared, 2)
+    self.assertTrue(all(key.startswith("key-") for key in shared))
+    with mock.patch.dict(os.environ, {
+        "XLA_FLAGS": "--xla_gpu_memory_limit_early_exit_bytes=1"}):
+      flagged = compiler._shared_key("key", options(4 << 30))
+    self.assertNotIn(flagged, shared)
 
   @jtu.run_on_devices("gpu")
   def test_a_finished_compile_is_read_under_any_limit_it_fits(self):
@@ -536,16 +563,52 @@ class CompilationCacheTest(CompilationCacheTestCase):
       config.persistent_cache_min_entry_size_bytes(0),
     ):
       f = jit(lambda x: (x @ x.T).sum())
-      x = jnp.ones((256, 256), jnp.float32)
+      x = jax.device_put(np.ones((256, 256), np.float32))
       lowered = f.lower(x)
       stopped = lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 1})
       self.assertTrue(stopped.memory_analysis().stopped_at_memory_limit)
+      with self.assertRaises(Exception):
+        stopped(x).block_until_ready()
       self.assertEqual(count_cache_items(), 0)
-      lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 4 << 30})
+      large = lowered.compile(
+          {"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
+      self.assertFalse(large.memory_analysis().stopped_at_memory_limit)
       self.assertEqual(count_cache_items(), 1)
+      # A limit never compiled under, smaller and still fitting: read, and run.
       with jtu.count_compilation_after_persistent_cache_miss() as missed:
-        lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
+        small = lowered.compile(
+            {"xla_gpu_memory_limit_early_exit_bytes": 4 << 30})
       self.assertEqual((count_cache_items(), missed()), (1, 0))
+      self.assertEqual(float(small(x)), 256.0 ** 3)
+      # The same bytes under any limit: the contents check finds none differ.
+      cc.reset_cache()
+      with config.compilation_cache_check_contents(True):
+        lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 6 << 30})
+      self.assertEqual(count_cache_items(), 1)
+
+  @jtu.run_on_devices("gpu")
+  def test_a_process_given_its_limit_by_xla_flags_reads_the_same_entry(self):
+    with (
+      config.persistent_cache_min_compile_time_secs(0),
+      config.persistent_cache_min_entry_size_bytes(0),
+    ):
+      f = jit(lambda x: (x @ x.T).sum())
+      f.lower(jax.device_put(np.ones((256, 256), np.float32))).compile()
+      self.assertEqual(count_cache_items(), 1)
+    script = (
+        "import jax, numpy as np\n"
+        "jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)\n"
+        "jax.config.update('jax_persistent_cache_min_entry_size_bytes', 0)\n"
+        "f = jax.jit(lambda x: (x @ x.T).sum())\n"
+        "print(float(f(jax.device_put(np.ones((256, 256), np.float32)))))\n")
+    ran = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        check=True, env={
+            **os.environ,
+            "JAX_COMPILATION_CACHE_DIR": config.compilation_cache_dir.value,
+            "XLA_FLAGS": "--xla_gpu_memory_limit_early_exit_bytes=4294967296"})
+    self.assertEqual(float(ran.stdout.split()[-1]), 256.0 ** 3)
+    self.assertEqual(count_cache_items(), 1)
 
   def test_min_compile_time(self):
     with (
