@@ -5,6 +5,8 @@ VERS_1.0 {
       MosaicGpuCaptureDeviceless;
       MosaicGpuCompile;
       MosaicGpuUnload;
+      XlaNvJitLinkBuildId;
+      XlaNvJitLinkLibrary;
     };
 
   local:
