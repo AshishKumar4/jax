@@ -168,6 +168,11 @@ archive_override(
         # the failure, which its peers return rather than wait for it; and a
         # local clique's rendezvous ends at the termination timeout.
         "//third_party:xla/collective_peer_failure.patch",
+        # A GPU sort over a dimension of one element orders nothing: no kernel,
+        # or one elementwise kernel writing a fused iota, never a stage count
+        # shifted by -1 (a sort algsimp would have removed). Newer XLA's
+        # kIotaCopy does the same: a rebase onto it drops this patch.
+        "//third_party:xla/sort_size_one.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
