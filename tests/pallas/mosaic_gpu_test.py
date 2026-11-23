@@ -5876,10 +5876,10 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       atol = rtol = 1e-12 if dtype == jnp.float64 else 1e-2
       np.testing.assert_allclose(res, ref, atol=atol, rtol=rtol)
 
-  @run_on_sm80
   @parameterized.product(
       m_warps=(1, 2, 4), bounds=((0, 64), (1, 48), (16, 17), (47, 127))
   )
+  @run_on_sm80
   def test_mma_row_bound(self, m_warps, bounds):
     m = 64
     k = 32
