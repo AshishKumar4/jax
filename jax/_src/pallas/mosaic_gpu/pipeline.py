@@ -663,17 +663,19 @@ def emit_pipeline[T](
             raise ValueError("a pipeline body calls its boundary once")
           called.append(True)
           following = next_slot(slot)
-          if barrier_ref is not None:
-            # No copy fills a slot past the last step's: its barrier is not
-            # awaited.
-            lax.cond(
-                step + 1 < num_steps,
-                lambda: gpu_primitives.barrier_wait(barrier_ref.at[following]),
-                lambda: None,
-            )
-          else:
+
+          def read():
+            if barrier_ref is not None:
+              gpu_primitives.barrier_wait(barrier_ref.at[following])
+            return prefetched_at(_inc_grid_by_1(indices, grid), following)
+
+          if barrier_ref is None:
             await_slot(following, next_wait_count)
-          return prefetched_at(_inc_grid_by_1(indices, grid), following)
+          # Past the last step no copy fills `following`: neither its barrier
+          # is awaited nor the prefetch run, and the step's own prefetched
+          # values stand in, unused, their registers' layout and types the
+          # prefetch's own (where values made up would lower otherwise).
+          return lax.cond(step + 1 < num_steps, read, lambda: prefetched)
         extra = (prefetched, boundary)
 
       next_body_carry = body(
@@ -772,96 +774,115 @@ def emit_pipeline[T](
         else (jnp.array(-1),) * len(bref.spec.block_shape)
         for bref in out_brefs
     ]
-    first_prefetched = None
-    if prefetch is not None:
-      # The first step's slots, awaited before the loop as each later step's
-      # are by the step before it (``boundary``): on cp.async, past the
-      # groups the prologue issued after the first step's (a dynamic grid's
-      # count is not known, so all of them).
-      if is_cp_async:
-        first_wait = 0 if has_dynamic_grid else (
-            (prologue_steps - 1) * copies_per_step
-        )
-        await_slot(jnp.asarray(0, dtype=jnp.int32), first_wait)
-      elif barrier_ref is not None:
-        lax.cond(
-            num_steps > 0,
-            lambda: gpu_primitives.barrier_wait(barrier_ref.at[0]),
-            lambda: None,
-        )
-      first_prefetched = prefetched_at(indices, jnp.asarray(0, dtype=jnp.int32))
-    init_loop_carry = (
-        indices,
-        fetch_index_levels,
-        last_store_indices,
-        init_carry,
-        jnp.asarray(0, dtype=jnp.int32),
-        tuple(
-            jnp.asarray(
-                (max_concurrent_steps - delay_release - lead)
-                % max_concurrent_steps,
-                dtype=jnp.int32,
-            )
-            for delay_release in delay_release_levels
-        ),
-        first_prefetched,
-    )
-    if is_cp_async and copies_per_step > 0:
-      if has_dynamic_grid:
-        # A weakly typed literal (the count's dtype under x64 too), not
-        # `zeros_like(num_steps)`, which inherits the count's sharding where its
-        # operands sit on a concrete mesh and binds a reshard of the literal
-        # inside the kernel.
-        steady_steps = jnp.maximum(
-            num_steps - (max_concurrent_steps - 1 - lead), 0
-        )
-      else:
-        steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
-      steady_wait = (max_concurrent_steps - 1 - lead) * copies_per_step
+    def run(carry):
+      first_prefetched = None
       if prefetch is not None:
-        # A steady step's ``boundary`` awaits the next step's slots at the
-        # steady count, as the next step itself would, but the last steady
-        # step's next one is the drain's first, which waits for one group
-        # fewer (no step past the grid fetched): it drains with exact counts.
-        steady_steps = (
-            jnp.maximum(steady_steps - 1, 0) if has_dynamic_grid
-            else max(0, steady_steps - 1)
-        )
-      loop_carry = lax.fori_loop(
-          0,
-          steady_steps,
-          functools.partial(
-              loop_body, wait_count=steady_wait, next_wait_count=steady_wait,
-          ),
-          init_loop_carry,
-      )
-      if has_dynamic_grid:
-        # cp.async.wait_group requires an immediate operand. We await all
-        # in-flight copies upfront to avoid unrolling the drain.
-        # TODO(slebedev): Consider branching on the number of remaining steps
-        # via ``pl.when`` to generate unrolled drain variants with precise wait
-        # counts, recovering the copy-compute overlap.
-        loop_carry = lax.fori_loop(
-            steady_steps,
-            num_steps,
-            functools.partial(loop_body, wait_count=0, next_wait_count=0),
-            loop_carry,
-        )
-      else:
-        # cp.async wait-group must be a compile-time constant. Drain steps are
-        # unrolled with decreasing wait counts (down to 0).
-        for step in range(steady_steps, num_steps):
-          loop_carry = loop_body(
-              jnp.asarray(step),
-              loop_carry,
-              wait_count=(num_steps - 1 - step) * copies_per_step,
-              next_wait_count=max(0, num_steps - 2 - step) * copies_per_step,
+        # The first step's slots, awaited before the loop as each later step's
+        # are by the step before it (``boundary``): on cp.async, past the
+        # groups the prologue issued after the first step's (a dynamic grid's
+        # count is not known, so all of them).
+        if is_cp_async:
+          first_wait = 0 if has_dynamic_grid else (
+              (prologue_steps - 1) * copies_per_step
           )
-      last_indices, _, _, final_carry, _, _, _ = loop_carry
-    else:
-      last_indices, _, _, final_carry, _, _, _ = lax.fori_loop(
-          0, num_steps, loop_body, init_loop_carry,
+          await_slot(jnp.asarray(0, dtype=jnp.int32), first_wait)
+        elif barrier_ref is not None:
+          gpu_primitives.barrier_wait(barrier_ref.at[0])
+        first_prefetched = prefetched_at(
+            indices, jnp.asarray(0, dtype=jnp.int32)
+        )
+      init_loop_carry = (
+          indices,
+          fetch_index_levels,
+          last_store_indices,
+          carry,
+          jnp.asarray(0, dtype=jnp.int32),
+          tuple(
+              jnp.asarray(
+                  (max_concurrent_steps - delay_release - lead)
+                  % max_concurrent_steps,
+                  dtype=jnp.int32,
+              )
+              for delay_release in delay_release_levels
+          ),
+          first_prefetched,
       )
+      if is_cp_async and copies_per_step > 0:
+        if has_dynamic_grid:
+          # A weakly typed literal (the count's dtype under x64 too), not
+          # `zeros_like(num_steps)`, which inherits the count's sharding where
+          # its operands sit on a concrete mesh and binds a reshard of the
+          # literal inside the kernel.
+          steady_steps = jnp.maximum(
+              num_steps - (max_concurrent_steps - 1 - lead), 0
+          )
+        else:
+          steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
+        steady_wait = (max_concurrent_steps - 1 - lead) * copies_per_step
+        if prefetch is not None:
+          # A steady step's ``boundary`` awaits the next step's slots at the
+          # steady count, as the next step itself would, but the last steady
+          # step's next one is the drain's first, which waits for one group
+          # fewer (no step past the grid fetched): it drains with exact counts.
+          steady_steps = (
+              jnp.maximum(steady_steps - 1, 0) if has_dynamic_grid
+              else max(0, steady_steps - 1)
+          )
+        loop_carry = lax.fori_loop(
+            0,
+            steady_steps,
+            functools.partial(
+                loop_body, wait_count=steady_wait, next_wait_count=steady_wait,
+            ),
+            init_loop_carry,
+        )
+        if has_dynamic_grid:
+          # cp.async.wait_group requires an immediate operand. We await all
+          # in-flight copies upfront to avoid unrolling the drain.
+          # TODO(slebedev): Consider branching on the number of remaining
+          # steps via ``pl.when`` to generate unrolled drain variants with
+          # precise wait counts, recovering the copy-compute overlap.
+          loop_carry = lax.fori_loop(
+              steady_steps,
+              num_steps,
+              functools.partial(loop_body, wait_count=0, next_wait_count=0),
+              loop_carry,
+          )
+        else:
+          # cp.async wait-group must be a compile-time constant. Drain steps are
+          # unrolled with decreasing wait counts (down to 0).
+          for step in range(steady_steps, num_steps):
+            loop_carry = loop_body(
+                jnp.asarray(step),
+                loop_carry,
+                wait_count=(num_steps - 1 - step) * copies_per_step,
+                next_wait_count=max(0, num_steps - 2 - step) * copies_per_step,
+            )
+        last_indices, _, _, final_carry, _, _, _ = loop_carry
+      else:
+        last_indices, _, _, final_carry, _, _, _ = lax.fori_loop(
+            0, num_steps, loop_body, init_loop_carry,
+        )
+      return last_indices, final_carry
+
+    if prefetch is not None and has_dynamic_grid:
+      # A dynamic grid of no steps fills no slot: its first prefetch and its
+      # loop run under the grid's count, so no prefetch runs and no slot is
+      # read, and only the body's carry crosses the guard. The loop gives its
+      # carry the types its body does (a weak float's promoted to a narrower
+      # one), which the guard's other arm gives the initial carry too.
+      _, carried = jax.eval_shape(run, init_carry)
+
+      def skip(carry):
+        return indices, jax.tree.map(
+            lambda value, aval: lax.convert_element_type(value, aval.dtype),
+            carry,
+            carried,
+        )
+
+      last_indices, final_carry = lax.cond(num_steps > 0, run, skip, init_carry)
+    else:
+      last_indices, final_carry = run(init_carry)
 
     # Outputs invariant to the sequential axis are never written from inside the
     # loop. This is the only place where we store them.
