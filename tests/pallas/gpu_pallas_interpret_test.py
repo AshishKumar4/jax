@@ -247,6 +247,46 @@ class InterpretTest(jtu.JaxTestCase):
 
     np.testing.assert_equal(jax.jit(_kernel)(), np.arange(num_threads))
 
+  @jtu.parameterized.product(steps=(0, 1, 3), dynamic=(False, True))
+  def test_pipeline_prefetch_reads_only_the_slots_a_copy_filled(
+      self, steps, dynamic
+  ):
+    # The prefetch runs at each step's boundary for the step after, and
+    # before the loop for the first: once a step, never for a step past the
+    # last or the first of none (its slot holds no copy's values).
+    rows, width = 8, 128
+    if steps == 0 and not dynamic:
+      self.skipTest("a static grid of no steps runs no pipeline")
+
+    def kernel(n_ref, x_ref, count_ref):
+      count_ref[0] = 0
+      grid = (n_ref[0],) if dynamic else (steps,)
+
+      def step(indices, x_smem, prefetched, boundary):
+        del indices, x_smem, prefetched
+        return boundary()
+
+      def prefetch(indices, x_smem):
+        del indices
+        count_ref[0] += 1
+        return x_smem[0]
+
+      plgpu.emit_pipeline(
+          step,
+          grid=grid,
+          in_specs=[plgpu.BlockSpec((rows, width), lambda i: (i, 0))],
+          max_concurrent_steps=2,
+          prefetch=prefetch,
+      )(x_ref)
+
+    x = jnp.zeros((max(steps, 1) * rows, width), jnp.float32)
+    count = plgpu.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((1,), jnp.int32),
+        interpret=InterpretParams(),
+    )(jnp.array([steps], jnp.int32), x)
+    self.assertEqual(int(count[0]), steps)
+
   @jtu.parameterized.product(steps=(1, 2, 5), stages=(2, 3), carried=(False, True))
   def test_pipeline_prefetch_reads_each_steps_first_values_at_the_step_before(
       self, steps, stages, carried

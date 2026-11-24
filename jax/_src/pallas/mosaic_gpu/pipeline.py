@@ -630,6 +630,17 @@ def emit_pipeline[T](
           indices, *(bref.get_ref_for_slot(slot) for bref in in_brefs)
       )
 
+    def prefetched_if(filled, indices, slot):
+      """The prefetch of `slot` where `filled`, else zeros of its type: a slot
+      no copy filled (past the last step, or the first of none) is not read."""
+      def read():
+        return prefetched_at(indices, slot)
+      def zeros():
+        return jax.tree.map(
+            lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(read)
+        )
+      return lax.cond(filled, read, zeros)
+
     def loop_body(step, carry, *, wait_count=0, next_wait_count=0):
       (indices, fetch_index_levels, last_store_indices, prev_body_carry,
        slot, fetch_slots, prefetched) = carry
@@ -673,7 +684,9 @@ def emit_pipeline[T](
             )
           else:
             await_slot(following, next_wait_count)
-          return prefetched_at(_inc_grid_by_1(indices, grid), following)
+          return prefetched_if(
+              step + 1 < num_steps, _inc_grid_by_1(indices, grid), following
+          )
         extra = (prefetched, boundary)
 
       next_body_carry = body(
@@ -789,7 +802,9 @@ def emit_pipeline[T](
             lambda: gpu_primitives.barrier_wait(barrier_ref.at[0]),
             lambda: None,
         )
-      first_prefetched = prefetched_at(indices, jnp.asarray(0, dtype=jnp.int32))
+      first_prefetched = prefetched_if(
+          num_steps > 0, indices, jnp.asarray(0, dtype=jnp.int32)
+      )
     init_loop_carry = (
         indices,
         fetch_index_levels,
