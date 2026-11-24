@@ -10,29 +10,70 @@ index 1cf566dfbd..d58ced8d3f 100644
          "//xla:shape_util",
          "//xla:status_macros",
          "//xla:types",
+diff --git a/xla/service/gpu/compile_module_to_llvm_ir.cc b/xla/service/gpu/compile_module_to_llvm_ir.cc
+index fa1250ec34..1ae0011974 100644
+--- a/xla/service/gpu/compile_module_to_llvm_ir.cc
++++ b/xla/service/gpu/compile_module_to_llvm_ir.cc
+@@ -254,6 +254,14 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+         std::make_unique<SequentialThunk>(Thunk::ThunkInfo{}, ThunkSequence{});
+     return results;
+   }
++  // A hollowed module's arguments and new outputs passed the limit, which its
++  // buffer assignment's bytes hold: one under it would run zeros.
++  if (hlo_module->frontend_attributes().map().contains(kMemoryLimitHollowed)) {
++    return absl::InternalError(absl::StrCat(
++        "Module ", hlo_module->name(),
++        " was hollowed over its compile's memory limit, yet its buffer "
++        "assignment is within it"));
++  }
+ 
+   VLOG(1) << "After optimization module fingerprint for " << hlo_module->name()
+           << ": " << hlo_module->GetFingerprint128();
+diff --git a/xla/service/gpu/compile_module_to_llvm_ir.h b/xla/service/gpu/compile_module_to_llvm_ir.h
+index f024b7cdc9..240fcf5ac9 100644
+--- a/xla/service/gpu/compile_module_to_llvm_ir.h
++++ b/xla/service/gpu/compile_module_to_llvm_ir.h
+@@ -69,6 +69,11 @@ absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
+     const HloModule* module, const GpuAliasInfo* alias_info,
+     BufferValue::SizeFunction buffer_size_bytes_function);
+ 
++// The module attribute HollowEntryOverMemoryLimit (gpu_compiler.cc) marks a
++// module with: its entry's outputs are zeros, so its compile must stop past
++// its memory limit, never emit code.
++inline constexpr char kMemoryLimitHollowed[] = "xla_gpu_memory_limit_hollowed";
++
+ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
+     const HloModule* hlo_module, llvm::LLVMContext* llvm_context,
+     const std::string& target_triple, const std::string& data_layout,
 diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
-index 9025596b36..063dd8fece 100644
+index 9025596b36..9ace172c84 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -334,6 +334,7 @@ limitations under the License.
- #include "xla/service/while_loop_simplifier.h"
- #include "xla/service/xla_transform.h"
- #include "xla/shape.h"
+@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
++#include "xla/layout.h"
 +#include "xla/literal_util.h"
- #include "xla/shape_util.h"
- #include "xla/status_macros.h"
- #include "xla/stream_executor/abi/executable_abi_version.h"
-@@ -1398,6 +1399,89 @@ absl::Status RunCollectiveOptimizationPasses(
+ #include "xla/service/gpu/gpu_compiler.h"
+ 
+ #include <algorithm>
+@@ -1398,6 +1400,98 @@ absl::Status RunCollectiveOptimizationPasses(
        .status();
  }
  
-+// Each array of `shape` (its leaves), as layout assignment left it, in bytes.
++// Each array of `shape` (its leaves) in device memory, as layout assignment
++// left it, in bytes: a leaf in host memory is none of a compile's device bytes
++// (CompiledMemoryStats counts it apart).
 +int64_t ArrayBytes(const Shape& shape,
 +                   const std::function<bool(const ShapeIndex&)>& counted) {
 +  int64_t bytes = 0;
 +  ShapeUtil::ForEachSubshape(
 +      shape, [&](const Shape& subshape, const ShapeIndex& index) {
-+        if (subshape.IsArray() && counted(index)) {
++        const bool host =
++            subshape.has_layout() &&
++            subshape.layout().memory_space() == Layout::kHostMemorySpace;
++        if (subshape.IsArray() && !host && counted(index)) {
 +          bytes += ShapeUtil::ByteSizeOf(subshape);
 +        }
 +      });
@@ -69,8 +110,11 @@ index 9025596b36..063dd8fece 100644
 +// zero outputs of its outputs' shapes and layouts, so the rest of the pipeline,
 +// autotuning and scheduling among it, runs over nothing, and buffer assignment
 +// states the arguments and outputs alone, past the limit, which stops the
-+// compile (CompileModuleToLlvmIr). Its memory is so a lower bound of the
-+// module's, and its live set no temporary. Whether it was hollowed.
++// compile (CompileModuleToLlvmIr), its bytes (CompiledMemoryStats: arguments
++// and outputs, an aliased pair once) at least these. Its memory is so a lower
++// bound of the module's, and its live set no temporary; it is marked
++// (kMemoryLimitHollowed), so a compile of it that would emit code fails.
++// Whether it was hollowed.
 +absl::StatusOr<bool> HollowEntryOverMemoryLimit(HloModule* module) {
 +  const int64_t limit =
 +      module->config().debug_options().xla_gpu_memory_limit_early_exit_bytes();
@@ -104,6 +148,7 @@ index 9025596b36..063dd8fece 100644
 +          << bytes << " bytes, over its compile's limit of " << limit
 +          << ": its entry is hollowed before its optimization";
 +  entry->set_root_instruction(zeros, /*accept_different_shape=*/false);
++  module->add_frontend_attribute(kMemoryLimitHollowed, "true");
 +  TF_RETURN_IF_ERROR(HloDCE().Run(module).status());
 +  module->RemoveUnusedComputations();
 +  return true;
@@ -112,7 +157,7 @@ index 9025596b36..063dd8fece 100644
  absl::Status RunLayoutAssignmentPasses(
      HloModule* hlo_module, se::GpuComputeCapability gpu_version,
      const se::DeviceDescription& device_description,
-@@ -1957,6 +2041,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
+@@ -1957,6 +2051,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
    if (options.early_exit_with_layouts) {
      return absl::OkStatus();
    }
