@@ -691,16 +691,29 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         run = self.lower()
         self.assertEqual(run["events"], ["miss"], run)
         self.assertEqual(run["normalized"], first["normalized"])
+    def serialized_with(**fields):
+      # The entry's serialized kernel with `fields` changed.
+      (entry,) = self.entries()
+      _, held, _ = harness.split_entry(entry.read_bytes())
+      return {"serialized": {**held["serialized"], **fields}}
+
     for name, header in {
-        "a serialized kernel missing a field": {
+        "a serialized kernel missing a field": lambda: {
             "serialized": {"sym_name": "k"}},
-        "a serialized kernel of the wrong type": {"serialized": "a kernel"},
+        "a serialized kernel of the wrong type": lambda: {
+            "serialized": "a kernel"},
+        "a kernel hash that is not hex": lambda: serialized_with(
+            kernel_id="not hex"),
+        "a kernel hash of 31 bytes": lambda: serialized_with(
+            kernel_id="00" * 31),
+        "symmetric memory flags that are not booleans": lambda: (
+            serialized_with(symmetric_memory_args=[1, 0])),
     }.items():
       with self.subTest(name):
         if not self.entries():
           self.lower()
         (entry,) = self.entries()
-        harness.rewrite_entry(entry, header=header)
+        harness.rewrite_entry(entry, header=header())
         run = self.lower()
         self.assertEqual(run["events"], ["miss"], run)
         self.assertEqual(run["normalized"], first["normalized"])
