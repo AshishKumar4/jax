@@ -214,6 +214,42 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
     self.assertEqual(allocations["out_smem_refs"], [])
     self.assertEqual(allocations["barrier_ref"] is None, capability == "8.0")
 
+  @parameterized.parameters(1, 2)
+  def test_emit_pipeline_states_its_threads_meeting_barriers(self, threads):
+    # Threads sharing one pipeline (``thread_axis``) meet at two barriers of
+    # one arrival a thread, which the pipeline states with its other
+    # allocations; one thread meets none.
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", num_cores=None, platform="cuda",
+        compute_capability="9.0",
+    )
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=device)
+    found = []
+
+    def stated():
+      pipeline = plgpu.emit_pipeline(
+          lambda *_: None,
+          grid=(4,),
+          in_specs=[plgpu.BlockSpec((64, 32), lambda i: (i, 0))],
+          max_concurrent_steps=2,
+          thread_axis="wg",
+      )
+      with jax_core.extend_axis_env_nd([("wg", threads)]):
+        found.append(
+            pipeline.get_allocations(
+                jax.ShapeDtypeStruct((256, 32), jnp.float16)
+            )
+        )
+
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.make_jaxpr(stated)()
+    [allocations] = found
+    meet = allocations["meet_ref"]
+    if threads == 1:
+      self.assertIsNone(meet)
+    else:
+      self.assertEqual((meet.num_arrivals, meet.num_barriers), (2, 2))
+
 
 class CtaBarrierLoweringTest(jtu.JaxTestCase):
 
