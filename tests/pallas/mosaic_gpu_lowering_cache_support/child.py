@@ -84,6 +84,8 @@ class Recorder:
     self.results: list[lowering.LoweringResult] = []
     # (name, whether the read was made while the cache's snapshot answered).
     self.reads: list[tuple[str, bool]] = []
+    # The serde passes and kernel hashes the custom call's making ran.
+    self.serialized: list[str] = []
     # What the pallas_call's lowering calls: the cache's wrapper, or (a case that
     # asks for it) the lowering with no cache around it.
     self.inner = lowering_cache.lower_unpipelined_jaxpr_to_module
@@ -104,8 +106,26 @@ class Recorder:
     lowering_cache.lower_unpipelined_jaxpr_to_module = capture
 
   def reset(self):
-    for items in (self.events, self.saved, self.results, self.reads):
+    for items in (self.events, self.saved, self.results, self.reads,
+                  self.serialized):
       del items[:]
+
+  def install_serialization_spies(self):
+    """Watches the serde passes and kernel hashes run, as the device reads are
+    watched: by the interpreter's monitoring, no function replaced."""
+    tool = sys.monitoring.DEBUGGER_ID
+    sys.monitoring.use_tool_id(tool, "lowering-cache-serialization")
+    names = {mgpu_core._run_serde_pass.__code__: "serde pass",
+             mgpu_core.kernel_hash.__code__: "kernel hash"}
+
+    def started(code, offset):
+      del offset
+      self.serialized.append(names[code])
+
+    start = sys.monitoring.events.PY_START
+    sys.monitoring.register_callback(tool, start, started)
+    for code in names:
+      sys.monitoring.set_local_events(tool, code, start)
 
   def install_topology_spies(self):
     """Watches the device reads the lowering makes, without changing any function
@@ -126,9 +146,10 @@ class Recorder:
       del offset
       self.reads.append((names[code], lowering_inputs.current() is not None))
 
-    sys.monitoring.register_callback(tool, sys.monitoring.events.PY_START, started)
+    start = sys.monitoring.events.PY_START
+    sys.monitoring.register_callback(tool, start, started)
     for code in names:
-      sys.monitoring.set_local_events(tool, code, sys.monitoring.events.PY_START)
+      sys.monitoring.set_local_events(tool, code, start)
 
 
 def normalize(result):
@@ -258,6 +279,7 @@ def one(case, rec, kernel, x):
       "has_file_locations": '.py"' in asm,
       "reads_in_snapshot": sorted({n for n, inside in rec.reads if inside}),
       "reads_outside": sorted({n for n, inside in rec.reads if not inside}),
+      "serialized": list(rec.serialized),
   }
 
 
@@ -450,6 +472,8 @@ def configure(case, rec):
     set_up_touching(case)
   if case.get("mesh") is not None:
     rec.install_topology_spies()
+  if case.get("serialization"):
+    rec.install_serialization_spies()
   if case.get("bug") is not None:
     apply_bug(case["bug"])
 
