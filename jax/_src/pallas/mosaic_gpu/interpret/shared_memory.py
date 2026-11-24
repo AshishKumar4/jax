@@ -582,7 +582,23 @@ class GPUSharedMemory(
 
     self.num_blocks_per_cluster = num_blocks_per_cluster
     self.num_pallas_threads_per_block = num_threads_per_block
-    self.reset_per_cluster_state()
+    # The sequences of IDs, never reset: an ID a device's running cluster holds
+    # must not be handed out again when another device's cluster finishes.
+    self.next_tma_thread_id = 0
+    self.next_regs_id = collections.defaultdict(lambda: -100)
+    self.next_pipelineable_task_id = 0
+    self.named_barriers = {}
+    self.pending_smem_to_gmem_read_clocks = {}
+    self.pending_smem_to_gmem_write_clocks = {}
+    self.pipelineable_async_tasks = collections.defaultdict(set)
+    self.tcgen05_completion_clocks = collections.defaultdict(
+        lambda: self.VectorClock(self.vector_clock_size)
+    )
+    self.pending_tmem_stores = {}
+    self.pending_tmem_loads = {}
+    self.reallocation_checker = BarrierReallocationChecker()
+    for device_id in range(num_devices):
+      self.reset_per_cluster_state(Device(device_id))
 
   def buffer_shape_and_dtype(self, key: MemKey) -> memory.ShapeAndDtype:
     """The logical shape and dtype of `key`'s buffer."""
@@ -642,33 +658,40 @@ class GPUSharedMemory(
       result = result.transpose(access.permutation)
     return result, shape_and_dtype, clock
 
-  def reset_per_cluster_state(self):
-    """Resets the per-cluster state of the shared memory."""
-    with self.lock:
-      self.next_tma_thread_id = 0
-      self.next_regs_id = collections.defaultdict(lambda: -100)
-      self.named_barriers = {}
-      self.clocks = {
-          thread: self.VectorClock(self.vector_clock_size)
-          for thread in self.all_concurrent_threads
-      }
+  def reset_per_cluster_state(self, device: Device):
+    """Resets `device`'s per-cluster state, as its cluster has finished.
 
-      self.pending_smem_to_gmem_read_clocks = {
-          thread: collections.deque()
-          for thread in self.all_concurrent_threads
+    Only `device`'s: the devices of a mesh interpret their kernels at once, so
+    another device's cluster may be running, its threads' state in use. Its
+    threads' clocks, pending copies, pipelineable tasks and tensor core clocks,
+    the named barriers of its blocks, and the reallocation checks of its
+    warpgroups go; the sequences of IDs (`next_regs_id`, `next_tma_thread_id`,
+    `next_pipelineable_task_id`) are never reset, as an ID a running cluster
+    holds would be handed out again (a REGS buffer allocated twice, its scope's
+    deallocation failing).
+    """
+    with self.lock:
+      for thread in self.concurrent_threads(device):
+        self.clocks[thread] = self.VectorClock(self.vector_clock_size)
+        self.pending_smem_to_gmem_read_clocks[thread] = collections.deque()
+        self.pending_smem_to_gmem_write_clocks[thread] = collections.deque()
+      self.named_barriers = {
+          key: barrier
+          for key, barrier in self.named_barriers.items()
+          if key[0] != device.device_id
       }
-      self.pending_smem_to_gmem_write_clocks = {
-          thread: collections.deque()
-          for thread in self.all_concurrent_threads
-      }
-      self.pipelineable_async_tasks = collections.defaultdict(set)
-      self.next_pipelineable_task_id = 0
-      self.tcgen05_completion_clocks = collections.defaultdict(
-          lambda: self.VectorClock(self.vector_clock_size)
-      )
-      self.pending_tmem_stores = {}
-      self.pending_tmem_loads = {}
-      self.reallocation_checker = BarrierReallocationChecker()
+      for by_thread in (
+          self.pipelineable_async_tasks,
+          self.tcgen05_completion_clocks,
+          self.pending_tmem_stores,
+          self.pending_tmem_loads,
+      ):
+        for thread in [
+            thread for thread in by_thread
+            if thread.device_id == device.device_id
+        ]:
+          del by_thread[thread]
+      self.reallocation_checker.forget(device)
 
   def _abort_waiters(self):
     # Called by `set_failed` while `self.lock` is held. Acquiring a barrier's
@@ -1155,6 +1178,20 @@ class BarrierReallocationChecker:
       self._check(barrier, warpgroup)
       if not barrier.has_zero_ref_count():
         self.reallocated[id(barrier)].add(warpgroup)
+
+  def forget(self, device: Device):
+    """Forgets the checks of `device`'s warpgroups, as its cluster finished."""
+    for warpgroup in [
+        warpgroup for warpgroup in self.deallocated
+        if warpgroup.device_id == device.device_id
+    ]:
+      del self.deallocated[warpgroup]
+    for barrier_id, warpgroups in list(self.reallocated.items()):
+      warpgroups.difference_update(
+          [w for w in warpgroups if w.device_id == device.device_id]
+      )
+      if not warpgroups:
+        del self.reallocated[barrier_id]
 
   def on_final_deallocate(self, barrier: Barrier):
     """Called when the last thread holding `barrier` deallocates it."""
