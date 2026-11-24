@@ -1,0 +1,138 @@
+diff --git a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
+index 0572043f1f..9ab479f274 100644
+--- a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
++++ b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
+@@ -561,6 +561,27 @@ void AddDynamicSliceOffsetExpressionInstructions(
+   }
+ }
+ 
++// Drops each sliced parameter whose slice reads a buffer another sliced
++// parameter's chain makes (a slice of a dynamic slice, both read by the hero):
++// the fusion's slices read its parameters, so that parameter stays outside it,
++// its chain an operand of the fusion, and the other chain is fused alone.
++// Planned with it, its slice would be cloned before the chain making its
++// buffer, whose clone it reads (CreateFusionBody).
++void DropParametersSlicingFusedBuffers(
++    std::vector<SlicedParameter>& sliced_params) {
++  absl::flat_hash_set<const HloInstruction*> fused;
++  for (const SlicedParameter& param : sliced_params) {
++    fused.insert(param.slice);
++    fused.insert(param.noops.begin(), param.noops.end());
++  }
++  sliced_params.erase(
++      std::remove_if(sliced_params.begin(), sliced_params.end(),
++                     [&](const SlicedParameter& param) {
++                       return fused.contains(param.slice->operand(0));
++                     }),
++      sliced_params.end());
++}
++
+ //===----------------------------------------------------------------------===//
+ // Build fusion plan
+ //===----------------------------------------------------------------------===//
+@@ -763,19 +784,23 @@ absl::StatusOr<HloComputation*> CreateFusionBody(
+             index, operand->shape(), absl::StrCat("p", index)));
+   }
+ 
+-  auto mapped_operands = [&](HloInstruction* instr) {
++  // Clone instructions in topological order: an operand neither cloned before
++  // nor a parameter is a plan's error, said as one, not thrown.
++  for (HloInstruction* instr : plan.clone_instructions) {
+     absl::InlinedVector<HloInstruction*, 4> operands;
+     operands.reserve(instr->operand_count());
+     for (HloInstruction* operand : instr->operands()) {
+-      operands.push_back(instr_mapping.at(operand));
++      auto mapped = instr_mapping.find(operand);
++      if (mapped == instr_mapping.end()) {
++        return absl::InternalError(absl::StrCat(
++            "DynamicSliceFusionRewriterV2: ", instr->name(), " of ",
++            hero->name(), "'s fusion reads ", operand->name(),
++            ", neither cloned before it nor a parameter"));
++      }
++      operands.push_back(mapped->second);
+     }
+-    return operands;
+-  };
+-
+-  // Clone instructions in topological order.
+-  for (HloInstruction* instr : plan.clone_instructions) {
+     instr_mapping[instr] = builder.AddInstruction(
+-        instr->CloneWithNewOperands(instr->shape(), mapped_operands(instr)));
++        instr->CloneWithNewOperands(instr->shape(), operands));
+   }
+ 
+   // Build root tuple when there are multiple results (DUS and/or passthrough).
+@@ -921,6 +946,7 @@ absl::StatusOr<bool> DynamicSliceFusionRewriterV2::RunImpl(
+           ResolveSlicedResults(hero, options_.capture_update_slice);
+       ABSL_RETURN_IF_ERROR(FilterAliasedParametersAndResults(
+           hero, sliced_params, sliced_results));
++      DropParametersSlicingFusedBuffers(sliced_params);
+       ABSL_ASSIGN_OR_RETURN(
+           bool hero_changed,
+           RewriteHero(module, hero, sliced_params, sliced_results));
+diff --git a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
+index b572d93800..ddccdef3e1 100644
+--- a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
++++ b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2_test.cc
+@@ -334,6 +334,61 @@ TEST_F(DynamicSliceFusionRewriterV2Test, DSWithConstantOffset) {
+   RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected, fusion_checks);
+ }
+ 
++TEST_F(DynamicSliceFusionRewriterV2Test, SliceOfAnotherOperandsSliceNotFused) {
++  // Operand 0 slices the dynamic slice operand 1 reads: its slice would read a
++  // buffer the fusion makes, cloned after it. It stays an operand of the
++  // fusion, and operand 1's dynamic slice is fused alone.
++  const char* hlo = R"(
++    HloModule test
++
++    ENTRY main {
++      %p0 = f32[4,8,8]{2,1,0} parameter(0)
++      %c0 = s32[] constant(0)
++      %c1 = s32[] constant(1)
++      %ds = f32[2,8,8]{2,1,0} dynamic-slice(%p0, %c1, %c0, %c0),
++        dynamic_slice_sizes={2,8,8}
++      %slice = f32[1,8,8]{2,1,0} slice(%ds), slice={[1:2], [0:8], [0:8]}
++      %bitcast0 = f32[8,8]{1,0} bitcast(%slice)
++      %bitcast1 = f32[16,8]{1,0} bitcast(%ds)
++      ROOT %hero = f32[8,8]{1,0} custom-call(%bitcast0, %bitcast1),
++        custom_call_target="fake_target"
++    }
++  )";
++
++  const char* expected = R"(
++    ; CHECK:     %dynamic-slice-fusion{{.*}} {
++    ; CHECK-DAG:   {{.*}} f32[4,8,8]{2,1,0} parameter(0)
++    ; CHECK-DAG:   {{.*}} f32[8,8]{1,0} parameter(1)
++    ; CHECK-DAG:   {{.*}} f32[2,8,8]{2,1,0} dynamic-slice(
++    ; CHECK-DAG:   {{.*}} f32[16,8]{1,0} bitcast(
++    ; CHECK:       ROOT {{.*}} custom-call(
++    ; CHECK:              custom_call_target="fake_target"
++    ; CHECK:     }
++    ; CHECK:     ENTRY %main{{.*}} {
++    ; CHECK:       ROOT {{.*}} fusion(%p0, %bitcast0),
++    ; CHECK:              kind=kCustom
++    ; CHECK:              "name":"dynamic_slice_fusion"
++    ; CHECK:     }
++  )";
++
++  auto f32_488 = ShapeUtil::MakeShape(F32, {4, 8, 8});
++  auto f32_288 = ShapeUtil::MakeShape(F32, {2, 8, 8});
++
++  auto fusion_checks = [&](HloModule* module) {
++    auto* hero = DynamicSliceFusion::FindHero(FindDsfBody(module));
++
++    ASSERT_OK_AND_ASSIGN(auto params,
++                         DynamicSliceFusion::ResolveParameters(hero));
++    std::vector<Offset> offsets = {{0, Offset::Constant(1)},
++                                   {1, Offset::Constant(0)},
++                                   {2, Offset::Constant(0)}};
++    EXPECT_THAT(params, ElementsAre(Param{1, f32_488, f32_288,
++                                          MakeStaticConfig(256), offsets}));
++  };
++
++  RunAndFilecheckHloRewrite(hlo, MakePipeline(), expected, fusion_checks);
++}
++
+ TEST_F(DynamicSliceFusionRewriterV2Test, SlicedOperandWithTupleResult) {
+   const char* hlo = R"(
+     HloModule test

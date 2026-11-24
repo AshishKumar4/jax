@@ -124,6 +124,10 @@ archive_override(
         # The backport at this pin: its sharing check reads HloValue's operand-use rule (kDomain transparent
         # here, removed upstream), and its tests' host copies use executor-allocated memory.
         "//third_party:xla/gpu_dynamic_slice_operand_uses_pin.patch",
+        # A sliced parameter whose slice reads a buffer another of the hero's sliced parameters makes (a slice
+        # of a dynamic slice) stays an operand of its dynamic-slice fusion: planned in, its slice was cloned
+        # before that buffer's chain and CreateFusionBody threw std::out_of_range (Dew's 4B step on one GH200).
+        "//third_party:xla/gpu_dynamic_slice_nested_slice.patch",
         # A compile-only GPU device states the client's memory spaces (device, pinned_host), so a program compiled
         # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
         # (row 8372: a host step prepared without a GPU compiled other programs than its run).
