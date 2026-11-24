@@ -248,7 +248,7 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
     if threads == 1:
       self.assertIsNone(meet)
     else:
-      self.assertEqual((meet.num_arrivals, meet.num_barriers), (2, 2))
+      self.assertEqual(meet, plgpu.Barrier(num_arrivals=2, num_barriers=2))
 
 
 class CtaBarrierLoweringTest(jtu.JaxTestCase):
