@@ -155,6 +155,10 @@ archive_override(
         # say whether it stopped at one, so its bytes are one under any limit it
         # fits and jax writes no stopped compile to its cache.
         "//third_party:xla/memory_limit_canonical.patch",
+        # A compile whose entry's arguments and new outputs alone pass its memory
+        # limit is hollowed right after layout assignment: its autotuning and
+        # scheduling run over nothing, and it stops stating those bytes alone.
+        "//third_party:xla/memory_limit_hollow.patch",
         # The nvJitLink stub names the library it loaded, its path and the
         # build id of its mapping (XlaNvJitLinkLibrary, XlaNvJitLinkBuildId),
         # which the CUDA plugin exports.
