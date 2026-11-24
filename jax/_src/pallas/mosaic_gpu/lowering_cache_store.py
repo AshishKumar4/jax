@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 _SUBDIRECTORY = "mosaic_gpu_lowering"
 
 _ENVELOPE_MAGIC = b"jax-mosaic-gpu-lowering-cache\n"
-_ENVELOPE_VERSION = 2
+_ENVELOPE_VERSION = 3
 _ENVELOPE_PREFIX = struct.Struct("<II")
 
 
@@ -62,11 +62,15 @@ class Entry:
   new_out_shapes: list[Any]
   gmem_scratch_shapes: list[Any]
   seconds: float
+  # What the custom call holds of the module (`mgpu.core.SerializedKernel`):
+  # its plain fields, its bytecode (`serialized_module`) apart.
+  serialized: dict[str, Any] | None = None
+  serialized_module: bytes = b""
 
 
-def _payload(fields: dict[str, Any], module: bytes) -> bytes:
+def _payload(fields: dict[str, Any], module: bytes, serialized: bytes) -> bytes:
   canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
-  return canonical.encode() + b"\n" + module
+  return canonical.encode() + b"\n" + module + serialized
 
 
 def pack(key: str, entry: Entry) -> bytes:
@@ -75,15 +79,17 @@ def pack(key: str, entry: Entry) -> bytes:
       "new_out_shapes": entry.new_out_shapes,
       "gmem_scratch_shapes": entry.gmem_scratch_shapes,
       "seconds": entry.seconds, "module_size": len(entry.module),
+      "serialized": entry.serialized,
   }
   header = {
       **fields,
-      "sha256": hashlib.sha256(_payload(fields, entry.module)).hexdigest(),
+      "sha256": hashlib.sha256(
+          _payload(fields, entry.module, entry.serialized_module)).hexdigest(),
   }
   blob = json.dumps(header, sort_keys=True).encode()
   return (
       _ENVELOPE_MAGIC + _ENVELOPE_PREFIX.pack(_ENVELOPE_VERSION, len(blob))
-      + blob + entry.module
+      + blob + entry.module + entry.serialized_module
   )
 
 
@@ -130,20 +136,24 @@ def unpack(key: str, data: bytes) -> Entry:
   if version != _ENVELOPE_VERSION:
     raise InvalidEntry(f"an entry of the envelope version {version}")
   header = json.loads(data[prefix_end:prefix_end + header_size])
-  module = data[prefix_end + header_size:]
   if not isinstance(header, dict):
     raise InvalidEntry("a header that is not a JSON object")
   fields = {k: v for k, v in header.items() if k != "sha256"}
+  size = fields["module_size"]
+  held = len(data) - prefix_end - header_size
+  if type(size) is not int or not 0 <= size <= held:
+    raise InvalidEntry("a module of another size")
+  module = data[prefix_end + header_size:prefix_end + header_size + size]
+  serialized_module = data[prefix_end + header_size + size:]
   digest = header["sha256"]
   if (
       not isinstance(digest, str)
-      or hashlib.sha256(_payload(fields, module)).hexdigest() != digest
+      or hashlib.sha256(
+          _payload(fields, module, serialized_module)).hexdigest() != digest
   ):
     raise InvalidEntry("an entry that is not what was stored (its checksum)")
   if fields["key"] != key:
     raise InvalidEntry("an entry of another key")
-  if fields["module_size"] != len(module):
-    raise InvalidEntry("a module of another size")
   seconds = fields["seconds"]
   if (
       isinstance(seconds, bool) or not isinstance(seconds, (int, float))
@@ -157,7 +167,41 @@ def unpack(key: str, data: bytes) -> Entry:
       new_out_shapes=_shapes(fields["new_out_shapes"]),
       gmem_scratch_shapes=_shapes(fields["gmem_scratch_shapes"]),
       seconds=float(seconds),
+      serialized=_serialized(fields["serialized"], serialized_module),
+      serialized_module=serialized_module,
   )
+
+
+_SERIALIZED_FIELDS = {
+    "forward_compatible": bool,
+    "kernel_id": str,
+    "resources": (str, type(None)),
+    "sym_name": str,
+    "has_communication": bool,
+    "uses_collective_metadata": bool,
+    "symmetric_memory_args": (list, type(None)),
+}
+
+
+def _serialized(value: Any, module: bytes) -> dict[str, Any] | None:
+  """An entry's serialized kernel fields, checked against the schema; none
+  for an entry stored without one (its bytecode then empty)."""
+  if value is None:
+    if module:
+      raise InvalidEntry("a serialized module with no fields")
+    return None
+  if not isinstance(value, dict) or set(value) != set(_SERIALIZED_FIELDS):
+    raise InvalidEntry(f"{value!r} is not a serialized kernel of the schema")
+  for name, kind in _SERIALIZED_FIELDS.items():
+    if not isinstance(value[name], kind):
+      raise InvalidEntry(f"{name}={value[name]!r} is not of the schema")
+  try:
+    bytes.fromhex(value["kernel_id"])
+  except ValueError as e:
+    raise InvalidEntry(f"{value['kernel_id']!r} is not a kernel hash") from e
+  if not module:
+    raise InvalidEntry("a serialized kernel with no bytecode")
+  return value
 
 
 class Store:

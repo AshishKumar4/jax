@@ -78,6 +78,7 @@ def _emit_mosaic_gpu_custom_call(
       use_custom_barrier=False,
       skip_device_barrier=skip_device_barrier,
       metadata=metadata,
+      serialized=lowering_result.serialized,
   )
   if (prof_spec := lowering_result.profiler_spec) is not None:
     *outs, prof_buffer = outs
