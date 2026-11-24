@@ -69,10 +69,6 @@ archive_override(
         # too, which the compile set (a backward's force_deterministic under deterministic ops): otherwise its
         # thunk's fingerprint names no serialized graph (Dew ledger 5322).
         "//third_party:xla/cudnn_graph_cache_hit_config.patch",
-        # Deterministic ops keep the autotuner's Triton backend (no split-k, so ordered sums), whatever the
-        # client's DebugOptions state of its mode: GEMM fusions compile with no device, and with one take their
-        # first compilable config as before (rows 5389 and the GPU tier's "No supported config found").
-        "//third_party:xla/deterministic_ops_keep_triton.patch",
         # A reducer rooted in a copy of its reduction (Shardy's export holds a region root's sharding so)
         # reduces by the copied operation: AllReducePromotion aborted a CPU bf16 psum's compile on it, and
         # MatchReductionComputation read it as no reduction (Dew row 5900).
