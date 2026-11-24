@@ -238,22 +238,30 @@ class InterpretDistributedTest(jtu.JaxTestCase):
       regs_id = allocate(memory, thread)
       if thread.device_id == 1 and not holds.is_set():
         holds.set()
-        self.assertTrue(finished.wait(60))
+        if not finished.wait(60):
+          raise TimeoutError("device 0's first cluster never finished")
       return regs_id
 
+    # A failure in it (a wait timed out) fails the run, as the interpreter's
+    # own callbacks do, rather than leave the other device at its barrier.
+    @gpu_callbacks.fail_on_exception
     def finishing(*, token, **device):
       if finished.is_set():
         return cluster_finished(token=token, **device)
-      self.assertTrue(holds.wait(60))
+      if not holds.wait(60):
+        raise TimeoutError("device 1 never allocated its outer REGS buffer")
       token = cluster_finished(token=token, **device)
       finished.set()
       return token
 
     def kernel(x_ref, o_ref):
-      # Each accumulator starts zeroed in the interpreter.
+      # Each grid point its own tile; each accumulator starts zeroed in the
+      # interpreter.
+      tile = pl.ds(lax.axis_index('g') * 64, 64)
+
       def outer(acc):
         def inner(again):
-          o_ref[...] = x_ref[...] + acc[...] + again[...] + 1.0
+          o_ref[tile] = x_ref[tile] + acc[...] + again[...] + 1.0
 
         pl.run_scoped(inner, plgpu.ACC((64, 64), jnp.float32))
 
@@ -269,7 +277,7 @@ class InterpretDistributedTest(jtu.JaxTestCase):
       )(x)
 
     mesh = jax.sharding.Mesh(jax.devices()[:2], ['x'])
-    x = jnp.arange(2 * 64 * 64, dtype=jnp.float32).reshape(-1, 64)
+    x = jnp.arange(2 * 2 * 64 * 64, dtype=jnp.float32).reshape(-1, 64)
     x = jax.device_put(x, jax.sharding.NamedSharding(mesh, P('x')))
     with (
         mock.patch.object(
