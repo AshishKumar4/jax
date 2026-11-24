@@ -570,17 +570,17 @@ def _independent_components(
   groups: dict[cs.Variable, list[cs.Variable]] = {}
   for u in unknowns:
     groups.setdefault(root(u), []).append(u)
-  free = [constraint for constraint, variables in mentioned if not variables]
+  # Each constraint filed under its group once, in the system's order: a
+  # kernel's thousands of groups would otherwise each scan every constraint.
+  constraints_of: dict[cs.Variable, list[cs.Constraint]] = {}
+  free = []
+  for constraint, variables in mentioned:
+    if variables:
+      constraints_of.setdefault(root(variables[0]), []).append(constraint)
+    else:
+      free.append(constraint)
   return [
-      (
-          members,
-          [
-              constraint
-              for constraint, variables in mentioned
-              if variables and root(variables[0]) == group
-          ]
-          + free,
-      )
+      (members, constraints_of.get(group, []) + free)
       for group, members in groups.items()
   ]
 
@@ -633,8 +633,13 @@ def find_assignments_for(
   # product of their searches rather than the sum.
   components = _independent_components(remaining_unknowns, constraint_system)
   if len(components) > 1:
+    # A set: a kernel's thousands of assignments are each looked up among its
+    # thousands of unknowns.
+    unknown_set = frozenset(unknowns)
     solution = {
-        v: k for v, k in constraint_system.assignments.items() if v in unknowns
+        v: k
+        for v, k in constraint_system.assignments.items()
+        if v in unknown_set
     }
     for component_unknowns, component_constraints in components:
       component_solution, fuel = find_assignments_for(
