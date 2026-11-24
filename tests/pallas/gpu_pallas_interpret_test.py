@@ -1546,6 +1546,28 @@ class InterpretTest(jtu.JaxTestCase):
     self.assertLen(refused, 1)
     self.assertIn("the hardware's wait at that parity", str(refused[0]))
 
+  def test_a_finished_cluster_resets_its_devices_state_alone(self):
+    # The devices of a mesh interpret their kernels at once: device 0's cluster
+    # finishing leaves device 1's running cluster its named barriers, and hands
+    # out no REGS ID device 1 holds again, while device 0's state goes.
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
+
+    memory = shared_memory.GPUSharedMemory(
+        num_devices=2, out_of_bounds_reads="raise", dma_execution_mode="eager",
+        uninitialized_memory="nan", detect_races=False,
+        barrier=threading.Barrier(1), clean_up_barrier=threading.Barrier(1),
+        num_threads_per_block=1, num_blocks_per_cluster=1,
+        num_tma_threads_per_device=1)
+    running = shared_memory.Warpgroup(1, 0, 0, 0)
+    finished = shared_memory.Warpgroup(0, 0, 0, 0)
+    held = memory.get_next_wgmma_accumulator_id(running)
+    named = memory.named_barrier(running, 0, 128)
+    gone = memory.named_barrier(finished, 0, 128)
+    memory.reset_per_cluster_state(shared_memory.Device(0))
+    self.assertNotEqual(memory.get_next_wgmma_accumulator_id(running), held)
+    self.assertIs(memory.named_barrier(running, 0, 128), named)
+    self.assertIsNot(memory.named_barrier(finished, 0, 128), gone)
+
   @jtu.parameterized.parameters(
       ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
   def test_a_wait_names_the_latest_or_the_pending_phase(
