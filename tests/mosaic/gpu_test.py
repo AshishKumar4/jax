@@ -5756,7 +5756,12 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     shape = (2, extent)
     def kernel(ctx, src, dst, smem):
       tmp, barrier = smem
-      ctx.async_copy(src_ref=src, dst_ref=tmp, barrier=barrier)
+      # The slice's whole source, in bounds (a load of 512 the tiled copy
+      # cannot take).
+      ctx.async_copy(
+          src_ref=src, dst_ref=tmp, barrier=barrier,
+          oob_mode=mgpu.OOBFillMode.PROMISE_IN_BOUNDS,
+      )
       barrier.wait()
       column = start
       if dynamic:
