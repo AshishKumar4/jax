@@ -1,0 +1,637 @@
+diff --git a/xla/stream_executor/cuda/BUILD b/xla/stream_executor/cuda/BUILD
+index 9131900c9e..5065b27f7f 100644
+--- a/xla/stream_executor/cuda/BUILD
++++ b/xla/stream_executor/cuda/BUILD
+@@ -2118,6 +2118,36 @@ cc_library(
+     ],
+ )
+ 
++xla_test(
++    name = "cuda_command_buffer_kernels_test",
++    srcs = ["cuda_command_buffer_kernels_test.cc"],
++    backends = ["gpu"],
++    tags = ["cuda-only"],
++    deps = [
++        ":cuda_executor",
++        ":cuda_platform",
++        "//xla/service:platform_util",
++        "//xla/stream_executor:command_buffer",
++        "//xla/stream_executor:device_address",
++        "//xla/stream_executor:launch_dim",
++        "//xla/stream_executor:platform",
++        "//xla/stream_executor:platform_manager",
++        "//xla/stream_executor:semantic_version",
++        "//xla/stream_executor:stream",
++        "//xla/stream_executor:stream_executor_h",
++        "//xla/stream_executor/gpu:gpu_test_kernels",
++        "//xla/tsl/cuda:cupti",
++        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status:status_macros",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_googletest//:gtest_main",
++        "@local_config_cuda//cuda:cuda_headers",
++        "@local_config_cuda//cuda:cupti_headers",
++    ],
++)
++
+ xla_test(
+     name = "cuda_command_buffer_test",
+     srcs = ["cuda_command_buffer_test.cc"],
+diff --git a/xla/stream_executor/cuda/cuda_command_buffer.cc b/xla/stream_executor/cuda/cuda_command_buffer.cc
+index e09b2e3f1e..b1fb4f115b 100644
+--- a/xla/stream_executor/cuda/cuda_command_buffer.cc
++++ b/xla/stream_executor/cuda/cuda_command_buffer.cc
+@@ -335,19 +335,41 @@ std::string CudaCommandBuffer::FormatGraphNodeHandles(
+   return result;
+ }
+ 
+-absl::StatusOr<std::unique_ptr<CudaCommandBuffer>> CudaCommandBuffer::Create(
+-    Mode mode, StreamExecutor* executor, CudaContext* cuda_context) {
+-  // Command buffers are built with graph APIs that require CUDA 12.3:
+-  // polymorphic node creation (cuGraphAddNode_v2), conditional nodes and
+-  // cuStreamBeginCaptureToGraph.
++absl::StatusOr<std::unique_ptr<CudaCommandBufferKernels>>
++CudaCommandBufferKernels::Load(StreamExecutor* executor) {
++  auto kernels = std::make_unique<CudaCommandBufferKernels>();
++  ABSL_ASSIGN_OR_RETURN(auto noop, cuda::GetNoOpKernelLoaderSpec());
++  ABSL_ASSIGN_OR_RETURN(kernels->noop,
++                        NoOp::FactoryType::Create(executor, noop));
++  ABSL_ASSIGN_OR_RETURN(auto set_case,
++                        cuda::GetSetCaseConditionKernelLoaderSpec());
++  ABSL_ASSIGN_OR_RETURN(
++      kernels->set_case_condition,
++      SetCaseCondition::FactoryType::Create(executor, set_case));
++  ABSL_ASSIGN_OR_RETURN(auto set_while,
++                        cuda::GetSetWhileConditionKernelLoaderSpec());
++  ABSL_ASSIGN_OR_RETURN(
++      kernels->set_while_condition,
++      SetWhileCondition::FactoryType::Create(executor, set_while));
++  return kernels;
++}
++
++absl::Status CudaCommandBuffer::Supported(StreamExecutor* executor) {
+   if (executor->GetDeviceDescription().driver_version() <
+       SemanticVersion{12, 3, 0}) {
+     return absl::UnimplementedError(
+         "CUDA command buffers require CUDA driver version >= 12.3");
+   }
++  return absl::OkStatus();
++}
++
++absl::StatusOr<std::unique_ptr<CudaCommandBuffer>> CudaCommandBuffer::Create(
++    Mode mode, StreamExecutor* executor, CudaContext* cuda_context,
++    const CudaCommandBufferKernels* kernels) {
++  ABSL_RETURN_IF_ERROR(Supported(executor));
+   ABSL_ASSIGN_OR_RETURN(CUgraph graph, CreateGraph());
+   return std::unique_ptr<CudaCommandBuffer>(new CudaCommandBuffer(
+-      mode, executor, cuda_context, graph, /*is_owned_graph=*/true));
++      mode, executor, cuda_context, kernels, graph, /*is_owned_graph=*/true));
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -361,29 +383,21 @@ absl::StatusOr<GraphNodeHandle> CudaCommandBuffer::CreateSetWhileConditionNode(
+           << "; conditional: " << conditional
+           << "; predicate: " << predicate.opaque();
+ 
+-  if (!set_while_condition_kernel_) {
+-    ABSL_ASSIGN_OR_RETURN(auto spec,
+-                          cuda::GetSetWhileConditionKernelLoaderSpec());
+-    ABSL_ASSIGN_OR_RETURN(
+-        set_while_condition_kernel_,
+-        SetWhileConditionKernel::FactoryType::Create(stream_exec_, spec));
+-  }
+-
+-  auto kernel_args = PackKernelArgs(set_while_condition_kernel_,
++  auto kernel_args = PackKernelArgs(kernels_->set_while_condition,
+                                     ToCudaGraphHandle(conditional), predicate);
+   return CreateKernelNode(dependencies, StreamPriority::Default, ThreadDim(),
+                           BlockDim(), /*cluster_dims=*/std::nullopt,
+-                          *set_while_condition_kernel_, *kernel_args);
++                          *kernels_->set_while_condition, *kernel_args);
+ }
+ 
+ absl::Status CudaCommandBuffer::UpdateSetWhileConditionNode(
+     GraphNodeHandle handle, GraphConditionalHandle conditional,
+     DeviceAddress<bool> predicate) {
+-  auto kernel_args = PackKernelArgs(set_while_condition_kernel_,
++  auto kernel_args = PackKernelArgs(kernels_->set_while_condition,
+                                     ToCudaGraphHandle(conditional), predicate);
+   return UpdateKernelNode(handle, ThreadDim(), BlockDim(),
+                           /*cluster_dims=*/std::nullopt,
+-                          *set_while_condition_kernel_, *kernel_args);
++                          *kernels_->set_while_condition, *kernel_args);
+ }
+ 
+ template <typename... Params>
+@@ -419,20 +433,12 @@ absl::StatusOr<GraphNodeHandle> CudaCommandBuffer::CreateSetCaseConditionNode(
+           << "; conditionals (" << conditionals.size()
+           << "): " << FormatGraphConditionalHandles(conditionals);
+ 
+-  if (!set_case_condition_kernel_) {
+-    ABSL_ASSIGN_OR_RETURN(auto spec,
+-                          cuda::GetSetCaseConditionKernelLoaderSpec());
+-    ABSL_ASSIGN_OR_RETURN(
+-        set_case_condition_kernel_,
+-        SetCaseConditionKernel::FactoryType::Create(stream_exec_, spec));
+-  }
+-
+   auto kernel_args = PackCaseConditionKernelArgs(
+-      set_case_condition_kernel_, conditionals, index, index_is_bool,
++      kernels_->set_case_condition, conditionals, index, index_is_bool,
+       batch_offset, enable_conditional_default);
+   return CreateKernelNode(dependencies, StreamPriority::Default, ThreadDim(),
+                           BlockDim(), /*cluster_dims=*/std::nullopt,
+-                          *set_case_condition_kernel_, *kernel_args);
++                          *kernels_->set_case_condition, *kernel_args);
+ }
+ 
+ absl::Status CudaCommandBuffer::UpdateSetCaseConditionNode(
+@@ -441,25 +447,15 @@ absl::Status CudaCommandBuffer::UpdateSetCaseConditionNode(
+     DeviceAddress<uint8_t> index, bool index_is_bool, int32_t batch_offset,
+     bool enable_conditional_default) {
+   auto kernel_args = PackCaseConditionKernelArgs(
+-      set_case_condition_kernel_, conditionals, index, index_is_bool,
++      kernels_->set_case_condition, conditionals, index, index_is_bool,
+       batch_offset, enable_conditional_default);
+   return UpdateKernelNode(handle, ThreadDim(), BlockDim(),
+                           /*cluster_dims=*/std::nullopt,
+-                          *set_case_condition_kernel_, *kernel_args);
++                          *kernels_->set_case_condition, *kernel_args);
+ }
+ 
+ //===----------------------------------------------------------------------===//
+ 
+-absl::StatusOr<CudaCommandBuffer::NoOpKernel*>
+-CudaCommandBuffer::GetNoOpKernel() {
+-  if (!noop_kernel_) {
+-    ABSL_ASSIGN_OR_RETURN(auto spec, cuda::GetNoOpKernelLoaderSpec());
+-    ABSL_ASSIGN_OR_RETURN(noop_kernel_,
+-                          NoOpKernel::FactoryType::Create(stream_exec_, spec));
+-  }
+-  return &noop_kernel_;
+-}
+-
+ absl::StatusOr<GpuCommandBuffer::GraphConditionalNodeHandle>
+ CudaCommandBuffer::CreateConditionalNode(
+     absl::Span<const GraphNodeHandle> dependencies,
+@@ -499,7 +495,7 @@ CudaCommandBuffer::CreateConditionalNode(
+           << cu_params.conditional.phGraph_out[0];
+ 
+   auto nested_cmd_buffer = absl::WrapUnique(new CudaCommandBuffer(
+-      Mode::kNested, stream_exec_, cuda_context_,
++      Mode::kNested, stream_exec_, cuda_context_, kernels_,
+       cu_params.conditional.phGraph_out[0], /*is_owned_graph=*/false));
+   nested_cmd_buffer->parent_ = this;
+ 
+@@ -1081,9 +1077,9 @@ absl::Status CudaCommandBuffer::PrepareFinalization() {
+       return absl::OkStatus();
+     }
+ 
+-    ABSL_ASSIGN_OR_RETURN(NoOpKernel * noop, GetNoOpKernel());
+     ABSL_RETURN_IF_ERROR(
+-        CreateLaunch(*noop, ThreadDim(), BlockDim(), {}, {}).status());
++        CreateLaunch(kernels_->noop, ThreadDim(), BlockDim(), {}, {})
++            .status());
+   }
+   return absl::OkStatus();
+ }
+diff --git a/xla/stream_executor/cuda/cuda_command_buffer.h b/xla/stream_executor/cuda/cuda_command_buffer.h
+index 8fb52da139..6060cb3319 100644
+--- a/xla/stream_executor/cuda/cuda_command_buffer.h
++++ b/xla/stream_executor/cuda/cuda_command_buffer.h
+@@ -27,6 +27,7 @@ limitations under the License.
+ #include "absl/functional/any_invocable.h"
+ #include "absl/log/log.h"
+ #include "absl/status/status.h"
++#include "absl/status/statusor.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+@@ -46,12 +47,48 @@ limitations under the License.
+ 
+ namespace stream_executor::gpu {
+ 
++// The kernels a CUDA graph's conditionals and barriers launch (no-op barriers,
++// updating conditional handles), loaded once by an executor and shared by
++// every command buffer it makes, nested ones among them: a graph recorded
++// later loads no module. A module loaded as a graph is recorded is PTX
++// compiled under the driver's lock; where one process drives two GPUs and
++// the other's graph waits in a collective for this one, that load and the
++// other's graph instantiation never return.
++struct CudaCommandBufferKernels {
++  using NoOp = TypedKernel<>;
++  using SetCaseCondition =
++      TypedKernel<CUgraphConditionalHandle, CUgraphConditionalHandle,
++                  CUgraphConditionalHandle, CUgraphConditionalHandle,
++                  CUgraphConditionalHandle, CUgraphConditionalHandle,
++                  CUgraphConditionalHandle, CUgraphConditionalHandle,
++                  DeviceAddress<uint8_t>, bool, int32_t, int32_t, bool>;
++  using SetWhileCondition =
++      TypedKernel<CUgraphConditionalHandle, DeviceAddress<bool>>;
++
++  // Loads the three on `executor`. Its cuModuleGetFunction loads each
++  // module to the device, also where the driver loads modules lazily
++  // (CUDA_MODULE_LOADING=LAZY).
++  static absl::StatusOr<std::unique_ptr<CudaCommandBufferKernels>> Load(
++      StreamExecutor* executor);
++
++  NoOp noop;
++  SetCaseCondition set_case_condition;
++  SetWhileCondition set_while_condition;
++};
++
+ // This class implements GpuCommandBuffer for Nvidia GPUs.
+ class CudaCommandBuffer final : public GpuCommandBuffer {
+  public:
+-  // Creates a new CUDA command buffer and the underlying CUDA graph.
++  // Whether `executor`'s driver builds command buffers: CUDA graph APIs of
++  // CUDA 12.3 (polymorphic node creation, cuGraphAddNode_v2; conditional
++  // nodes; cuStreamBeginCaptureToGraph).
++  static absl::Status Supported(StreamExecutor* executor);
++
++  // Creates a new CUDA command buffer and the underlying CUDA graph, its
++  // conditionals and barriers launching `kernels`, which outlive it.
+   static absl::StatusOr<std::unique_ptr<CudaCommandBuffer>> Create(
+-      Mode mode, StreamExecutor* executor, CudaContext* cuda_context);
++      Mode mode, StreamExecutor* executor, CudaContext* cuda_context,
++      const CudaCommandBufferKernels* kernels);
+ 
+   std::string ToString() const override;
+ 
+@@ -61,9 +98,11 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
+ 
+  private:
+   CudaCommandBuffer(Mode mode, StreamExecutor* executor,
+-                    CudaContext* cuda_context, CUgraph graph,
++                    CudaContext* cuda_context,
++                    const CudaCommandBufferKernels* kernels, CUgraph graph,
+                     bool is_owned_graph)
+       : GpuCommandBuffer(mode, executor),
++        kernels_(kernels),
+         stream_exec_(executor),
+         cuda_context_(cuda_context),
+         graph_(graph),
+@@ -99,10 +138,6 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
+ 
+   //===--------------------------------------------------------------------===//
+ 
+-  using NoOpKernel = TypedKernel<>;
+-
+-  absl::StatusOr<NoOpKernel*> GetNoOpKernel();
+-
+   absl::StatusOr<GraphConditionalNodeHandle> CreateConditionalNode(
+       absl::Span<const GraphNodeHandle> dependencies,
+       GraphConditionalHandle conditional, ConditionType type) override;
+@@ -242,22 +277,8 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
+   static std::vector<CUgraphNode> ToCudaGraphHandles(
+       absl::Span<const GraphNodeHandle> opaque_handles);
+ 
+-  // A signature of a device kernels updating conditional handle(s).
+-  using SetCaseConditionKernel =
+-      TypedKernel<CUgraphConditionalHandle, CUgraphConditionalHandle,
+-                  CUgraphConditionalHandle, CUgraphConditionalHandle,
+-                  CUgraphConditionalHandle, CUgraphConditionalHandle,
+-                  CUgraphConditionalHandle, CUgraphConditionalHandle,
+-                  DeviceAddress<uint8_t>, bool, int32_t, int32_t, bool>;
+-
+-  using SetWhileConditionKernel =
+-      TypedKernel<CUgraphConditionalHandle, DeviceAddress<bool>>;
+-
+-  // Lazy loaded auxiliary kernels required for building CUDA graphs (no-op
+-  // barriers, updating conditional handles, etc.).
+-  NoOpKernel noop_kernel_;
+-  SetCaseConditionKernel set_case_condition_kernel_;
+-  SetWhileConditionKernel set_while_condition_kernel_;
++  // The executor's kernels its conditionals and barriers launch.
++  const CudaCommandBufferKernels* kernels_;
+ 
+   StreamExecutor* stream_exec_ = nullptr;
+   CudaCommandBuffer* parent_ = nullptr;
+diff --git a/xla/stream_executor/cuda/cuda_command_buffer_kernels_test.cc b/xla/stream_executor/cuda/cuda_command_buffer_kernels_test.cc
+new file mode 100644
+index 0000000000..e19866f689
+--- /dev/null
++++ b/xla/stream_executor/cuda/cuda_command_buffer_kernels_test.cc
+@@ -0,0 +1,193 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <atomic>
++#include <cstdint>
++#include <initializer_list>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include <gmock/gmock.h>
++#include <gtest/gtest.h>
++#include "absl/status/status_macros.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/ascii.h"
++#include "third_party/gpus/cuda/extras/CUPTI/include/cupti.h"
++#include "xla/service/platform_util.h"
++#include "xla/stream_executor/command_buffer.h"
++#include "xla/stream_executor/cuda/cuda_executor.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/stream_executor/gpu/gpu_test_kernels.h"
++#include "xla/stream_executor/launch_dim.h"
++#include "xla/stream_executor/platform.h"
++#include "xla/stream_executor/platform_manager.h"
++#include "xla/stream_executor/semantic_version.h"
++#include "xla/stream_executor/stream.h"
++#include "xla/stream_executor/stream_executor.h"
++#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/statusor.h"
++
++namespace stream_executor::cuda {
++namespace {
++
++using ::testing::Each;
++
++static Platform* CudaPlatform() {
++  auto name = absl::AsciiStrToUpper(
++      xla::PlatformUtil::CanonicalPlatformName("cuda").value());
++  return PlatformManager::PlatformWithName(name).value();
++}
++
++static constexpr auto primary = CommandBuffer::Mode::kPrimary;  // NOLINT
++
++absl::StatusOr<std::vector<const CommandBuffer::Command*>> Wrap(
++    absl::StatusOr<const CommandBuffer::Command*> command) {
++  ABSL_RETURN_IF_ERROR(command.status());
++  return std::vector<const CommandBuffer::Command*>{*command};
++}
++
++// The CUDA modules this process loads while one lives and is subscribed: the
++// calls into cuModuleLoadData and cuModuleLoadDataEx CUPTI's driver callbacks
++// see, from any thread.
++class ModuleLoads {
++ public:
++  ModuleLoads() {
++    status_ = cuptiSubscribe(&subscriber_, &Count, &loads_);
++    if (status_ != CUPTI_SUCCESS) {
++      return;
++    }
++    subscribed_ = true;
++    for (CUpti_CallbackId call : {CUPTI_DRIVER_TRACE_CBID_cuModuleLoadData,
++                                  CUPTI_DRIVER_TRACE_CBID_cuModuleLoadDataEx}) {
++      if (status_ == CUPTI_SUCCESS) {
++        status_ = cuptiEnableCallback(1, subscriber_,
++                                      CUPTI_CB_DOMAIN_DRIVER_API, call);
++      }
++    }
++  }
++  ~ModuleLoads() {
++    if (subscribed_) {
++      cuptiUnsubscribe(subscriber_);
++    }
++  }
++
++  CUptiResult status() const { return status_; }
++  int loads() const { return loads_.load(); }
++
++ private:
++  static void CUPTIAPI Count(void* loads, CUpti_CallbackDomain,
++                             CUpti_CallbackId, const void* data) {
++    if (static_cast<const CUpti_CallbackData*>(data)->callbackSite ==
++        CUPTI_API_ENTER) {
++      ++*static_cast<std::atomic<int>*>(loads);
++    }
++  }
++
++  CUpti_SubscriberHandle subscriber_ = nullptr;
++  bool subscribed_ = false;
++  CUptiResult status_;
++  std::atomic<int> loads_ = 0;
++};
++
++// A graph's while and case nodes are steered, and an empty branch filled, by
++// kernels of their own: a cold executor loads them as it makes its first
++// command buffer, so recording a while whose body holds a case, one branch
++// empty, nested graphs each, loads no module. A load while the graph is
++// recorded compiles PTX under the driver's lock, which in a process driving
++// two GPUs never returned while the other GPU's graph waited in a collective
++// for this one.
++TEST(CudaCommandBufferKernelsTest, RecordingConditionalsLoadsNoModule) {
++  StreamExecutor* cached = CudaPlatform()->ExecutorForDevice(0).value();
++  if (cached->GetDeviceDescription().driver_version() <
++      SemanticVersion{12, 3, 0}) {
++    GTEST_SKIP() << "CUDA command buffers require CUDA driver >= 12.3";
++  }
++  // A fresh executor, none of whose kernels is loaded yet, held as the
++  // StreamExecutor it is (CudaExecutor's own CreateStream hides the base's).
++  auto cuda_executor = std::make_unique<gpu::CudaExecutor>(CudaPlatform(), 0);
++  TF_ASSERT_OK(cuda_executor->Init());
++  std::unique_ptr<StreamExecutor> executor = std::move(cuda_executor);
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
++                          executor->CreateStream());
++  TF_ASSERT_OK_AND_ASSIGN(auto add, gpu::LoadAddI32TestKernel(executor.get()));
++  TF_ASSERT_OK_AND_ASSIGN(auto inc_and_cmp,
++                          gpu::LoadCmpAndIncTestKernel(executor.get()));
++
++  constexpr int64_t kLength = 4;
++  constexpr int64_t kBytes = sizeof(int32_t) * kLength;
++  DeviceAddress<bool> pred = executor->AllocateArray<bool>(1, 0);
++  DeviceAddress<int32_t> counter = executor->AllocateArray<int32_t>(1, 0);
++  DeviceAddress<int32_t> iterations = executor->AllocateArray<int32_t>(1, 0);
++  DeviceAddress<int32_t> index = executor->AllocateArray<int32_t>(1, 0);
++  DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(kLength, 0);
++  DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(kLength, 0);
++  TF_ASSERT_OK(stream->Memset32(&counter, 0, sizeof(int32_t)));
++  TF_ASSERT_OK(stream->Memset32(&iterations, 10, sizeof(int32_t)));
++  TF_ASSERT_OK(stream->Memset32(&index, 0, sizeof(int32_t)));
++  TF_ASSERT_OK(stream->Memset32(&a, 1, kBytes));
++  TF_ASSERT_OK(stream->MemZero(&b, kBytes));
++
++  std::unique_ptr<CommandBuffer> cmd_buffer;
++  {
++    ModuleLoads made;
++    if (made.status() == CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED) {
++      GTEST_SKIP() << "Another CUPTI subscriber holds the driver callbacks";
++    }
++    ASSERT_EQ(made.status(), CUPTI_SUCCESS);
++    TF_ASSERT_OK_AND_ASSIGN(cmd_buffer, executor->CreateCommandBuffer(primary));
++    // The control: the cold executor's helper kernels load here.
++    EXPECT_GT(made.loads(), 0);
++  }
++
++  ModuleLoads recorded;
++  ASSERT_EQ(recorded.status(), CUPTI_SUCCESS);
++  CommandBuffer::CreateCommands cond = [&](CommandBuffer* cond_cmd,
++                                           auto deps) {
++    return Wrap(cond_cmd->CreateLaunch(inc_and_cmp, ThreadDim(), BlockDim(),
++                                       {}, deps, counter, pred, iterations));
++  };
++  CommandBuffer::CreateCommands body = [&](CommandBuffer* body_cmd,
++                                           auto deps) {
++    std::vector<CommandBuffer::CreateCommands> branches;
++    branches.push_back([&](CommandBuffer* branch_cmd, auto branch_deps) {
++      return Wrap(branch_cmd->CreateLaunch(add, ThreadDim(),
++                                           BlockDim(kLength), {}, branch_deps,
++                                           a, b, b));
++    });
++    branches.push_back([](CommandBuffer*, auto) {
++      return std::vector<const CommandBuffer::Command*>{};
++    });
++    return Wrap(body_cmd->CreateCase(index, std::move(branches), deps));
++  };
++  TF_ASSERT_OK(cmd_buffer->CreateWhile(pred, std::move(cond), std::move(body),
++                                    {}));
++  TF_ASSERT_OK(cmd_buffer->Finalize());
++  EXPECT_EQ(recorded.loads(), 0);
++
++  TF_ASSERT_OK(cmd_buffer->Submit(stream.get()));
++  std::vector<int32_t> sums(kLength, 42);
++  TF_ASSERT_OK(stream->Memcpy(sums.data(), b, kBytes));
++  TF_ASSERT_OK(stream->BlockHostUntilDone());
++  EXPECT_THAT(sums, Each(10));
++  for (DeviceAddressBase* held :
++       std::initializer_list<DeviceAddressBase*>{&pred, &counter, &iterations,
++                                                 &index, &a, &b}) {
++    executor->Deallocate(held);
++  }
++}
++
++}  // namespace
++}  // namespace stream_executor::cuda
+diff --git a/xla/stream_executor/cuda/cuda_executor.cc b/xla/stream_executor/cuda/cuda_executor.cc
+index 6d4aa0c9d7..4e38245c9e 100644
+--- a/xla/stream_executor/cuda/cuda_executor.cc
++++ b/xla/stream_executor/cuda/cuda_executor.cc
+@@ -816,7 +816,19 @@ std::unique_ptr<ActivateContext> CudaExecutor::Activate() {
+   return std::make_unique<ScopedActivateContext>(cuda_context_);
+ }
+ 
++// Out of line, as its destructor: its members hold CudaCommandBufferKernels,
++// which its header declares alone.
++CudaExecutor::CudaExecutor(Platform* platform, int device_ordinal,
++                           absl::Duration monitor_poll_interval)
++    : GpuExecutor(platform, device_ordinal),
++      host_callback_registry_(std::make_unique<HostCallbackRegistry>(
++          device_ordinal, monitor_poll_interval)) {}
++
+ CudaExecutor::~CudaExecutor() {
++  {
++    absl::MutexLock lock(command_buffer_kernels_mu_);
++    command_buffer_kernels_.reset();
++  }
+   CHECK(kernel_to_gpu_binary_.empty()) << "CudaExecutor has live kernels.";
+   CHECK(gpu_binary_to_module_.empty()) << "CudaExecutor has loaded modules.";
+ }
+@@ -1103,8 +1115,12 @@ absl::StatusOr<ModuleHandle> CudaExecutor::LoadModuleFromCuBin(
+   LoadedModule& loaded_module = gpu_binary_to_module_[module_handle];
+ 
+   if (loaded_module.module == nullptr) {
+-    ABSL_ASSIGN_OR_RETURN(loaded_module.module,
+-                          LoadCubin(cuda_context_, cubin));
++    absl::StatusOr<CUmodule> loaded = LoadCubin(cuda_context_, cubin);
++    if (!loaded.ok()) {
++      gpu_binary_to_module_.erase(module_handle);  // As LoadModuleFromPtx.
++      return loaded.status();
++    }
++    loaded_module.module = *loaded;
+     loaded_module.refcount = 1;
+     XLA_VLOG_DEVICE(3, device_ordinal())
+         << "Loaded CUBIN " << static_cast<const void*>(cubin) << " as module "
+@@ -1123,7 +1139,14 @@ absl::StatusOr<ModuleHandle> CudaExecutor::LoadModuleFromPtx(const char* ptx) {
+   LoadedModule& loaded_module = gpu_binary_to_module_[module_handle];
+ 
+   if (loaded_module.module == nullptr) {
+-    ABSL_ASSIGN_OR_RETURN(loaded_module.module, LoadPtx(cuda_context_, ptx));
++    absl::StatusOr<CUmodule> loaded = LoadPtx(cuda_context_, ptx);
++    if (!loaded.ok()) {
++      // No entry is left for a module that did not load: the executor's end
++      // requires none (~CudaExecutor), and a later load tries it afresh.
++      gpu_binary_to_module_.erase(module_handle);
++      return loaded.status();
++    }
++    loaded_module.module = *loaded;
+     loaded_module.refcount = 1;
+     XLA_VLOG_DEVICE(3, device_ordinal())
+         << "Loaded PTX " << static_cast<const void*>(ptx) << " as module "
+@@ -1771,7 +1794,23 @@ absl::StatusOr<std::unique_ptr<CommandBuffer>>
+ CudaExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
+   XLA_VLOG_DEVICE(2, device_ordinal())
+       << "Create CUDA command buffer (CUDA graph)";
+-  return CudaCommandBuffer::Create(mode, this, cuda_context_);
++  ABSL_RETURN_IF_ERROR(CudaCommandBuffer::Supported(this));
++  ABSL_ASSIGN_OR_RETURN(const CudaCommandBufferKernels* kernels,
++                        CommandBufferKernels());
++  return CudaCommandBuffer::Create(mode, this, cuda_context_, kernels);
++}
++
++absl::StatusOr<const CudaCommandBufferKernels*>
++CudaExecutor::CommandBufferKernels() {
++  // Loaded as the first command buffer is made, in a thunk's initialization
++  // before the rendezvous after it (xla/service/gpu/gpu_executable.cc), so no
++  // graph recorded after it loads a module.
++  absl::MutexLock lock(command_buffer_kernels_mu_);
++  if (command_buffer_kernels_ == nullptr) {
++    ABSL_ASSIGN_OR_RETURN(command_buffer_kernels_,
++                          CudaCommandBufferKernels::Load(this));
++  }
++  return command_buffer_kernels_.get();
+ }
+ 
+ absl::StatusOr<std::unique_ptr<DeviceDescription>>
+diff --git a/xla/stream_executor/cuda/cuda_executor.h b/xla/stream_executor/cuda/cuda_executor.h
+index 6821e7769f..00c83ac190 100644
+--- a/xla/stream_executor/cuda/cuda_executor.h
++++ b/xla/stream_executor/cuda/cuda_executor.h
+@@ -71,6 +71,8 @@ limitations under the License.
+ 
+ namespace stream_executor::gpu {
+ 
++struct CudaCommandBufferKernels;
++
+ class CudaStream;
+ enum class CudaStreamType;
+ 
+@@ -78,10 +80,7 @@ enum class CudaStreamType;
+ class CudaExecutor : public GpuExecutor {
+  public:
+   CudaExecutor(Platform* platform, int device_ordinal,
+-               absl::Duration monitor_poll_interval = absl::Seconds(5))
+-      : GpuExecutor(platform, device_ordinal),
+-        host_callback_registry_(std::make_unique<HostCallbackRegistry>(
+-            device_ordinal, monitor_poll_interval)) {}
++               absl::Duration monitor_poll_interval = absl::Seconds(5));
+ 
+   ~CudaExecutor() override;
+   std::unique_ptr<ActivateContext> Activate() override;
+@@ -302,6 +301,10 @@ class CudaExecutor : public GpuExecutor {
+   // Returns true if a delay kernel is supported.
+   absl::StatusOr<bool> DelayKernelIsSupported();
+ 
++  // The kernels every command buffer of this executor launches, loaded with
++  // its first command buffer (CudaCommandBufferKernels).
++  absl::StatusOr<const CudaCommandBufferKernels*> CommandBufferKernels();
++
+   // Whether multicast objects are supported by this device.
+   bool is_multicast_supported_ = false;
+ 
+@@ -313,6 +316,10 @@ class CudaExecutor : public GpuExecutor {
+   // Guards the in-memory-module mapping.
+   absl::Mutex in_memory_modules_mu_;
+ 
++  absl::Mutex command_buffer_kernels_mu_;
++  std::unique_ptr<CudaCommandBufferKernels> command_buffer_kernels_
++      ABSL_GUARDED_BY(command_buffer_kernels_mu_);
++
+   absl::Mutex shared_constants_mu_;
+   // On-device constants that can be shared between multiple executables. A
+   // pointer for a given constant will expire when no executables require use
