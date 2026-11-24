@@ -5736,6 +5736,35 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, smem)(x)
     np.testing.assert_array_equal(y, x)
 
+  @parameterized.product(start=(0, 16, 32, 64))
+  def test_a_contiguous_store_past_its_rows_end_is_clipped_there(self, start):
+    # A [1, 64] slice of a [2, 80] array is contiguous, and lowered as one bulk
+    # copy. Started past column 16 it crosses its row's end: clipped as the
+    # tiled copy clips each dimension, it writes row 0's columns to 80 alone,
+    # and row 1 stays as it was (a clip at the buffer's end wrote into it).
+    dtype = jnp.float32
+    shape = (2, 80)
+    def kernel(ctx, src, dst, smem):
+      tmp, barrier = smem
+      ctx.async_copy(src_ref=src, dst_ref=tmp, barrier=barrier)
+      barrier.wait()
+      ctx.async_copy(
+          src_ref=tmp, dst_ref=dst, gmem_slice=(0, ds(start, 64)),
+      )
+      ctx.await_async_copy(0)
+    x = np.arange(64, dtype=dtype) + 1
+    dst = -np.ones(shape, dtype)
+    smem = (jax.ShapeDtypeStruct((64,), dtype), mgpu.Barrier(1))
+    f = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), x, (), smem,
+        inout_shape=(jax.ShapeDtypeStruct(shape, dtype),),
+    )
+    y = np.asarray(f(x, dst)[0])
+    want = dst.copy()
+    kept = min(64, shape[1] - start)
+    want[0, start:start + kept] = x[:kept]
+    np.testing.assert_array_equal(y, want)
+
   @parameterized.product(small_dim=(0, 1),)
   def test_tma_small_tile_store(self, small_dim):
     if small_dim == 0:

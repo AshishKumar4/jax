@@ -2075,9 +2075,34 @@ class LaunchContext:
     ref_ty = ir.MemRefType(ref.type)
     strides, _ = ref_ty.get_strides_and_offset()
 
+    # The slice's outermost dimension of more than one element (its last if
+    # none): a contiguous slice past the ref's end along it holds its
+    # in-bounds elements first, so a 1D copy clipped there writes what the
+    # tiled copy's per-dimension clipping writes. Past the end of any inner
+    # dimension (a slice crossing its rows' end), the in-bounds elements are
+    # no prefix of the slice, which only the tiled copy clips.
+    outer = next(
+        (d for d, size in enumerate(slice_shape) if size != 1),
+        len(slice_shape) - 1,
+    )
+
+    def static_zero(value: ir.Value) -> bool:
+      owner = value.owner
+      return (
+          isinstance(owner, ir.Operation | ir.OpView)
+          and owner.name == "arith.constant"
+          and ir.IntegerAttr(owner.attributes["value"]).value == 0
+      )
+
+    inner_whole = all(
+        slice_shape[d] == ref_ty.shape[d] and static_zero(dyn_base_indices[d])
+        for d in range(outer + 1, len(slice_shape))
+    )
+
     # Use the simpler copy instruction for bulk contiguous transfers.
     is_simple_contiguous_copy = (
         check_contiguous_slice(slice_shape, strides)
+        and (oob_mode == OOBFillMode.PROMISE_IN_BOUNDS or inner_whole)
         and reduction_op is None
         and (
             swizzle is None or swizzle == mgpu_dialect.SwizzlingMode.kNoSwizzle
@@ -2102,13 +2127,25 @@ class LaunchContext:
         index = ir.IndexType.get()
         to_i32 = lambda x: arith.index_cast(ir.IntegerType.get_signless(32), x)
 
-        # Clamp the out-of-bounds accesses to be within the bounds of the GMEM ref shape.
-        total_elements = c(math.prod(gmem_ref_ty.shape), index)
-        linear_offset_elems = memref.extract_strided_metadata(ref_slice)[1]  # pyrefly: ignore[bad-index]
-
-        # Equivalent to: max(0, total - offset)
-        valid_offset_elems = arith.minui(linear_offset_elems, total_elements)
-        remaining_elements = arith.subi(total_elements, valid_offset_elems)
+        # Clipped as the tiled copy clips each dimension: along the outermost
+        # one, at the ref's end (max(0, extent - base) of its elements, each
+        # a whole inner block); none where an outer unit dimension's base is
+        # past its end. The inner dimensions are whole (`inner_whole`).
+        extent = c(ref_ty.shape[outer], index)
+        base = dyn_base_indices[outer]
+        left = arith.subi(extent, arith.minui(base, extent))
+        rows = arith.minui(left, c(slice_shape[outer], index))
+        remaining_elements = arith.muli(
+            rows, c(math.prod(slice_shape[outer + 1:]), index)
+        )
+        zero = c(0, index)
+        for d in range(outer):
+          inside = arith.cmpi(
+              arith.CmpIPredicate.ult,
+              dyn_base_indices[d],
+              c(ref_ty.shape[d], index),
+          )
+          remaining_elements = arith.select(inside, remaining_elements, zero)
 
         remaining_bytes = utils.elements_to_bytes(remaining_elements, element_bitwidth)
         transfer_bytes_idx = arith.index_cast(index, transfer_bytes)
