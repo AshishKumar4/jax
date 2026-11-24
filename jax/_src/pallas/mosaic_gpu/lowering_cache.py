@@ -750,11 +750,10 @@ def lower_unpipelined_jaxpr_to_module(
           _count("unsealed")  # Not a lowering to compare the hit with.
           return lowered
         differences = _differences(_normalized(result), _normalized(lowered))
-        if result.serialized is not None:
-          fresh = _rebuild(_normalized(lowered), context)
-          if fresh is None or result.serialized != mgpu_core.serialized_kernel(
-              fresh.module, result.serialized.forward_compatible):
-            differences.append("serialized")
+        if result.serialized is not None and (
+            result.serialized != mgpu_core.serialized_kernel(
+                lowered.module, result.serialized.forward_compatible)):
+          differences.append("serialized")
         if differences:
           raise LoweringCacheMismatch(
               f"the cached Mosaic GPU lowering {key} differs from a fresh one"
@@ -777,15 +776,11 @@ def lower_unpipelined_jaxpr_to_module(
     return result
   _count("miss")
   # The serialized kernel made once, for the custom call and the entry alike,
-  # from the entry's module parsed again (the serde pass runs in place, and
-  # the lowering's module stays as it was lowered): what a hit makes its call
-  # from, so a hit's call is the miss's.
+  # from the location-neutral lowering (the serde pass runs over a copy of its
+  # module): what a hit makes its call from, so a hit's call is the miss's.
   entry = dataclasses.replace(_normalized(result), seconds=seconds)
-  copy = _rebuild(entry, context)
-  if copy is None:
-    return result
   serialized = mgpu_core.serialized_kernel(
-      copy.module, ctx.is_forward_compat()
+      result.module, ctx.is_forward_compat()
   )
   result = dataclasses.replace(result, serialized=serialized)
   if store is not None:
