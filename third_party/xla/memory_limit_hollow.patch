@@ -1,15 +1,24 @@
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 1cf566dfbd..d58ced8d3f 100644
+index 1cf566dfbd..407e0f4e68 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
-@@ -1827,6 +1827,7 @@ cc_library(
+@@ -1827,6 +1827,8 @@ cc_library(
          ":thunk_emitter",
          "//xla:autotune_results_proto_cc",
          "//xla:debug_options_flags",
++        "//xla:layout",
 +        "//xla:literal_util",
          "//xla:shape_util",
          "//xla:status_macros",
          "//xla:types",
+@@ -2049,6 +2051,7 @@ cc_library(
+         "//xla/service:compilation_stats",
+         "//xla/service:compiled_module",
+         "//xla/service:compiler",
++        "//xla/service:computation_layout",
+         "//xla/service:conditional_simplifier",
+         "//xla/service:copy_insertion",
+         "//xla/service:cpu_gpu_shape_verifier",
 diff --git a/xla/service/gpu/compile_module_to_llvm_ir.cc b/xla/service/gpu/compile_module_to_llvm_ir.cc
 index fa1250ec34..1ae0011974 100644
 --- a/xla/service/gpu/compile_module_to_llvm_ir.cc
@@ -46,56 +55,60 @@ index f024b7cdc9..240fcf5ac9 100644
      const HloModule* hlo_module, llvm::LLVMContext* llvm_context,
      const std::string& target_triple, const std::string& data_layout,
 diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
-index 9025596b36..9ace172c84 100644
+index 9025596b36..fad86594c7 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
+@@ -13,6 +13,9 @@ See the License for the specific language governing permissions and
  limitations under the License.
  ==============================================================================*/
  
 +#include "xla/layout.h"
 +#include "xla/literal_util.h"
++#include "xla/service/computation_layout.h"
  #include "xla/service/gpu/gpu_compiler.h"
  
  #include <algorithm>
-@@ -1398,6 +1400,98 @@ absl::Status RunCollectiveOptimizationPasses(
+@@ -1398,6 +1401,119 @@ absl::Status RunCollectiveOptimizationPasses(
        .status();
  }
  
-+// Each array of `shape` (its leaves) in device memory, as layout assignment
-+// left it, in bytes: a leaf in host memory is none of a compile's device bytes
-+// (CompiledMemoryStats counts it apart).
-+int64_t ArrayBytes(const Shape& shape,
-+                   const std::function<bool(const ShapeIndex&)>& counted) {
++// The device bytes of `shape`'s arrays as the entry's ABI places them
++// (`counted` picks leaves), or nullopt where any leaf is no array (a token, an
++// opaque) or lies outside device memory (pinned host, S(5)): layout assignment
++// clears an instruction's memory space, and the host offloader restores it
++// from the entry computation layout, so that layout alone says where an
++// argument or a result lives.
++std::optional<int64_t> DeviceArrayBytes(
++    const Shape& shape,
++    const std::function<bool(const ShapeIndex&)>& counted) {
 +  int64_t bytes = 0;
++  bool device = true;
 +  ShapeUtil::ForEachSubshape(
 +      shape, [&](const Shape& subshape, const ShapeIndex& index) {
-+        const bool host =
-+            subshape.has_layout() &&
-+            subshape.layout().memory_space() == Layout::kHostMemorySpace;
-+        if (subshape.IsArray() && !host && counted(index)) {
++        if (subshape.IsTuple()) {
++          return;
++        }
++        if (!subshape.IsArray() || !subshape.has_layout() ||
++            subshape.layout().memory_space() != Layout::kDefaultMemorySpace) {
++          device = false;
++          return;
++        }
++        if (counted(index)) {
 +          bytes += ShapeUtil::ByteSizeOf(subshape);
 +        }
 +      });
-+  return bytes;
++  return device ? std::optional<int64_t>(bytes) : std::nullopt;
 +}
 +
-+// An all-zero value of `shape`, its layout `shape`'s, built in `computation`;
-+// nullptr where a leaf is no array (a token).
++// An all-zero value of `shape` (a tuple of arrays, nested), its layout
++// `shape`'s, built in `computation`.
 +HloInstruction* ZerosOf(HloComputation* computation, const Shape& shape) {
 +  if (shape.IsTuple()) {
 +    std::vector<HloInstruction*> elements;
 +    for (const Shape& element : shape.tuple_shapes()) {
-+      HloInstruction* zeros = ZerosOf(computation, element);
-+      if (zeros == nullptr) {
-+        return nullptr;
-+      }
-+      elements.push_back(zeros);
++      elements.push_back(ZerosOf(computation, element));
 +    }
 +    return computation->AddInstruction(HloInstruction::CreateTuple(elements));
-+  }
-+  if (!shape.IsArray()) {
-+    return nullptr;
 +  }
 +  HloInstruction* zero = computation->AddInstruction(
 +      HloInstruction::CreateConstant(LiteralUtil::Zero(shape.element_type())));
@@ -112,35 +125,53 @@ index 9025596b36..9ace172c84 100644
 +// states the arguments and outputs alone, past the limit, which stops the
 +// compile (CompileModuleToLlvmIr), its bytes (CompiledMemoryStats: arguments
 +// and outputs, an aliased pair once) at least these. Its memory is so a lower
-+// bound of the module's, and its live set no temporary; it is marked
-+// (kMemoryLimitHollowed), so a compile of it that would emit code fails.
-+// Whether it was hollowed.
++// bound of the module's, and its live set no temporary.
++//
++// All is checked before the module changes: a module is left whole where its
++// entry ABI (entry_computation_layout) holds a leaf that is no array or lies
++// outside device memory, which CompiledMemoryStats does not count as device
++// bytes, or where any instruction has a side effect, which neither hollowing
++// nor dead code elimination may drop. A hollowed module is marked
++// (kMemoryLimitHollowed): a compile of it whose buffer assignment came within
++// the limit fails rather than emit code that would run zeros. Whether it was
++// hollowed.
 +absl::StatusOr<bool> HollowEntryOverMemoryLimit(HloModule* module) {
 +  const int64_t limit =
 +      module->config().debug_options().xla_gpu_memory_limit_early_exit_bytes();
 +  if (limit <= 0) {
 +    return false;
 +  }
-+  HloComputation* entry = module->entry_computation();
++  const ComputationLayout& abi = module->entry_computation_layout();
 +  int64_t bytes = 0;
-+  for (const HloInstruction* parameter : entry->parameter_instructions()) {
-+    bytes += ArrayBytes(parameter->shape(), [](const ShapeIndex&) {
-+      return true;
-+    });
++  for (int64_t i = 0; i < abi.parameter_count(); ++i) {
++    std::optional<int64_t> argument =
++        DeviceArrayBytes(abi.parameter_layout(i).shape(),
++                         [](const ShapeIndex&) { return true; });
++    if (!argument.has_value()) {
++      return false;
++    }
++    bytes += *argument;
 +  }
 +  const HloInputOutputAliasConfig& aliases =
 +      module->input_output_alias_config();
++  std::optional<int64_t> outputs =
++      DeviceArrayBytes(abi.result_layout().shape(), [&](const ShapeIndex& at) {
++        return !aliases.OutputHasAlias(at);
++      });
++  if (!outputs.has_value() || bytes + *outputs <= limit) {
++    return false;
++  }
++  bytes += *outputs;
++  for (const HloComputation* computation : module->computations()) {
++    for (const HloInstruction* instruction : computation->instructions()) {
++      if (instruction->HasSideEffectNoRecurse()) {
++        return false;
++      }
++    }
++  }
++  HloComputation* entry = module->entry_computation();
 +  HloInstruction* root = entry->root_instruction();
-+  bytes += ArrayBytes(root->shape(), [&](const ShapeIndex& index) {
-+    return !aliases.OutputHasAlias(index);
-+  });
-+  if (bytes <= limit) {
-+    return false;
-+  }
 +  HloInstruction* zeros = ZerosOf(entry, root->shape());
-+  if (zeros == nullptr) {
-+    return false;
-+  }
 +  if (root->has_sharding()) {
 +    zeros->set_sharding(root->sharding());
 +  }
@@ -157,7 +188,7 @@ index 9025596b36..9ace172c84 100644
  absl::Status RunLayoutAssignmentPasses(
      HloModule* hlo_module, se::GpuComputeCapability gpu_version,
      const se::DeviceDescription& device_description,
-@@ -1957,6 +2051,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
+@@ -1957,6 +2073,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
    if (options.early_exit_with_layouts) {
      return absl::OkStatus();
    }
@@ -166,10 +197,82 @@ index 9025596b36..9ace172c84 100644
    ABSL_RETURN_IF_ERROR(RunLayoutNormalizationPasses(
        hlo_module,
 diff --git a/xla/service/gpu/gpu_compiler_memory_limit_test.cc b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-index 4ae39ba021..39b194abef 100644
+index 4ae39ba021..38013798bd 100644
 --- a/xla/service/gpu/gpu_compiler_memory_limit_test.cc
 +++ b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-@@ -121,6 +121,33 @@ TEST_F(GpuCompilerMemoryLimitTest,
+@@ -55,23 +55,66 @@ constexpr absl::string_view kHloText = R"hlo(
+   }
+ )hlo";
+ 
++// One f32[256,256] array's bytes.
++constexpr int64_t kArrayBytes = 256 * 256 * 4;
++
++// Its second parameter's leaf {1} donated to its output {0}: its arguments'
++// three leaves and its one new output hold four arrays.
++constexpr absl::string_view kDonatedHlo = R"hlo(
++  HloModule donated, input_output_alias={ {0}: (0, {1}, must-alias) }
++
++  ENTRY main {
++    p0 = f32[256,256]{1,0} parameter(0)
++    p1 = (f32[256,256]{1,0}, f32[256,256]{1,0}) parameter(1)
++    w = f32[256,256]{1,0} get-tuple-element(p1), index=1
++    dot = f32[256,256] dot(p0, w),
++      lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    tanh = f32[256,256] tanh(dot)
++    out = f32[256,256] dot(tanh, w),
++      lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    ROOT result = (f32[256,256], f32[256,256]) tuple(out, tanh)
++  }
++)hlo";
++
++// Its first argument lives in pinned host memory (S(5)) as its entry's ABI
++// says: no device byte of its compile's.
++constexpr absl::string_view kHostArgumentHlo = R"hlo(
++  HloModule host_argument,
++    entry_computation_layout={(f32[256,256]{1,0:S(5)}, f32[256,256]{1,0})
++                              ->f32[256,256]{1,0}}
++
++  ENTRY main {
++    host = f32[256,256]{1,0} parameter(0)
++    p0 = f32[256,256]{1,0} custom-call(host), custom_call_target="MoveToDevice"
++    p1 = f32[256,256]{1,0} parameter(1)
++    dot = f32[256,256] dot(p0, p1),
++      lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    tanh = f32[256,256] tanh(dot)
++    ROOT out = f32[256,256] dot(tanh, p1),
++      lhs_contracting_dims={1}, rhs_contracting_dims={0}
++  }
++)hlo";
++
+ class GpuCompilerMemoryLimitTest : public HloPjRtGpuTestBase {
+  protected:
+-  // `kHloText` under a compile limited to `limit` device bytes (none at 0).
+-  absl::StatusOr<std::unique_ptr<HloModule>> Limited(int64_t limit) {
++  // `hlo` under a compile limited to `limit` device bytes (none at 0).
++  absl::StatusOr<std::unique_ptr<HloModule>> Limited(
++      int64_t limit, absl::string_view hlo = kHloText) {
+     HloModuleConfig config = GetModuleConfigForTest();
+     DebugOptions options = config.debug_options();
+     options.set_xla_gpu_memory_limit_early_exit_bytes(limit);
+     config.set_debug_options(options);
+-    return ParseAndReturnVerifiedModule(kHloText, config);
++    return ParseAndReturnVerifiedModule(hlo, config);
+   }
+ 
+   // It compiled ahead of time for this GPU under `limit`.
+-  absl::StatusOr<std::unique_ptr<CompiledModule>> CompiledAhead(int64_t limit) {
++  absl::StatusOr<std::unique_ptr<CompiledModule>> CompiledAhead(
++      int64_t limit, absl::string_view hlo = kHloText) {
+     AotCompilationOptions aot_options(compiler()->PlatformId());
+     aot_options.set_gpu_topology(GetSingleDeviceGpuTopology(
+         /*platform_version=*/"", gpu_target_config()));
+-    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module, Limited(limit));
++    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
++                        Limited(limit, hlo));
+     TF_ASSIGN_OR_RETURN(
+         std::vector<std::unique_ptr<CompiledModule>> results,
+         compiler()->CompileAheadOfTime(std::move(module), aot_options));
+@@ -121,6 +164,109 @@ TEST_F(GpuCompilerMemoryLimitTest,
                HasSubstr("stopped after buffer assignment"));
  }
  
@@ -198,6 +301,82 @@ index 4ae39ba021..39b194abef 100644
 +                                                                 0.5f);
 +  absl::StatusOr<Literal> ran = Execute(std::move(module), {&x, &x});
 +  EXPECT_EQ(ran.status().code(), absl::StatusCode::kFailedPrecondition);
++}
++
++TEST_F(GpuCompilerMemoryLimitTest,
++       ALimitItsArgumentsAndOutputsExactlyFitStopsAsTheWholeCompile) {
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> unlimited,
++                          CompiledAhead(0));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole,
++                          unlimited->GetCompiledMemoryStats());
++  // Its arguments and its output hold the limit exactly: no hollowing, so its
++  // temporaries pass the limit and it stops with the whole compile's memory.
++  const int64_t limit =
++      whole.argument_size_in_bytes + whole.output_size_in_bytes;
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> limited,
++                          CompiledAhead(limit));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stopped,
++                          limited->GetCompiledMemoryStats());
++  EXPECT_EQ(stopped.temp_size_in_bytes, whole.temp_size_in_bytes);
++  EXPECT_EQ(DeviceBytes(stopped), DeviceBytes(whole));
++  EXPECT_GT(DeviceBytes(stopped), limit);
++}
++
++TEST_F(GpuCompilerMemoryLimitTest,
++       ADonatedTupleLeafCountsOnceAmongTheArgumentsAndOutputsThatStopIt) {
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> unlimited,
++                          CompiledAhead(0, kDonatedHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole,
++                          unlimited->GetCompiledMemoryStats());
++  ASSERT_EQ(whole.alias_size_in_bytes, kArrayBytes);
++  // Four arrays (the arguments' three leaves, one donated to the output, and
++  // one new output) hold the limit exactly: the module is not hollowed.
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> fitting,
++                          CompiledAhead(4 * kArrayBytes, kDonatedHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats fit,
++                          fitting->GetCompiledMemoryStats());
++  EXPECT_EQ(fit.temp_size_in_bytes, whole.temp_size_in_bytes);
++  // One byte under them, it is hollowed: its arguments, its outputs and their
++  // alias as the whole compile's, no temporary, past the limit.
++  const int64_t limit = 4 * kArrayBytes - 1;
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> limited,
++                          CompiledAhead(limit, kDonatedHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stopped,
++                          limited->GetCompiledMemoryStats());
++  EXPECT_EQ(stopped.argument_size_in_bytes, whole.argument_size_in_bytes);
++  EXPECT_EQ(stopped.output_size_in_bytes, whole.output_size_in_bytes);
++  EXPECT_EQ(stopped.alias_size_in_bytes, whole.alias_size_in_bytes);
++  EXPECT_EQ(stopped.temp_size_in_bytes, 0);
++  EXPECT_GT(DeviceBytes(stopped), limit);
++}
++
++TEST_F(GpuCompilerMemoryLimitTest,
++       AModuleWithAPinnedHostArgumentIsNeverHollowed) {
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> unlimited,
++                          CompiledAhead(0, kHostArgumentHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats whole,
++                          unlimited->GetCompiledMemoryStats());
++  ASSERT_EQ(whole.host_argument_size_in_bytes, kArrayBytes);
++  // Its arguments and output, the host one among them, pass this limit, which
++  // its device bytes alone do not: it compiles whole, never hollowed to zeros
++  // whose device bytes would fit and run.
++  const int64_t limit = whole.argument_size_in_bytes +
++                        whole.host_argument_size_in_bytes +
++                        whole.output_size_in_bytes - 1;
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> limited,
++                          CompiledAhead(limit, kHostArgumentHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stats,
++                          limited->GetCompiledMemoryStats());
++  EXPECT_EQ(stats.temp_size_in_bytes, whole.temp_size_in_bytes);
++  EXPECT_EQ(DeviceBytes(stats), DeviceBytes(whole));
++  // Under a limit its device bytes fit, it is no stopped compile
++  // (DeviceBytesOverMemoryLimit, what its executable and jax's cache read).
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> fitting,
++                          CompiledAhead(DeviceBytes(whole), kHostArgumentHlo));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats fit,
++                          fitting->GetCompiledMemoryStats());
++  EXPECT_EQ(fit.temp_size_in_bytes, whole.temp_size_in_bytes);
++  EXPECT_LE(DeviceBytes(fit), DeviceBytes(whole));
 +}
 +
  TEST_F(GpuCompilerMemoryLimitTest, ACompileWithinItsLimitRunsAsAnUnlimitedOne) {
