@@ -439,34 +439,32 @@ def emit_pipeline[T](
               " provably in bounds, or oob_fill_mode="
               "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
           )
-    threads = (
-        1 if thread_axis is None
-        else core.get_axis_env().axis_size(thread_axis)
-    )
     return pl.run_scoped(
         functools.partial(
             scoped_pipeline,
             in_specs=effective_in_specs,
             in_gmem_refs=in_gmem_refs,
             out_gmem_refs=out_gmem_refs,
-            threads=threads,
+            threads=thread_count(),
         ),
         **get_allocations(*gmem_refs),
-        # Two barriers the threads meet at in turn, so that no thread arrives
-        # at a barrier's next phase before every thread has seen its last.
-        meet_ref=None
-        if threads == 1
-        else gpu_core.Barrier(num_arrivals=threads, num_barriers=2),
         collective_axes=() if thread_axis is None else thread_axis,
     )
+
+  def thread_count() -> int:
+    """How many threads run the pipeline: ``thread_axis``'s size, else one."""
+    if thread_axis is None:
+      return 1
+    return core.get_axis_env().axis_size(thread_axis)
 
   def get_allocations(*gmem_refs: Any) -> dict[str, Any]:
     """The buffers and barriers the pipeline scopes for ``gmem_refs``: its
     SMEM slots, ``max_concurrent_steps`` of each block (fewer where a static
-    grid has fewer steps), and its TMA barriers. ``gmem_refs`` need only
-    their shapes and dtypes, so a caller can size the pipeline's shared
+    grid has fewer steps), its TMA barriers, and, where ``thread_axis`` names
+    more than one thread, the two barriers they meet at. ``gmem_refs`` need
+    only their shapes and dtypes, so a caller can size the pipeline's shared
     memory before it runs (as the warp-specialized pipeline's
-    ``get_allocations`` gives its own)."""
+    ``get_allocations`` gives its own); a ``thread_axis`` must be bound."""
     in_smem_refs, out_smem_refs = util.split_list(
         [
             gpu_core.SMEM(
@@ -484,9 +482,15 @@ def emit_pipeline[T](
         [len(in_specs)],
     )
     copies_per_step = sum(map(_in_smem, in_specs))
+    threads = thread_count()
     return dict(
         in_smem_refs=in_smem_refs,
         out_smem_refs=out_smem_refs,
+        # Two barriers the threads meet at in turn, so that no thread arrives
+        # at a barrier's next phase before every thread has seen its last.
+        meet_ref=None
+        if threads == 1
+        else gpu_core.Barrier(num_arrivals=threads, num_barriers=2),
         barrier_ref=None
         if copies_per_step == 0
         or is_cp_async  # cp.async uses wait_gmem_to_smem
