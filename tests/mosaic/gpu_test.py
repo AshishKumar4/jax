@@ -5736,12 +5736,13 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     y = mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, x, smem)(x)
     np.testing.assert_array_equal(y, x)
 
-  @parameterized.product(start=(0, 16, 32, 64))
-  def test_a_contiguous_store_past_its_rows_end_is_clipped_there(self, start):
-    # A [1, 64] slice of a [2, 80] array is contiguous, and lowered as one bulk
-    # copy. Started past column 16 it crosses its row's end: clipped as the
-    # tiled copy clips each dimension, it writes row 0's columns to 80 alone,
-    # and row 1 stays as it was (a clip at the buffer's end wrote into it).
+  @parameterized.product(start=(0, 16, 32, 64, -16, 80))
+  def test_a_contiguous_store_past_its_rows_ends_is_clipped_there(self, start):
+    # A [1, 64] slice of a [2, 80] array is contiguous, and stored (its bounds
+    # unpromised, as Pallas stores) as one bulk copy. Past its row's end, or
+    # before its start, it is clipped as the tiled copy clips each dimension:
+    # row 0's in-bounds columns alone are written, and row 1 stays as it was
+    # (a clip at the buffer's end wrote into it).
     dtype = jnp.float32
     shape = (2, 80)
     def kernel(ctx, src, dst, smem):
@@ -5750,6 +5751,7 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
       barrier.wait()
       ctx.async_copy(
           src_ref=tmp, dst_ref=dst, gmem_slice=(0, ds(start, 64)),
+          oob_mode=mgpu.OOBFillMode.UNDEFINED,
       )
       ctx.await_async_copy(0)
     x = np.arange(64, dtype=dtype) + 1
@@ -5761,8 +5763,51 @@ class AsyncCopyTest(TestCase, jtu.CudaArchSpecificTest):
     )
     y = np.asarray(f(x, dst)[0])
     want = dst.copy()
-    kept = min(64, shape[1] - start)
-    want[0, start:start + kept] = x[:kept]
+    for k in range(64):
+      if 0 <= start + k < shape[1]:
+        want[0, start + k] = x[k]
+    np.testing.assert_array_equal(y, want)
+
+  @parameterized.product(
+      start=(0, 64, -16, 80), row=(1, 2), arrive=(True, False)
+  )
+  def test_a_contiguous_load_past_its_rows_ends_is_clipped_there(
+      self, start, row, arrive
+  ):
+    # A [1, 64] load of a [2, 80] array as one bulk copy, its bounds
+    # unpromised: the in-bounds columns of its row are loaded into the slots
+    # they hold in the slice, the rest of its buffer as it was, and its
+    # barrier completes whether its caller expects the clipped bytes (arrive)
+    # or the whole slice's. Row 2 is past the array: nothing is loaded.
+    dtype = jnp.float32
+    shape = (2, 80)
+    def kernel(ctx, src, out, smem):
+      tmp, barrier = smem
+      mgpu.FragmentedArray.splat(
+          c(-1.0, ir.F32Type.get()), (64,), is_signed=None,
+      ).store_untiled(tmp)
+      mgpu.commit_shared()
+      if not arrive:
+        barrier.arrive_expect_tx(64 * 4, predicate=single_thread_predicate())
+      ctx.async_copy(
+          src_ref=src, dst_ref=tmp, gmem_slice=(row, ds(start, 64)),
+          barrier=barrier, arrive=arrive,
+          oob_mode=mgpu.OOBFillMode.UNDEFINED,
+      )
+      barrier.wait()
+      ctx.async_copy(src_ref=tmp, dst_ref=out)
+      ctx.await_async_copy(0)
+    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    smem = (jax.ShapeDtypeStruct((64,), dtype), mgpu.Barrier(1))
+    out = jax.ShapeDtypeStruct((64,), dtype)
+    y = np.asarray(
+        mgpu.as_gpu_kernel(kernel, (1, 1, 1), (128, 1, 1), x, out, smem)(x)
+    )
+    want = -np.ones((64,), dtype)
+    if row < shape[0]:
+      for k in range(64):
+        if 0 <= start + k < shape[1]:
+          want[k] = x[row, start + k]
     np.testing.assert_array_equal(y, want)
 
   @parameterized.product(small_dim=(0, 1),)

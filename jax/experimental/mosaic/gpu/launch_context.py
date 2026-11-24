@@ -2076,27 +2076,21 @@ class LaunchContext:
     strides, _ = ref_ty.get_strides_and_offset()
 
     # The slice's outermost dimension of more than one element (its last if
-    # none): a contiguous slice past the ref's end along it holds its
-    # in-bounds elements first, so a 1D copy clipped there writes what the
-    # tiled copy's per-dimension clipping writes. Past the end of any inner
+    # none): a contiguous slice past the ref's ends along it holds its
+    # in-bounds elements as one run, so a 1D copy of that run writes what the
+    # tiled copy's per-dimension clipping writes. Past the ends of any inner
     # dimension (a slice crossing its rows' end), the in-bounds elements are
-    # no prefix of the slice, which only the tiled copy clips.
+    # no run of the slice, which only the tiled copy clips: an inner dimension
+    # is whole, its base zero (a dynamic one checked as the copy runs).
     outer = next(
         (d for d, size in enumerate(slice_shape) if size != 1),
         len(slice_shape) - 1,
     )
-
-    def static_zero(value: ir.Value) -> bool:
-      owner = value.owner
-      return (
-          isinstance(owner, ir.Operation | ir.OpView)
-          and owner.name == "arith.constant"
-          and ir.IntegerAttr(owner.attributes["value"]).value == 0
-      )
-
+    inner = range(outer + 1, len(slice_shape))
     inner_whole = all(
-        slice_shape[d] == ref_ty.shape[d] and static_zero(dyn_base_indices[d])
-        for d in range(outer + 1, len(slice_shape))
+        slice_shape[d] == ref_ty.shape[d]
+        and _constant(dyn_base_indices[d]) in (0, None)
+        for d in inner
     )
 
     # Use the simpler copy instruction for bulk contiguous transfers.
@@ -2121,35 +2115,60 @@ class LaunchContext:
       del ref  # Use ref_slice from now on.
       gmem_base_ptr = utils.memref_ptr(ref_slice)
 
+      skipped_bytes = None  # The run's start in the slice, where clipped.
       if oob_mode == OOBFillMode.PROMISE_IN_BOUNDS:
         clamped_transfer_bytes = transfer_bytes
       else:
         index = ir.IndexType.get()
         to_i32 = lambda x: arith.index_cast(ir.IntegerType.get_signless(32), x)
 
-        # Clipped as the tiled copy clips each dimension: along the outermost
-        # one, at the ref's end (max(0, extent - base) of its elements, each
-        # a whole inner block); none where an outer unit dimension's base is
-        # past its end. The inner dimensions are whole (`inner_whole`).
+        # Clipped as the tiled copy clips each dimension. Along the outermost
+        # one, the run [max(base, 0), min(base + size, extent)) of its
+        # elements, each a whole inner block, its start `skipped` elements
+        # into the slice (a base below zero); none where an outer unit
+        # dimension's base is out of its bounds, or a dynamic inner base is
+        # not zero (`inner_whole`).
+        zero = c(0, index)
         extent = c(ref_ty.shape[outer], index)
         base = dyn_base_indices[outer]
-        left = arith.subi(extent, arith.minui(base, extent))
-        rows = arith.minui(left, c(slice_shape[outer], index))
-        remaining_elements = arith.muli(
-            rows, c(math.prod(slice_shape[outer + 1:]), index)
+        start = arith.maxsi(base, zero)
+        end = arith.minsi(
+            arith.addi(base, c(slice_shape[outer], index)), extent
         )
-        zero = c(0, index)
+        rows = arith.maxsi(arith.subi(end, start), zero)
+        block = c(math.prod(slice_shape[outer + 1:]), index)
+        remaining_elements = arith.muli(rows, block)
+        inside = None
+        def within(value):
+          nonlocal inside
+          inside = value if inside is None else arith.andi(inside, value)
         for d in range(outer):
-          inside = arith.cmpi(
-              arith.CmpIPredicate.ult,
+          within(arith.cmpi(
+              arith.CmpIPredicate.sge, dyn_base_indices[d], zero))
+          within(arith.cmpi(
+              arith.CmpIPredicate.slt,
               dyn_base_indices[d],
               c(ref_ty.shape[d], index),
-          )
+          ))
+        for d in inner:
+          if _constant(dyn_base_indices[d]) is None:
+            within(arith.cmpi(
+                arith.CmpIPredicate.eq, dyn_base_indices[d], zero))
+        if inside is not None:
           remaining_elements = arith.select(inside, remaining_elements, zero)
+        skipped = arith.muli(
+            arith.subi(start, base), block
+        )
 
         remaining_bytes = utils.elements_to_bytes(remaining_elements, element_bitwidth)
         transfer_bytes_idx = arith.index_cast(index, transfer_bytes)
         clamped_transfer_bytes = to_i32(arith.minui(transfer_bytes_idx, remaining_bytes))
+        # Where nothing is copied, the run starts where the slice does.
+        skipped_bytes = arith.select(
+            arith.cmpi(arith.CmpIPredicate.eq, remaining_elements, zero),
+            zero,
+            utils.elements_to_bytes(skipped, element_bitwidth),
+        )
 
       if gmem_peer_id is not None:
         if isinstance(gmem_peer_id, GlobalBroadcast):
@@ -2161,6 +2180,14 @@ class LaunchContext:
 
           remote_ref = self.to_remote(ref_slice, gmem_peer_id, on_host=False)
           gmem_base_ptr = utils.memref_ptr(remote_ref)
+
+      if skipped_bytes is not None:
+        # Both ends of the copy start at its run's first element.
+        i64 = ir.IntegerType.get_signless(64)
+        offset = arith.index_cast(i64, skipped_bytes)
+        i8 = ir.IntegerType.get_signless(8)
+        gmem_base_ptr = utils.getelementptr(gmem_base_ptr, [offset], i8)
+        smem_ptr = utils.getelementptr(smem_ptr, [offset], i8)
 
       if gmem_ref is src_ref:
         assert barrier is not None
