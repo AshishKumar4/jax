@@ -1271,6 +1271,72 @@ _LN2_HI = 0.693145751953125
 _LN2_LO = 1.428606765330187e-06
 
 
+def _saturating_to_integer(ty: ir.Type, x: ir.Value, *, signed: bool) -> ir.Value:
+  """`x`, a float or a vector of them, converted to `ty`'s integers toward zero,
+  saturating as XLA's convert does: a value past the integer's range takes its
+  bound and a NaN zero.
+
+  PTX's `cvt.rzi` from a float into an integer clamps to the destination's range
+  by default and takes a NaN to zero from an f32 into at most 32 bits (PTX ISA,
+  `cvt`: `.sat` is redundant there; an f64's or a 64-bit integer's NaN is chosen
+  zero here),
+  so one `cvt` an element does it, where LLVM's `fptosi` and `fptoui`, poison past
+  the range, needed a clamp ahead of them; an f64 converts as itself, a 16-bit
+  float extended to f32 first, exactly. It is inline PTX because the pinned
+  LLVM does not translate `llvm.intr.fptosi.sat` and `llvm.intr.fptoui.sat`
+  ("LLVM Translation failed for operation"); once it does, those intrinsics, which
+  NVPTX lowers to this `cvt`, replace it. An 8-bit integer is converted in a
+  16-bit register, PTX having none of 8 bits, and truncated, its value already
+  within the 8-bit range. Widths `cvt` takes none of (a packed 4-bit integer's)
+  are `FragmentedArray.astype`'s to convert otherwise.
+  """
+  if isinstance(ty, ir.VectorType):
+    result = llvm.mlir_undef(ty)
+    element_ty = ir.VectorType(ty).element_type
+    for i in range(ir.VectorType(ty).shape[0]):
+      position = ir.DenseI64ArrayAttr.get([i])
+      element = vector.extract(x, dynamic_position=[], static_position=position)
+      converted = _saturating_to_integer(element_ty, element, signed=signed)
+      result = vector.insert(
+          converted, result, dynamic_position=[], static_position=position
+      )
+    return result
+  if isinstance(x.type, ir.F64Type):
+    source, source_constraint = "f64", "d"
+  else:
+    source, source_constraint = "f32", "f"
+    if not isinstance(x.type, ir.F32Type):
+      x = arith.extf(ir.F32Type.get(), x)
+  width = ir.IntegerType(ty).width
+  register_width, constraint = _SATURATED_REGISTERS[width]
+  register_ty = ir.IntegerType.get_signless(register_width)
+  kind = "s" if signed else "u"
+  converted = llvm.inline_asm(
+      register_ty,
+      [x],
+      f"cvt.rzi.{kind}{width}.{source} $0, $1;",
+      f"={constraint},{source_constraint}",
+  )
+  assert isinstance(converted, ir.Value)
+  if source == "f64" or width == 64:
+    # Where the source is an f64 or the integer 64 bits, `cvt` takes a NaN to
+    # `1 << (width - 1)` rather than zero (PTX ISA, `cvt`): zero chosen here.
+    is_nan = arith.cmpf(arith.CmpFPredicate.UNO, x, x)
+    converted = arith.select(is_nan, c(0, register_ty), converted)
+  return converted if register_width == width else arith.trunci(ty, converted)
+
+
+# Each integer width PTX's cvt converts a float into, saturating, by the
+# register and constraint it takes (PTX has no 8-bit register).
+_SATURATED_REGISTERS = {8: (16, "h"), 16: (16, "h"), 32: (32, "r"), 64: (64, "l")}
+
+
+def saturates_into(width: int) -> bool:
+  """Whether a float converts into an integer of `width` bits saturating as one
+  `cvt` (`_saturating_to_integer`); another width's caller clamps ahead of it."""
+  return width in _SATURATED_REGISTERS
+
+
 def _exp_series(r: ir.Value) -> ir.Value:
   """e^r for an f32 `r` within ln 2 / 2 of zero (`_EXP_TERMS`)."""
   ty = r.type
@@ -3535,7 +3601,12 @@ class FragmentedArray:
     elif from_float and to_integer:
       # TODO(apaszke): Support other rounding modes.
       check_supported_rounding((Rounding.TO_ZERO,), hw_limitation=False)
-      convert = arith.fptosi if is_signed else arith.fptoui
+      if saturates_into(ir.IntegerType(new_dtype).width):
+        convert = functools.partial(_saturating_to_integer, signed=bool(is_signed))
+      else:
+        # A width no `cvt` saturates into (a packed 4-bit integer's): its
+        # caller clamps ahead of it (Pallas's lowering rule).
+        convert = arith.fptosi if is_signed else arith.fptoui
     else:
       raise NotImplementedError(f"Unsupported conversion {cur_dtype} -> {new_dtype}")
     new_registers = np.empty_like(self.registers)
