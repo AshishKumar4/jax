@@ -23,15 +23,18 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax._src import config
+from jax._src import custom_call_targets
 from jax._src import dtypes
 from jax._src import mesh as mesh_lib
 from jax._src import test_util as jtu
+from jax._src.lib.mlir import ir
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
 
 if sys.platform != "win32":
   from jax.experimental.pallas import triton as plgpu
+  from jax._src.lib.triton import dialect as tt_dialect
 else:
   plgpu = None
 
@@ -913,6 +916,50 @@ def matmul(x, y, *, bm, bn, gm, bk, interpret, debug=False):
     o_ref[o_idx] = acc
 
   return matmul_kernel(x, y)
+
+
+class TritonKernelLocationsTest(PallasBaseTest):
+
+  @parameterized.parameters(False, True)
+  def test_a_kernel_serializes_locations_only_when_debugged(self, debug):
+    # A reduction's combiner is traced once a process, so its locations named
+    # the first kernel to lower it in every later one: a kernel serialized
+    # apart across processes and call orders, its program with it.
+    if jtu.test_device_matches(["cpu"]):
+      self.skipTest("Lowers a Triton kernel only for a GPU")
+
+    def body(x_ref, o_ref):
+      o_ref[...] = jnp.sum(x_ref[...], axis=0, keepdims=True)
+
+    f = self.pallas_call(
+        body, out_shape=jax.ShapeDtypeStruct((1, 128), jnp.float32),
+        debug=debug)
+    with contextlib.redirect_stdout(io.StringIO()):
+      lowered = jax.jit(f).lower(jnp.ones((16, 128), jnp.float32))
+    kernels = []
+
+    def find(op):
+      if (op.name == "stablehlo.custom_call"
+          and op.attributes["call_target_name"].value
+          == custom_call_targets.TRITON):
+        config = ir.DictAttr(op.attributes["mhlo.backend_config"])
+        kernels.append(ir.StringAttr(config["ir"]).value_bytes)
+      return ir.WalkResult.ADVANCE
+
+    lowered.compiler_ir().operation.walk(find)
+    [kernel] = kernels
+    ctx = ir.Context()
+    tt_dialect.register_dialect(ctx)
+    known = []
+
+    def located(op):
+      if str(op.location) != "loc(unknown)":
+        known.append(str(op.location))
+      return ir.WalkResult.ADVANCE
+
+    with ctx:
+      ir.Module.parse(kernel).operation.walk(located)
+    self.assertEqual(bool(known), debug, known[:3])
 
 
 class TritonDialectLookupTest(jtu.JaxTestCase):
