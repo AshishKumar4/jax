@@ -183,6 +183,10 @@ archive_override(
         # the driver's lock never returned where another GPU's graph of the
         # process waited in a collective for this one.
         "//third_party:xla/command_buffer_kernels_held.patch",
+        # A command buffer's graph is instantiated only at thunk initialization:
+        # one instantiated as it executed never returned where another device's
+        # collective waited on it.
+        "//third_party:xla/command_buffer_first_record.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],
