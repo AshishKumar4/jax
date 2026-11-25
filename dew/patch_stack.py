@@ -414,8 +414,12 @@ def staged(site: Path, version: str, base: str, manifests: dict[str, dict], asse
         pages[project] = [
             f'<a href="{base}/packages/{project}/{name}#sha256={entry["sha256"]}"'
             f' data-requires-python="{html.escape(entry["requires_python"])}"'
+            + core_metadata(entry.get("metadata_sha256"))
             + (f' data-yanked="{html.escape(entry["yanked"])}"' if "yanked" in entry else "")
             + f'>{name}</a><br>\n' for name, entry in sorted(listed.items())]
+    # A wheel's core metadata, where its release holds it beside it (attach-plugin.yml's FILE.metadata).
+    beside = {found["name"].removesuffix(".metadata"): found.get("digest") or "" for found in assets
+              if found["name"].endswith(".whl.metadata")}
     for asset in sorted(assets, key=lambda found: found["name"]):
         name = asset["name"]
         if not name.endswith(".whl"):
@@ -426,8 +430,11 @@ def staged(site: Path, version: str, base: str, manifests: dict[str, dict], asse
         project = canonical(name.split("-")[0])
         if project not in STAGED or name in manifests.get(project, {}):
             continue
+        held = beside.get(name, "")
         pages.setdefault(project, []).append(
-            f'<a href="{asset["browser_download_url"]}#sha256={digest.removeprefix("sha256:")}">{name}</a><br>\n')
+            f'<a href="{asset["browser_download_url"]}#sha256={digest.removeprefix("sha256:")}"'
+            + core_metadata(held.removeprefix("sha256:") if held.startswith("sha256:") else None)
+            + f'>{name}</a><br>\n')
     rendered = {project: PAGE.format(title=f"Links for {project}", body="".join(links))
                 for project, links in sorted(pages.items())}
     rendered[""] = PAGE.format(title="Simple index",
@@ -440,6 +447,16 @@ def staged(site: Path, version: str, base: str, manifests: dict[str, dict], asse
         (site / prefix / project / "index.html").write_text(page)
         written.append(prefix + (f"{project}/" if project else ""))
     return sorted(written, key=lambda page: (page == prefix, page))
+
+
+def core_metadata(digest: str | None) -> str:
+    """A link's PEP 658 and 714 attributes for a wheel whose core metadata lies beside it as FILE.metadata, of
+    sha256 `digest`; none where it has none, which an installer then reads from the wheel itself: a lock of a
+    staging index without them fetched every staged wheel of every machine from GitHub's releases, and 35 at
+    once were refused (Dew's train 1273)."""
+    if digest is None:
+        return ""
+    return f' data-dist-info-metadata="sha256={digest}" data-core-metadata="sha256={digest}"'
 
 
 def root(site: Path, projects: list[str]) -> None:

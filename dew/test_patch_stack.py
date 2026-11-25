@@ -3,6 +3,7 @@ the test files it runs, over a repository of its own."""
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import zipfile
@@ -527,6 +528,27 @@ def test_a_release_is_indexed_only_as_mains_locks_pin_it_byte_for_byte(tmp_path)
     whole = {"jax": jaxed, "jaxlib": page("jaxlib-0.12.0.1.post101-cp312-cp312-manylinux_2_27_x86_64.whl")}
     assert patch_stack.unindexed(pins, whole) == []
 
+
+
+def test_a_staging_index_states_each_wheels_core_metadata_where_it_lies_beside_it(tmp_path):
+    """A staging page (`staged`) states a file's core metadata (PEP 658 and 714) where it lies beside it: an indexed
+    file's at /packages (its manifest's digest), a release's wheel's as its release's FILE.metadata asset (GitHub's
+    sha256 of it); a wheel with none beside it is linked without, which an installer reads from the wheel itself."""
+    manifests = {"jaxlib": {"jaxlib-0.12.0.1-cp312-cp312-manylinux_2_27_x86_64.whl": {
+        "sha256": "1" * 64, "metadata_sha256": "2" * 64, "requires_python": ">=3.12"}}}
+    url = "https://github.com/AshishKumar4/jax/releases/download/plugin-0.12.0.1.post101"
+    held, bare = (f"jaxlib-0.12.0.1.post101-cp312-cp312-manylinux_2_27_{machine}.whl"
+                  for machine in ("x86_64", "aarch64"))
+    assets = [{"name": name, "digest": "sha256:" + digit * 64, "browser_download_url": f"{url}/{name}"}
+              for name, digit in ((held, "3"), (f"{held}.metadata", "4"), (bare, "5"))]
+    prefix = patch_stack.staged(tmp_path, "0.12.0.1.post101", "https://pypi.dewml.dev", manifests, assets)[-1]
+    links = {found[1]: found[0] for found in re.findall(r'(<a href="[^"]*/([^/"#]+)#[^>]*>)',
+                                                        (tmp_path / prefix / "jaxlib" / "index.html").read_text())}
+    indexed = links["jaxlib-0.12.0.1-cp312-cp312-manylinux_2_27_x86_64.whl"]
+    assert 'data-core-metadata="sha256=' + "2" * 64 + '"' in indexed
+    assert 'data-core-metadata="sha256=' + "4" * 64 + '"' in links[held]
+    assert "data-core-metadata" not in links[bare] and "data-dist-info-metadata" not in links[bare]
+    assert f"{held}.metadata" not in links
 
 
 def test_a_staging_index_lists_the_forks_projects_alone_every_file_hashed(tmp_path):

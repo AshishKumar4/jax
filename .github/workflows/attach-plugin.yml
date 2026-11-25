@@ -68,3 +68,34 @@ jobs:
           release: plugin-${{ inputs.version }}
           repository: ${{ github.repository }}
           token: ${{ github.token }}
+
+  # Each wheel's core metadata (PEP 658), FILE.metadata beside it on the release, read from the attached wheel
+  # itself: a release's staging index (patch_stack.py's `staged`) states it, so a lock resolving from that index
+  # reads each wheel's METADATA alone and fetches no wheel (Dew's train 1273: 35 locks at once, each fetching
+  # every staged wheel of every machine, were refused by GitHub's releases). One already beside its wheel stands;
+  # one another attach of the release writes at once is the same bytes (--clobber). Run whatever the attach's
+  # outcome, so an ask of no assets ('[]') writes a release's missing metadata alone.
+  metadata:
+    needs: [release, attach]
+    if: ${{ always() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Each wheel's METADATA attached beside it
+        run: |
+          set -euo pipefail
+          release="plugin-$VERSION"
+          names=$(gh release view "$release" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for wheel in $(grep '\.whl$' <<< "$names"); do
+            grep -qxF "$wheel.metadata" <<< "$names" && continue
+            gh release download "$release" -R "$GITHUB_REPOSITORY" --pattern "$wheel" --dir wheels --clobber
+            metadata=$(unzip -Z1 "wheels/$wheel" | grep -E '^[^/]+\.dist-info/METADATA$')
+            unzip -p "wheels/$wheel" "$metadata" > "$wheel.metadata"
+            gh release upload "$release" -R "$GITHUB_REPOSITORY" "$wheel.metadata" --clobber
+            rm -f "wheels/$wheel" "$wheel.metadata"
+          done
