@@ -153,6 +153,19 @@ jax_py_test(
 )
 
 jax_py_test(
+    name = "gpu_barriers_test",
+    size = "small",
+    srcs = ["gpu_barriers_test.py"],
+    tags = ["gpu_mlir_deviceless_test"],
+    deps = [
+        "//jax",
+        "//jax/_src:test_util",
+    ] + if_cuda_is_configured([
+        "//jax/experimental:mosaic_gpu",
+    ]) + py_deps("absl/testing"),
+)
+
+jax_py_test(
     name = "gpu_layout_inference_test",
     size = "small",
     srcs = ["gpu_layout_inference_test.py"],
