@@ -955,19 +955,49 @@ def _name_lowering(ctx, x, *, name):
   # `checkpoint_name`, comma-separated), which XLA keeps on the instruction
   # defining its buffer: a compile's live buffers name the residuals a policy
   # saves (`Compiled.peak_live`). A parameter has no defining op to carry them.
+  # A reshape holds its operand's elements in their order, and XLA makes most
+  # reshapes bitcasts of their operand's buffer, folding reshapes of reshapes
+  # into one, so the instruction defining the buffer is the operand's producer
+  # and the reshape that carried the name is gone: the producer is named too,
+  # through each reshape in turn. This is approximate: a reshape XLA copies
+  # keeps its own name and its operand's buffer is named beside it, though the
+  # two are allocations of their own. A producer of several results (a
+  # custom call's, a variadic sort's) is not named, since XLA reads one
+  # instruction's attribute for each of its results' buffers.
   del ctx
-  op = x.owner
-  if op is None or isinstance(op, ir.Block):
-    return [x]
-  op = op.operation
+  op = _defining(x)
+  while op is not None:
+    _named(op, name)
+    if op.name != "stablehlo.reshape":
+      break
+    op = _defining(op.operands[0])
+    if op is not None and not _one_array(op):
+      break
+  return [x]
+
+def _defining(value):
+  """The operation defining ``value``; None for a block's argument (a
+  parameter, a loop's carry), which no operation defines."""
+  owner = value.owner
+  if owner is None or isinstance(owner, ir.Block):
+    return None
+  return owner.operation
+
+def _one_array(op):
+  """Whether ``op`` makes one result, an array: its buffer is that result's."""
+  return len(op.results) == 1 and not isinstance(op.results[0].type, ir.TupleType)
+
+def _named(op, name):
+  """``op`` with ``name`` among its ``checkpoint_name`` names, once."""
   attributes = (
       {a.name: a.attr for a in ir.DictAttr(op.attributes["mhlo.frontend_attributes"])}
       if "mhlo.frontend_attributes" in op.attributes else {})
   held = attributes.get("checkpoint_name")
-  names = (*ir.StringAttr(held).value.split(","), name) if held else (name,)
-  attributes["checkpoint_name"] = ir.StringAttr.get(",".join(names))
+  names = tuple(ir.StringAttr(held).value.split(",")) if held else ()
+  if name in names:
+    return
+  attributes["checkpoint_name"] = ir.StringAttr.get(",".join((*names, name)))
   op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attributes)
-  return [x]
 
 # Lowered in its caller's function, not a cached one of its own, where its
 # operand would be an argument with no defining op to tag (as
