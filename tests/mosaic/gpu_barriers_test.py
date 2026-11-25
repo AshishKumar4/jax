@@ -43,6 +43,12 @@ func.func @kernel(%ref: memref<128xf32, 3>, %x: f32, %i: index) {
   nvvm.barrier id = %id number_of_threads = %c128
   nvvm.barrier id = %id number_of_threads = %c128
   nvvm.barrier id = %id number_of_threads = %c1 {mosaic_gpu.collective_barrier}
+  %n8 = arith.index_cast %i : index to i8
+  %a = arith.extui %n8 : i8 to i32
+  %n16 = arith.index_cast %i : index to i16
+  %b = arith.extui %n16 : i16 to i32
+  nvvm.barrier id = %a number_of_threads = %c128 {mosaic_gpu.collective_barrier}
+  nvvm.barrier id = %b number_of_threads = %c128 {mosaic_gpu.collective_barrier}
   return
 }
 """
@@ -56,19 +62,31 @@ class RepeatedBarriersTest(jtu.JaxTestCase):
       context.load_all_available_dialects()
       context.allow_unregistered_dialects = True
       module = ir.Module.parse(_MODULE)
+      block = module.body.operations[0].regions[0].blocks[0]
+
+      def others():
+        return [str(op) for op in block.operations
+                if op.operation.name != "nvvm.barrier"]
+
+      before = others()
       mgpu_core._drop_repeated_barriers(module)
       barriers = [
           op.operation
-          for op in module.body.operations[0].regions[0].blocks[0].operations
+          for op in block.operations
           if op.operation.name == "nvvm.barrier"
       ]
       marks = [b for b in barriers if utils.COLLECTIVE_BARRIER in b.attributes]
+      # No other operation is merged or erased: the launch context still holds
+      # values of the module, which its TMA descriptors' host initialization
+      # reads (a CSE here freed them, and that initialization segfaulted).
+      self.assertEqual(others(), before)
     # The barrier after a store and the one before the next, its index
     # recomputed alike, are one; a barrier after a store stays; one of the
     # same operands and other attributes stays; unmarked barriers, whose
     # participants a branch may split, stay even repeated; another thread count
-    # is another barrier. No mark outlives the pass.
-    self.assertLen(barriers, 7)
+    # is another barrier; ids alike but for a cast's width are two. No mark
+    # outlives the pass.
+    self.assertLen(barriers, 9)
     self.assertEmpty(marks)
 
 

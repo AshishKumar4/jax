@@ -1309,6 +1309,48 @@ _PURE_OPS = frozenset({
 })
 
 
+def _pure(op: ir.Operation) -> bool:
+  return not op.regions and (
+      op.name.startswith(_PURE_DIALECTS) or op.name in _PURE_OPS)
+
+
+def _attributes(op: ir.Operation) -> tuple[tuple[str, str], ...]:
+  attributes = op.attributes
+  return tuple(sorted(
+      (attributes[i].name, str(attributes[i].attr))
+      for i in range(len(attributes))))
+
+
+def _same_value(a: ir.Value, b: ir.Value, depth: int = 8) -> bool:
+  """Whether `a` and `b` hold one value: the same SSA value, or the same
+  result, of one type, of alike pure operations of the same values (a
+  barrier's index recomputed alike), at most `depth` operations deep,
+  compared without merging any operation of the module."""
+  if a == b:
+    return True
+  if (depth == 0 or a.type != b.type
+      or not (isinstance(a, ir.OpResult) and isinstance(b, ir.OpResult))):
+    return False
+  x, y = a.owner.operation, b.owner.operation
+  return (
+      a.result_number == b.result_number
+      and x.name == y.name
+      and _pure(x)
+      and _attributes(x) == _attributes(y)
+      and len(x.operands) == len(y.operands)
+      and all(_same_value(p, q, depth - 1)
+              for p, q in zip(x.operands, y.operands))
+  )
+
+
+def _same_barrier(a: ir.Operation, b: ir.Operation) -> bool:
+  return (
+      _attributes(a) == _attributes(b)
+      and len(a.operands) == len(b.operands)
+      and all(_same_value(p, q) for p, q in zip(a.operands, b.operands))
+  )
+
+
 def _drop_repeated_barriers(module: ir.Module) -> None:
   """Drops each collective warpgroup barrier (`utils.COLLECTIVE_BARRIER`)
   that repeats one before it in its block, of the same operands and
@@ -1316,25 +1358,10 @@ def _drop_repeated_barriers(module: ir.Module) -> None:
   after one store and the one before the next, which ptxas keeps. Both are
   reached by every thread of the warpgroup from the same program point, so the
   second syncs nothing the first did not. Other barriers, whose participants a
-  branch may split, are kept. Barrier ids are compared as SSA values after CSE,
-  which merges their recomputed index arithmetic, run only where a barrier is
-  marked. The marks are removed after."""
-
-  def marks(op: ir.Operation) -> bool:
-    return any(
-        inner.operation.name == "nvvm.barrier"
-        and utils.COLLECTIVE_BARRIER in inner.operation.attributes
-        or marks(inner.operation)
-        for region in op.regions
-        for block in region.blocks
-        for inner in block.operations
-    )
-
-  if not marks(module.operation):
-    return
-  pm = passmanager.PassManager.parse("builtin.module(cse)", module.context)
-  pm.enable_verifier(False)
-  pm.run(module.operation)
+  branch may split, are kept. Barrier ids recomputed alike are one
+  (`_same_value`); no operation but a dropped barrier is changed, as the
+  launch context still holds values of the module (its TMA descriptors' host
+  initialization, `finalize_size`). The marks are removed after."""
   dropped, marked = [], []
 
   def walk(op: ir.Operation) -> None:
@@ -1343,20 +1370,15 @@ def _drop_repeated_barriers(module: ir.Module) -> None:
         last = None  # The block's last collective barrier still in force.
         for inner in block.operations:
           inner = inner.operation
-          name = inner.name
-          if name == "nvvm.barrier" and utils.COLLECTIVE_BARRIER in inner.attributes:
+          if (inner.name == "nvvm.barrier"
+              and utils.COLLECTIVE_BARRIER in inner.attributes):
             marked.append(inner)
-            attributes = inner.attributes
-            stated = (tuple(inner.operands), tuple(sorted(
-                (attributes[i].name, str(attributes[i].attr))
-                for i in range(len(attributes)))))
-            if last is not None and stated == last:
+            if last is not None and _same_barrier(inner, last):
               dropped.append(inner)
-            last = stated
+            else:
+              last = inner
             continue
-          if inner.regions or not (
-              name.startswith(_PURE_DIALECTS) or name in _PURE_OPS
-          ):
+          if not _pure(inner):
             last = None
           walk(inner)
 
