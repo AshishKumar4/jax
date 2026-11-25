@@ -1,0 +1,679 @@
+diff --git a/xla/backends/gpu/runtime/BUILD b/xla/backends/gpu/runtime/BUILD
+index 8eabf31331..c33d695fc9 100644
+--- a/xla/backends/gpu/runtime/BUILD
++++ b/xla/backends/gpu/runtime/BUILD
+@@ -614,6 +614,42 @@ cc_library(
+     ] + xla_internal(["service:execution_graph_visualizer_google"]),
+ )
+ 
++xla_test(
++    name = "command_buffer_thunk_first_record_test",
++    srcs = ["command_buffer_thunk_first_record_test.cc"],
++    backends = ["gpu"],
++    # Linked whole: jax's build hides each library's symbols
++    # (-fvisibility=hidden), so a test linked to them one shared object each
++    # finds none.
++    linkstatic = True,
++    deps = [
++        ":command_buffer_thunk",
++        ":command_executor",
++        ":device_to_device_copy_thunk",
++        ":sequential_thunk",
++        ":thunk",
++        "//xla:shape_util",
++        "//xla:xla_data_proto_cc",
++        "//xla/service:buffer_assignment",
++        "//xla/service:executable",
++        "//xla/service:platform_util",
++        "//xla/service:shaped_slice",
++        "//xla/service/gpu:buffer_allocations",
++        "//xla/stream_executor:command_buffer",
++        "//xla/stream_executor:device_address",
++        "//xla/stream_executor:platform",
++        "//xla/stream_executor:platform_manager",
++        "//xla/stream_executor:stream_executor_address_allocator",
++        "//xla/stream_executor:stream_executor_h",
++        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/types:span",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "command_buffer_thunk_test",
+     srcs = ["command_buffer_thunk_test.cc"],
+diff --git a/xla/backends/gpu/runtime/command_buffer_thunk.cc b/xla/backends/gpu/runtime/command_buffer_thunk.cc
+index 828f87f1c0..d87ddf8f21 100644
+--- a/xla/backends/gpu/runtime/command_buffer_thunk.cc
++++ b/xla/backends/gpu/runtime/command_buffer_thunk.cc
+@@ -251,6 +251,18 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
+         cmd_buffer->UpdateBufferAllocations(commands_, execute_params,
+                                             *params.persistent_alloc_indices);
+ 
++    // The device quiesced before a graph is instantiated on it: an
++    // instantiation may wait on the device's work under the driver's lock,
++    // and that work may be a collective whose peer's host thread waits on the
++    // same lock. Every peer has launched its earlier work by now
++    // (GpuExecutable's rendezvous before initialization), so this ends.
++    if (is_first_record && !params.executor->SynchronizeAllActivity()) {
++      return Internal(
++          "Failed to synchronize device #%d before instantiating its command "
++          "buffer",
++          params.executor->device_ordinal());
++    }
++
+     Command::RecordParams record_params = {cmd_buffer->state,
+                                            std::move(updated_allocs),
+                                            /*is_initialization=*/true};
+@@ -316,6 +328,20 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
+   bool is_first_record =
+       cmd_buffer->command_buffer->state() == se::CommandBuffer::State::kCreate;
+ 
++  // A command buffer is never created while it executes: its graph would be
++  // instantiated with no rendezvous of the process's devices, while a peer's
++  // collective may wait on this device and the peer's host thread on the
++  // driver lock the instantiation holds (a while loop's next iteration, after
++  // the warmup of a buffer holding a custom call or a collective). Until
++  // `Initialize` records it, before an execution's thunks run, the buffer runs
++  // its thunks.
++  if (is_first_record && thunks_) {
++    XLA_VLOG_DEVICE(2, executor->device_ordinal())
++        << "Execute command buffer thunk as a regular thunk sequence until "
++           "its command buffer is recorded at initialization";
++    return thunks_->ExecuteOnStream(params);
++  }
++
+   bool has_dynamic_allocations = cmd_buffer->HasDynamicAllocations(
+       commands_, *params.persistent_alloc_indices);
+   auto updated_allocs = cmd_buffer->UpdateBufferAllocations(
+diff --git a/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc b/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc
+new file mode 100644
+index 0000000000..b99e095d17
+--- /dev/null
++++ b/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc
+@@ -0,0 +1,164 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <cstdint>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include "absl/status/statusor.h"
++#include "absl/strings/ascii.h"
++#include "absl/types/span.h"
++#include "xla/backends/gpu/runtime/command_buffer_thunk.h"
++#include "xla/backends/gpu/runtime/command_executor.h"
++#include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
++#include "xla/backends/gpu/runtime/sequential_thunk.h"
++#include "xla/backends/gpu/runtime/thunk.h"
++#include "xla/service/buffer_assignment.h"
++#include "xla/service/gpu/buffer_allocations.h"
++#include "xla/service/platform_util.h"
++#include "xla/service/service_executable_run_options.h"
++#include "xla/service/shaped_slice.h"
++#include "xla/shape.h"
++#include "xla/shape_util.h"
++#include "xla/stream_executor/command_buffer.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/stream_executor/platform.h"
++#include "xla/stream_executor/platform_manager.h"
++#include "xla/stream_executor/stream_executor.h"
++#include "xla/stream_executor/stream_executor_address_allocator.h"
++#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/statusor.h"
++#include "xla/xla_data.pb.h"
++
++namespace xla::gpu {
++namespace {
++
++se::StreamExecutor* GpuExecutor() {
++  auto name =
++      absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
++  auto* platform = se::PlatformManager::PlatformWithName(name).value();
++  return platform->ExecutorForDevice(0).value();
++}
++
++// A copy that, as a custom call or a collective, runs its first execution as
++// a thunk (`requires_warmup`), counting the times it is recorded.
++class WarmedCopyThunk : public DeviceToDeviceCopyThunk {
++ public:
++  WarmedCopyThunk(const ShapedSlice& source, const ShapedSlice& destination,
++                  int64_t mem_size, int* record_count)
++      : DeviceToDeviceCopyThunk(Thunk::ThunkInfo(), source, destination,
++                                mem_size),
++        record_count_(record_count) {}
++
++  absl::StatusOr<const se::CommandBuffer::Command*> Record(
++      const Thunk::ExecuteParams& execute_params,
++      const RecordParams& record_params, RecordAction record_action,
++      se::CommandBuffer* command_buffer) override {
++    ++*record_count_;
++    return DeviceToDeviceCopyThunk::Record(execute_params, record_params,
++                                           std::move(record_action),
++                                           command_buffer);
++  }
++
++  bool requires_warmup() const override { return true; }
++
++ private:
++  int* record_count_;
++};
++
++// A command buffer whose commands need a warmup runs it as thunks, and its
++// next executions too, a while loop's next iteration among them, until an
++// initialization records it: no execution instantiates a graph, which with
++// no rendezvous of the process's devices waited on the driver lock a peer's
++// instantiation held while that peer's collective waited on this device.
++TEST(CommandBufferThunkFirstRecordTest, OnlyInitializationRecordsAfterWarmup) {
++  se::StreamExecutor* stream_executor = GpuExecutor();
++  TF_ASSERT_OK_AND_ASSIGN(auto stream, stream_executor->CreateStream());
++
++  constexpr int64_t kLength = 4;
++  constexpr int64_t kByteLength = sizeof(int32_t) * kLength;
++  Shape shape = ShapeUtil::MakeShape(S32, {kLength});
++  se::DeviceAddress<int32_t> a =
++      stream_executor->AllocateArray<int32_t>(kLength, 0);
++  se::DeviceAddress<int32_t> b =
++      stream_executor->AllocateArray<int32_t>(kLength, 0);
++  TF_ASSERT_OK(stream->Memset32(&a, 42, kByteLength));
++
++  BufferAllocation source(/*index=*/0, kByteLength, /*color=*/0);
++  BufferAllocation destination(/*index=*/1, kByteLength, /*color=*/0);
++  ShapedSlice from{BufferAllocation::Slice(&source, 0, kByteLength), shape};
++  ShapedSlice to{BufferAllocation::Slice(&destination, 0, kByteLength), shape};
++
++  int record_count = 0;
++  CommandSequence commands;
++  commands.Emplace<WarmedCopyThunk>(from, to, kByteLength, &record_count);
++  constexpr auto kSerialize = CommandExecutor::SynchronizationMode::kSerialize;
++  TF_ASSERT_OK_AND_ASSIGN(
++      CommandExecutor executor,
++      CommandExecutor::Create(std::move(commands), kSerialize));
++  ThunkSequence fallback;
++  fallback.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
++      Thunk::ThunkInfo(), from, to, kByteLength));
++  CommandBufferThunk thunk(
++      std::move(executor), Thunk::ThunkInfo(), /*devices_in_process=*/1,
++      std::make_unique<SequentialThunk>(Thunk::ThunkInfo(),
++                                        std::move(fallback)));
++
++  se::StreamExecutorAddressAllocator allocator(stream_executor);
++  ServiceExecutableRunOptions run_options;
++  BufferAllocations allocations({a, b}, /*device_ordinal=*/0, &allocator);
++  std::vector<BufferAllocation::Index> persistent = {0, 1};
++  Thunk::InitializeParams initialize_params;
++  initialize_params.executor = stream_executor;
++  initialize_params.buffer_allocations = &allocations;
++  initialize_params.stream = stream.get();
++  initialize_params.persistent_alloc_indices = absl::MakeConstSpan(persistent);
++  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
++      run_options, allocations, stream.get(), stream.get(), nullptr, nullptr,
++      nullptr, /*additional_compute_streams=*/{},
++      /*execution_scoped_state=*/nullptr, absl::MakeConstSpan(persistent));
++
++  // Each execution copies; the record count after it, and its copy's values.
++  auto executed = [&]() -> std::vector<int32_t> {
++    EXPECT_TRUE(stream->MemZero(&b, kByteLength).ok());
++    EXPECT_TRUE(thunk.ExecuteOnStream(execute_params).ok());
++    std::vector<int32_t> copied(kLength, 0);
++    EXPECT_TRUE(stream->Memcpy(copied.data(), b, kByteLength).ok());
++    EXPECT_TRUE(stream->BlockHostUntilDone().ok());
++    return copied;
++  };
++  const std::vector<int32_t> copied(kLength, 42);
++
++  TF_ASSERT_OK(thunk.Initialize(initialize_params));  // Warmup not done.
++  EXPECT_EQ(record_count, 0);
++  EXPECT_EQ(executed(), copied);  // The warmup.
++  EXPECT_EQ(executed(), copied);  // Its loop's next iteration.
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(record_count, 0);
++
++  TF_ASSERT_OK(thunk.Initialize(initialize_params));  // The next execution's.
++  EXPECT_EQ(record_count, 1);
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(record_count, 1);
++
++  stream_executor->Deallocate(&a);
++  stream_executor->Deallocate(&b);
++}
++
++}  // namespace
++}  // namespace xla::gpu
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index 4f308e64e9..4f010c7588 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -951,6 +951,27 @@ tf_proto_library(
+     ],
+ )
+ 
++xla_test(
++    name = "gpu_executable_rendezvous_test",
++    srcs = ["gpu_executable_rendezvous_test.cc"],
++    backends = ["gpu"],
++    # Linked whole: jax's build hides each library's symbols
++    # (-fvisibility=hidden), so a test linked to them one shared object each
++    # finds none.
++    linkstatic = True,
++    deps = [
++        ":gpu_executable",
++        ":gpu_executable_run_options",
++        "//xla:executable_run_options",
++        "//xla:xla_proto_cc",
++        "//xla/runtime:device_id",
++        "//xla/service:device_assignment",
++        "//xla/service:executable",
++        "@com_google_absl//absl/status",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "gpu_executable_test",
+     srcs = ["gpu_executable_test.cc"],
+diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
+index 1848c2f54e..60556b7ea6 100644
+--- a/xla/service/gpu/gpu_executable.cc
++++ b/xla/service/gpu/gpu_executable.cc
+@@ -235,6 +235,24 @@ absl::StatusOr<bool> ShouldCollectiveUseMinimalResource(
+ using ::tsl::profiler::ScopedAnnotation;
+ 
+ // Returns the number of additional streams to allocate for a `GpuExecutable`.
++// Whether `executor`'s thunks, nested ones among them, hold both a command
++// buffer, which thunk initialization may instantiate, and a collective: its
++// executions' local participants rendezvous before initialization.
++static bool JoinsBeforeInitialization(ThunkExecutor& executor) {
++  bool command_buffer = false;
++  bool collective = false;
++  for (const auto& thunk : executor.thunks()) {
++    thunk->Walk([&](Thunk* nested) {
++      command_buffer |= nested->kind() == Thunk::kCommandBuffer;
++      // A collective of any kind that acquires a clique: the ones
++      // `IsCollective` names, and a collective kernel's.
++      collective |= nested->IsCollective() ||
++                    nested->kind() == Thunk::kCollectiveKernel;
++    });
++  }
++  return command_buffer && collective;
++}
++
+ static GpuExecutable::NumAdditionalStreams GetNumAdditionalStreams(
+     ThunkExecutor& executor, const DebugOptions& opts) {
+   // First initialize based on what was requested via the DebugOptions.
+@@ -490,6 +508,8 @@ GpuExecutable::GpuExecutable(
+       definition_plan_(ThunkExecutor::BuildDefinitionPlan(*thunk_executor_)),
+       num_additional_streams_(
+           GetNumAdditionalStreams(*thunk_executor_, debug_options)),
++      joins_before_initialization_(
++          JoinsBeforeInitialization(*thunk_executor_)),
+       module_name_(std::move(module_name)),
+       program_shape_(std::move(program_shape)),
+       allocation_ptrs_(
+@@ -581,9 +601,6 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
+                                  se::EventBasedTimer* execution_timer,
+                                  se::Stream* stream_to_sync);
+ 
+-absl::Status RendezvousAfterInitialization(
+-    const ServiceExecutableRunOptions& run_options,
+-    const DebugOptions* absl_nullable debug_options);
+ 
+ // Returns HangWatchdog guards for the given execution timeout handlers.
+ static std::vector<std::shared_ptr<HangWatchdog::Guard>> ExecutionTimeoutGuards(
+@@ -618,7 +635,7 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+         persistent_alloc_indices,
+     GpuExecutable::NumAdditionalStreams num_additional_streams,
+     CollectiveMemoryCache& collective_memory_cache,
+-    bool collective_use_minimal_resource) {
++    bool collective_use_minimal_resource, bool joins_before_initialization) {
+   const GpuExecutableRunOptions* gpu_run_options =
+       run_options->run_options().gpu_executable_run_options();
+ 
+@@ -809,6 +826,7 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+   CollectiveCliqueRequests collective_clique_requests;
+   CollectiveMemoryRequests collective_memory_requests(buffer_allocations);
+ 
++  absl::Status prepared;
+   {  // Prepare thunks for execution and collect requested GPU cliques.
+     Thunk::PrepareParams prepare_params{
+         &collective_params,
+@@ -820,8 +838,26 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+         run_options->run_options().custom_options()};
+ 
+     tsl::profiler::TraceMe trace_prepare("Thunks::Prepare");
+-    ABSL_RETURN_IF_ERROR(thunk_executor.Prepare(prepare_params));
+-  }
++    prepared = thunk_executor.Prepare(prepare_params);
++  }
++
++  // Join a round of rendezvous before thunks initialize where they may
++  // instantiate command buffers beside collectives: an instantiation may wait
++  // on its device's work under the driver's lock, and that work may be a
++  // collective whose peer has not launched its half yet, its host thread
++  // waiting on that lock. Once every local device has joined, each has
++  // launched every earlier collective. Joined by every local participant of
++  // an executable that holds both, whatever its own cliques, so all of them
++  // meet; one with no collective, or whose collectives are mocked (neither
++  // acquiring cliques nor run), joins none, as an `ExecuteSharded` shard may
++  // run alone. A rank's failure to prepare is carried to every rank, which
++  // returns it rather than wait for a rank that left.
++  if (joins_before_initialization && !mock_collectives) {
++    prepared = RendezvousAroundInitialization(*run_options, debug_options,
++                                              InitializationRound::kBefore,
++                                              std::move(prepared));
++  }
++  ABSL_RETURN_IF_ERROR(prepared);
+ 
+   XLA_VLOG_DEVICE(3, run_options->device_ordinal()) << absl::StreamFormat(
+       "Prepared GPU executable module: %s for execution: "
+@@ -878,8 +914,8 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
+   // deadlocks if we try to execute it concurrently with other potentially
+   // memory-allocating operations.
+   if (!collective_cliques.empty()) {
+-    ABSL_RETURN_IF_ERROR(
+-        RendezvousAfterInitialization(*run_options, debug_options));
++    ABSL_RETURN_IF_ERROR(RendezvousAroundInitialization(
++        *run_options, debug_options, InitializationRound::kAfter));
+   }
+ 
+   // Prepare parameters for thunks execution.
+@@ -972,21 +1008,23 @@ namespace {
+ // run multiple unrelated rendezvous for a same key.
+ struct InitializationKey {
+   RunId run_id;
++  InitializationRound round;
+ 
+   template <typename H>
+   friend H AbslHashValue(H h, const InitializationKey& key) {
+-    return H::combine(std::move(h), key.run_id);
++    return H::combine(std::move(h), key.run_id, key.round);
+   }
+ };
+ 
+ bool operator==(const InitializationKey& a, const InitializationKey& b) {
+-  return a.run_id == b.run_id;
++  return a.run_id == b.run_id && a.round == b.round;
+ }
+ }  // namespace
+ 
+-absl::Status RendezvousAfterInitialization(
++absl::Status RendezvousAroundInitialization(
+     const ServiceExecutableRunOptions& run_options,
+-    const DebugOptions* absl_nullable debug_options) {
++    const DebugOptions* absl_nullable debug_options, InitializationRound round,
++    absl::Status carried) {
+   // Thunk initialization can allocate new control data structures on device
+   // that can lead to deadlocks if other replicas are executing concurrently
+   // (i.e. this happens if we try to instantiate CUDA graph when other replica
+@@ -999,7 +1037,7 @@ absl::Status RendezvousAfterInitialization(
+   // If we don't have Gpu executable options or device assignment it means we
+   // are running in a single Gpu config and don't need a rendezvous.
+   if (!gpu_opts || !device_assn) {
+-    return absl::OkStatus();
++    return carried;
+   }
+ 
+   // Assume that all participants execute locally first, if we have a local
+@@ -1023,34 +1061,51 @@ absl::Status RendezvousAfterInitialization(
+     }
+   }
+ 
++  bool before = round == InitializationRound::kBefore;
+   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
+-      "Join thunks initialization rendezvous with %d local participants",
+-      num_local_participants);
++      "Join thunks initialization rendezvous (%s) with %d local participants",
++      before ? "before" : "after", num_local_participants);
+ 
+   tsl::profiler::TraceMe trace([&] {
+     return tsl::profiler::TraceMeEncode(
+-        "RendezvousAfterInitialization",
++        before ? "RendezvousBeforeInitialization"
++               : "RendezvousAfterInitialization",
+         {{"run_id", run_options.run_options().run_id().ToInt()},
+          {"num_local_participants", num_local_participants}});
+   });
+ 
+-  auto rendezvous_key = InitializationKey{run_options.run_options().run_id()};
++  auto rendezvous_key =
++      InitializationKey{run_options.run_options().run_id(), round};
+   auto rendezvous_name = absl::StrFormat(
+-      "thunk initialization completion for device ordinal %d; run_id=%d",
+-      run_options.device_ordinal(), run_options.run_options().run_id().ToInt());
+-
+-  return Rendezvous(
+-      rendezvous_name, rendezvous_key, num_local_participants,
+-      absl::Seconds(
+-          debug_options
+-              ? debug_options->xla_gpu_executable_warn_stuck_timeout_seconds()
+-              : 10),
+-      absl::Seconds(
+-          debug_options
+-              ? debug_options->xla_gpu_executable_terminate_timeout_seconds()
+-              : 30));
+-}
++      "thunk initialization %s for device ordinal %d; run_id=%d",
++      before ? "start" : "completion", run_options.device_ordinal(),
++      run_options.run_options().run_id().ToInt());
+ 
++  // Every rank returns the first failure any rank carried, its own among them.
++  ABSL_ASSIGN_OR_RETURN(
++      std::shared_ptr<absl::Status> agreed,
++      Rendezvous<absl::Status>(
++          rendezvous_name, rendezvous_key, carried, num_local_participants,
++          [](absl::Span<absl::Status*> statuses) {
++            for (const absl::Status* status : statuses) {
++              if (!status->ok()) {
++                return *status;
++              }
++            }
++            return absl::OkStatus();
++          },
++          absl::Seconds(
++              debug_options
++                  ? debug_options
++                        ->xla_gpu_executable_warn_stuck_timeout_seconds()
++                  : 10),
++          absl::Seconds(
++              debug_options
++                  ? debug_options
++                        ->xla_gpu_executable_terminate_timeout_seconds()
++                  : 30)));
++  return *agreed;
++}
+ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
+                                  se::EventBasedTimer* execution_timer,
+                                  se::Stream* stream_to_sync = nullptr) {
+@@ -1409,7 +1464,7 @@ absl::Status GpuExecutable::ExecuteThunks(
+       unique_id, *thunk_executor_, executable_source, run_options,
+       buffer_allocations, block_host_until_done, persistent_alloc_indices,
+       num_additional_streams_, collective_memory_cache_,
+-      collective_use_minimal_resource_);
++      collective_use_minimal_resource_, joins_before_initialization_);
+ }
+ 
+ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
+diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
+index 1d1f11b6c1..8fc07f086f 100644
+--- a/xla/service/gpu/gpu_executable.h
++++ b/xla/service/gpu/gpu_executable.h
+@@ -77,6 +77,18 @@ namespace gpu {
+ // Launches the given GPU kernel via the StreamExecutor.
+ //
+ // This is an immutable data type after initialization, and thus thread safe.
++// Which of an execution's rendezvous around thunk initialization: before it,
++// where every local device has launched its earlier work, or after it.
++enum class InitializationRound { kBefore, kAfter };
++
++// Joins an execution's rendezvous of `round` with its other local
++// participants, carrying `carried`: every participant returns the first
++// failure any of them carried, or a failure of the rendezvous itself.
++absl::Status RendezvousAroundInitialization(
++    const ServiceExecutableRunOptions& run_options,
++    const DebugOptions* absl_nullable debug_options, InitializationRound round,
++    absl::Status carried = absl::OkStatus());
++
+ class GpuExecutable : public Executable {
+  public:
+   struct NumAdditionalStreams {
+@@ -330,7 +342,7 @@ class GpuExecutable : public Executable {
+           persistent_alloc_indices,
+       NumAdditionalStreams num_additional_streams,
+       CollectiveMemoryCache& collective_memory_cache,
+-      bool collective_use_minimal_resource);
++      bool collective_use_minimal_resource, bool joins_before_initialization);
+ 
+   // Compare current allocation's address with previous run's address, and
+   // report the allocation info if memory addressed changed. Useful for identify
+@@ -361,6 +373,11 @@ class GpuExecutable : public Executable {
+   // Number of additional streams available at run time.
+   NumAdditionalStreams num_additional_streams_;
+ 
++  // Whether its thunks, nested ones among them, hold both a command buffer
++  // and a collective: every execution's local participants rendezvous before
++  // thunk initialization.
++  bool joins_before_initialization_;
++
+   std::string module_name_;
+ 
+   ProgramShape program_shape_;
+diff --git a/xla/service/gpu/gpu_executable_rendezvous_test.cc b/xla/service/gpu/gpu_executable_rendezvous_test.cc
+new file mode 100644
+index 0000000000..35535ecad2
+--- /dev/null
++++ b/xla/service/gpu/gpu_executable_rendezvous_test.cc
+@@ -0,0 +1,115 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <memory>
++#include <thread>  // NOLINT
++#include <utility>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include "absl/status/status.h"
++#include "xla/executable_run_options.h"
++#include "xla/runtime/device_id.h"
++#include "xla/service/device_assignment.h"
++#include "xla/service/gpu/gpu_executable.h"
++#include "xla/service/gpu/gpu_executable_run_options.h"
++#include "xla/service/service_executable_run_options.h"
++#include "xla/xla.pb.h"
++
++namespace xla::gpu {
++namespace {
++
++// The rendezvous before thunk initialization carries each local participant's
++// failure to every participant: of two local devices, the one that failed to
++// prepare and the healthy one both return its failure, neither waiting on the
++// other until its terminate timeout.
++TEST(GpuExecutableRendezvousTest, AFailureBeforeInitializationReachesAllRanks) {
++  DeviceAssignment assignment(/*replica_count=*/2, /*computation_count=*/1);
++  assignment(0, 0) = 0;
++  assignment(1, 0) = 1;
++  GpuExecutableRunOptions gpu_options;
++  gpu_options.set_gpu_global_device_ids(GpuExecutableRunOptions::DeviceIdMap{
++      {LocalDeviceId(0), GlobalDeviceId(0)},
++      {LocalDeviceId(1), GlobalDeviceId(1)}});
++  DebugOptions debug_options;
++  debug_options.set_xla_gpu_executable_warn_stuck_timeout_seconds(5);
++  debug_options.set_xla_gpu_executable_terminate_timeout_seconds(10);
++
++  RunId run_id = RunId::CreateUniqueId();
++  std::vector<absl::Status> returned(2);
++  std::vector<std::thread> ranks;
++  for (int rank = 0; rank < 2; ++rank) {
++    ranks.emplace_back([&, rank] {
++      ExecutableRunOptions options;
++      options.set_device_ordinal(rank)
++          .set_device_assignment(&assignment)
++          .set_gpu_executable_run_options(&gpu_options)
++          .set_run_id(run_id);
++      ServiceExecutableRunOptions run_options(options);
++      absl::Status carried =
++          rank == 1 ? absl::InternalError("rank 1 failed to prepare")
++                    : absl::OkStatus();
++      returned[rank] = RendezvousAroundInitialization(
++          run_options, &debug_options, InitializationRound::kBefore,
++          std::move(carried));
++    });
++  }
++  for (std::thread& rank : ranks) {
++    rank.join();
++  }
++  for (const absl::Status& status : returned) {
++    EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
++  }
++  EXPECT_EQ(returned[0], returned[1]);
++}
++
++// A healthy round returns success on every rank, and the round after
++// initialization of the same run meets apart from it.
++TEST(GpuExecutableRendezvousTest, RoundsOfOneRunMeetApart) {
++  DeviceAssignment assignment(/*replica_count=*/2, /*computation_count=*/1);
++  assignment(0, 0) = 0;
++  assignment(1, 0) = 1;
++  GpuExecutableRunOptions gpu_options;
++  DebugOptions debug_options;
++  debug_options.set_xla_gpu_executable_warn_stuck_timeout_seconds(5);
++  debug_options.set_xla_gpu_executable_terminate_timeout_seconds(10);
++
++  RunId run_id = RunId::CreateUniqueId();
++  std::vector<absl::Status> returned(4);
++  std::vector<std::thread> ranks;
++  for (int rank = 0; rank < 2; ++rank) {
++    ranks.emplace_back([&, rank] {
++      ExecutableRunOptions options;
++      options.set_device_ordinal(rank)
++          .set_device_assignment(&assignment)
++          .set_gpu_executable_run_options(&gpu_options)
++          .set_run_id(run_id);
++      ServiceExecutableRunOptions run_options(options);
++      returned[rank] = RendezvousAroundInitialization(
++          run_options, &debug_options, InitializationRound::kBefore);
++      returned[2 + rank] = RendezvousAroundInitialization(
++          run_options, &debug_options, InitializationRound::kAfter);
++    });
++  }
++  for (std::thread& rank : ranks) {
++    rank.join();
++  }
++  for (const absl::Status& status : returned) {
++    EXPECT_TRUE(status.ok()) << status;
++  }
++}
++
++}  // namespace
++}  // namespace xla::gpu
