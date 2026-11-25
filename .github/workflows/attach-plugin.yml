@@ -45,6 +45,8 @@ jobs:
 
   attach:
     needs: release
+    # An ask of no assets ('[]', a release's metadata alone) attaches none: skipped before its matrix is read.
+    if: ${{ inputs.assets != '[]' }}
     name: attach ${{ matrix.asset }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -68,3 +70,48 @@ jobs:
           release: plugin-${{ inputs.version }}
           repository: ${{ github.repository }}
           token: ${{ github.token }}
+
+  # Each wheel's core metadata (PEP 658), FILE.metadata beside it on the release, read from the attached wheel
+  # itself: a release's staging index (patch_stack.py's `staged`) states it, so a lock resolving from that index
+  # reads each wheel's METADATA alone and fetches no wheel (Dew's train 1273: 35 locks at once, each fetching
+  # every staged wheel of every machine, were refused by GitHub's releases). One already beside its wheel stands,
+  # and none is ever replaced. Run whatever the attach's outcome, so an ask of no assets ('[]') writes a release's
+  # missing metadata alone.
+  metadata:
+    needs: [release, attach]
+    if: ${{ always() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Each wheel's METADATA attached beside it
+        run: |
+          set -euo pipefail
+          release="plugin-$VERSION"
+          # The release's uploaded assets alone (one still uploading is none yet), each with GitHub's sha256.
+          uploaded() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release" \
+              --jq '.assets[] | select(.state == "uploaded") | "\(.name) \(.digest)"'
+          }
+          # One snapshot, read in an assignment of its own: a failed read fails the step, never an empty loop.
+          assets=$(uploaded)
+          wheels=$(awk '$1 ~ /\.whl$/ {print $1}' <<< "$assets")
+          for wheel in $wheels; do
+            awk -v name="$wheel.metadata" '$1 == name {found = 1} END {exit !found}' <<< "$assets" && continue
+            gh release download "$release" -R "$GITHUB_REPOSITORY" --pattern "$wheel" --dir wheels --clobber
+            metadata=$(unzip -Z1 "wheels/$wheel" | grep -E '^[^/]+\.dist-info/METADATA$')
+            unzip -p "wheels/$wheel" "$metadata" > "$wheel.metadata"
+            # Never replaced (gh's --clobber deletes the asset first, which a page may already state): another
+            # attach's upload of it meanwhile stands where its sha256 is these bytes', and fails this one else.
+            if ! gh release upload "$release" -R "$GITHUB_REPOSITORY" "$wheel.metadata"; then
+              want="sha256:$(sha256sum "$wheel.metadata" | cut -d' ' -f1)"
+              now=$(uploaded)
+              have=$(awk -v name="$wheel.metadata" '$1 == name {print $2}' <<< "$now")
+              [ "$have" = "$want" ] || { echo "::error::$wheel.metadata: $have on the release, not $want"; exit 1; }
+            fi
+            rm -f "wheels/$wheel" "$wheel.metadata"
+          done
