@@ -21,6 +21,7 @@ from jax._src import hlo_reader
 from jax._src import peak_live
 from jax._src import test_util as jtu
 from jax._src.lib import xla_client as xc
+from jax._src.lib.mlir import ir
 import jax.experimental.topologies as topologies
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
@@ -80,6 +81,65 @@ class PeakLiveTest(jtu.JaxTestCase):
     self.assertEqual(
         sorted(buffer.parameter for buffer in live if buffer.kind == "parameter"),
         [0, 1])
+
+  @jtu.run_on_devices("cpu", "cuda")
+  def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast(self):
+    # The saved residual is named after two reshapes, which XLA may fold into a
+    # bitcast of the tanh's buffer, the reshapes that carried the name gone (as
+    # it did a GPU gemm's converted output, Dew row 12898): the tanh's own op is
+    # named through them, so the buffer live at the gradient's peak is named,
+    # once, however XLA lays the reshapes out.
+    def step(x, w):
+      hidden = jnp.tanh(x @ w).reshape(2048, 16, 16).reshape(2048 * 16, 16)
+      hidden = ad_checkpoint.checkpoint_name(hidden, "hidden")
+      return jnp.sum(jnp.sin(hidden))
+
+    saved = jax.checkpoint(
+        step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+    rows = jax.ShapeDtypeStruct((2048, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    live = jax.jit(jax.grad(saved, argnums=1)).lower(rows, weight).compile().peak_live()
+    self.assertIsNotNone(live)
+    named = [buffer for buffer in live if buffer.names]
+    self.assertTrue(named, live)
+    self.assertEqual({buffer.names for buffer in named}, {("hidden",)})
+
+  def test_a_name_reaches_through_reshapes_to_their_producer_and_no_further(self):
+    # Each reshape on the way and the op making their operand carry the name,
+    # once however often it is given; an argument reshaped has no producer, so
+    # its reshape alone does; an op the producer reads is never named; nor is a
+    # producer of several results, whose unnamed sibling would read it.
+    def names(f, *args):
+      found = []
+
+      def walk(operation):
+        for region in operation.regions:
+          for block in region.blocks:
+            for inner in block.operations:
+              op = inner.operation
+              if "mhlo.frontend_attributes" in op.attributes:
+                attributes = ir.DictAttr(op.attributes["mhlo.frontend_attributes"])
+                if "checkpoint_name" in attributes:
+                  found.append((op.name, ir.StringAttr(attributes["checkpoint_name"]).value))
+              walk(op)
+
+      walk(jax.jit(f).lower(*args).compiler_ir("stablehlo").operation)
+      return found
+
+    x = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+    hidden = lambda x: ad_checkpoint.checkpoint_name(ad_checkpoint.checkpoint_name(
+        jnp.tanh(jnp.exp(x)).reshape(2, 64).reshape(128), "hidden"), "hidden")
+    self.assertEqual(names(hidden, x), [("stablehlo.tanh", "hidden"),
+                                        ("stablehlo.reshape", "hidden"),
+                                        ("stablehlo.reshape", "hidden")])
+    flat = lambda x: ad_checkpoint.checkpoint_name(x.reshape(128), "flat")
+    self.assertEqual(names(flat, x), [("stablehlo.reshape", "flat")])
+
+    def sorted_keys(x):
+      keys, values = jax.lax.sort((x, jnp.exp(x)), num_keys=1)
+      return ad_checkpoint.checkpoint_name(keys.reshape(128), "keys"), values
+
+    self.assertEqual(names(sorted_keys, x), [("stablehlo.reshape", "keys")])
 
   @jtu.run_on_devices("cuda")
   def test_a_probe_on_the_devices_twin_states_the_devices_own_compile(self):
