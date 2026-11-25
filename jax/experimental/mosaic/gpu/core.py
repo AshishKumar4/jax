@@ -1299,6 +1299,74 @@ def _declare_runtime_functions():
   )
 
 
+# Operations that touch no memory and synchronize nothing: a collective
+# barrier repeated with only these between it and the one before it syncs
+# nothing new.
+_PURE_DIALECTS = ("arith.", "index.", "math.")
+_PURE_OPS = frozenset({
+    "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "gpu.thread_id",
+    "gpu.block_dim", "gpu.block_id", "gpu.grid_dim",
+})
+
+
+def _drop_repeated_barriers(module: ir.Module) -> None:
+  """Drops each collective warpgroup barrier (`utils.COLLECTIVE_BARRIER`)
+  that repeats one before it in its block, of the same operands and
+  attributes, with only pure operations between (`_PURE_OPS`): the barrier
+  after one store and the one before the next, which ptxas keeps. Both are
+  reached by every thread of the warpgroup from the same program point, so the
+  second syncs nothing the first did not. Other barriers, whose participants a
+  branch may split, are kept. Barrier ids are compared as SSA values after CSE,
+  which merges their recomputed index arithmetic, run only where a barrier is
+  marked. The marks are removed after."""
+
+  def marks(op: ir.Operation) -> bool:
+    return any(
+        inner.operation.name == "nvvm.barrier"
+        and utils.COLLECTIVE_BARRIER in inner.operation.attributes
+        or marks(inner.operation)
+        for region in op.regions
+        for block in region.blocks
+        for inner in block.operations
+    )
+
+  if not marks(module.operation):
+    return
+  pm = passmanager.PassManager.parse("builtin.module(cse)", module.context)
+  pm.enable_verifier(False)
+  pm.run(module.operation)
+  dropped, marked = [], []
+
+  def walk(op: ir.Operation) -> None:
+    for region in op.regions:
+      for block in region.blocks:
+        last = None  # The block's last collective barrier still in force.
+        for inner in block.operations:
+          inner = inner.operation
+          name = inner.name
+          if name == "nvvm.barrier" and utils.COLLECTIVE_BARRIER in inner.attributes:
+            marked.append(inner)
+            attributes = inner.attributes
+            stated = (tuple(inner.operands), tuple(sorted(
+                (attributes[i].name, str(attributes[i].attr))
+                for i in range(len(attributes)))))
+            if last is not None and stated == last:
+              dropped.append(inner)
+            last = stated
+            continue
+          if inner.regions or not (
+              name.startswith(_PURE_DIALECTS) or name in _PURE_OPS
+          ):
+            last = None
+          walk(inner)
+
+  walk(module.operation)
+  for op in marked:
+    del op.attributes[utils.COLLECTIVE_BARRIER]
+  for op in dropped:
+    op.erase()
+
+
 def lower_mgpu_module(
     module: ir.Module,
     launch_ctx: launch_context.LaunchContext,
@@ -1337,6 +1405,7 @@ def lower_mgpu_module(
         module, launch_ctx, auto_barriers=auto_barriers
     )
 
+  _drop_repeated_barriers(module)
   launch_ctx.scratch.finalize_size()
   try:
     module.operation.verify()
