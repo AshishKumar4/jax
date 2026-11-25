@@ -672,7 +672,9 @@ def _run_scoped_to_lojax(*args, jaxpr, **params):
   closed_hi_jaxpr = jaxpr.with_consts(args)
   closed_lo_jaxpr = pe.lower_jaxpr2(closed_hi_jaxpr)
   consts = closed_lo_jaxpr.consts
-  return run_scoped_p.bind(*consts, jaxpr=closed_lo_jaxpr, **params)
+  return run_scoped_p.bind(
+      *consts, jaxpr=closed_lo_jaxpr.with_consts(()), **params
+  )
 run_scoped_p.to_lojax = _run_scoped_to_lojax
 
 def run_scoped(
@@ -718,8 +720,14 @@ def run_scoped(
         f_with_transforms,
         avals,
         api_util.debug_info("pallas run_scoped", f, types, kw_types))
+  # The values the body closes over are the eqn's operands alone: its `jaxpr`
+  # param holds none of them, its leading invars standing for them, so a
+  # nested jaxpr keeps no tracer of the trace that bound it (a `run_scoped` in
+  # a `cond` branch kept the branch's tracers past the branch's closure
+  # conversion, which an enclosing trace then hoisted as stale inputs). Each
+  # rule attaches its own operands (`jaxpr.with_consts(args)`).
   out = run_scoped_p.bind(*jaxpr.consts,
-                          jaxpr=jaxpr,
+                          jaxpr=jaxpr.with_consts(()),
                           collective_axes=collective_axes,
                           ref_transforms=ref_transforms)
   return tree_util.tree_unflatten(out_avals.tree, out)
@@ -727,7 +735,8 @@ def run_scoped(
 
 @run_scoped_p.def_effectful_abstract_eval
 def _run_scoped_abstract_eval(*args, jaxpr, collective_axes, **_):
-  del args, collective_axes
+  del collective_axes
+  jaxpr = jaxpr.with_consts(args)
   # jaxpr will have effects for its inputs (Refs that are allocated) and for
   # constvars (closed over Refs). The effects for the allocated Refs are local
   # to the jaxpr and shouldn't propagate out. The eqn's inputs are the jaxpr's
@@ -755,22 +764,20 @@ def _run_scoped_discharge_rule(
     raise NotImplementedError(
         "run_scoped discharge does not support collective_axes yet."
     )
-  # discharge_state only discharges invars, not consts, so in order to
-  # discharge the requested refs we need to move them to the invar set.
-  jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
-  num_return_values = len(jaxpr_noconst.outvars)
+  # discharge_state discharges invars alone: the body's leading invars are its
+  # operands (`run_scoped`), the rest the refs it allocates, none discharged.
+  num_return_values = len(jaxpr.outvars)
   discharged_closed_body = state_discharge.discharge_state(
-      jaxpr_noconst,
-      should_discharge=ctx.should_discharge + [False] * len(jaxpr.invars),
+      jaxpr,
+      should_discharge=(
+          ctx.should_discharge + [False] * (len(jaxpr.invars) - len(args_flat))
+      ),
       strip_memory_space=ctx.strip_memory_space,
   )
   discharged_body, new_consts = discharged_closed_body, discharged_closed_body.consts
   if new_consts:
     raise NotImplementedError(
         "Cannot handle new consts created by state discharge.")
-
-  # Lowering expects that the jaxpr.consts to be the eqn.invals.
-  discharged_body = discharged_body.with_consts(args_flat)
 
   # Run_scoped discharged the external variables but the scoped ones
   # are not discharged.
@@ -802,10 +809,10 @@ def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes, **_):
         "run_scoped lowering outside of Pallas does not support"
         " collective_axes."
     )
-  jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
-  num_return_values = len(jaxpr_noconst.outvars)
+  # The body's leading invars are its operands (`run_scoped`).
+  num_return_values = len(jaxpr.outvars)
   discharged_closed_body = state_discharge.discharge_state(
-      jaxpr_noconst, should_discharge=True, strip_memory_space=True)
+      jaxpr, should_discharge=True, strip_memory_space=True)
   discharged_body, new_consts = discharged_closed_body, discharged_closed_body.consts
   if new_consts:
     raise NotImplementedError(
