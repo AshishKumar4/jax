@@ -1355,6 +1355,7 @@ class OpsTest(PallasBaseTest):
       ),
       ([lax.population_count, lax.clz, jnp.invert], ["int32", "int64"]),
       ([jnp.logical_not], ["bool"]),
+      ([lax.erf], ["float32", "float64"]),
   ]
 
   @parameterized.named_parameters(
@@ -1408,6 +1409,42 @@ class OpsTest(PallasBaseTest):
       x = jnp.array([0.42, 2.4] * (8 * 128 // 2)).reshape(8, 128).astype(dtype)
       rtol = 1e-6
     self.assertAllClose(kernel(x), fn(x), rtol=rtol)
+
+  @parameterized.parameters(jnp.float16, jnp.bfloat16)
+  def test_erf_of_a_narrow_float_rounds_float32s(self, dtype):
+    self.skip_if_mosaic_gpu()
+    if not jtu.test_device_matches(["gpu"]):
+      self.skipTest("the narrow erf's float32 route is the GPU lowering's")
+
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct((8, 128), dtype)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = lax.erf(x_ref[...])
+
+    x = jnp.linspace(-3, 3, 8 * 128, dtype=jnp.float32).reshape(8, 128)
+    np.testing.assert_allclose(
+        np.asarray(kernel(x.astype(dtype)), np.float32),
+        np.asarray(lax.erf(x.astype(dtype).astype(jnp.float32)).astype(dtype),
+                   np.float32),
+        rtol=float(jnp.finfo(dtype).eps),
+    )
+
+  def test_erf_of_a_weak_float64_is_float64s(self):
+    self.skip_if_mosaic_gpu()
+    if not jax.config.x64_enabled:
+      self.skipTest("64-bit types require x64_enabled")
+
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float64)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...] * 0 + lax.erf(0.42)
+
+    x = jnp.zeros((8, 128), jnp.float64)
+    np.testing.assert_allclose(
+        kernel(x), np.full((8, 128), math.erf(0.42)), rtol=1e-15
+    )
 
   @parameterized.named_parameters(
       (f"{fn.__name__}_{dtype}", fn, dtype)
