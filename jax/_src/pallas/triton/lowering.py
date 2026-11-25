@@ -996,6 +996,41 @@ tanh_dispatch_table = _make_dispatch_table(
     ],
 )
 
+_ERF_SYMBOLS = {
+    ("cuda", jnp.dtype(jnp.float32)): "__nv_erff",
+    ("cuda", jnp.dtype(jnp.float64)): "__nv_erf",
+    ("rocm", jnp.dtype(jnp.float32)): "__ocml_erf_f32",
+    ("rocm", jnp.dtype(jnp.float64)): "__ocml_erf_f64",
+}
+
+
+def _erf_lowering_rule(ctx: LoweringRuleContext, x: ir.Value) -> ir.Value:
+  # The device library's erf at the result's exact dtype, a float16 or bfloat16 one through float32's and
+  # rounded back: an extern table matches a weak float64 to float32's symbol, and nothing on a Pallas
+  # call's path lowers math.erf itself.
+  [x_aval] = ctx.avals_in
+  [out_aval] = ctx.avals_out
+  dtype = jnp.dtype(out_aval.dtype)
+  wide = dtype if dtype in (jnp.float32, jnp.float64) else jnp.dtype(jnp.float32)
+  if dtype not in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
+    raise NotImplementedError(f"unsupported types for erf: {dtype}")
+  x = _bcast_to(_ensure_ir_value(x, x_aval), out_aval.shape)
+  if jnp.dtype(x_aval.dtype) != wide:
+    x = _cast(x, x_aval.dtype, wide)
+  result_type = _dtype_to_ir_type(wide)
+  if out_aval.shape:
+    result_type = ir.RankedTensorType.get(out_aval.shape, result_type)
+  result = tt_dialect.extern_elementwise(
+      result_type,
+      [x],
+      libname="",
+      libpath="",
+      symbol=_ERF_SYMBOLS[(ctx.context.platform, wide)],
+      pure=True,
+  )
+  return result if dtype == wide else _cast(result, wide, dtype)
+
+
 asinh_dispatch_table = _make_dispatch_table(
     "asinh",
     cuda=[
@@ -1111,6 +1146,7 @@ triton_lowering_rules.update({
     lax.sinh_p: sinh_dispatch_table,
     lax.cosh_p: cosh_dispatch_table,
     lax.tanh_p: tanh_dispatch_table,
+    lax.erf_p: _erf_lowering_rule,
     lax.asinh_p: asinh_dispatch_table,
     lax.acosh_p: acosh_dispatch_table,
     lax.atanh_p: atanh_dispatch_table,
