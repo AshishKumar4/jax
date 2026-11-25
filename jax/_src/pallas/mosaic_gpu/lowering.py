@@ -389,7 +389,7 @@ def _run_scoped_resource_estimator(
   # NOTE: This rule assumes that the allocation happens collectively, although
   # it can't be checked here due to limited context. We check this in the actual
   # lowering rule.
-  del consts  # Unused.
+  jaxpr = jaxpr.with_consts(consts)  # Its leading invars are its operands.
   rs = Resources()
   for v in jaxpr.invars:
     aval = cast(ShapedAbstractValue, v.aval)
@@ -4220,6 +4220,7 @@ def _run_scoped_lowering_rule(
     collective_axes,
     **_,
 ):
+  jaxpr = jaxpr.with_consts(consts)  # Its leading invars are its operands.
   if pallas_core.poison_buffers_enabled():
     raise NotImplementedError("Buffer poisoning is not supported on GPU yet.")
   input_refs = []
