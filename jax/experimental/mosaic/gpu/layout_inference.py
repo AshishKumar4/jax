@@ -847,6 +847,8 @@ for _op in [
     mlir_math.RsqrtOp,
     mlir_math.SqrtOp,
     mlir_math.TanhOp,
+    mlir_math.ErfOp,
+    mlir_math.Atan2Op,
     mlir_math.AbsFOp,
     mlir_math.AbsIOp,
     mlir_math.RoundOp,

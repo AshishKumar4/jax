@@ -996,6 +996,20 @@ tanh_dispatch_table = _make_dispatch_table(
     ],
 )
 
+erf_dispatch_table = _make_dispatch_table(
+    "erf",
+    cuda=[
+        _Extern([jnp.float32], "__nv_erff", jnp.float32),
+        _Extern([jnp.float64], "__nv_erf", jnp.float64),
+        _Fallback([jnp.floating], math_dialect.erf),
+    ],
+    rocm=[
+        _Extern([jnp.float32], "__ocml_erf_f32", jnp.float32),
+        _Extern([jnp.float64], "__ocml_erf_f64", jnp.float64),
+        _Fallback([jnp.floating], math_dialect.erf),
+    ],
+)
+
 asinh_dispatch_table = _make_dispatch_table(
     "asinh",
     cuda=[
@@ -1111,6 +1125,7 @@ triton_lowering_rules.update({
     lax.sinh_p: sinh_dispatch_table,
     lax.cosh_p: cosh_dispatch_table,
     lax.tanh_p: tanh_dispatch_table,
+    lax.erf_p: erf_dispatch_table,
     lax.asinh_p: asinh_dispatch_table,
     lax.acosh_p: acosh_dispatch_table,
     lax.atanh_p: atanh_dispatch_table,
