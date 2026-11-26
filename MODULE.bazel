@@ -109,6 +109,8 @@ archive_override(
         # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
         # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554).
         "//third_party:xla/dot_algorithm_multiply.patch",
+        # DotStrengthReduction multiplies in the accumulator type when an implicit GEMV is reduced.
+        "//third_party:xla/gpu_dot_strength_wide.patch",
         # A CPU executable deserialized (from the compilation cache) keeps one collective communicator across a
         # while loop's body, a call's and a conditional's branches and the sequence holding them, as the compile
         # emits it: each nested sequence's resources deserialized apart dropped every resource edge between a
