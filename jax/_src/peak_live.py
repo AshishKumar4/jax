@@ -70,6 +70,58 @@ class LiveBuffer:
   dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LiveInterval(LiveBuffer):
+  """A buffer of a compile's allocation over the part of a heap simulation's
+  schedule it lives in.
+
+  Attributes (besides ``LiveBuffer``'s):
+    allocation: the buffer allocation it is assigned to.
+    trace: the heap simulation that orders it (its index among the
+      assignment's ``heap_simulator_traces``): positions compare within one
+      trace alone (an allocation simulated per computation has one each,
+      their positions each from 0; the pages of one heap each a copy of its
+      one trace, their positions alike).
+    whole: whether that simulation's schedule is the whole module's
+      (XLA:GPU's), a while body's buffers within its loop's span, or one
+      computation's; no word of what else its allocation holds.
+    complete: whether every buffer its allocation is assigned lies in one of
+      its simulations: XLA places some in an allocation unsimulated (temporary
+      heaps reused, or combined), so a planner needing all of an allocation's
+      buffers over one schedule reads it first.
+    start: its first position among that simulation's events.
+    end: the position after its last: the simulation's length for one never
+      freed.
+    buffer: its logical buffer's id.
+    storage: the logical buffer whose memory it lies in, as first allocated:
+      its own where it was allocated, else the one the buffer it shares lies
+      in (XLA's ``SHARE_WITH``: an in-place output over its operand, or
+      memory reused once freed, however many times over). The memory a trace
+      occupies at a position is each storage some interval covering it lies
+      in, once, at the most of their ``bytes``.
+    charged: whether XLA's count of the allocation's peak charges it, from
+      its start to its end: where no buffer then held its storage's memory,
+      as XLA counts it (``ComputePeakMemoryLogicalBuffers``: a share charged
+      where its canonical buffer has no other live instance, each charge
+      undone at its own buffer's free, so a memory shared past its first
+      buffer's free is no longer charged though occupied; a slice of no bytes
+      never charged). In a complete allocation's one trace, the charged
+      intervals covering its peak position (the first of the most bytes they
+      hold) are ``live``'s buffers of it.
+
+  ``bytes`` is its slice of the allocation, as the assignment states it.
+  """
+  allocation: int
+  trace: int
+  whole: bool
+  complete: bool
+  start: int
+  end: int
+  buffer: int
+  storage: int
+  charged: bool
+
+
 def live(assignment: bytes, module: bytes,
          argument: Callable[[int], int | None] | None = None
          ) -> tuple[LiveBuffer, ...]:
@@ -77,61 +129,167 @@ def live(assignment: bytes, module: bytes,
   ``BufferAssignmentProto`` ``assignment``, whose buffers serialized
   ``HloModuleProto`` ``module`` defines; a constant's and a thread-local
   allocation's are none."""
-  proto = hlo_reader.message_class("xla.BufferAssignmentProto").FromString(
-      assignment)
-  compiled = hlo_reader.message_class("xla.HloModuleProto").FromString(module)
-  instructions = {
-      instruction.id: instruction
-      for computation in compiled.computations
-      for instruction in computation.instructions}
-  descended = provenance(compiled, argument)
-  computations = {computation.id: computation
-                  for computation in compiled.computations}
-  # Each logical buffer's other positions, as XLA's must-alias analysis states
-  # them: a loop state's buffer's among them, at the while's own output.
-  aliases: dict[int, list[Any]] = {}
-  for alias in proto.buffer_aliases:
-    aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
-  primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
-  buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
-  kinds = {allocation.index: _kind(allocation)
-           for allocation in proto.buffer_allocations}
-  parameters = {allocation.index: allocation.parameter_number
-                for allocation in proto.buffer_allocations
-                if allocation.is_entry_computation_parameter}
+  read = _Read(assignment, module, argument)
+  return tuple(LiveBuffer(**found) for peak in read.proto.peak_buffers
+               for buffer in peak.logical_buffer_ids
+               if (found := read.described(buffer, peak.index)) is not None)
+
+
+def intervals(assignment: bytes, module: bytes,
+              argument: Callable[[int], int | None] | None = None
+              ) -> tuple[LiveInterval, ...]:
+  """Each array buffer of serialized ``BufferAssignmentProto`` ``assignment``
+  over the positions of a heap simulation it lives in (its
+  ``heap_simulator_traces``' events: allocated at one, or placed in another's
+  memory, and freed at another), as ``live`` describes it, for each
+  allocation it is assigned to whose simulation that is; a constant's and a
+  thread-local allocation's are none, as are those of an allocation the
+  assignment states no simulation of (XLA:CPU keeps none), and an allocation
+  no simulation names emits none. Positions compare within one trace alone:
+  in a complete allocation's one trace, the charged intervals covering its
+  peak are the buffers ``live`` names; ``complete`` is the union of its
+  traces, no clock across them."""
+  read = _Read(assignment, module, argument)
+  event = hlo_reader.pool().FindMessageTypeByName(
+      "xla.HeapSimulatorTrace.Event")
+  kinds = {value.name: value.number
+           for value in event.fields_by_name["kind"].enum_type.values}
+  # A heap's pages each hold a copy of its one trace, of their own buffers,
+  # each its slice's size (as XLA's own count of the peak reads it).
+  assigned = {allocation.index: {each.logical_buffer_id: each.size
+                                 for each in allocation.assigned}
+              for allocation in read.proto.buffer_allocations}
+  traced: dict[int, set[int]] = {}
+  for simulated in read.proto.heap_simulator_traces:
+    traced.setdefault(simulated.buffer_allocation_index, set()).update(
+        step.buffer_id for step in simulated.events)
+  complete = {allocation: set(sizes) <= traced.get(allocation, set())
+              for allocation, sizes in assigned.items()}
   found = []
-  for peak in proto.peak_buffers:
-    kind = kinds[peak.index]
-    if kind is None:
-      continue
-    for buffer_id in peak.logical_buffer_ids:
-      buffer = buffers[buffer_id]
-      instruction = instructions[buffer.defined_at.instruction_id]
-      shape, dims = instruction.shape, descended.get(instruction.id)
-      for index in buffer.defined_at.shape_index:
-        shape = shape.tuple_shapes[index]
-        dims = None if dims is None else dims[index]
-      if shape.tuple_shapes:
-        continue  # A tuple's index table, no array.
-      metadata = instruction.metadata
-      named = instruction.frontend_attributes.map.get("checkpoint_name")
-      written = None if named else _aliased_named(
-          aliases.get(buffer.id, ()), instructions, computations)
-      if written is not None:
-        named = written.frontend_attributes.map.get("checkpoint_name")
-      found.append(LiveBuffer(
-          bytes=buffer.size, shape=tuple(shape.dimensions),
-          dtype=primitive_type.values_by_number[shape.element_type]
-          .name.lower(),
-          kind=kind, instruction=instruction.name,
-          op_name=metadata.op_name or (
-              written.metadata.op_name if written is not None else ""),
-          source=f"{metadata.source_file}:{metadata.source_line}",
-          names=tuple(named.split(",")) if named else (),
-          parameter=parameters.get(peak.index),
-          dims=(tuple(None for _ in shape.dimensions) if dims is None
-                else tuple(dims))))
+  for trace, simulated in enumerate(read.proto.heap_simulator_traces):
+    # Each buffer's storage, as first allocated: a share names the buffer it
+    # shares, itself perhaps sharing another's, freed or not.
+    storages: dict[int, int] = {}
+    opened: dict[int, int] = {}
+    spans = []
+    for position, step in enumerate(simulated.events):
+      if step.kind == kinds["FREE"]:
+        spans.append((step.buffer_id, opened.pop(step.buffer_id), position))
+        continue
+      storages[step.buffer_id] = (
+          storages.get(step.share_with_canonical_id,
+                       step.share_with_canonical_id)
+          if step.kind == kinds["SHARE_WITH"] else step.buffer_id)
+      opened[step.buffer_id] = position
+    spans += [(buffer, start, len(simulated.events))
+              for buffer, start in opened.items()]
+    allocation = simulated.buffer_allocation_index
+    sizes = assigned.get(allocation, {})
+    charged = _charged(simulated.events, sizes, kinds)
+    found += [LiveInterval(**{**described, "bytes": sizes[buffer]},
+                           allocation=allocation, trace=trace,
+                           whole=simulated.whole_module_simulation,
+                           complete=complete[allocation],
+                           start=start, end=end, buffer=buffer,
+                           storage=storages[buffer],
+                           charged=buffer in charged)
+              for buffer, start, end in spans
+              if buffer in sizes
+              and (described := read.described(buffer, allocation))
+              is not None]
   return tuple(found)
+
+
+def _charged(events: Any, assigned: dict[int, int],
+             kinds: dict[str, int]) -> set[int]:
+  """The buffers of ``assigned`` (an allocation's, by id) XLA's count of its
+  peak charges over a heap simulation's ``events``, as it counts them
+  (``ComputePeakMemoryLogicalBuffers``): each allocated one; each share whose
+  canonical buffer has no other live instance then, instances counted by the
+  canonical buffer it names, each freed one by the buffer it shared; one of
+  no bytes never, as XLA's count names no buffer it adds nothing for."""
+  instances: dict[int, int] = {}
+  canonical: dict[int, int] = {}
+  charged = set()
+  for step in events:
+    if step.buffer_id not in assigned:
+      continue  # Another page's, which this allocation's count skips.
+    if step.kind == kinds["ALLOC"]:
+      instances[step.buffer_id] = 1
+      if assigned[step.buffer_id] > 0:
+        charged.add(step.buffer_id)
+    elif step.kind == kinds["SHARE_WITH"]:
+      shared = canonical[step.buffer_id] = step.share_with_canonical_id
+      instances[shared] = instances.get(shared, 0) + 1
+      if instances[shared] == 1 and assigned[step.buffer_id] > 0:
+        charged.add(step.buffer_id)
+    else:
+      freed = canonical.get(step.buffer_id, step.buffer_id)
+      instances[freed] = instances.get(freed, 0) - 1
+  return charged
+
+
+class _Read:
+  """A buffer assignment read beside the compiled module it assigns."""
+
+  def __init__(self, assignment: bytes, module: bytes,
+               argument: Callable[[int], int | None] | None):
+    self.proto = hlo_reader.message_class(
+        "xla.BufferAssignmentProto").FromString(assignment)
+    compiled = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module)
+    self.instructions = {
+        instruction.id: instruction
+        for computation in compiled.computations
+        for instruction in computation.instructions}
+    self.descended = provenance(compiled, argument)
+    self.computations = {computation.id: computation
+                         for computation in compiled.computations}
+    # Each logical buffer's other positions, as XLA's must-alias analysis
+    # states them: a loop state's buffer's among them, at the while's output.
+    self.aliases: dict[int, list[Any]] = {}
+    for alias in self.proto.buffer_aliases:
+      self.aliases.setdefault(alias.source_buffer_id, []).append(
+          alias.location)
+    self.types = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
+    self.buffers = {buffer.id: buffer for buffer in self.proto.logical_buffers}
+    self.kinds = {allocation.index: _kind(allocation)
+                  for allocation in self.proto.buffer_allocations}
+    self.parameters = {allocation.index: allocation.parameter_number
+                       for allocation in self.proto.buffer_allocations
+                       if allocation.is_entry_computation_parameter}
+
+  def described(self, buffer_id: int, allocation: int) -> dict | None:
+    """``LiveBuffer``'s fields of logical buffer ``buffer_id`` of
+    ``allocation``; None for a constant's or a thread-local allocation's, and
+    for a tuple's index table, no array."""
+    if (kind := self.kinds.get(allocation)) is None:
+      return None
+    buffer = self.buffers[buffer_id]
+    instruction = self.instructions[buffer.defined_at.instruction_id]
+    shape, dims = instruction.shape, self.descended.get(instruction.id)
+    for index in buffer.defined_at.shape_index:
+      shape = shape.tuple_shapes[index]
+      dims = None if dims is None else dims[index]
+    if shape.tuple_shapes:
+      return None
+    metadata = instruction.metadata
+    named = instruction.frontend_attributes.map.get("checkpoint_name")
+    written = None if named else _aliased_named(
+        self.aliases.get(buffer.id, ()), self.instructions, self.computations)
+    if written is not None:
+      named = written.frontend_attributes.map.get("checkpoint_name")
+    return dict(
+        bytes=buffer.size, shape=tuple(shape.dimensions),
+        dtype=self.types.values_by_number[shape.element_type].name.lower(),
+        kind=kind, instruction=instruction.name,
+        op_name=metadata.op_name or (
+            written.metadata.op_name if written is not None else ""),
+        source=f"{metadata.source_file}:{metadata.source_line}",
+        names=tuple(named.split(",")) if named else (),
+        parameter=self.parameters.get(allocation),
+        dims=(tuple(None for _ in shape.dimensions) if dims is None
+              else tuple(dims)))
 
 
 def _aliased_named(locations: Any, instructions: dict[int, Any],
