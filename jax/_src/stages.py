@@ -816,6 +816,22 @@ class Compiled(Stage):
     except NotImplementedError:
       return None
 
+  def live_intervals(self) -> tuple[peak_live.LiveInterval, ...] | None:
+    """Each buffer of the compile's allocations over the part of its
+    allocation's heap schedule it lives in: at each allocation's peak, the
+    unshared ones are ``peak_live``'s.
+
+    Read from the same buffer assignment as ``peak_live``; ``None`` where the
+    backend states none.
+    """
+    analysis = self.memory_analysis()
+    if analysis is None or not analysis.serialized_buffer_assignment_proto:
+      return None
+    module, = self._executable.xla_extension_executable().hlo_modules()
+    return peak_live.intervals(analysis.serialized_buffer_assignment_proto,
+                               module.as_serialized_hlo_module_proto(),
+                               self._parameter_arguments())
+
   def peak_live(self) -> tuple[peak_live.LiveBuffer, ...] | None:
     """The buffers live at the peak of each of the compile's allocations.
 

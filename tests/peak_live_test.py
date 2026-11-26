@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 from typing import Any
 
 from absl.testing import absltest
@@ -57,6 +58,47 @@ class PeakLiveTest(jtu.JaxTestCase):
         for buffer in temporaries), live)
     self.assertLessEqual(sum(buffer.bytes for buffer in temporaries),
                          compiled.memory_analysis().temp_size_in_bytes)
+
+  @jtu.run_on_devices("cpu", "cuda")
+  def test_a_compiles_intervals_hold_its_peak_buffers_at_each_allocations_peak(
+      self):
+    # Each buffer over the positions of its allocation's heap simulation it
+    # lives in: at the first position an allocation holds its most unshared
+    # bytes, the intervals covering it are the buffers peak_live names of it,
+    # as XLA's own peak is read from the same simulation.
+    def step(x, w):
+      for _ in range(3):
+        x = jnp.tanh(x @ w)
+      return x.sum(), x
+
+    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, has_aux=True)).lower(tile, tile).compile()
+    intervals, live = compiled.live_intervals(), compiled.peak_live()
+    self.assertTrue(intervals)
+    self.assertTrue(all(each.start < each.end for each in intervals), intervals)
+    allocations: dict[int, list[peak_live.LiveInterval]] = {}
+    for each in intervals:
+      allocations.setdefault(each.allocation, []).append(each)
+
+    def held(at, each):
+      return each.start <= at < each.end
+
+    def unshared(at, each):
+      return sum(interval.bytes for interval in each
+                 if held(at, interval) and not interval.shared)
+
+    peaked = []
+    for each in allocations.values():
+      at = max(range(max(interval.end for interval in each)),
+               key=lambda at, each=each: unshared(at, each))
+      peaked += [interval for interval in each if held(at, interval)]
+
+    def named(buffers):
+      return collections.Counter((buffer.instruction, buffer.bytes)
+                                 for buffer in buffers
+                                 if buffer.kind == "temporary")
+
+    self.assertEqual(named(peaked), named(live))
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
