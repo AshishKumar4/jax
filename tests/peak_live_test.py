@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 from typing import Any
 
 from absl.testing import absltest
@@ -57,6 +58,95 @@ class PeakLiveTest(jtu.JaxTestCase):
         for buffer in temporaries), live)
     self.assertLessEqual(sum(buffer.bytes for buffer in temporaries),
                          compiled.memory_analysis().temp_size_in_bytes)
+
+  @jtu.run_on_devices("cuda")
+  def test_a_compiles_intervals_hold_its_peak_buffers_at_each_allocations_peak(
+      self):
+    # At the first position a trace holds its most bytes, each storage counted
+    # once, an allocation's intervals covering it are the buffers peak_live
+    # names of it, as XLA's own peak is read from the same simulation
+    # (XLA:GPU's, which keeps its traces; XLA:CPU's assignment states none).
+    def step(x, w):
+      for _ in range(3):
+        x = jnp.tanh(x @ w)
+      return x.sum(), x
+
+    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, has_aux=True)).lower(tile, tile).compile()
+    intervals, live = compiled.live_intervals(), compiled.peak_live()
+    self.assertTrue(intervals)
+    peaked = []
+    for trace in {each.trace for each in intervals}:
+      within = [each for each in intervals if each.trace == trace]
+      at = max(range(max(each.end for each in within)),
+               key=lambda at, within=within: _held(within, at))
+      peaked += [each for each in within if each.start <= at < each.end]
+    self.assertEqual(_temporaries(peaked), _temporaries(live))
+
+  def test_an_interval_shares_memory_only_with_a_buffer_still_live(self):
+    # A heap simulation's events: an output in place over a live operand
+    # shares its memory; one placed where a freed buffer was is new memory
+    # again (XLA's FREE then SHARE_WITH); a heap's pages each hold their own
+    # buffers of one trace; an allocation simulated per computation has a
+    # trace each, positions from 0 in each; a share of a share, freed or not,
+    # lies in the first's memory.
+    hlo = """
+HloModule m, entry_computation_layout={(f32[4]{0})->f32[4]{0}}
+
+ENTRY e {
+  p = f32[4]{0} parameter(0)
+  a = f32[4]{0} negate(p), frontend_attributes={checkpoint_name="first"}
+  b = f32[4]{0} exponential(a)
+  c = f32[4]{0} sine(b)
+  d = f32[4]{0} cosine(c)
+  e = f32[4]{0} tanh(d)
+  ROOT r = f32[4]{0} add(e, c)
+}
+"""
+    module = hlo_reader.module_from_text(hlo).as_serialized_hlo_module_proto()
+    [entry] = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module).computations
+    defined = {instruction.name: instruction.id
+               for instruction in entry.instructions}
+    assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+    ids = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
+    for name, buffer in ids.items():
+      logical = assignment.logical_buffers.add(id=buffer, size=16)
+      logical.defined_at.instruction_id = defined[name]
+    for index, names in enumerate(("ab", "cde")):
+      allocation = assignment.buffer_allocations.add(index=index, size=32)
+      for name in names:
+        allocation.assigned.add(logical_buffer_id=ids[name], size=16)
+    alloc, free, share = 0, 1, 2
+    events = [(alloc, "a", None), (alloc, "c", None), (free, "a", None),
+              (share, "b", "a"), (share, "d", "c"), (free, "c", None),
+              (free, "d", None), (share, "e", "d"), (free, "e", None),
+              (free, "b", None)]
+    for allocation, steps in ((0, events), (1, events),
+                              (0, [(alloc, "a", None), (free, "a", None)])):
+      trace = assignment.heap_simulator_traces.add(
+          buffer_allocation_index=allocation,
+          whole_module_simulation=steps is events)
+      for kind, name, shared in steps:
+        trace.events.add(kind=kind, buffer_id=ids[name],
+                         share_with_canonical_id=ids[shared] if shared else 0)
+    found = peak_live.intervals(assignment.SerializeToString(), module)
+    self.assertEqual(
+        sorted((each.instruction, each.allocation, each.trace, each.start,
+                each.end, each.storage) for each in found),
+        [("a", 0, 0, 0, 2, 1), ("a", 0, 2, 0, 1, 1), ("b", 0, 0, 3, 9, 1),
+         ("c", 1, 1, 1, 5, 3), ("d", 1, 1, 4, 6, 3), ("e", 1, 1, 7, 8, 3)])
+    self.assertEqual({each.names for each in found if each.instruction == "a"},
+                     {("first",)})
+    self.assertEqual({(each.trace, each.whole) for each in found},
+                     {(0, True), (1, True), (2, False)})
+    page = [each for each in found if each.trace == 0]
+    # b in a's freed memory holds it anew; d in c's live memory holds none.
+    self.assertEqual([_held(page, at) for at in range(10)],
+                     [16, 16, 0, 16, 16, 16, 16, 16, 16, 0])
+    other = [each for each in found if each.trace == 1]
+    self.assertEqual([_held(other, at) for at in range(10)],
+                     [0, 16, 16, 16, 16, 16, 0, 16, 0, 0])
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
@@ -316,6 +406,23 @@ def _loop_names(steps: int) -> dict[str, tuple[str, ...]]:
     peak.logical_buffer_ids.append(element)
   live = peak_live.live(assignment.SerializeToString(), module)
   return {buffer.instruction: buffer.names for buffer in live}
+
+
+def _held(intervals, at: int) -> int:
+  """The bytes ``intervals``, of one trace, hold at position ``at``: each
+  storage some interval covering it lies in, once, at its members' most."""
+  storages: dict[int, int] = {}
+  for each in intervals:
+    if each.start <= at < each.end:
+      storages[each.storage] = max(storages.get(each.storage, 0), each.bytes)
+  return sum(storages.values())
+
+
+def _temporaries(buffers) -> collections.Counter:
+  """``buffers``' temporaries by their instruction and size."""
+  return collections.Counter((buffer.instruction, buffer.bytes)
+                             for buffer in buffers
+                             if buffer.kind == "temporary")
 
 
 def _descended(text: str) -> dict[str, Any]:
