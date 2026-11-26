@@ -279,17 +279,38 @@ class _Read:
         self.aliases.get(buffer.id, ()), self.instructions, self.computations)
     if written is not None:
       named = written.frontend_attributes.map.get("checkpoint_name")
+    made = _fused_root(instruction, buffer.defined_at.shape_index,
+                       self.instructions, self.computations)
+    if not named and made is not None:
+      named = made.frontend_attributes.map.get("checkpoint_name")
     return dict(
         bytes=buffer.size, shape=tuple(shape.dimensions),
         dtype=self.types.values_by_number[shape.element_type].name.lower(),
         kind=kind, instruction=instruction.name,
         op_name=metadata.op_name or (
-            written.metadata.op_name if written is not None else ""),
+            written.metadata.op_name if written is not None else "") or (
+            made.metadata.op_name if made is not None else ""),
         source=f"{metadata.source_file}:{metadata.source_line}",
         names=tuple(named.split(",")) if named else (),
         parameter=self.parameters.get(allocation),
         dims=(tuple(None for _ in shape.dimensions) if dims is None
               else tuple(dims)))
+
+
+def _fused_root(instruction: Any, index: Any, instructions: dict[int, Any],
+                computations: dict[int, Any]) -> Any | None:
+  """What makes fusion ``instruction``'s output at shape ``index`` inside it:
+  its fused computation's root, or the root tuple's element there (XLA:GPU's
+  own fusions carry no op_name of their own, the instruction they fuse does:
+  a gemm's address-computation fusion, its cuBLAS call and the workspace it
+  holds, Dew's decoder in its backward); None for any other instruction."""
+  if instruction.opcode != "fusion":
+    return None
+  root = instructions[
+      computations[instruction.called_computation_ids[0]].root_id]
+  if root.opcode == "tuple" and index:
+    root = instructions[root.operand_ids[index[0]]]
+  return root
 
 
 def _aliased_named(locations: Any, instructions: dict[int, Any],
@@ -336,15 +357,22 @@ def _stacked(loop: Any, element: int, written: Any,
   update, where the loop provably writes every row of the element and nothing
   else: a broadcast fills the element at the loop's start; the body writes
   one whole row into the element's own state at the induction variable i or
-  at n - 1 - i; XLA's trip count annotation (WhileLoopBackendConfig) states i
-  runs from 0 by 1 over n steps, n the stack's rows. None otherwise."""
-  fusion, fused = None, frozenset()
+  at n - 1 - i, itself, fused or not, run asynchronously or not (XLA:GPU's
+  async fusion: an async-done of an async-start whose computation is the
+  fusion); XLA's trip count annotation (WhileLoopBackendConfig) states i runs
+  from 0 by 1 over n steps, n the stack's rows. None otherwise."""
+  # Each caller the write is made in, outermost first, with what its called
+  # computation holds: an async-start's, then a fusion's.
+  callers: list[tuple[Any, frozenset[int]]] = []
   put = written
-  if written.opcode == "fusion":
-    fusion = written
-    computation = computations[written.called_computation_ids[0]]
-    fused = frozenset(
-        instruction.id for instruction in computation.instructions)
+  if put.opcode == "async-done":
+    put = instructions[put.operand_ids[0]]
+    if put.opcode != "async-start":
+      return None
+  while put.opcode in ("async-start", "fusion"):
+    computation = computations[put.called_computation_ids[0]]
+    callers.append((put, frozenset(
+        instruction.id for instruction in computation.instructions)))
     put = instructions[computation.root_id]
   if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
     return None
@@ -367,10 +395,12 @@ def _stacked(loop: Any, element: int, written: Any,
               if instruction.opcode == "parameter"]
 
   def outside(instruction: Any) -> Any:
-    # The body's instruction a fused one is: a fusion parameter's operand.
-    if (fusion is not None and instruction.id in fused
-        and instruction.opcode == "parameter"):
-      return instructions[fusion.operand_ids[instruction.parameter_number]]
+    # The body's instruction a called one is: each caller's parameter its
+    # operand, innermost first.
+    for caller, called in reversed(callers):
+      if instruction.opcode == "parameter" and instruction.id in called:
+        instruction = instructions[
+            caller.operand_ids[instruction.parameter_number]]
     return instruction
 
   def state(instruction: Any) -> int | None:
