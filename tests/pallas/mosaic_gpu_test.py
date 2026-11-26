@@ -1283,6 +1283,96 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(x), op(x), rtol=1e-5 if approx_math else 3e-7
     )
 
+  @parameterized.product(
+      source=(jnp.float32, jnp.float16, jnp.bfloat16),
+      target=(jnp.int8, jnp.int16, jnp.int32, jnp.uint8, jnp.uint16),
+  )
+  def test_a_float_converts_to_an_integer_saturating(self, source, target):
+    # As XLA converts: toward zero, a value past the target's range its bound
+    # and a NaN zero (LLVM's fptosi.sat and fptoui.sat, no clamp ahead of them).
+    info = np.iinfo(target)
+    edges = [np.nan, np.inf, -np.inf, 2.0**31, -(2.0**31), 2.0**32,
+             info.max + 1.0, info.min - 1.0, info.max + 0.75, info.min - 0.75,
+             info.max, info.min, 2.5, -2.5, 0.0, -0.0]
+    # A 16-bit source takes 2^31 and past as inf, numpy warning as it casts.
+    with np.errstate(over="ignore"):
+      values = np.resize(np.asarray(edges, np.float32), (8, 128)).astype(source)
+    x = jnp.asarray(values)
+
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([8, 128], target)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...].astype(target)
+
+    held = np.asarray(values, np.float64)
+    bounded = np.clip(np.trunc(np.nan_to_num(held, nan=0.0)), info.min, info.max)
+    np.testing.assert_array_equal(kernel(x), bounded.astype(target))
+
+  @parameterized.parameters(np.nan, np.inf, 3e9, -3e9, 2.75, -2.75)
+  def test_a_scalar_float_converts_to_an_integer_saturating(self, value):
+    # A scalar, which has no vector layout, saturates as a vector does. It is
+    # read from a block of 128, which a warpgroup's copy into SMEM can take.
+    @functools.partial(
+        self.pallas_call,
+        in_specs=[pl.BlockSpec(memory_space=plgpu.SMEM)],
+        out_shape=jax.ShapeDtypeStruct([128], jnp.int32),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = jnp.full(o_ref.shape, x_ref[0].astype(jnp.int32))
+
+    info = np.iinfo(np.int32)
+    expected = np.clip(np.trunc(np.nan_to_num(value, nan=0.0)), info.min, info.max)
+    np.testing.assert_array_equal(
+        kernel(jnp.full([128], value, jnp.float32)),
+        np.full([128], expected, np.int32),
+    )
+
+  @parameterized.parameters(
+      (jnp.float64, jnp.int32, 2.0 - 2.0**-40, 1),
+      (jnp.float64, jnp.int32, -(2.0 - 2.0**-40), -1),
+      (jnp.float64, jnp.int32, np.nan, 0),
+      (jnp.float64, jnp.int32, 1e10, np.iinfo(np.int32).max),
+      (jnp.float32, jnp.int64, np.nan, 0),
+      (jnp.float32, jnp.uint64, np.nan, 0),
+      (jnp.float32, jnp.int64, -np.inf, np.iinfo(np.int64).min),
+  )
+  def test_a_64_bit_conversion_saturates_with_nan_zero(self, source, target, value, expected):
+    # An f64 converts as itself, not through f32, and where PTX's cvt takes a
+    # NaN to a bound (from an f64, into 64 bits) it is zero, as XLA converts.
+    # A TMA copies no f64: the source is copied as its bits, an unsigned
+    # integer of its width.
+    bits = {jnp.float32: jnp.uint32, jnp.float64: jnp.uint64}[source]
+    with jax.enable_x64(True):
+
+      @functools.partial(
+          self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], target)
+      )
+      def kernel(x_ref, o_ref):
+        o_ref[...] = lax.bitcast_convert_type(x_ref[...], source).astype(target)
+
+      x = jnp.full([128], value, source)
+      got = kernel(lax.bitcast_convert_type(x, bits))
+    np.testing.assert_array_equal(np.asarray(got), np.full([128], expected, target))
+
+  @jtu.thread_unsafe_test()  # Modifies `os.environ`.
+  def test_a_float_converts_to_a_32_bit_integer_with_no_clamp(self):
+    # Its saturation is LLVM's fptosi.sat, which NVPTX selects as PTX's cvt.rzi,
+    # saturating itself: no float clamp ahead of it.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.int32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...].astype(jnp.int32)
+
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
+      jax.block_until_ready(kernel(jnp.full([256], np.nan, jnp.float32)))
+    ptx = out()
+    self.assertIn(".entry", ptx)  # This case's own kernel compiled here.
+    self.assertIn("cvt.rzi.s32.f32", ptx)
+    for clamp in ("max.f32", "min.f32", "max.NaN.f32", "min.NaN.f32"):
+      self.assertNotIn(clamp, ptx)
+
   @parameterized.parameters(jnp.int32, jnp.int8, jnp.float32)
   def test_a_number_converts_to_a_boolean_by_comparing_with_zero(self, dtype):
     # lax converts to a boolean by comparing with zero: 2 and 0.5 are True,
