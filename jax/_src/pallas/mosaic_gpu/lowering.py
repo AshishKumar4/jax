@@ -2892,10 +2892,19 @@ def _convert_element_type_lowering_rule_wg(
       convert = arith_dialect.uitofp
   elif from_float and to_integer:
     dst_width = mgpu_utils.bitwidth(new_dtype)
+    signed = bool(mgpu_utils.is_signed(y_aval.dtype))
+    if fa.truncates_into_32_bits(cur_dtype, dst_width):
+      # An f32 into 32 bits converts saturating by itself, as JAX/XLA's casting
+      # does (`fa.truncated_into_32_bits`), so no clamp precedes it: a scalar
+      # directly, a vector by `FragmentedArray.astype`.
+      if not x_aval.shape:
+        return fa.truncated_into_32_bits(new_dtype, x, signed=signed)
+      convert = arith_dialect.fptosi if signed else arith_dialect.fptoui
+      return convert(ir.VectorType.get(x_aval.shape, new_dtype), x)
     # We clamp the float value to the min/max integer destination value
     # in order to match JAX/XLA casting behavior. Note that this differs
     # from numpy casting behavior.
-    if mgpu_utils.is_signed(y_aval.dtype):
+    if signed:
       maxint = 2 ** (dst_width - 1) - 1
       minint = -(2 ** (dst_width - 1))
       convert = arith_dialect.fptosi

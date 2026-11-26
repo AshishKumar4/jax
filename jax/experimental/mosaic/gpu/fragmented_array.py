@@ -1271,6 +1271,47 @@ _LN2_HI = 0.693145751953125
 _LN2_LO = 1.428606765330187e-06
 
 
+def truncated_into_32_bits(
+    ty: ir.Type, x: ir.Value, *, signed: bool
+) -> ir.Value:
+  """`x`, an f32 or a vector of them, converted toward zero into `ty`'s 32-bit
+  integers, saturating as XLA's convert does: a value past the integer's range
+  takes its bound and a NaN zero.
+
+  That is NVVM's `llvm.nvvm.f2i.rz` and `llvm.nvvm.f2ui.rz`, PTX's
+  `cvt.rzi.{s,u}32.f32`, which clamps to the destination's range by default and
+  takes an f32's NaN to zero (PTX ISA, `cvt`), where LLVM's `fptosi` and
+  `fptoui`, poison past the range, need a clamp ahead of them. An intrinsic the
+  backend schedules, where an inline `cvt`, opaque to it, held registers of its
+  own, and none of the compares and selects NVPTX's generic expansion of
+  `llvm.fptosi.sat` puts around the `cvt` (three of each a conversion, which
+  spilled register-tight kernels; Dew row 12990). It takes a scalar: a vector
+  converts an element at a time.
+  """
+  if isinstance(ty, ir.VectorType):
+    result = llvm.mlir_undef(ty)
+    element_ty = ir.VectorType(ty).element_type
+    for i in range(ir.VectorType(ty).shape[0]):
+      position = ir.DenseI64ArrayAttr.get([i])
+      element = vector.extract(x, dynamic_position=[], static_position=position)
+      converted = truncated_into_32_bits(element_ty, element, signed=signed)
+      result = vector.insert(
+          converted, result, dynamic_position=[], static_position=position
+      )
+    return result
+  name = "llvm.nvvm.f2i.rz" if signed else "llvm.nvvm.f2ui.rz"
+  return llvm.CallIntrinsicOp(
+      ty, ir.StringAttr.get(name), [x], [], ir.DenseI32ArrayAttr.get([])
+  ).result
+
+
+def truncates_into_32_bits(source: ir.Type, width: int) -> bool:
+  """Whether a float of type `source` converts into an integer of `width` bits
+  saturating by one conversion (`truncated_into_32_bits`): an f32 into 32 bits.
+  Another's caller clamps ahead of its conversion."""
+  return isinstance(source, ir.F32Type) and width == 32
+
+
 def _exp_series(r: ir.Value) -> ir.Value:
   """e^r for an f32 `r` within ln 2 / 2 of zero (`_EXP_TERMS`)."""
   ty = r.type
@@ -3535,7 +3576,12 @@ class FragmentedArray:
     elif from_float and to_integer:
       # TODO(apaszke): Support other rounding modes.
       check_supported_rounding((Rounding.TO_ZERO,), hw_limitation=False)
-      convert = arith.fptosi if is_signed else arith.fptoui
+      if truncates_into_32_bits(cur_dtype, ir.IntegerType(new_dtype).width):
+        convert = functools.partial(
+            truncated_into_32_bits, signed=bool(is_signed)
+        )
+      else:
+        convert = arith.fptosi if is_signed else arith.fptoui
     else:
       raise NotImplementedError(f"Unsupported conversion {cur_dtype} -> {new_dtype}")
     new_registers = np.empty_like(self.registers)
