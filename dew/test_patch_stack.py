@@ -231,29 +231,34 @@ def test_a_plugin_build_records_every_file_it_read_and_what_configures_it(tmp_pa
     Bazel's flags, its modules and its driver; a version stamp blanked; an archive_override's patches apart, by
     module; nothing else of the tree (row 5670)."""
     workspace, output_base = tmp_path / "jax", tmp_path / "output_base"
-    files = {"jaxlib/kernel.cc": "int k;\n", "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n',
+    # The build tree's version stamp, as dew/build_plugin.sh writes it (None).
+    files = {"jaxlib/kernel.cc": "int k;\n", "jax/version.py": "_release_version: str | None = None\n",
              ".bazelrc": "build --copt=-O2\n", "build/build.py": "TARGETS = 1\n", "docs/notes.md": "no build\n",
              "third_party/xla/fix.patch": "the fix\n",
              "MODULE.bazel": 'archive_override(module_name = "xla", patches = ["//third_party/xla:fix.patch"])\n'}
     for name, text in files.items():
         (workspace / name).parent.mkdir(parents=True, exist_ok=True)
         (workspace / name).write_text(text)
-    for name in ("xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl"):
+    for name in ("xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl", "third_party/gpus/a b.json"):
         (output_base / "external" / "xla+" / name).parent.mkdir(parents=True, exist_ok=True)
         (output_base / "external" / "xla+" / name).write_text(name)
+    # As Bazel writes a marker: a path, not a label, escaped (a space \\s).
     (output_base / "external" / "@@xla+.marker").write_text(
-        "FILE:@@xla+//third_party/gpus:cuda.tpl 0a\nFILE:@@//third_party/xla:fix.patch 0b\nENV:CUDA 12\n")
+        "FILE:@@xla+//third_party/gpus/cuda.tpl 0a\nFILE:@@xla+//third_party/gpus/a\\sb.json 0c\n"
+        "FILE:@@//third_party/xla/fix.patch 0b\nENV:CUDA 12\n")
+    (workspace / "MODULE.bazel.lock").write_text("written by Bazel\n")
+    # Source files by their location; loaded files by their canonical label (`--output=label`), Bazel's own none.
     locations = [f"{workspace}/jaxlib/kernel.cc:1:1: source file //jaxlib:kernel.cc",
                  f"{workspace}/jax/version.py:1:1: source file //jax:version.py",
                  f"{output_base}/external/xla+/xla/compiled.cc:1:1: source file @@xla+//xla:compiled.cc",
-                 f"{output_base}/external/xla+/xla/BUILD:1:1: source file @@xla+//xla:BUILD",
-                 "/install/base/embedded_tools/tools/cpp/BUILD:1:1: source file @@bazel_tools//tools/cpp:BUILD"]
+                 "@@xla+//xla:BUILD", "@@bazel_tools//tools/cpp:BUILD"]
     record = patch_stack.recorded(workspace, output_base, locations)
     assert sorted(record["main"]) == [".bazelrc", "MODULE.bazel", "build/build.py", "jax/version.py",
                                       "jaxlib/kernel.cc"]
-    assert record["main"]["jax/version.py"] == patch_stack.digest(b'_release_version: str | None = "other"\n')
+    for stamped in (b'_release_version: str | None = "0.12.0.1.post82"\n', b"_release_version: str | None = None\n"):
+        assert record["main"]["jax/version.py"] == patch_stack.digest(stamped)
     assert record["external"] == {"xla+": {name: patch_stack.digest(name.encode()) for name in (
-        "xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl")}}
+        "xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl", "third_party/gpus/a b.json")}}
     assert record["patches"] == {"xla": {"third_party/xla/fix.patch": patch_stack.digest(b"the fix\n")}}
 
 
@@ -308,11 +313,14 @@ def test_a_release_ships_the_plugins_whose_build_read_nothing_it_changed(tmp_pat
     (output_base / "external").mkdir(parents=True)
     xla = patch_stack.materialized(patch_stack.overrides(module)["xla"], "HEAD", tmp_path / "made")
     (output_base / "external" / "xla+").symlink_to(xla)
+    # The build tree stamps no release (dew/build_plugin.sh).
+    (clone / "jax" / "version.py").write_text("_release_version: str | None = None\n")
     record = patch_stack.recorded(clone, output_base, [
         f"{clone}/jaxlib/kernel.cc:1:1: source file //jaxlib:kernel.cc",
         f"{clone}/jax/version.py:1:1: source file //jax:version.py",
         f"{output_base}/external/xla+/xla/compiled.cc:1:1: source file @@xla+//xla:compiled.cc",
-        f"{output_base}/external/xla+/xla/BUILD:1:1: source file @@xla+//xla:BUILD"])
+        "@@xla+//xla:BUILD"])
+    run("checkout", "--", "jax/version.py")
     monkeypatch.setattr(patch_stack, "built_from",
                         lambda tag: [record] if tag == "plugin-0.12.0.1.post81" else [])
 

@@ -178,8 +178,12 @@ if [ "${DEW_PLUGIN_WHEELS:-}" != jaxlib ]; then
     targets="$targets + //jaxlib/tools:jax_cuda${cuda}_plugin_wheel + //jaxlib/tools:jax_cuda${cuda}_pjrt_wheel"
   done
 fi
-"${DEW_BAZEL:-bazel}" query --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" --output=location \
-  "kind('source file', deps($targets)) + buildfiles(deps($targets))" > "$out/read.txt" 2> "$out/read.log" ||
+# Two queries: Bazel lists a loaded BUILD or .bzl file by no location (its location output refuses buildfiles()), so
+# those are listed by their canonical labels, which patch_stack.py resolves to their repositories.
+{ "${DEW_BAZEL:-bazel}" query --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" --output=location \
+    "kind('source file', deps($targets))" &&
+  "${DEW_BAZEL:-bazel}" query --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" --output=label \
+    --consistent_labels "buildfiles(deps($targets))"; } > "$out/read.txt" 2> "$out/read.log" ||
   { tail -20 "$out/read.log"; echo "build_plugin: the query of what the build read failed" >&2; exit 1; }
 python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" record "$PWD" "$("${DEW_BAZEL:-bazel}" info output_base)" \
   "$out/read.txt" > "$out/sources-$(uname -m).json"

@@ -107,18 +107,29 @@ def native(base: str) -> list[str]:
 SOURCES = "sources-{machine}.json"
 """A plugin release's record of what its build read on one machine (`recorded`, dew/build_plugin.sh)."""
 MACHINES = ("x86_64", "aarch64")
-CONFIGURED = (".bazelrc", ".bazelversion", "MODULE.bazel", "MODULE.bazel.lock", "platform_mappings",
-              "bazel_downloader.cfg", "build/build.py")
+CONFIGURED = (".bazelrc", ".bazelversion", "MODULE.bazel", "platform_mappings", "bazel_downloader.cfg",
+              "build/build.py")
 """What configures a build beside the files it reads (`recorded`): Bazel's flags and its version, the modules and
 their overrides, and the driver that names its targets and options: a flag or a macro changed over the same sources
-builds other code."""
-STAMP = re.compile(rb'^_release_version: str \| None = "[^"]*"$', re.MULTILINE)
-"""A release's version stamp (`RELEASE`), which every release changes and no native code reads as code: a
-digest (`digest`) is of a file with it blanked."""
+builds other code. MODULE.bazel.lock is none: Bazel writes it from MODULE.bazel at a build, and no tree holds it
+(it is ignored)."""
+STAMP = re.compile(rb'^_release_version: str \| None = (?:"[^"]*"|None)$', re.MULTILINE)
+"""A release's version stamp (`RELEASE`), which every release changes and no native code reads as code, as a
+release holds it or as a plugin build writes it (None, dew/build_plugin.sh): a digest (`digest`) is of a file
+with it blanked."""
 LOCATION = re.compile(r"^(.+?):\d+:\d+: ")
 """A path in `bazel query --output=location`'s line."""
 LABEL = re.compile(r"^@@([^/]*)//([^:]*):(.+)$")
-"""A canonical label in a repository's marker: its repository (empty: the main one), package and name."""
+"""A canonical label (`bazel query --output=label --consistent_labels`'s): its repository (empty: the main
+one), package and name."""
+MARKED = re.compile(r"^@@([^/]*)//(.*)$")
+"""A file a repository rule read, as its repository's marker names it (Bazel's RepoRecordedInput: `@@repo//path`,
+a path, not a label; the main repository's `@@//path`), escaped (`unescaped`)."""
+
+
+def unescaped(text: str) -> str:
+    """A marker's field as Bazel wrote it: `\\s` a space, `\\n` a newline, `\\\\` a backslash."""
+    return re.sub(r"\\(.)", lambda escape: {"s": " ", "n": "\n"}.get(escape[1], escape[1]), text)
 
 
 def digest(data: bytes) -> str:
@@ -147,9 +158,11 @@ def labelled(label: str) -> str:
 
 
 def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
-    """What a plugin build read, each file's `digest`: every file `bazel query --output=location` lists
-    (`locations`: its targets' source files and the BUILD and .bzl files loaded for them), every file a repository
-    rule read (each repository's marker in OUTPUT_BASE/external, its FILE lines), and what configures the build
+    """What a plugin build read, each file's `digest`: every file `locations` names, by its path (`bazel query
+    --output=location`'s lines: its targets' source files) or its canonical label (`--output=label
+    --consistent_labels`'s: the BUILD and .bzl files loaded for them, which Bazel lists by no location), every
+    file a repository rule read (each repository's marker in OUTPUT_BASE/external, its FILE lines), and what
+    configures the build
     (`CONFIGURED`): the main repository's by path (`main`), each external repository's by its canonical name
     (`external`), Bazel's own (its install base) none. The patches each archive_override applies are kept apart
     (`patches`, by module): their effect is the patched repository's files, which a release compares
@@ -168,17 +181,24 @@ def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
             repository, *rest = path.relative_to(external).parts
             outer.setdefault(repository, {})[str(Path(*rest))] = digest(real.read_bytes())
 
+    def named(name: str) -> None:
+        if found := LABEL.match(name):
+            take((workspace if not found[1] else external / found[1]) / found[2] / found[3])
+        elif name.startswith("/"):
+            take(Path(name))
+
     for line in locations:
         if found := LOCATION.match(line):
             take(Path(found[1]))
+        else:
+            named(line.strip())
     for marker in sorted(external.glob("*.marker")):
         for line in marker.read_text(errors="replace").splitlines():
             if not line.startswith("FILE:"):
                 continue
-            name = line.removeprefix("FILE:").rsplit(" ", 1)[0]
-            if found := LABEL.match(name):
-                base = workspace if not found[1] else external / found[1]
-                take(base / found[2] / found[3])
+            name = unescaped(line.removeprefix("FILE:").rsplit(" ", 1)[0])
+            if found := MARKED.match(name):
+                take((workspace if not found[1] else external / found[1]) / found[2])
             elif name.startswith("/"):
                 take(Path(name))
     for name in CONFIGURED:
