@@ -83,6 +83,29 @@ class PeakLiveTest(jtu.JaxTestCase):
         [0, 1])
 
   @jtu.run_on_devices("cpu", "cuda")
+  def test_a_scans_stacked_residual_is_named_by_what_its_body_writes(self):
+    # A scan saves each step's named residual into a stacked output, a loop
+    # state element whose buffer is the zeros a broadcast makes (Dew row
+    # 13304): that buffer, live at the gradient's peak, is named by the
+    # residual the body writes into it.
+    def step(xs, w):
+      def body(carry, x):
+        hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
+        return carry + jnp.sum(jnp.sin(hidden)), None
+      saved = jax.checkpoint(
+          body, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+      return jax.lax.scan(saved, 0.0, xs)[0]
+
+    rows = jax.ShapeDtypeStruct((16, 512, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, argnums=1)).lower(rows, weight).compile()
+    live = compiled.peak_live()
+    self.assertIsNotNone(live)
+    stacked = [buffer for buffer in live if buffer.shape == (16, 512, 256)]
+    self.assertTrue(stacked, live)
+    self.assertIn(("hidden",), {buffer.names for buffer in stacked}, stacked)
+
+  @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast(self):
     # The saved residual is named after two reshapes, which XLA may fold into a
     # bitcast of the tanh's buffer, the reshapes that carried the name gone (as

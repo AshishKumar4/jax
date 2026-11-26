@@ -45,7 +45,10 @@ class LiveBuffer:
     op_name: that instruction's ``op_name`` (jax's name stack).
     source: that instruction's source, ``file:line``.
     names: the ``jax.ad_checkpoint.checkpoint_name`` names of the value that
-      instruction defines, where it carries them (a fusion its named root's).
+      instruction defines, where it carries them (a fusion its named root's);
+      for a while loop's state an unnamed instruction fills (a scan's stacked
+      output, zeros the loop's body writes its residuals into), the names of
+      what the body writes into that element (``_loop_named``).
     parameter: the entry parameter's number, for a ``parameter`` buffer.
     dims: for each of its dimensions the (argument, axis) pairs it descends
       from, each argument by its flat index among the call's (``args_info``'s
@@ -81,6 +84,7 @@ def live(assignment: bytes, module: bytes,
       for computation in compiled.computations
       for instruction in computation.instructions}
   descended = provenance(compiled, argument)
+  users = _users(compiled)
   primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
   buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
   kinds = {allocation.index: _kind(allocation)
@@ -104,18 +108,76 @@ def live(assignment: bytes, module: bytes,
         continue  # A tuple's index table, no array.
       metadata = instruction.metadata
       named = instruction.frontend_attributes.map.get("checkpoint_name")
+      written = (None if named else
+                 _loop_named(instruction, instructions, users, compiled))
+      if written is not None:
+        named = written.frontend_attributes.map.get("checkpoint_name")
       found.append(LiveBuffer(
           bytes=buffer.size, shape=tuple(shape.dimensions),
           dtype=primitive_type.values_by_number[shape.element_type]
           .name.lower(),
           kind=kind, instruction=instruction.name,
-          op_name=metadata.op_name,
+          op_name=metadata.op_name or (
+              written.metadata.op_name if written is not None else ""),
           source=f"{metadata.source_file}:{metadata.source_line}",
           names=tuple(named.split(",")) if named else (),
           parameter=parameters.get(peak.index),
           dims=(tuple(None for _ in shape.dimensions) if dims is None
                 else tuple(dims))))
   return tuple(found)
+
+
+def _users(module: Any) -> dict[int, list[tuple[Any, int]]]:
+  """Each instruction's users in ``module``, by its id: (user, its operand)."""
+  found: dict[int, list[tuple[Any, int]]] = {}
+  for computation in module.computations:
+    for instruction in computation.instructions:
+      for number, operand in enumerate(instruction.operand_ids):
+        found.setdefault(operand, []).append((instruction, number))
+  return found
+
+
+def _loop_named(instruction: Any, instructions: dict[int, Any],
+                users: dict[int, list[tuple[Any, int]]],
+                module: Any) -> Any | None:
+  """The named value a while loop's body writes into the state element
+  ``instruction`` fills, where it fills one: XLA keeps a loop's state in its
+  initial elements' buffers, so a scan's stacked output is the buffer of the
+  zeros its broadcast makes, which carries no name, while each step's
+  dynamic-update-slice writes the named residual into it (Dew row 13304: a
+  scanned stack's residuals, gibibytes each, read unnamed at the step's
+  peak). The body's element is that value where it is named, else the first
+  of its operands that is, its carry left out; None where ``instruction``
+  fills no loop's state or the body writes nothing named into it."""
+  computations = {computation.id: computation
+                  for computation in module.computations}
+  for user, number in users.get(instruction.id, []):
+    element = None
+    if user.opcode == "tuple":
+      loops = [(loop, at) for loop, at in users.get(user.id, [])
+               if loop.opcode == "while" and at == 0]
+      element = number
+    else:
+      loops = [(user, number)] if user.opcode == "while" and number == 0 else []
+    for loop, _ in loops:
+      body = next((computation for index in loop.called_computation_ids
+                   if _root_shape(computation := computations[index])
+                   == loop.shape), None)
+      if body is None:
+        continue
+      root = instructions[body.root_id]
+      written = (root if element is None else
+                 instructions[root.operand_ids[element]]
+                 if root.opcode == "tuple" else None)
+      if written is None:
+        continue
+      for candidate in (written, *(instructions[operand]
+                                   for operand in written.operand_ids)):
+        if candidate.opcode in ("get-tuple-element", "parameter"):
+          continue  # The carry the body reads back.
+        if candidate.frontend_attributes.map.get("checkpoint_name"):
+          return candidate
+  return None
 
 
 def _kind(allocation: Any) -> str | None:
