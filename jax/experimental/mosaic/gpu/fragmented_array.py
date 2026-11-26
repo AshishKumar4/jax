@@ -1271,6 +1271,51 @@ _LN2_HI = 0.693145751953125
 _LN2_LO = 1.428606765330187e-06
 
 
+def _saturating_to_integer(
+    ty: ir.Type, x: ir.Value, *, signed: bool
+) -> ir.Value:
+  """`x`, a float or a vector of them, converted to `ty`'s integers toward zero,
+  saturating as XLA's convert does: a value past the integer's range takes its
+  bound and a NaN zero.
+
+  That is LLVM's `llvm.fptosi.sat` and `llvm.fptoui.sat`, which NVPTX selects
+  as PTX's `cvt.rzi` (clamping to the destination's range by default, PTX ISA
+  `cvt`) where it can and legalizes otherwise, where LLVM's `fptosi` and
+  `fptoui`, poison past the range, needed a clamp ahead of them. The intrinsics
+  are called by name (`llvm.call_intrinsic`): the pinned LLVM does not translate
+  the dialect's `llvm.intr.fptosi.sat` op. An inline `cvt` an element, which the
+  optimizer cannot see into, held registers of its own (a recurrence kernel
+  spilled 8 bytes over it, Dew row 12990); the intrinsic is the backend's. A
+  16-bit float is extended to f32 first, exactly. Widths `saturates_into` names
+  none of (a packed 4-bit integer's) are `FragmentedArray.astype`'s to convert
+  otherwise.
+  """
+  f32 = ir.F32Type.get()
+  if isinstance(x.type, ir.VectorType):
+    vector_ty = ir.VectorType(x.type)
+    if not isinstance(vector_ty.element_type, (ir.F32Type, ir.F64Type)):
+      x = arith.extf(ir.VectorType.get(vector_ty.shape, f32), x)
+  elif not isinstance(x.type, (ir.F32Type, ir.F64Type)):
+    x = arith.extf(f32, x)
+  # An overloaded intrinsic by its base name: its declaration takes the call's
+  # operand and result types.
+  name = "llvm.fptosi.sat" if signed else "llvm.fptoui.sat"
+  return llvm.CallIntrinsicOp(
+      ty, ir.StringAttr.get(name), [x], [], ir.DenseI32ArrayAttr.get([])
+  ).result
+
+
+# Each integer width a float converts into saturating
+# (`_saturating_to_integer`).
+_SATURATED_WIDTHS = frozenset({8, 16, 32, 64})
+
+
+def saturates_into(width: int) -> bool:
+  """Whether a float converts into an integer of `width` bits saturating
+  (`_saturating_to_integer`); another width's caller clamps ahead of it."""
+  return width in _SATURATED_WIDTHS
+
+
 def _exp_series(r: ir.Value) -> ir.Value:
   """e^r for an f32 `r` within ln 2 / 2 of zero (`_EXP_TERMS`)."""
   ty = r.type
@@ -3535,7 +3580,14 @@ class FragmentedArray:
     elif from_float and to_integer:
       # TODO(apaszke): Support other rounding modes.
       check_supported_rounding((Rounding.TO_ZERO,), hw_limitation=False)
-      convert = arith.fptosi if is_signed else arith.fptoui
+      if saturates_into(ir.IntegerType(new_dtype).width):
+        convert = functools.partial(
+            _saturating_to_integer, signed=bool(is_signed)
+        )
+      else:
+        # A width no `cvt` saturates into (a packed 4-bit integer's): its
+        # caller clamps ahead of it (Pallas's lowering rule).
+        convert = arith.fptosi if is_signed else arith.fptoui
     else:
       raise NotImplementedError(f"Unsupported conversion {cur_dtype} -> {new_dtype}")
     new_registers = np.empty_like(self.registers)
