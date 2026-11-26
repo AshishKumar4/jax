@@ -82,6 +82,100 @@ class PeakLiveTest(jtu.JaxTestCase):
         sorted(buffer.parameter for buffer in live if buffer.kind == "parameter"),
         [0, 1])
 
+  @jtu.run_on_devices("cuda")
+  def test_a_scans_stacked_residual_is_named_by_what_its_body_writes(self):
+    # A scan saves each step's named residual into a stacked output, a loop
+    # state element whose buffer is the zeros a broadcast makes (Dew row
+    # 13304): that buffer, live at the gradient's peak, is named by the
+    # residual the body writes into it.
+    def step(xs, w):
+      def body(carry, x):
+        hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
+        return carry + jnp.sum(jnp.sin(hidden)), None
+      saved = jax.checkpoint(
+          body, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+      return jax.lax.scan(saved, 0.0, xs)[0]
+
+    rows = jax.ShapeDtypeStruct((16, 512, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, argnums=1)).lower(rows, weight).compile()
+    live = compiled.peak_live()
+    self.assertIsNotNone(live)
+    stacked = [buffer for buffer in live if buffer.shape == (16, 512, 256)]
+    self.assertTrue(stacked, live)
+    self.assertIn(("hidden",), {buffer.names for buffer in stacked}, stacked)
+
+  def test_a_loops_state_is_named_only_by_what_its_body_writes_into_it(self):
+    # A dynamic-update-slice's update says what the element it writes holds,
+    # through a fusion's parameter laid out again; its start index never.
+    hlo = """
+HloModule m, entry_computation_layout={(f32[], f32[2]{0})->(f32[4,2]{1,0}, f32[4,2]{1,0})}
+
+fused_write {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[2]{0} parameter(1)
+  laid = f32[1,2]{1,0} bitcast(row)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, laid, at, zero)
+}
+
+body {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  stack = f32[4,2]{1,0} get-tuple-element(state), index=0
+  other = f32[4,2]{1,0} get-tuple-element(state), index=1
+  i = s32[] get-tuple-element(state), index=2
+  zero = s32[] constant(0), frontend_attributes={checkpoint_name="index"}
+  named = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}
+  written = f32[4,2]{1,0} fusion(stack, named, i), kind=kLoop, calls=fused_write
+  plain = f32[1,2]{1,0} constant({{3, 4}})
+  more = f32[4,2]{1,0} dynamic-update-slice(other, plain, zero, zero)
+  one = s32[] constant(1)
+  next = s32[] add(i, one)
+  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, more, next)
+}
+
+condition {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  i = s32[] get-tuple-element(state), index=2
+  four = s32[] constant(4)
+  ROOT less = pred[] compare(i, four), direction=LT
+}
+
+ENTRY e {
+  a = f32[] parameter(0)
+  b = f32[2]{0} parameter(1)
+  zeros = f32[4,2]{1,0} broadcast(a), dimensions={}
+  others = f32[4,2]{1,0} broadcast(a), dimensions={}
+  start = s32[] constant(0)
+  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, others, start)
+  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body
+  x = f32[4,2]{1,0} get-tuple-element(loop), index=0
+  y = f32[4,2]{1,0} get-tuple-element(loop), index=1
+  ROOT r = (f32[4,2]{1,0}, f32[4,2]{1,0}) tuple(x, y)
+}
+"""
+    module = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        hlo_reader.module_from_text(hlo).as_serialized_hlo_module_proto())
+    instructions = {instruction.id: instruction
+                    for computation in module.computations
+                    for instruction in computation.instructions}
+    computations = {computation.id: computation
+                    for computation in module.computations}
+    [loop] = [instruction for instruction in instructions.values()
+              if instruction.opcode == "while"]
+
+    def named(element):
+      found = peak_live._loop_named(loop, element, instructions, computations)
+      return None if found is None else (
+          found.name, found.frontend_attributes.map.get("checkpoint_name"))
+
+    # The stack is named by its update; the other by its unnamed update alone
+    # (its op_name read from it), never by its named start index; the counter
+    # by nothing.
+    self.assertEqual([named(element) for element in range(3)],
+                     [("named", "hidden"), ("plain", None), None])
+
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast(self):
     # The saved residual is named after two reshapes, which XLA may fold into a
