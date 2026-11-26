@@ -1,0 +1,180 @@
+diff --git a/xla/backends/gpu/transforms/dot_strength_reduction.cc b/xla/backends/gpu/transforms/dot_strength_reduction.cc
+--- a/xla/backends/gpu/transforms/dot_strength_reduction.cc
++++ b/xla/backends/gpu/transforms/dot_strength_reduction.cc
+@@ -156,4 +156,15 @@
+   const OpMetadata* metadata = &dot->metadata();
+   ABSL_ASSIGN_OR_RETURN(auto dot_dims, DotOperandDims::FromDot(dot));
++  const auto algorithm = dot->precision_config().algorithm();
++  const PrimitiveType output_type = dot->shape().element_type();
++  const int64_t contracting_dims = dot_dims[0].Rank(DotOperandDims::kContracting);
++  const PrimitiveType accumulator_type = GetGemmAccumulatorType(dot);
++  // A dot with an implicit algorithm must not round each product to the
++  // output type before summation. Outer products and explicit algorithms
++  // retain the multiply input types they used before.
++  const PrimitiveType multiply_type =
++      algorithm == PrecisionConfig::ALG_UNSET && contracting_dims != 0
++          ? accumulator_type
++          : output_type;
+ 
+   std::array<HloInstruction*, 2> operands = {dot->mutable_operand(0),
+@@ -162,6 +173,5 @@
+     DotOperandDims& our_dims = dot_dims[i];
+     DotOperandDims& other_dims = dot_dims[1 - i];
+-    // Convert operands to the dot resulting type.
+-    operands[i] = ConvertTo(operands[i], dot->shape().element_type(), metadata);
++    operands[i] = ConvertTo(operands[i], multiply_type, metadata);
+     // Ensure dimensions are in "batch, non-contracting, contracting" order.
+     operands[i] = PermuteDotOperandDimensions(operands[i], &our_dims, metadata);
+@@ -186,15 +196,14 @@
+       HloInstruction * flow,
+       MakeMultiplyForDotPrecisionAlgorithm(
+-          operands[0], operands[1], dot->precision_config().algorithm()));
++          operands[0], operands[1], algorithm));
+   flow->set_metadata(*metadata);
+ 
+   // If there were any contracting dims, we need to reduce them.
+-  flow = ReduceDimensions(flow, dot_dims[0].Rank(DotOperandDims::kContracting),
+-                          GetGemmAccumulatorType(dot), metadata);
++  flow = ReduceDimensions(flow, contracting_dims, accumulator_type, metadata);
+ 
+   // If the output type is different from what it was before (either because
+   // reduction used a different accumulator type, or because types of operand
+   // differed the output type for multiply), convert to the output type.
+-  flow = ConvertTo(flow, dot->shape().element_type(), metadata);
++  flow = ConvertTo(flow, output_type, metadata);
+   return flow;
+ }
+diff --git a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
+--- a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
++++ b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
+@@ -22,11 +22,15 @@
+ #include <string>
+ 
+ #include "absl/log/check.h"
++#include "xla/hlo/evaluator/hlo_evaluator.h"
+ #include "xla/hlo/testlib/filecheck.h"
+ #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+ #include "xla/hlo/testlib/verified_hlo_module.h"
++#include "xla/literal.h"
++#include "xla/literal_util.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+ #include "xla/stream_executor/device_description.h"
++#include "xla/xla_data.pb.h"
+ 
+ namespace xla {
+ namespace gpu {
+@@ -65,38 +69,65 @@
+                        RunFileCheck(module->ToString(), filecheck_pattern));
+   EXPECT_TRUE(filecheck_result);
+ }
+ 
++TEST_F(DotStrengthReductionTest, NarrowGemvKeepsProductBitsThroughReduction) {
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
++HloModule narrow_gemv
++ENTRY main {
++  lhs = bf16[2] parameter(0)
++  rhs = bf16[2,2] parameter(1)
++  ROOT dot = bf16[2] dot(lhs, rhs), lhs_contracting_dims={0},
++      rhs_contracting_dims={0}, operand_precision={highest,highest}
++})"));
++  DotStrengthReduction pass{
++      se::GpuComputeCapability(se::CudaComputeCapability::Hopper())};
++  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&pass, module.get()));
++  ASSERT_TRUE(changed);
++  CHECK_OK(module->Verify());
++
++  ASSERT_OK_AND_ASSIGN(
++      auto lhs, LiteralUtil::CreateR1<float>({1.0078125f, 1.f}).Convert(BF16));
++  ASSERT_OK_AND_ASSIGN(
++      auto rhs,
++      LiteralUtil::CreateR2<float>({{1.0078125f, 1.f}, {-1.015625f, 0.f}})
++          .Convert(BF16));
++  ASSERT_OK_AND_ASSIGN(Literal result,
++                       HloEvaluator().Evaluate(*module, {&lhs, &rhs}));
++  // (1 + 2^-7)^2 - (1 + 2^-6) = 2^-14, but in BF16 the products cancel.
++  EXPECT_EQ(result.GetAsDouble({0}), 0x1p-14);
++  EXPECT_EQ(result.GetAsDouble({1}), 1.0078125);
++}
++
+ TEST_F(DotStrengthReductionTest, UpcastInReduction) {
+   const char* hlo_text = R"(
+ HloModule test
+ 
+ ENTRY test {
+   p0 = bf16[6144]{0} parameter(0)
+   p1 = bf16[6144,256]{1,0} parameter(1)
+   ROOT dot = bf16[256]{0} dot(p0, p1), lhs_contracting_dims={0}, rhs_contracting_dims={0}
+ }
+ )";
+ 
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        ParseAndReturnVerifiedModule(hlo_text));
+   DotStrengthReduction pass{
+       se::GpuComputeCapability(se::CudaComputeCapability::Hopper())};
+   ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+   EXPECT_TRUE(changed);
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: bf16[256,6144]{1,0} multiply
+-// CHECK: f32[256,6144]{1,0} convert
++// CHECK: f32[256,6144]{1,0} multiply
+ // CHECK: f32[] constant(0)
+ // CHECK: f32[256]{0} reduce
+ // CHECK: bf16[256]{0} convert
+ )";
+ 
+   ASSERT_OK_AND_ASSIGN(bool filecheck_result,
+                        RunFileCheck(module->ToString(), filecheck_pattern));
+   EXPECT_TRUE(filecheck_result);
+   CHECK_OK(module->Verify());
+ }
+ 
+ TEST_F(DotStrengthReductionTest, MaintainsMetadata) {
+@@ -119,9 +150,8 @@
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: bf16[256,6144]{1,0} multiply{{.*}}, metadata={op_name="test"}
+-// CHECK: f32[256,6144]{1,0} convert{{.*}}, metadata={op_name="test"}
++// CHECK: f32[256,6144]{1,0} multiply{{.*}}, metadata={op_name="test"}
+ // CHECK: f32[256]{0} reduce{{.*}}, metadata={op_name="test"}
+ // CHECK: bf16[256]{0} convert{{.*}}, metadata={op_name="test"}
+ )";
+ 
+@@ -150,12 +180,11 @@
+   EXPECT_TRUE(changed);
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: f8e4m3fn[8,32,16]{2,1,0} multiply
+-// CHECK: f32[8,32,16]{2,1,0} convert
++// CHECK: f32[8,32,16]{2,1,0} multiply
+ // CHECK: f32[] constant(0)
+ // CHECK: f32[8,32]{1,0} reduce
+ // CHECK: f8e4m3fn[8,32]{1,0} convert
+ )";
+ 
+   ASSERT_OK_AND_ASSIGN(bool filecheck_result,
+diff --git a/xla/backends/gpu/transforms/BUILD b/xla/backends/gpu/transforms/BUILD
+--- a/xla/backends/gpu/transforms/BUILD
++++ b/xla/backends/gpu/transforms/BUILD
+@@ -1580,14 +1580,18 @@
+ xla_cc_test(
+     name = "dot_strength_reduction_test",
+     srcs = ["dot_strength_reduction_test.cc"],
+     deps = [
+         ":dot_strength_reduction",
++        "//xla:literal",
++        "//xla:literal_util",
++        "//xla:xla_data_proto_cc",
++        "//xla/hlo/evaluator:hlo_evaluator",
+         "//xla/hlo/testlib:filecheck",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:verified_hlo_module",
+         "//xla/stream_executor:device_description",
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "@com_google_absl//absl/log:check",
+         "@com_google_googletest//:gtest_main",
+     ],
+ )
