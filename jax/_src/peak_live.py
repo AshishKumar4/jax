@@ -45,7 +45,11 @@ class LiveBuffer:
     op_name: that instruction's ``op_name`` (jax's name stack).
     source: that instruction's source, ``file:line``.
     names: the ``jax.ad_checkpoint.checkpoint_name`` names of the value that
-      instruction defines, where it carries them (a fusion its named root's).
+      instruction defines, where it carries them (a fusion its named root's);
+      for a while loop's state element an unnamed instruction's buffer holds
+      (XLA's buffer aliases), the names of what the body writes into the
+      whole of that element: a scan's stacked output, the residual each step
+      writes a row of (``_loop_named``).
     parameter: the entry parameter's number, for a ``parameter`` buffer.
     dims: for each of its dimensions the (argument, axis) pairs it descends
       from, each argument by its flat index among the call's (``args_info``'s
@@ -81,6 +85,13 @@ def live(assignment: bytes, module: bytes,
       for computation in compiled.computations
       for instruction in computation.instructions}
   descended = provenance(compiled, argument)
+  computations = {computation.id: computation
+                  for computation in compiled.computations}
+  # Each logical buffer's other positions, as XLA's must-alias analysis states
+  # them: a loop state's buffer's among them, at the while's own output.
+  aliases: dict[int, list[Any]] = {}
+  for alias in proto.buffer_aliases:
+    aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
   primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
   buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
   kinds = {allocation.index: _kind(allocation)
@@ -104,18 +115,177 @@ def live(assignment: bytes, module: bytes,
         continue  # A tuple's index table, no array.
       metadata = instruction.metadata
       named = instruction.frontend_attributes.map.get("checkpoint_name")
+      written = None if named else _aliased_named(
+          aliases.get(buffer.id, ()), instructions, computations)
+      if written is not None:
+        named = written.frontend_attributes.map.get("checkpoint_name")
       found.append(LiveBuffer(
           bytes=buffer.size, shape=tuple(shape.dimensions),
           dtype=primitive_type.values_by_number[shape.element_type]
           .name.lower(),
           kind=kind, instruction=instruction.name,
-          op_name=metadata.op_name,
+          op_name=metadata.op_name or (
+              written.metadata.op_name if written is not None else ""),
           source=f"{metadata.source_file}:{metadata.source_line}",
           names=tuple(named.split(",")) if named else (),
           parameter=parameters.get(peak.index),
           dims=(tuple(None for _ in shape.dimensions) if dims is None
                 else tuple(dims))))
   return tuple(found)
+
+
+def _aliased_named(locations: Any, instructions: dict[int, Any],
+                   computations: dict[int, Any]) -> Any | None:
+  """What a while loop's body writes into a state element a buffer is also
+  at (its aliases' ``locations``: a while's output element), the first found
+  (`_loop_named`); None where it is at none."""
+  for location in locations:
+    loop = instructions[location.instruction_id]
+    if loop.opcode == "while" and len(location.shape_index) == 1:
+      written = _loop_named(loop, location.shape_index[0], instructions,
+                            computations)  # Named or not.
+      if written is not None:
+        return written
+  return None
+
+
+def _loop_named(loop: Any, element: int, instructions: dict[int, Any],
+                computations: dict[int, Any]) -> Any | None:
+  """What while ``loop``'s body writes into the whole of its state's
+  ``element``: the body's element where it is named (the state element is
+  that value); else the row a scan writes into its stacked output each step
+  (`_stacked`); None for any other element, a write into part of a buffer
+  naming none of it."""
+  # XLA's while names its body first, its condition second.
+  root = instructions[computations[loop.called_computation_ids[0]].root_id]
+  if root.opcode != "tuple" or element >= len(root.operand_ids):
+    return None
+  written = instructions[root.operand_ids[element]]
+  if written.frontend_attributes.map.get("checkpoint_name"):
+    return written
+  return _stacked(loop, element, written, instructions, computations)
+
+
+def _stacked(loop: Any, element: int, written: Any,
+             instructions: dict[int, Any],
+             computations: dict[int, Any]) -> Any | None:
+  """The row a scan writes into its stacked output each step, state
+  ``element`` of while ``loop``, ``written`` the body's value for it: XLA
+  keeps a loop's state in its initial elements' buffers, so a scan's stack is
+  the buffer its broadcast fills, which carries no name, while each step's
+  dynamic-update-slice writes the residual into it (Dew row 13304: a scanned
+  stack's residuals, gibibytes each, read unnamed at the step's peak). The
+  update, where the loop provably writes every row of the element and nothing
+  else: a broadcast fills the element at the loop's start; the body writes
+  one whole row into the element's own state at the induction variable i or
+  at n - 1 - i; XLA's trip count annotation (WhileLoopBackendConfig) states i
+  runs from 0 by 1 over n steps, n the stack's rows. None otherwise."""
+  fusion = None
+  put = written
+  if written.opcode == "fusion":
+    fusion = written
+    put = instructions[computations[written.called_computation_ids[0]].root_id]
+  if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
+    return None
+  try:
+    known = json.loads(loop.backend_config or "{}")
+  except ValueError:
+    return None
+  if not isinstance(known, dict) or not {
+      "known_trip_count", "known_init_step",
+      "known_induction_variable"} <= known.keys():
+    return None  # Proto3's JSON leaves a zero out, so a missing field is 0.
+  steps = int(known["known_trip_count"].get("n", 0))
+  start = known["known_init_step"]
+  counter = int(known["known_induction_variable"].get("tuple_index", 0))
+  if int(start.get("init", 0)) != 0 or int(start.get("step", 0)) != 1:
+    return None
+  # XLA's while names its body first; its one parameter is the loop's state.
+  body = computations[loop.called_computation_ids[0]]
+  [state_] = [instruction.id for instruction in body.instructions
+              if instruction.opcode == "parameter"]
+
+  def outside(instruction: Any, laid: bool = True) -> Any:
+    # The body's instruction a fused one is: a fusion parameter's operand;
+    # with ``laid``, through the bitcasts, reshapes and copies on its way.
+    if laid:
+      instruction = _laid_out(instruction, instructions)
+    if fusion is not None and instruction.opcode == "parameter":
+      instruction = instructions[
+          fusion.operand_ids[instruction.parameter_number]]
+      if laid:
+        instruction = _laid_out(instruction, instructions)
+    return instruction
+
+  def state(instruction: Any) -> int | None:
+    # The body state's element ``instruction`` reads, if it reads one.
+    if (instruction.opcode != "get-tuple-element"
+        or instruction.operand_ids[0] != state_):
+      return None
+    return instruction.tuple_index
+
+  rows, *row = put.shape.dimensions
+  update = instructions[put.operand_ids[1]]
+  if (steps != rows or list(update.shape.dimensions) != [1, *row]
+      # The element itself, never one laid out again: a bitcast to another
+      # layout and a copy back moves its elements (a square's transpose).
+      or state(outside(instructions[put.operand_ids[0]], laid=False))
+      != element):
+    return None
+  # The row each step writes, its other starts clamped to 0 as it is whole.
+  index = _laid_out(instructions[put.operand_ids[2]], instructions)
+  if index.opcode == "subtract":
+    last = instructions[index.operand_ids[0]]
+    if last.opcode != "constant" or _scalar(last) != rows - 1:
+      return None
+    index = instructions[index.operand_ids[1]]
+  if state(outside(index)) != counter:
+    return None
+  initial = instructions[loop.operand_ids[0]]
+  if initial.opcode != "tuple" or not _spread(
+      instructions[initial.operand_ids[element]], instructions,
+      computations):
+    return None
+  return outside(update)
+
+
+def _laid_out(instruction: Any, instructions: dict[int, Any]) -> Any:
+  """The value ``instruction`` lays out again (a bitcast, a reshape, a copy,
+  which keep its elements), through each; ``instruction`` where it is none."""
+  while instruction.opcode in ("bitcast", "reshape", "copy"):
+    instruction = instructions[instruction.operand_ids[0]]
+  return instruction
+
+
+def _spread(value: Any, instructions: dict[int, Any],
+            computations: dict[int, Any]) -> bool:
+  """Whether array ``value`` is one scalar broadcast, or a constant: a
+  fusion's output or a multi-output fusion's element so made too."""
+  value = _laid_out(value, instructions)
+  element = None
+  if value.opcode == "get-tuple-element":
+    element, value = value.tuple_index, instructions[value.operand_ids[0]]
+  if value.opcode == "fusion":
+    value = instructions[
+        computations[value.called_computation_ids[0]].root_id]
+  if element is not None:
+    if value.opcode != "tuple":
+      return False
+    value = instructions[value.operand_ids[element]]
+  value = _laid_out(value, instructions)
+  if value.opcode == "constant":
+    return True
+  return value.opcode == "broadcast" and not instructions[
+      value.operand_ids[0]].shape.dimensions
+
+
+def _scalar(constant: Any) -> int | None:
+  """Integer scalar ``constant``'s value; None for any other."""
+  literal = constant.literal
+  for values in (literal.s32s, literal.s64s, literal.u32s, literal.u64s):
+    if len(values) == 1:
+      return int(values[0])
+  return None
 
 
 def _kind(allocation: Any) -> str | None:
@@ -258,7 +428,7 @@ def _of(instruction: Any, operands: list[Any], operand_shapes: list[Any],
   if opcode in ("fusion", "call"):
     return evaluate(called[0], dict(enumerate(operands)))
   if opcode == "while":
-    return _loop(shape, operands[0], called, evaluate)
+    return _loop(operands[0], called, evaluate)
   if opcode == "conditional":
     joined = None
     for branch, operand in zip(called, operands[1:]):
@@ -454,22 +624,16 @@ def _gathered(instruction: Any, operands: list[Any]) -> Dims:
   return tuple(dims)
 
 
-def _loop(shape: Any, initial: Any, called: list[Any], evaluate: Any) -> Any:
+def _loop(initial: Any, called: list[Any], evaluate: Any) -> Any:
   """A while loop's provenance: its state's, its body's output joined into it
   until the body adds nothing (sets only grow, so it ends)."""
-  body = next(computation for computation in called
-              if _root_shape(computation) == shape)
+  body = called[0]  # XLA's while names its body first, its condition second.
   state = initial
   while True:
     joined = _joined(state, evaluate(body, {0: state}))
     if joined == state:
       return state
     state = joined
-
-
-def _root_shape(computation: Any) -> Any:
-  return next(instruction.shape for instruction in computation.instructions
-              if instruction.id == computation.root_id)
 
 
 def _custom(instruction: Any, operands: list[Any], shape: Any) -> Any:
