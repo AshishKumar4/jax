@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Mosaic GPU drops a collective warpgroup barrier repeating the one before it."""
+"""Mosaic GPU keeps every warpgroup barrier, its collective marks removed."""
 
 from absl.testing import absltest
 from jax._src import test_util as jtu
@@ -56,7 +56,7 @@ func.func @kernel(%ref: memref<128xf32, 3>, %x: f32, %i: index) {
 
 class RepeatedBarriersTest(jtu.JaxTestCase):
 
-  def test_a_collective_barrier_repeating_one_with_no_memory_access_between_is_dropped(self):
+  def test_every_barrier_is_kept_its_collective_mark_removed(self):
     with ir.Context() as context, ir.Location.unknown():
       context.append_dialect_registry(mlir_interpreter.upstream_dialects)
       context.load_all_available_dialects()
@@ -71,13 +71,10 @@ class RepeatedBarriersTest(jtu.JaxTestCase):
           if op.operation.name == "nvvm.barrier"
       ]
       marks = [b for b in barriers if utils.COLLECTIVE_BARRIER in b.attributes]
-    # The barrier after a store and the one before the next, its index
-    # recomputed alike, are one; a barrier after a store stays; one of the
-    # same operands and other attributes stays; unmarked barriers, whose
-    # participants a branch may split, stay even repeated; another thread count
-    # is another barrier; ids alike but for a cast's width are two. No mark
-    # outlives the pass.
-    self.assertLen(barriers, 9)
+    # Every barrier stays, repeated or not: a barrier dropped frees the
+    # scheduler across it, which spilled kernels that held no spill with it.
+    # No mark outlives the pass.
+    self.assertLen(barriers, 10)
     self.assertEmpty(marks)
 
 
