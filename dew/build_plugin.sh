@@ -165,6 +165,24 @@ for python in $pythons; do
                          echo "build_plugin: a build of $python, CUDA $cuda failed ($code)" >&2; exit "$code"; }
   done
 done
+# What the build read, with digests (row 5670): every source file of its wheel targets' dependencies and every BUILD
+# and .bzl file loaded for them (an unconfigured query: every select's branch, a superset of what one config
+# compiles), every file a repository rule read (each repository's marker), and what configures the build. The plugin
+# release carries it as sources-<machine>.json, and a later release ships beside these plugins only where it holds
+# every file of it as read (`patch_stack.py plugins`). DEW_PATCH_STACK names patch_stack.py where this script is
+# staged apart from it (a fleet job's extra/). A query that fails fails the build: a record short of a file would
+# pair a release that changed it.
+targets=//jaxlib/tools:jaxlib_wheel
+if [ "${DEW_PLUGIN_WHEELS:-}" != jaxlib ]; then
+  for cuda in $cudas; do
+    targets="$targets + //jaxlib/tools:jax_cuda${cuda}_plugin_wheel + //jaxlib/tools:jax_cuda${cuda}_pjrt_wheel"
+  done
+fi
+"${DEW_BAZEL:-bazel}" query --repo_env=HERMETIC_PYTHON_VERSION="${pythons%% *}" --output=location \
+  "kind('source file', deps($targets)) + buildfiles(deps($targets))" > "$out/read.txt" 2> "$out/read.log" ||
+  { tail -20 "$out/read.log"; echo "build_plugin: the query of what the build read failed" >&2; exit 1; }
+python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" record "$PWD" "$("${DEW_BAZEL:-bazel}" info output_base)" \
+  "$out/read.txt" > "$out/sources-$(uname -m).json"
 # Every wheel carries VERSION, or none is published: an OUT reused with an older build's wheels fails here,
 # before anything is summed or attached.
 for wheel in "$out"/dist/*.whl; do
