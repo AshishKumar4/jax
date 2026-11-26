@@ -2891,11 +2891,10 @@ def _convert_element_type_lowering_rule_wg(
     else:
       convert = arith_dialect.uitofp
   elif from_float and to_integer:
-    # Saturating as JAX/XLA's casting is (numpy's differs): a width PTX's
-    # cvt.rzi converts into saturates there (`FragmentedArray.astype`), a value
-    # past the target's range its bound and a NaN zero, no clamp ahead; another
-    # (a packed 4-bit integer) is clamped to its range first.
     dst_width = mgpu_utils.bitwidth(new_dtype)
+    # We clamp the float value to the min/max integer destination value
+    # in order to match JAX/XLA casting behavior. Note that this differs
+    # from numpy casting behavior.
     if mgpu_utils.is_signed(y_aval.dtype):
       maxint = 2 ** (dst_width - 1) - 1
       minint = -(2 ** (dst_width - 1))
@@ -2904,20 +2903,14 @@ def _convert_element_type_lowering_rule_wg(
       maxint = 2**dst_width - 1
       minint = 0
       convert = arith_dialect.fptoui
-    if not fa.saturates_into(dst_width):
-      maxint = _ir_constant(maxint, cur_dtype)
-      minint = _ir_constant(minint, cur_dtype)
-      if x_aval.shape:
-        maxint = vector_dialect.broadcast(x.type, maxint)
-        minint = vector_dialect.broadcast(x.type, minint)
-      x = arith_dialect.minimumf(x, maxint)
-      x = arith_dialect.maximumf(x, minint)
-    elif not x_aval.shape:
-      # A scalar has no vector layout and is not a fragmented array's: it takes
-      # the saturating conversion directly.
-      return fa._saturating_to_integer(
-          new_dtype, x, signed=bool(mgpu_utils.is_signed(y_aval.dtype))
-      )
+
+    maxint = _ir_constant(maxint, cur_dtype)
+    minint = _ir_constant(minint, cur_dtype)
+    if x_aval.shape:
+      maxint = vector_dialect.broadcast(x.type, maxint)
+      minint = vector_dialect.broadcast(x.type, minint)
+    x = arith_dialect.minimumf(x, maxint)
+    x = arith_dialect.maximumf(x, minint)
   else:
     raise NotImplementedError(f"Unsupported conversion {cur_dtype} -> {new_dtype}")
 
