@@ -1,6 +1,7 @@
 """The patch stack's choice of the release to carry next, over remotes' refs as git ls-remote lists them, and
 the test files it runs, over a repository of its own."""
 
+import base64
 import hashlib
 import json
 import re
@@ -12,6 +13,12 @@ from pathlib import Path
 import pytest
 
 import patch_stack
+
+
+@pytest.fixture(autouse=True)
+def unrecorded(monkeypatch):
+    """No test reads a plugin release's record from the network: each releases none but its own test's."""
+    monkeypatch.setattr(patch_stack, "built_from", lambda tag: [])
 
 
 def listing(*refs: str) -> str:
@@ -216,6 +223,110 @@ def test_a_python_only_release_ships_the_plugins_of_the_stack_it_grows_from(tmp_
     run("reset", "-q", "--hard", "HEAD~1")
     commit({"jaxlib/kernel.cc": "post82"}, "a native source changed")
     assert patch_stack.plugins("0.12.0.1.post82") == ""
+
+
+def test_a_plugin_build_records_every_file_it_read_and_what_configures_it(tmp_path):
+    """A plugin build's record (`recorded`) holds each file its query listed and each file a repository rule read
+    (its repository's marker), the main repository's by path and an external one's by its canonical name, with
+    Bazel's flags, its modules and its driver; a version stamp blanked; an archive_override's patches apart, by
+    module; nothing else of the tree (row 5670)."""
+    workspace, output_base = tmp_path / "jax", tmp_path / "output_base"
+    files = {"jaxlib/kernel.cc": "int k;\n", "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n',
+             ".bazelrc": "build --copt=-O2\n", "build/build.py": "TARGETS = 1\n", "docs/notes.md": "no build\n",
+             "third_party/xla/fix.patch": "the fix\n",
+             "MODULE.bazel": 'archive_override(module_name = "xla", patches = ["//third_party/xla:fix.patch"])\n'}
+    for name, text in files.items():
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / name).write_text(text)
+    for name in ("xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl"):
+        (output_base / "external" / "xla+" / name).parent.mkdir(parents=True, exist_ok=True)
+        (output_base / "external" / "xla+" / name).write_text(name)
+    (output_base / "external" / "@@xla+.marker").write_text(
+        "FILE:@@xla+//third_party/gpus:cuda.tpl 0a\nFILE:@@//third_party/xla:fix.patch 0b\nENV:CUDA 12\n")
+    locations = [f"{workspace}/jaxlib/kernel.cc:1:1: source file //jaxlib:kernel.cc",
+                 f"{workspace}/jax/version.py:1:1: source file //jax:version.py",
+                 f"{output_base}/external/xla+/xla/compiled.cc:1:1: source file @@xla+//xla:compiled.cc",
+                 f"{output_base}/external/xla+/xla/BUILD:1:1: source file @@xla+//xla:BUILD",
+                 "/install/base/embedded_tools/tools/cpp/BUILD:1:1: source file @@bazel_tools//tools/cpp:BUILD"]
+    record = patch_stack.recorded(workspace, output_base, locations)
+    assert sorted(record["main"]) == [".bazelrc", "MODULE.bazel", "build/build.py", "jax/version.py",
+                                      "jaxlib/kernel.cc"]
+    assert record["main"]["jax/version.py"] == patch_stack.digest(b'_release_version: str | None = "other"\n')
+    assert record["external"] == {"xla+": {name: patch_stack.digest(name.encode()) for name in (
+        "xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl")}}
+    assert record["patches"] == {"xla": {"third_party/xla/fix.patch": patch_stack.digest(b"the fix\n")}}
+
+
+def test_a_release_ships_the_plugins_whose_build_read_nothing_it_changed(tmp_path, monkeypatch):
+    """Where an earlier plugin release recorded what its build read (`recorded`), a later release ships its
+    plugins only where it holds every file of the record as the build read it (`differences`): a patch to XLA
+    made again from its pinned archive and compared file for file, so the patch's own test and reworded message,
+    which no build read, pair; a changed compiled line of it, a native source, or a flag over the same sources
+    (.bazelrc) does not (row 5670: post81's pairing judged by hand)."""
+    archive_root = tmp_path / "archive" / "xla-1"
+    (archive_root / "xla").mkdir(parents=True)
+    (archive_root / "xla" / "compiled.cc").write_text("int f() { return 1; }\n")
+    (archive_root / "xla" / "BUILD").write_text("cc_library(name = 'compiled')\n")
+    tarball = tmp_path / "xla-1.tar.gz"
+    subprocess.run(["tar", "-czf", str(tarball), "-C", str(tmp_path / "archive"), "xla-1"], check=True)
+    integrity = "sha256-" + base64.b64encode(hashlib.sha256(tarball.read_bytes()).digest()).decode()
+    module = (f'archive_override(module_name = "xla", integrity = "{integrity}", patch_strip = 1,\n'
+              f'    patches = ["//third_party/xla:fix.patch"], strip_prefix = "xla-1",\n'
+              f'    urls = ["{tarball.as_uri()}"])\n')
+
+    def fix(line: str, test: str = "", message: str = "the fix\n") -> str:
+        added = (f"--- /dev/null\n+++ b/xla/compiled_test.cc\n@@ -0,0 +1 @@\n+{test}\n" if test else "")
+        return (f"{message}--- a/xla/compiled.cc\n+++ b/xla/compiled.cc\n@@ -1 +1 @@\n"
+                f"-int f() {{ return 1; }}\n+{line}\n{added}")
+
+    origin, clone = tmp_path / "origin.git", tmp_path / "clone"
+
+    def run(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=clone, check=True,
+                       capture_output=True)
+
+    def commit(files: dict[str, str], message: str) -> None:
+        for name, text in files.items():
+            (clone / name).parent.mkdir(parents=True, exist_ok=True)
+            (clone / name).write_text(text)
+        run("add", "-A")
+        run("commit", "-qm", message)
+
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    clone.mkdir()
+    run("init", "-q")
+    run("remote", "add", "origin", str(origin))
+    commit({"jaxlib/kernel.cc": "int k;\n", "jax/core.py": "post81", ".bazelrc": "build --copt=-O2\n",
+            "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n', "MODULE.bazel": module,
+            "third_party/xla/fix.patch": fix("int f() { return 2; }")}, "the commit post81's plugins were built at")
+    run("tag", "plugin-0.12.0.1.post81")
+    run("push", "-q", "origin", "--tags")
+    run("tag", "-d", "plugin-0.12.0.1.post81")
+    monkeypatch.chdir(clone)
+    # The build's record: its tree, XLA as its override makes it, what its query listed.
+    output_base = tmp_path / "output_base"
+    (output_base / "external").mkdir(parents=True)
+    xla = patch_stack.materialized(patch_stack.overrides(module)["xla"], "HEAD", tmp_path / "made")
+    (output_base / "external" / "xla+").symlink_to(xla)
+    record = patch_stack.recorded(clone, output_base, [
+        f"{clone}/jaxlib/kernel.cc:1:1: source file //jaxlib:kernel.cc",
+        f"{clone}/jax/version.py:1:1: source file //jax:version.py",
+        f"{output_base}/external/xla+/xla/compiled.cc:1:1: source file @@xla+//xla:compiled.cc",
+        f"{output_base}/external/xla+/xla/BUILD:1:1: source file @@xla+//xla:BUILD"])
+    monkeypatch.setattr(patch_stack, "built_from",
+                        lambda tag: [record] if tag == "plugin-0.12.0.1.post81" else [])
+
+    commit({"jax/core.py": "post82", "tests/core_test.py": "post82",
+            "jax/version.py": '_release_version: str | None = "0.12.0.1.post82"\n'}, "post82, Python only")
+    assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
+    commit({"third_party/xla/fix.patch": fix("int f() { return 2; }", test="TEST(F, Two) {}",
+                                             message="its message, reworded\n")}, "the patch's own test")
+    assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
+    for change in ({"third_party/xla/fix.patch": fix("int f() { return 3; }")}, {"jaxlib/kernel.cc": "int k2;\n"},
+                   {".bazelrc": "build --copt=-O3\n"}):
+        commit(change, "a native change")
+        assert patch_stack.plugins("0.12.0.1.post82") == ""
+        run("reset", "-q", "--hard", "HEAD~1")
 
 
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):

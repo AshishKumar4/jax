@@ -5,6 +5,7 @@ release to the next.
     python dew/patch_stack.py rebase OLD NEW    # in a clone holding jax-vOLD, jax-vNEW and the OLD branch
     python dew/patch_stack.py tests RELEASE     # the stack's own test files, in a clone holding jax-vRELEASE
     python dew/patch_stack.py plugins VERSION   # the plugin release the stack at VERSION ships beside its jax
+    python dew/patch_stack.py record WORKSPACE OUTPUT_BASE LOCATIONS   # what a plugin build read (`recorded`)
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
     python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
@@ -39,20 +40,30 @@ regressions, which the workflow runs, with the API they change, before it pushes
 `plugins` prints the plugin release (plugin-X, its CUDA and PJRT plugins) the stack checked out ships beside its
 jax: its own where the fork has one, else an earlier post release's built from the same native code; nothing
 where neither is, and its plugins are to be built (dew/build_plugin.sh).
+
+`record`, run by dew/build_plugin.sh after its build, prints what the build read, with digests (`recorded`), which
+the plugin release carries as sources-<machine>.json and `plugins` compares a later release against.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import base64
+import contextlib
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -93,6 +104,168 @@ def native(base: str) -> list[str]:
     return git("diff", "--name-only", base, "HEAD", "--", ".", *(f":(exclude){path}" for path in PYTHON_ONLY)).split()
 
 
+SOURCES = "sources-{machine}.json"
+"""A plugin release's record of what its build read on one machine (`recorded`, dew/build_plugin.sh)."""
+MACHINES = ("x86_64", "aarch64")
+CONFIGURED = (".bazelrc", ".bazelversion", "MODULE.bazel", "MODULE.bazel.lock", "platform_mappings",
+              "bazel_downloader.cfg", "build/build.py")
+"""What configures a build beside the files it reads (`recorded`): Bazel's flags and its version, the modules and
+their overrides, and the driver that names its targets and options: a flag or a macro changed over the same sources
+builds other code."""
+STAMP = re.compile(rb'^_release_version: str \| None = "[^"]*"$', re.MULTILINE)
+"""A release's version stamp (`RELEASE`), which every release changes and no native code reads as code: a
+digest (`digest`) is of a file with it blanked."""
+LOCATION = re.compile(r"^(.+?):\d+:\d+: ")
+"""A path in `bazel query --output=location`'s line."""
+LABEL = re.compile(r"^@@([^/]*)//([^:]*):(.+)$")
+"""A canonical label in a repository's marker: its repository (empty: the main one), package and name."""
+
+
+def digest(data: bytes) -> str:
+    """The SHA-256 of a file's bytes, its release stamp (`STAMP`) blanked."""
+    return hashlib.sha256(STAMP.sub(b'_release_version: str | None = ""', data)).hexdigest()
+
+
+def overrides(module: str) -> dict[str, dict]:
+    """Each archive_override of MODULE.bazel text `module`, by its module_name: its literal arguments."""
+    found = {}
+    for call in ast.walk(ast.parse(module)):
+        if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "archive_override":
+            arguments = {}
+            for keyword in call.keywords:
+                with contextlib.suppress(ValueError, SyntaxError):
+                    arguments[keyword.arg] = ast.literal_eval(keyword.value)
+            if "module_name" in arguments:
+                found[arguments["module_name"]] = arguments
+    return found
+
+
+def labelled(label: str) -> str:
+    """The main repository's path a label names (//third_party/xla:fix.patch: third_party/xla/fix.patch)."""
+    package, _, name = label.split("//", 1)[1].partition(":")
+    return f"{package}/{name}" if package else name
+
+
+def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
+    """What a plugin build read, each file's `digest`: every file `bazel query --output=location` lists
+    (`locations`: its targets' source files and the BUILD and .bzl files loaded for them), every file a repository
+    rule read (each repository's marker in OUTPUT_BASE/external, its FILE lines), and what configures the build
+    (`CONFIGURED`): the main repository's by path (`main`), each external repository's by its canonical name
+    (`external`), Bazel's own (its install base) none. The patches each archive_override applies are kept apart
+    (`patches`, by module): their effect is the patched repository's files, which a release compares
+    (`differences`), so a patch's own test or message read by no build pairs."""
+    workspace, external = workspace.resolve(), (output_base / "external").resolve()
+    main: dict[str, str] = {}
+    outer: dict[str, dict[str, str]] = {}
+
+    def take(path: Path) -> None:
+        if not path.is_file():
+            return
+        real = path.resolve()
+        if real.is_relative_to(workspace):
+            main[str(real.relative_to(workspace))] = digest(real.read_bytes())
+        elif path.is_relative_to(external) and len(path.relative_to(external).parts) > 1:
+            repository, *rest = path.relative_to(external).parts
+            outer.setdefault(repository, {})[str(Path(*rest))] = digest(real.read_bytes())
+
+    for line in locations:
+        if found := LOCATION.match(line):
+            take(Path(found[1]))
+    for marker in sorted(external.glob("*.marker")):
+        for line in marker.read_text(errors="replace").splitlines():
+            if not line.startswith("FILE:"):
+                continue
+            name = line.removeprefix("FILE:").rsplit(" ", 1)[0]
+            if found := LABEL.match(name):
+                base = workspace if not found[1] else external / found[1]
+                take(base / found[2] / found[3])
+            elif name.startswith("/"):
+                take(Path(name))
+    for name in CONFIGURED:
+        take(workspace / name)
+    for tool in sorted((workspace / "build" / "tools").rglob("*")):
+        take(tool)
+    module = (workspace / "MODULE.bazel").read_text() if (workspace / "MODULE.bazel").is_file() else ""
+    patches = {}
+    for name, override in overrides(module).items():
+        paths = [labelled(label) for label in override.get("patches", [])]
+        patches[name] = {path: digest((workspace / path).read_bytes()) for path in paths}
+        for path in paths:
+            main.pop(path, None)
+    return {"main": main, "external": outer, "patches": patches}
+
+
+def materialized(override: dict, commit: str, into: Path) -> Path:
+    """The repository an archive_override makes at `commit` (its archive, verified by its integrity, its
+    strip_prefix taken, each of its patches as `commit` holds them applied in order, as Bazel applies them, with
+    no fuzz) made under `into`: its root."""
+    with urllib.request.urlopen(override["urls"][0], timeout=600) as response:
+        data = response.read()
+    algorithm, _, expected = override["integrity"].partition("-")
+    if hashlib.new(algorithm, data).digest() != base64.b64decode(expected):
+        raise ValueError(f"{override['urls'][0]} is not its integrity's archive")
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        archive.extractall(into, filter="data")
+    root = into / override.get("strip_prefix", "")
+    for label in override.get("patches", []):
+        patch = into / "patch"
+        patch.write_bytes(subprocess.run(["git", "show", f"{commit}:{labelled(label)}"], check=True,
+                                         capture_output=True).stdout)
+        subprocess.run(["patch", f"-p{override.get('patch_strip', 0)}", "-F0", "-s", "--no-backup-if-mismatch",
+                        "-d", str(root), "-i", str(patch)], check=True, capture_output=True)
+    return root
+
+
+def differences(record: dict, commit: str = "HEAD") -> list[str]:
+    """What `commit` holds otherwise than a plugin build read (a `recorded` record), each named; none where its
+    native code is the build's. Each main file of the record is compared by its digest; each archive_override
+    whose patches `commit` holds as the build did is the same repository (its archive is pinned by its integrity,
+    MODULE.bazel among the main files), and one whose patches differ is made again (`materialized`) and each of its
+    files the build read compared. A repository a module extension generated (a canonical name holding "++") is
+    made from what its rules read, which the record holds among the files compared."""
+    differing = []
+    for path, wanted in sorted(record["main"].items()):
+        held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
+        if held.returncode != 0 or digest(held.stdout) != wanted:
+            differing.append(path)
+    if differing:
+        return differing
+    module = subprocess.run(["git", "show", f"{commit}:MODULE.bazel"], capture_output=True, text=True).stdout
+    for name, override in overrides(module).items():
+        built = record["patches"].get(name)
+        paths = [labelled(label) for label in override.get("patches", [])]
+        held = {path: digest(subprocess.run(["git", "show", f"{commit}:{path}"], check=True,
+                                            capture_output=True).stdout) for path in paths}
+        if built == held:
+            continue
+        read = {repository: files for repository, files in record["external"].items()
+                if repository in (f"{name}+", f"{name}~")}
+        with tempfile.TemporaryDirectory() as into:
+            try:
+                root = materialized(override, commit, Path(into))
+            except (OSError, ValueError, subprocess.CalledProcessError, urllib.error.URLError) as failure:
+                return [f"{name}'s patched archive: {failure}"]
+            for repository, files in sorted(read.items()):
+                differing += [f"@{repository}//{path}" for path, wanted in sorted(files.items())
+                              if not (root / path).is_file() or digest((root / path).read_bytes()) != wanted]
+    return differing
+
+
+def built_from(tag: str) -> list[dict]:
+    """The records of what plugin release `tag`'s builds read (`SOURCES`, one a machine it carries one of);
+    none for a release built before the builds recorded (0.12.0.1.post142 and earlier)."""
+    found = []
+    for machine in MACHINES:
+        address = f"{FORK.removesuffix('.git')}/releases/download/{tag}/{SOURCES.format(machine=machine)}"
+        try:
+            with urllib.request.urlopen(address, timeout=120) as response:
+                found.append(json.loads(response.read()))
+        except urllib.error.HTTPError as failure:
+            if failure.code != 404:
+                raise
+    return found
+
+
 def plugins(version: str) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
@@ -113,6 +286,11 @@ def plugins(version: str) -> str:
         tag = published[found]
         if found == int(post):
             return tag.removeprefix("refs/tags/")
+        # Where its builds recorded what they read, HEAD holds all of it as they read it, or it is none.
+        if records := built_from(tag.removeprefix("refs/tags/")):
+            if not any(differences(record) for record in records):
+                return tag.removeprefix("refs/tags/")
+            continue
         git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
         stack = f"refs/remotes/origin/release/{release}.post{found}"
         git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
@@ -475,6 +653,10 @@ def main() -> int:
     rebasing.add_argument("new")
     commands.add_parser("tests").add_argument("release")
     commands.add_parser("plugins").add_argument("version")
+    recording = commands.add_parser("record", help="what a plugin build read, as sources-<machine>.json")
+    recording.add_argument("workspace", type=Path)
+    recording.add_argument("output_base", type=Path)
+    recording.add_argument("locations", type=Path, help="`bazel query --output=location`'s output")
     commands.add_parser("native").add_argument("release")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
@@ -511,6 +693,10 @@ def main() -> int:
         return 0
     if args.command == "plugins":
         print(plugins(args.version))
+        return 0
+    if args.command == "record":
+        print(json.dumps(recorded(args.workspace, args.output_base, args.locations.read_text().splitlines()),
+                         indent=1, sort_keys=True))
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))
