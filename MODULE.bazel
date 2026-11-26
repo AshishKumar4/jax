@@ -187,6 +187,9 @@ archive_override(
         # one instantiated as it executed never returned where another device's
         # collective waited on it.
         "//third_party:xla/command_buffer_first_record.patch",
+        # Narrow GEMV's dot-to-reduce rewrite must widen the operands, not
+        # already rounded BF16/F16 products, before accumulating in F32.
+        "//third_party:xla/algsimp_narrow_dot_accumulation.patch",
     ],
     strip_prefix = "xla-d867969800d4a8fd045505eabc65e1e66f30794f",
     urls = ["https://github.com/openxla/xla/archive/d867969800d4a8fd045505eabc65e1e66f30794f.tar.gz"],

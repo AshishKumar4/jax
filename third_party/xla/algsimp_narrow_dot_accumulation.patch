@@ -1,0 +1,145 @@
+diff --git a/xla/hlo/transforms/simplifiers/algebraic_simplifier.cc b/xla/hlo/transforms/simplifiers/algebraic_simplifier.cc
+--- a/xla/hlo/transforms/simplifiers/algebraic_simplifier.cc
++++ b/xla/hlo/transforms/simplifiers/algebraic_simplifier.cc
+@@ -4180,67 +4180,71 @@
+ }
+ 
+ absl::Status AlgebraicSimplifierVisitor::RewriteBatchPlusContractingAsReduce(
+     HloDotInstruction* dot, HloInstruction* lhs, HloInstruction* rhs,
+     const DotDimensionNumbers& dnums) {
++  const PrimitiveType output_type = dot->shape().element_type();
++  const PrimitiveType reduce_type =
++      ShapeUtil::ElementIsFloating(dot->shape()) && output_type != F64
++          ? F32
++          : output_type;
++  // An implicit floating-point dot multiplies in the accumulator's type.
++  // Widening the product instead would already have rounded each term.
++  // Explicit algorithms define their own multiply precision.
++  const PrimitiveType multiply_type =
++      dot->precision_config().algorithm() == PrecisionConfig::ALG_UNSET
++          ? reduce_type
++          : output_type;
+   ABSL_ASSIGN_OR_RETURN(HloInstruction * new_lhs,
+                         NormalizeDotOperandToBatchMajorAndContractingMinor(
+                             lhs, dnums.lhs_batch_dimensions(),
+                             dnums.lhs_contracting_dimensions()));
+-  if (!ShapeUtil::SameElementType(dot->shape(), new_lhs->shape())) {
+-    new_lhs = MakeConvertToHlo(new_lhs, dot->shape().element_type());
+-  }
++  new_lhs = AsType(new_lhs, multiply_type);
+ 
+   ABSL_ASSIGN_OR_RETURN(HloInstruction * new_rhs,
+                         NormalizeDotOperandToBatchMajorAndContractingMinor(
+                             rhs, dnums.rhs_batch_dimensions(),
+                             dnums.rhs_contracting_dimensions()));
+-  if (!ShapeUtil::SameElementType(dot->shape(), new_rhs->shape())) {
+-    new_rhs = MakeConvertToHlo(new_rhs, dot->shape().element_type());
+-  }
++  new_rhs = AsType(new_rhs, multiply_type);
+ 
+   int64_t lhs_outer_dims = lhs->shape().dimensions().size() -
+                            (dnums.lhs_batch_dimensions_size() +
+                             dnums.lhs_contracting_dimensions_size());
+   int64_t rhs_outer_dims = rhs->shape().dimensions().size() -
+                            (dnums.rhs_batch_dimensions_size() +
+                             dnums.rhs_contracting_dimensions_size());
+   CHECK(lhs_outer_dims == 0 || rhs_outer_dims == 0);
+   if (rhs_outer_dims > 0) {
+     std::vector<int64_t> lhs_broadcast_dims(dnums.lhs_batch_dimensions_size());
+     absl::c_iota(lhs_broadcast_dims, 0);
+     lhs_broadcast_dims.resize(lhs->shape().dimensions().size());
+     std::iota(lhs_broadcast_dims.begin() + dnums.lhs_batch_dimensions_size(),
+               lhs_broadcast_dims.end(),
+               dnums.lhs_batch_dimensions_size() + rhs_outer_dims);
+     new_lhs = dot->AddInstruction(HloInstruction::CreateBroadcast(
+         new_rhs->shape(), new_lhs, lhs_broadcast_dims));
+   } else if (lhs_outer_dims > 0) {
+     std::vector<int64_t> rhs_broadcast_dims(dnums.rhs_batch_dimensions_size());
+     absl::c_iota(rhs_broadcast_dims, 0);
+     rhs_broadcast_dims.resize(rhs->shape().dimensions().size());
+     std::iota(rhs_broadcast_dims.begin() + dnums.rhs_batch_dimensions_size(),
+               rhs_broadcast_dims.end(),
+               dnums.rhs_batch_dimensions_size() + lhs_outer_dims);
+     new_rhs = dot->AddInstruction(HloInstruction::CreateBroadcast(
+         new_lhs->shape(), new_rhs, rhs_broadcast_dims));
+   }
+ 
+   ABSL_ASSIGN_OR_RETURN(
+       HloInstruction * new_dot,
+       MakeMultiplyForPrecisionAlgorithm(dot, new_lhs, new_rhs));
+ 
+   std::vector<int64_t> reduce_dims(dnums.lhs_contracting_dimensions_size());
+-  PrimitiveType dot_type =
+-      ShapeUtil::ElementIsFloating(dot->shape())
+-          ? (dot->shape().element_type() == F64 ? F64 : F32)
+-          : dot->shape().element_type();
+-  new_dot = AsType(new_dot, dot_type);
++  new_dot = AsType(new_dot, reduce_type);
+   const int64_t outer_dims = std::max(rhs_outer_dims, lhs_outer_dims);
+   absl::c_iota(reduce_dims, outer_dims + dnums.lhs_batch_dimensions_size());
+-  new_dot = AddReduce(new_dot, reduce_dims, dot_type);
+-  new_dot = AsType(new_dot, dot->shape().element_type());
++  new_dot = AddReduce(new_dot, reduce_dims, reduce_type);
++  new_dot = AsType(new_dot, output_type);
+   return ReplaceInstruction(dot, new_dot);
+ }
+ 
+ bool AlgebraicSimplifierVisitor::SupportedDotPrecisionConfig(
+     const PrecisionConfig& config, bool has_contracting_dim) {
+ }
+diff --git a/xla/hlo/transforms/simplifiers/algebraic_simplifier_test.cc b/xla/hlo/transforms/simplifiers/algebraic_simplifier_test.cc
+--- a/xla/hlo/transforms/simplifiers/algebraic_simplifier_test.cc
++++ b/xla/hlo/transforms/simplifiers/algebraic_simplifier_test.cc
+@@ -38,6 +38,7 @@
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+ #include "xla/comparison_util.h"
++#include "xla/hlo/evaluator/hlo_evaluator.h"
+ #include "xla/hlo/ir/hlo_casting_utils.h"
+ #include "xla/hlo/ir/hlo_computation.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+@@ -9511,6 +9512,33 @@
+   EXPECT_THAT(computation->instructions(), ::testing::Contains(op::Dot()));
+ }
+ 
++TEST_F(AlgebraicSimplifierTest, Bfloat16GemvKeepsProductBitsThroughReduction) {
++  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
++HloModule narrow_gemv
++ENTRY main {
++  lhs = bf16[2] parameter(0)
++  rhs = bf16[2,2] parameter(1)
++  ROOT dot = bf16[2] dot(lhs, rhs), lhs_contracting_dims={0},
++      rhs_contracting_dims={0}, operand_precision={highest,highest}
++})"));
++  auto options = default_options_;
++  options.set_enable_dot_strength_reduction(true);
++  ASSERT_THAT(AlgebraicSimplifier(options).Run(module.get()),
++              absl_testing::IsOkAndHolds(true));
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto lhs, LiteralUtil::CreateR1<float>({1.0078125f, 1.f}).Convert(BF16));
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto rhs,
++      LiteralUtil::CreateR2<float>({{1.0078125f, 1.f}, {-1.015625f, 0.f}})
++          .Convert(BF16));
++  TF_ASSERT_OK_AND_ASSIGN(Literal result,
++                          HloEvaluator().Evaluate(*module, {&lhs, &rhs}));
++  // (1 + 2^-7)^2 - (1 + 2^-6) = 2^-14, but in BF16 the products cancel.
++  EXPECT_EQ(result.GetAsDouble({0}), 0x1p-14);
++  EXPECT_EQ(result.GetAsDouble({1}), 1.0078125);
++}
++
+ class DotStrengthReductionTest
+     : public AlgebraicSimplifierTest,
+       public ::testing::WithParamInterface<
+diff --git a/xla/hlo/transforms/simplifiers/BUILD b/xla/hlo/transforms/simplifiers/BUILD
+--- a/xla/hlo/transforms/simplifiers/BUILD
++++ b/xla/hlo/transforms/simplifiers/BUILD
+@@ -545,6 +545,7 @@
+         "//xla:util",
+         "//xla:window_util",
+         "//xla:xla_data_proto_cc",
++        "//xla/hlo/evaluator:hlo_evaluator",
+         "//xla/hlo/ir:hlo",
+         "//xla/hlo/parser:hlo_parser",
+         "//xla/hlo/pass:hlo_pass",
