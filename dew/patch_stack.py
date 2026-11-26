@@ -157,16 +157,31 @@ def labelled(label: str) -> str:
     return f"{package}/{name}" if package else name
 
 
-def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
-    """What a plugin build read, each file's `digest`: every file `locations` names, by its path (`bazel query
-    --output=location`'s lines: its targets' source files) or its canonical label (`--output=label
-    --consistent_labels`'s: the BUILD and .bzl files loaded for them, which Bazel lists by no location), every
-    file a repository rule read (each repository's marker in OUTPUT_BASE/external, its FILE lines), and what
-    configures the build
-    (`CONFIGURED`): the main repository's by path (`main`), each external repository's by its canonical name
-    (`external`), Bazel's own (its install base) none. The patches each archive_override applies are kept apart
-    (`patches`, by module): their effect is the patched repository's files, which a release compares
-    (`differences`), so a patch's own test or message read by no build pairs."""
+STARLARK = ("BUILD", "BUILD.bazel", "MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel")
+"""Files Bazel evaluates by name (beside every .bzl file): a change to one can change what a build does though no
+record names it (a module extension's implementation, whose transitive loads Bazel digests apart), so a release
+whose tree changes one a build could have read is paired with no earlier plugins (`differences`)."""
+LEGACY_THROUGH = 142
+"""The last post release whose plugin builds recorded nothing (`recorded`): a later one's plugins pair a release
+only through a record of every machine's build (`built_from`)."""
+
+
+def starlark(path: str) -> bool:
+    """Whether Bazel evaluates `path` (`STARLARK`)."""
+    return path.endswith(".bzl") or Path(path).name in STARLARK
+
+
+def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
+    """What one plugin build cell read (a Python and a CUDA, as dew/build_plugin.sh builds them), each file's
+    `digest`, taken right after the cell's build, its repositories as it fetched them: every file `read` names, by
+    its path (`bazel query --output=location`'s lines) or its canonical label (`--output=label
+    --consistent_labels`'s, cquery's with its configuration after it: the cell's configured source files, and the
+    BUILD and .bzl files loaded for them), every file a repository rule read (each repository's marker in
+    OUTPUT_BASE/external) or a module extension did (MODULE.bazel.lock's recorded inputs, written at the build),
+    and what configures the build (`CONFIGURED`): the main repository's by path (`main`), each external
+    repository's by its canonical name (`external`), Bazel's own (its install base) none. The patches each
+    archive_override applies are kept apart (`patches`, by module): their effect is the patched repository's
+    files, which a release compares (`differences`)."""
     workspace, external = workspace.resolve(), (output_base / "external").resolve()
     main: dict[str, str] = {}
     outer: dict[str, dict[str, str]] = {}
@@ -181,26 +196,40 @@ def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
             repository, *rest = path.relative_to(external).parts
             outer.setdefault(repository, {})[str(Path(*rest))] = digest(real.read_bytes())
 
-    def named(name: str) -> None:
-        if found := LABEL.match(name):
-            take((workspace if not found[1] else external / found[1]) / found[2] / found[3])
+    def marked(name: str) -> None:
+        # A file as a marker or the lockfile names it: @@repo//path, escaped.
+        name = unescaped(name)
+        if found := MARKED.match(name):
+            take((workspace if not found[1] else external / found[1]) / found[2])
         elif name.startswith("/"):
             take(Path(name))
 
-    for line in locations:
+    for line in read:
         if found := LOCATION.match(line):
             take(Path(found[1]))
-        else:
-            named(line.strip())
+        elif found := LABEL.match(line.strip().split(" (", 1)[0]):  # cquery's: its configuration after it.
+            take((workspace if not found[1] else external / found[1]) / found[2] / found[3])
     for marker in sorted(external.glob("*.marker")):
         for line in marker.read_text(errors="replace").splitlines():
-            if not line.startswith("FILE:"):
-                continue
-            name = unescaped(line.removeprefix("FILE:").rsplit(" ", 1)[0])
-            if found := MARKED.match(name):
-                take((workspace if not found[1] else external / found[1]) / found[2])
-            elif name.startswith("/"):
-                take(Path(name))
+            if line.startswith("FILE:"):
+                marked(line.removeprefix("FILE:").rsplit(" ", 1)[0])
+    lock = workspace / "MODULE.bazel.lock"
+
+    def inputs(value) -> None:
+        # Every recorded input a module extension read, wherever the lockfile holds it.
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if isinstance(key, str) and key.startswith("FILE:"):
+                    marked(key.removeprefix("FILE:"))
+                inputs(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                if isinstance(inner, str) and inner.startswith("FILE:"):
+                    marked(inner.removeprefix("FILE:").rsplit(" ", 1)[0])
+                inputs(inner)
+
+    if lock.is_file():
+        inputs(json.loads(lock.read_text()))
     for name in CONFIGURED:
         take(workspace / name)
     for tool in sorted((workspace / "build" / "tools").rglob("*")):
@@ -213,6 +242,16 @@ def recorded(workspace: Path, output_base: Path, locations: list[str]) -> dict:
         for path in paths:
             main.pop(path, None)
     return {"main": main, "external": outer, "patches": patches}
+
+
+def merged(cells: dict[str, dict]) -> dict:
+    """One machine's record of its build (`SOURCES`): each cell's (`recorded`), by its name, and the patches their
+    one tree applies."""
+    patches = [cell["patches"] for cell in cells.values()]
+    if any(other != patches[0] for other in patches):
+        raise ValueError("a build's cells applied different patches")
+    return {"cells": {name: {"main": cell["main"], "external": cell["external"]} for name, cell in cells.items()},
+            "patches": patches[0] if patches else {}}
 
 
 def materialized(override: dict, commit: str, into: Path) -> Path:
@@ -236,50 +275,65 @@ def materialized(override: dict, commit: str, into: Path) -> Path:
     return root
 
 
-def differences(record: dict, commit: str = "HEAD") -> list[str]:
-    """What `commit` holds otherwise than a plugin build read (a `recorded` record), each named; none where its
-    native code is the build's. Each main file of the record is compared by its digest; each archive_override
-    whose patches `commit` holds as the build did is the same repository (its archive is pinned by its integrity,
-    MODULE.bazel among the main files), and one whose patches differ is made again (`materialized`) and each of its
-    files the build read compared. A repository a module extension generated (a canonical name holding "++") is
-    made from what its rules read, which the record holds among the files compared."""
+def tree(root: Path) -> dict[str, str]:
+    """Each file under `root` by its path in it: its `digest`."""
+    return {str(path.relative_to(root)): digest(path.read_bytes()) for path in root.rglob("*") if path.is_file()}
+
+
+def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
+    """What `commit` holds that could build otherwise than the plugin build at commit `built` did (a machine's
+    record, `merged`), each named; none where its native code is the build's. Every cell's main files are compared
+    by digest, and a .bzl file `commit` changes over `built` refuses (an extension's code, read by no record). An
+    archive_override whose patches `commit` holds as the build did is the same repository (its archive pinned by
+    its integrity, MODULE.bazel among the main files); one whose patches differ is made at both commits
+    (`materialized`) and refused for any file that differs between them that a cell read, that `commit` adds (a
+    glob may take it) or that Bazel evaluates (`starlark`): only a file read by none, unadded and no Starlark, a
+    patch's own test changed, pairs; a patch's message changes no file. A repository a module extension generated
+    (a canonical name holding "++") is made from inputs the record holds."""
     differing = []
-    for path, wanted in sorted(record["main"].items()):
-        held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
-        if held.returncode != 0 or digest(held.stdout) != wanted:
-            differing.append(path)
+    for name, cell in sorted(record["cells"].items()):
+        for path, wanted in sorted(cell["main"].items()):
+            held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
+            if held.returncode != 0 or digest(held.stdout) != wanted:
+                differing.append(f"{name}: {path}")
+    changed = git("diff", "--name-only", built, commit).split()
+    differing += [f"{path}: Starlark" for path in changed if path.endswith(".bzl")]
     if differing:
-        return differing
+        return sorted(set(differing))
     module = subprocess.run(["git", "show", f"{commit}:MODULE.bazel"], capture_output=True, text=True).stdout
     for name, override in overrides(module).items():
-        built = record["patches"].get(name)
         paths = [labelled(label) for label in override.get("patches", [])]
         held = {path: digest(subprocess.run(["git", "show", f"{commit}:{path}"], check=True,
                                             capture_output=True).stdout) for path in paths}
-        if built == held:
+        if record["patches"].get(name) == held:
             continue
-        read = {repository: files for repository, files in record["external"].items()
-                if repository in (f"{name}+", f"{name}~")}
-        with tempfile.TemporaryDirectory() as into:
+        read = {path for cell in record["cells"].values() for repository, files in cell["external"].items()
+                if repository in (f"{name}+", f"{name}~") for path in files}
+        with tempfile.TemporaryDirectory() as then, tempfile.TemporaryDirectory() as now:
             try:
-                root = materialized(override, commit, Path(into))
+                before = tree(materialized(override, built, Path(then)))
+                after = tree(materialized(override, commit, Path(now)))
             except (OSError, ValueError, subprocess.CalledProcessError, urllib.error.URLError) as failure:
                 return [f"{name}'s patched archive: {failure}"]
-            for repository, files in sorted(read.items()):
-                differing += [f"@{repository}//{path}" for path, wanted in sorted(files.items())
-                              if not (root / path).is_file() or digest((root / path).read_bytes()) != wanted]
+        for path in sorted(set(before) | set(after)):
+            if before.get(path) == after.get(path):
+                continue
+            why = ("read" if path in read else "added" if path not in before else "Starlark" if starlark(path)
+                   else None)
+            if why:
+                differing.append(f"@{name}//{path}: {why}")
     return differing
 
 
-def built_from(tag: str) -> list[dict]:
-    """The records of what plugin release `tag`'s builds read (`SOURCES`, one a machine it carries one of);
-    none for a release built before the builds recorded (0.12.0.1.post142 and earlier)."""
-    found = []
+def built_from(tag: str) -> dict[str, dict]:
+    """The records of what plugin release `tag`'s builds read (`SOURCES`), by each machine it carries one of; none
+    for a release built before the builds recorded (`LEGACY_THROUGH`)."""
+    found = {}
     for machine in MACHINES:
         address = f"{FORK.removesuffix('.git')}/releases/download/{tag}/{SOURCES.format(machine=machine)}"
         try:
             with urllib.request.urlopen(address, timeout=120) as response:
-                found.append(json.loads(response.read()))
+                found[machine] = json.loads(response.read())
         except urllib.error.HTTPError as failure:
             if failure.code != 404:
                 raise
@@ -306,12 +360,14 @@ def plugins(version: str) -> str:
         tag = published[found]
         if found == int(post):
             return tag.removeprefix("refs/tags/")
-        # Where its builds recorded what they read, HEAD holds all of it as they read it, or it is none.
-        if records := built_from(tag.removeprefix("refs/tags/")):
-            if not any(differences(record) for record in records):
+        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
+        # A release built since its builds record what they read pairs only through every machine's record, HEAD
+        # holding all of each as it was read; an earlier one, by the path rule below.
+        records = built_from(tag.removeprefix("refs/tags/"))
+        if records or found > LEGACY_THROUGH:
+            if set(records) == set(MACHINES) and not any(differences(record, tag) for record in records.values()):
                 return tag.removeprefix("refs/tags/")
             continue
-        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
         stack = f"refs/remotes/origin/release/{release}.post{found}"
         git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
         held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
@@ -673,10 +729,12 @@ def main() -> int:
     rebasing.add_argument("new")
     commands.add_parser("tests").add_argument("release")
     commands.add_parser("plugins").add_argument("version")
-    recording = commands.add_parser("record", help="what a plugin build read, as sources-<machine>.json")
+    recording = commands.add_parser("record", help="what one plugin build cell read (`recorded`)")
     recording.add_argument("workspace", type=Path)
     recording.add_argument("output_base", type=Path)
-    recording.add_argument("locations", type=Path, help="`bazel query --output=location`'s output")
+    recording.add_argument("read", type=Path, help="the cell's queries' output")
+    merging = commands.add_parser("merged", help="a machine's cells' records, as sources-<machine>.json")
+    merging.add_argument("cells", type=Path, nargs="+", help="each cell's record, named <cell>.json")
     commands.add_parser("native").add_argument("release")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
@@ -715,8 +773,11 @@ def main() -> int:
         print(plugins(args.version))
         return 0
     if args.command == "record":
-        print(json.dumps(recorded(args.workspace, args.output_base, args.locations.read_text().splitlines()),
-                         indent=1, sort_keys=True))
+        print(json.dumps(recorded(args.workspace, args.output_base, args.read.read_text().splitlines()),
+                         sort_keys=True))
+        return 0
+    if args.command == "merged":
+        print(json.dumps(merged({path.stem: json.loads(path.read_text()) for path in args.cells}), sort_keys=True))
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))
