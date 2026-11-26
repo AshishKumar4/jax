@@ -70,6 +70,28 @@ class LiveBuffer:
   dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LiveInterval(LiveBuffer):
+  """A buffer of a compile's allocation over the part of its heap's schedule
+  it lives in.
+
+  Attributes (besides ``LiveBuffer``'s):
+    allocation: the buffer allocation whose heap simulation orders it:
+      positions compare within one allocation alone.
+    start: its first position among that simulation's events.
+    end: the position after its last: the simulation's length for one never
+      freed. Positions are XLA's flattened schedule, a while body's buffers
+      within its loop's span.
+    shared: whether it lies in another buffer's memory (XLA's ``SHARE_WITH``:
+      an in-place output over its operand): the bytes an allocation holds at
+      a position are those of the unshared intervals covering it.
+  """
+  allocation: int
+  start: int
+  end: int
+  shared: bool = False
+
+
 def live(assignment: bytes, module: bytes,
          argument: Callable[[int], int | None] | None = None
          ) -> tuple[LiveBuffer, ...]:
@@ -77,61 +99,109 @@ def live(assignment: bytes, module: bytes,
   ``BufferAssignmentProto`` ``assignment``, whose buffers serialized
   ``HloModuleProto`` ``module`` defines; a constant's and a thread-local
   allocation's are none."""
-  proto = hlo_reader.message_class("xla.BufferAssignmentProto").FromString(
-      assignment)
-  compiled = hlo_reader.message_class("xla.HloModuleProto").FromString(module)
-  instructions = {
-      instruction.id: instruction
-      for computation in compiled.computations
-      for instruction in computation.instructions}
-  descended = provenance(compiled, argument)
-  computations = {computation.id: computation
-                  for computation in compiled.computations}
-  # Each logical buffer's other positions, as XLA's must-alias analysis states
-  # them: a loop state's buffer's among them, at the while's own output.
-  aliases: dict[int, list[Any]] = {}
-  for alias in proto.buffer_aliases:
-    aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
-  primitive_type = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
-  buffers = {buffer.id: buffer for buffer in proto.logical_buffers}
-  kinds = {allocation.index: _kind(allocation)
-           for allocation in proto.buffer_allocations}
-  parameters = {allocation.index: allocation.parameter_number
-                for allocation in proto.buffer_allocations
-                if allocation.is_entry_computation_parameter}
+  read = _Read(assignment, module, argument)
+  return tuple(LiveBuffer(**found) for peak in read.proto.peak_buffers
+               for buffer in peak.logical_buffer_ids
+               if (found := read.described(buffer, peak.index)) is not None)
+
+
+def intervals(assignment: bytes, module: bytes,
+              argument: Callable[[int], int | None] | None = None
+              ) -> tuple[LiveInterval, ...]:
+  """Each array buffer of serialized ``BufferAssignmentProto`` ``assignment``
+  over the positions of its allocation's heap simulation it lives in (its
+  ``heap_simulator_traces``' events: allocated at one, freed at another, or
+  placed in another's memory), as ``live`` describes it; a constant's and a
+  thread-local allocation's are none, as are those of an allocation the
+  assignment states no simulation of (XLA:CPU keeps none). At each
+  allocation's peak position the unshared intervals covering it are the
+  buffers ``live`` names."""
+  read = _Read(assignment, module, argument)
+  event = hlo_reader.pool().FindMessageTypeByName(
+      "xla.HeapSimulatorTrace.Event")
+  kinds = {value.name: value.number
+           for value in event.fields_by_name["kind"].enum_type.values}
   found = []
-  for peak in proto.peak_buffers:
-    kind = kinds[peak.index]
-    if kind is None:
-      continue
-    for buffer_id in peak.logical_buffer_ids:
-      buffer = buffers[buffer_id]
-      instruction = instructions[buffer.defined_at.instruction_id]
-      shape, dims = instruction.shape, descended.get(instruction.id)
-      for index in buffer.defined_at.shape_index:
-        shape = shape.tuple_shapes[index]
-        dims = None if dims is None else dims[index]
-      if shape.tuple_shapes:
-        continue  # A tuple's index table, no array.
-      metadata = instruction.metadata
-      named = instruction.frontend_attributes.map.get("checkpoint_name")
-      written = None if named else _aliased_named(
-          aliases.get(buffer.id, ()), instructions, computations)
-      if written is not None:
-        named = written.frontend_attributes.map.get("checkpoint_name")
-      found.append(LiveBuffer(
-          bytes=buffer.size, shape=tuple(shape.dimensions),
-          dtype=primitive_type.values_by_number[shape.element_type]
-          .name.lower(),
-          kind=kind, instruction=instruction.name,
-          op_name=metadata.op_name or (
-              written.metadata.op_name if written is not None else ""),
-          source=f"{metadata.source_file}:{metadata.source_line}",
-          names=tuple(named.split(",")) if named else (),
-          parameter=parameters.get(peak.index),
-          dims=(tuple(None for _ in shape.dimensions) if dims is None
-                else tuple(dims))))
+  for trace in read.proto.heap_simulator_traces:
+    opened: dict[int, tuple[int, bool]] = {}
+    spans = []
+    for position, step in enumerate(trace.events):
+      if step.kind == kinds["FREE"]:
+        start, shared = opened.pop(step.buffer_id)
+        spans.append((step.buffer_id, start, position, shared))
+      else:  # ALLOC, or SHARE_WITH: placed in another's memory.
+        opened[step.buffer_id] = (position, step.kind == kinds["SHARE_WITH"])
+    spans += [(buffer, start, len(trace.events), shared)
+              for buffer, (start, shared) in opened.items()]
+    allocation = trace.buffer_allocation_index
+    found += [LiveInterval(**described, allocation=allocation, start=start,
+                           end=end, shared=shared)
+              for buffer, start, end, shared in spans
+              if (described := read.described(buffer, allocation)) is not None]
   return tuple(found)
+
+
+class _Read:
+  """A buffer assignment read beside the compiled module it assigns."""
+
+  def __init__(self, assignment: bytes, module: bytes,
+               argument: Callable[[int], int | None] | None):
+    self.proto = hlo_reader.message_class(
+        "xla.BufferAssignmentProto").FromString(assignment)
+    compiled = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module)
+    self.instructions = {
+        instruction.id: instruction
+        for computation in compiled.computations
+        for instruction in computation.instructions}
+    self.descended = provenance(compiled, argument)
+    self.computations = {computation.id: computation
+                         for computation in compiled.computations}
+    # Each logical buffer's other positions, as XLA's must-alias analysis
+    # states them: a loop state's buffer's among them, at the while's output.
+    self.aliases: dict[int, list[Any]] = {}
+    for alias in self.proto.buffer_aliases:
+      self.aliases.setdefault(alias.source_buffer_id, []).append(
+          alias.location)
+    self.types = hlo_reader.pool().FindEnumTypeByName("xla.PrimitiveType")
+    self.buffers = {buffer.id: buffer for buffer in self.proto.logical_buffers}
+    self.kinds = {allocation.index: _kind(allocation)
+                  for allocation in self.proto.buffer_allocations}
+    self.parameters = {allocation.index: allocation.parameter_number
+                       for allocation in self.proto.buffer_allocations
+                       if allocation.is_entry_computation_parameter}
+
+  def described(self, buffer_id: int, allocation: int) -> dict | None:
+    """``LiveBuffer``'s fields of logical buffer ``buffer_id`` of
+    ``allocation``; None for a constant's or a thread-local allocation's, and
+    for a tuple's index table, no array."""
+    if (kind := self.kinds.get(allocation)) is None:
+      return None
+    buffer = self.buffers[buffer_id]
+    instruction = self.instructions[buffer.defined_at.instruction_id]
+    shape, dims = instruction.shape, self.descended.get(instruction.id)
+    for index in buffer.defined_at.shape_index:
+      shape = shape.tuple_shapes[index]
+      dims = None if dims is None else dims[index]
+    if shape.tuple_shapes:
+      return None
+    metadata = instruction.metadata
+    named = instruction.frontend_attributes.map.get("checkpoint_name")
+    written = None if named else _aliased_named(
+        self.aliases.get(buffer.id, ()), self.instructions, self.computations)
+    if written is not None:
+      named = written.frontend_attributes.map.get("checkpoint_name")
+    return dict(
+        bytes=buffer.size, shape=tuple(shape.dimensions),
+        dtype=self.types.values_by_number[shape.element_type].name.lower(),
+        kind=kind, instruction=instruction.name,
+        op_name=metadata.op_name or (
+            written.metadata.op_name if written is not None else ""),
+        source=f"{metadata.source_file}:{metadata.source_line}",
+        names=tuple(named.split(",")) if named else (),
+        parameter=self.parameters.get(allocation),
+        dims=(tuple(None for _ in shape.dimensions) if dims is None
+              else tuple(dims)))
 
 
 def _aliased_named(locations: Any, instructions: dict[int, Any],
