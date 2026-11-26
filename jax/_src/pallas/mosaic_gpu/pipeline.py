@@ -160,7 +160,8 @@ class BufferedRef:
         map(_make_block_slice, index_map(*grid_indices), self.spec.block_shape)
     )
 
-  def copy_in(self, slot, grid_indices, barrier_ref, barrier_slot=None):
+  def copy_in(self, slot, grid_indices, barrier_ref, barrier_slot=None, *,
+              ordered=False):
     if not _in_smem(self.spec):
       return
     assert self.smem_ref is not None
@@ -179,9 +180,11 @@ class BufferedRef:
         barrier,
         collective_axes=getattr(self.spec, "collective_axes", None),
         oob_mode=oob_mode,
+        ordered=ordered,
     )
 
-  def copy_in_share(self, slot, grid_indices, thread, threads: int):
+  def copy_in_share(self, slot, grid_indices, thread, threads: int, *,
+                    ordered=False):
     """``copy_in`` by cp.async of the ``thread``'s share of the block's first
     axis, one of ``threads`` equal shares: of a tiled block, whole 8-row tiles
     for each of a warpgroup's four warps, over which its copy spreads them; of
@@ -212,6 +215,7 @@ class BufferedRef:
             smem.at[pl.ds(share * part, part)],
             None,
             oob_mode=oob_mode,
+            ordered=ordered,
         )
 
   def copy_out(self, slot, grid_indices, predicate=None):
@@ -521,12 +525,13 @@ def emit_pipeline[T](
         gpu_primitives.barrier_arrive(barrier)
         gpu_primitives.barrier_wait(barrier)
 
-    def copy_in(bref, slot, fetch_indices):
+    def copy_in(bref, slot, fetch_indices, ordered=False):
       if meet_ref is None:
-        bref.copy_in(slot, fetch_indices, barrier_ref)
+        bref.copy_in(slot, fetch_indices, barrier_ref, ordered=ordered)
       elif is_cp_async:
         bref.copy_in_share(
-            slot, fetch_indices, lax.axis_index(thread_axis), threads
+            slot, fetch_indices, lax.axis_index(thread_axis), threads,
+            ordered=ordered,
         )
       else:
         # One thread issues the TMA copies; every thread waits on the barrier.
@@ -602,9 +607,21 @@ def emit_pipeline[T](
       ):
         fetch_step = step + (max_concurrent_steps - delay_release - lead)
         def do_fetch(fetch_slot=fetch_slot):
-          for bref in in_brefs:
-            if getattr(bref.spec, "delay_release", 0) == delay_release:
-              copy_in(bref, fetch_slot, fetch_indices)
+          fetched = [
+              bref for bref in in_brefs
+              if getattr(bref.spec, "delay_release", 0) == delay_release
+          ]
+          for at, bref in enumerate(fetched):
+            # A cp.async copy's automatic barrier orders the warpgroup's reads
+            # of the slot it fills: the step's own wait ended with one where
+            # it awaited this step's slot past every read of the slot the
+            # fetch refills (``lead``, no ``prefetch``, whose boundary awaits
+            # before the step's last reads), and the step's first copy's
+            # orders the rest. One barrier a step where each copy took its
+            # own: an A100's grouped input gradient waited at two a step, 22%
+            # of its stall samples (Dew rows 5623, 5271).
+            ordered = is_cp_async and (at > 0 or (lead and prefetch is None))
+            copy_in(bref, fetch_slot, fetch_indices, ordered=ordered)
 
         jax.lax.cond(
             lax.bitwise_and(step >= delay_release, fetch_step < num_steps),

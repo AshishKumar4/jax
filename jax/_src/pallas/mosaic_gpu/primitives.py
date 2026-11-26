@@ -980,6 +980,7 @@ def _copy_gmem_to_smem_lowering(
     oob_mode,
     has_barrier,
     has_user_predicate,
+    ordered=False,
 ):
   if has_barrier:
     barrier, *flat_args = flat_args
@@ -1170,6 +1171,7 @@ def _copy_gmem_to_smem_lowering(
     if (
         ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warpgroup
         and ctx.module_ctx.auto_barriers
+        and not ordered
     ):
       mgpu.warpgroup_barrier()  # Make sure all reads have completed.
 
@@ -1328,6 +1330,7 @@ def copy_gmem_to_smem(
     leader_tracked: CopyPartition | None = None,
     oob_mode: OOBFillMode | None = None,
     predicate: bool | jax.Array | None = None,
+    ordered: bool = False,
 ) -> None:
   """Asynchronously copies a GMEM reference to a SMEM reference.
 
@@ -1381,6 +1384,10 @@ def copy_gmem_to_smem(
     predicate: A boolean indicating whether the copy should be performed. If
       ``None``, the copy is always performed. If ``False``, neither the copy nor
       the barrier arrival is performed.
+    ordered: Whether every read of ``dst`` is already ordered before the copy,
+      the warpgroup past a barrier since its last read of it: the copy then
+      takes no automatic warpgroup barrier of its own (warpgroup primitive
+      semantics place one before every copy, with automatic barriers on).
 
   See also:
     :func:`jax.experimental.pallas.mosaic_gpu.barrier_arrive`
@@ -1433,6 +1440,7 @@ def copy_gmem_to_smem(
       oob_mode=oob_mode,
       has_barrier=has_barrier,
       has_user_predicate=predicate is not None,
+      ordered=ordered,
   )
   return None
 

@@ -251,6 +251,79 @@ class PipelineAllocationsTest(jtu.JaxTestCase):
       self.assertEqual(meet, plgpu.Barrier(num_arrivals=2, num_barriers=2))
 
 
+class PipelineBarriersTest(jtu.JaxTestCase):
+  """A cp.async pipeline's warpgroup barriers, as its module states them."""
+
+  @parameterized.parameters(1, 2)
+  def test_a_cp_async_pipeline_step_meets_at_its_wait_alone(self, streams):
+    # A step's wait for its own copies ends at a warpgroup barrier; its fetch
+    # right after it refills the slot the step before read, so the fetch's
+    # copies take none of their own (``ordered``): one barrier a step, however
+    # many streams it loads, where each copy took one besides.
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=108,
+        compute_capability="8.0",
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    shapes = [jax.ShapeDtypeStruct((64, 8 * 64), jnp.float16)] * streams
+
+    @_kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    def kernel(*refs):
+      *x_refs, o_ref = refs
+
+      def body(_, *slots_and_carry):
+        *slots, carry = slots_and_carry
+        return carry + sum(
+            plgpu.load(slot, optimized=False).astype(jnp.float32)
+            for slot in slots
+        )
+
+      o_ref[...] = plgpu.emit_pipeline(
+          body,
+          grid=(8,),
+          in_specs=[plgpu.BlockSpec((64, 64), lambda i: (0, i))] * streams,
+          max_concurrent_steps=3,
+          init_carry=jnp.zeros((64, 64), jnp.float32),
+      )(*x_refs)
+
+    with jax.sharding.use_abstract_mesh(mesh):
+      lowered = jax.jit(kernel).trace(*shapes).lower(lowering_platforms=("cuda",))
+    [call] = [
+        op for op in lowered.compiler_ir("stablehlo").body.operations
+        if op.operation.name == "func.func"
+        for block in op.regions[0].blocks for op in block.operations
+        if op.operation.name == "stablehlo.custom_call"
+    ]
+    config = ir.DictAttr(call.attributes["mhlo.backend_config"])
+    module = mgpu.deserialized(ir.StringAttr(config["module"]).value_bytes)
+
+    def barriers(operation):
+      return sum(
+          (inner.operation.name == "nvvm.barrier") + barriers(inner.operation)
+          for region in operation.regions for block in region.blocks
+          for inner in block.operations
+      )
+
+    def loops(operation):
+      for region in operation.regions:
+        for block in region.blocks:
+          for inner in block.operations:
+            if inner.operation.name == "scf.for":
+              yield inner.operation
+            yield from loops(inner.operation)
+
+    with module.context:
+      [loop] = [
+          loop for loop in loops(module.operation)
+          if any(
+              inner.operation.name == "nvvm.cp.async.wait.group"
+              for block in loop.regions[0].blocks
+              for inner in block.operations
+          )
+      ]
+      self.assertEqual(barriers(loop), 1)
+
+
 class CtaBarrierLoweringTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
