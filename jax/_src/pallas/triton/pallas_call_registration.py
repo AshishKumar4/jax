@@ -27,6 +27,7 @@ from jax._src import frozen_dict
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src import gpu_info as gpu_info_lib
+from jax._src.lib.mlir import passmanager as pm
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.triton import core as triton_core
 from jax._src.pallas.triton import lowering
@@ -128,6 +129,15 @@ def pallas_call_lowering(
     print(module_op.get_asm(enable_debug_info=True, pretty_debug_info=True))
 
   grid_x, grid_y, grid_z = normalize_grid(lowering_result.grid)
+  if not debug:
+    # The kernel's locations name where its body and helpers were traced, and
+    # a helper traced once a process (a reduction's combiner, a scan's) keeps
+    # its first caller's: one kernel would serialize apart across processes
+    # and call orders, its program with it. XLA strips them before LLVM
+    # anyway, reading them only for its diagnostics; `debug` keeps them.
+    pm.PassManager.parse(
+        "builtin.module(strip-debuginfo)", context=module_op.context
+    ).run(module_op)
   buf = io.BytesIO()
   module_op.write_bytecode(buf)
 

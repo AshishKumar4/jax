@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import functools
+import io
 import sys
 
 from absl.testing import absltest
@@ -19,13 +22,17 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax._src import config
+from jax._src import custom_call_targets
+from jax._src import dtypes
 from jax._src import test_util as jtu
+from jax._src.lib.mlir import ir
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
 
 if sys.platform != "win32":
   from jax.experimental.pallas import triton as plgpu
+  from jax._src.lib.triton import dialect as tt_dialect
 else:
   plgpu = None
 
@@ -187,6 +194,107 @@ class TritonForkTest(PallasBaseTest):
     unpipelined = call(1)
     for _ in range(8):
       self.assertArraysEqual(call(2), unpipelined)
+
+
+intx = dtypes.default_int_dtype()
+
+
+@functools.partial(
+    jax.jit, static_argnames=["bm", "bn", "gm", "bk", "interpret", "debug"]
+)
+def matmul(x, y, *, bm, bn, gm, bk, interpret, debug=False):
+  m, n, k = x.shape[0], y.shape[1], x.shape[1]
+
+  @functools.partial(
+      pl.pallas_call,
+      out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
+      grid=pl.cdiv(m, bm) * pl.cdiv(n, bn),
+      interpret=interpret,
+      debug=debug,
+      compiler_params=plgpu.CompilerParams(),
+  )
+  def matmul_kernel(x_ref, y_ref, o_ref):
+    pid = pl.program_id(axis=0).astype(intx)
+    num_pid_m = m // bm
+    num_pid_n = n // bn
+    num_pid_in_group = gm * num_pid_n
+    group_id = lax.div(pid, num_pid_in_group)
+    first_pid_m = group_id * gm
+    group_size_m = jnp.minimum(num_pid_m - first_pid_m, gm)
+    pid_m = first_pid_m + lax.rem(pid, group_size_m)
+    pid_n = lax.div(lax.rem(pid, num_pid_in_group), group_size_m)
+    idx_m = pid_m * bm + jnp.arange(bm)
+    idx_n = pid_n * bn + jnp.arange(bn)
+    idx_m = plgpu.max_contiguous(pl.multiple_of(idx_m, bm), bm)
+    idx_n = plgpu.max_contiguous(pl.multiple_of(idx_n, bn), bn)
+    acc = jnp.zeros((bm, bn), dtype=jnp.float32)
+
+    def body(i, acc):
+      idx_k = i * bk + jnp.arange(bk)
+      x_idx = (
+          lax.broadcast_in_dim(idx_m, (bm, bk), (0,)),
+          lax.broadcast_in_dim(idx_k, (bm, bk), (1,)),
+      )
+      y_idx = (
+          lax.broadcast_in_dim(idx_k, (bk, bn), (0,)),
+          lax.broadcast_in_dim(idx_n, (bk, bn), (1,)),
+      )
+      x_block, y_block = x_ref[x_idx], y_ref[y_idx]
+      out = plgpu.dot(x_block, y_block)
+      return acc + out
+
+    acc = lax.fori_loop(0, k // bk, body, acc).astype(o_ref.dtype)
+    o_idx = (
+        lax.broadcast_in_dim(idx_m, (bm, bn), (0,)),
+        lax.broadcast_in_dim(idx_n, (bm, bn), (1,)),
+    )
+    o_ref[o_idx] = acc
+
+  return matmul_kernel(x, y)
+
+
+class TritonKernelLocationsTest(PallasBaseTest):
+
+  @parameterized.parameters(False, True)
+  def test_a_kernel_serializes_locations_only_when_debugged(self, debug):
+    # A reduction's combiner is traced once a process, so its locations named
+    # the first kernel to lower it in every later one: a kernel serialized
+    # apart across processes and call orders, its program with it.
+    if jtu.test_device_matches(["cpu"]):
+      self.skipTest("Lowers a Triton kernel only for a GPU")
+
+    def body(x_ref, o_ref):
+      o_ref[...] = jnp.sum(x_ref[...], axis=0, keepdims=True)
+
+    f = self.pallas_call(
+        body, out_shape=jax.ShapeDtypeStruct((1, 128), jnp.float32),
+        debug=debug)
+    with contextlib.redirect_stdout(io.StringIO()):
+      lowered = jax.jit(f).lower(jnp.ones((16, 128), jnp.float32))
+    kernels = []
+
+    def find(op):
+      if (op.name == "stablehlo.custom_call"
+          and op.attributes["call_target_name"].value
+          == custom_call_targets.TRITON):
+        config = ir.DictAttr(op.attributes["mhlo.backend_config"])
+        kernels.append(ir.StringAttr(config["ir"]).value_bytes)
+      return ir.WalkResult.ADVANCE
+
+    lowered.compiler_ir().operation.walk(find)
+    [kernel] = kernels
+    ctx = ir.Context()
+    tt_dialect.register_dialect(ctx)
+    known = []
+
+    def located(op):
+      if str(op.location) != "loc(unknown)":
+        known.append(str(op.location))
+      return ir.WalkResult.ADVANCE
+
+    with ctx:
+      ir.Module.parse(kernel).operation.walk(located)
+    self.assertEqual(bool(known), debug, known[:3])
 
 
 class TritonDialectLookupTest(jtu.JaxTestCase):
