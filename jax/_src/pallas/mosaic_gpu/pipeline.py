@@ -258,17 +258,6 @@ def _downcast_spec(
   )
 
 
-class Pipeline(Protocol):
-  """Protocol for a pipeline ``emit_pipeline`` emits: called on its GMEM refs,
-  and stating the buffers and barriers it scopes for them before it runs."""
-
-  def __call__(self, *gmem_refs: Any) -> Any:
-    ...
-
-  def get_allocations(self, *gmem_refs: Any) -> dict[str, Any]:
-    ...
-
-
 def emit_pipeline[T](
     body: Callable[..., T],
     *,
@@ -277,8 +266,7 @@ def emit_pipeline[T](
     out_specs: Sequence[pallas_core.BlockSpec] = (),
     max_concurrent_steps: int = 1,
     init_carry: T | None = None,
-    prefetch: Callable[..., Any] | None = None,
-) -> Pipeline:
+):
   r"""Creates a function to emit a manual pipeline within a Pallas kernel.
 
   Args:
@@ -300,21 +288,6 @@ def emit_pipeline[T](
     init_carry: Optional initial carry. If provided, ``body`` handles
       carry-over state between iterations, and the pipeline returns the
       final carry.
-    prefetch: Optional. ``prefetch(indices, *input_refs)`` reads a step's first
-      values from its input slots into registers (a matrix product's first
-      fragments). With it, ``body`` takes two more arguments after the carry
-      (if any): ``prefetched``, the values ``prefetch`` read of this step's
-      slots, and ``boundary``, a callable taking no arguments that ``body``
-      calls exactly once, before its last reads of this step's slots end
-      (its last products, their operands already in registers). ``boundary``
-      waits for the next step's slots (as the next step would at its start)
-      and returns ``prefetch`` of them, so the next step's first values load
-      under this step's last products, CUTLASS's multistage order across a
-      step; ``body`` returns them beside its carry
-      (``(next_carry, next_prefetched)``, or ``next_prefetched`` alone
-      without ``init_carry``), and the next step does not wait again. On the
-      last step ``boundary`` waits for nothing more and its values are not
-      read. Input-only pipelines whose specs take no ``delay_release``.
 
   Returns:
     A function that, when called with GMEM input and output refs, executes the
@@ -353,24 +326,13 @@ def emit_pipeline[T](
   # Shrink ``max_concurrent_steps`` if the total number of steps is lower to
   # reduce the size of the refs allocated in SMEM.
   if not has_dynamic_grid and max_concurrent_steps > num_steps:
-    max_concurrent_steps = int(num_steps)
-  if prefetch is not None and max_concurrent_steps == 1 and (
-      has_dynamic_grid or num_steps > 1
-  ):
-    # One slot is refilled after its step's body, so no step's boundary finds
-    # the next step's slots in flight.
-    raise ValueError("emit_pipeline's prefetch needs two slots or more")
+    max_concurrent_steps = num_steps
 
   if is_cp_async := mgpu_utils._infer_arch() < (9, 0):
     if out_specs:
       raise NotImplementedError(
           "emit_pipeline on pre-Hopper GPUs only supports input-only pipelines"
       )
-  if prefetch is not None and (out_specs or delay_release_levels != [0]):
-    raise NotImplementedError(
-        "emit_pipeline's prefetch takes an input-only pipeline whose specs"
-        " take no delay_release"
-    )
 
   def pipeline(*gmem_refs: state.AbstractRef):
     in_gmem_refs, out_gmem_refs = util.split_list(gmem_refs, [len(in_specs)])
@@ -387,23 +349,6 @@ def emit_pipeline[T](
               " provably in bounds, or oob_fill_mode="
               "OOBFillMode.PROMISE_IN_BOUNDS to be set explicitly"
           )
-    return pl.run_scoped(
-        functools.partial(
-            scoped_pipeline,
-            in_specs=effective_in_specs,
-            in_gmem_refs=in_gmem_refs,
-            out_gmem_refs=out_gmem_refs,
-        ),
-        **get_allocations(*gmem_refs),
-    )
-
-  def get_allocations(*gmem_refs: Any) -> dict[str, Any]:
-    """The buffers and barriers the pipeline scopes for ``gmem_refs``: its
-    SMEM slots, ``max_concurrent_steps`` of each block (fewer where a static
-    grid has fewer steps), and its TMA barriers. ``gmem_refs`` need only
-    their shapes and dtypes, so a caller can size the pipeline's shared
-    memory before it runs (as the warp-specialized pipeline's
-    ``get_allocations`` gives its own)."""
     in_smem_refs, out_smem_refs = util.split_list(
         [
             gpu_core.SMEM(
@@ -416,12 +361,20 @@ def emit_pipeline[T](
             )
             if _in_smem(spec)
             else None
-            for spec, ref in zip(it.chain(in_specs, out_specs), gmem_refs)
+            for spec, ref in zip(
+                it.chain(effective_in_specs, out_specs), gmem_refs
+            )
         ],
         [len(in_specs)],
     )
     copies_per_step = sum(map(_in_smem, in_specs))
-    return dict(
+    return pl.run_scoped(
+        functools.partial(
+            scoped_pipeline,
+            in_specs=effective_in_specs,
+            in_gmem_refs=in_gmem_refs,
+            out_gmem_refs=out_gmem_refs,
+        ),
         in_smem_refs=in_smem_refs,
         out_smem_refs=out_smem_refs,
         barrier_ref=None
@@ -433,8 +386,6 @@ def emit_pipeline[T](
             num_barriers=max_concurrent_steps,
         ),
     )
-
-  pipeline.get_allocations = get_allocations  # pyrefly: ignore[missing-attribute]
 
   def scoped_pipeline(
       *,
@@ -458,31 +409,17 @@ def emit_pipeline[T](
         )
     ]
     copies_per_step = sum(_in_smem(bref.spec) for bref in in_brefs)
-    # Pre-Hopper, a step's fetch overwrites a slot every thread may still be
-    # reading until a warpgroup barrier, and each cp.async copy takes one
-    # (its auto barrier). Fetching at the step's start, after the barrier its
-    # wait ends with, into the slot the previous step read leaves that barrier
-    # the guard and the copies' own barriers no skew to wait out: CUTLASS's
-    # multistage order. The steps in flight beside a step's body are the same
-    # (``max_concurrent_steps - 1``), one fewer fetched before the loop. On an
-    # A100 the fetch after the body left warps waiting at three warpgroup
-    # barriers a step, 13.5% of a dense GEMM's stall samples (Dew 2152).
-    lead = int(
-        is_cp_async and copies_per_step > 0 and max_concurrent_steps > 1
-        and delay_release_levels == [0]
-    )
 
     # Initialize the pipeline.
     indices = (jnp.asarray(0, dtype=jnp.int32),) * len(grid)
     if has_dynamic_grid:
       assert isinstance(num_steps, jax.Array)
       prologue_steps = lax.min(
-          jnp.asarray(max_concurrent_steps - lead, dtype=num_steps.dtype),
-          num_steps,
+          jnp.asarray(max_concurrent_steps, dtype=num_steps.dtype), num_steps
       )
     else:
       assert max_concurrent_steps <= num_steps
-      prologue_steps = max_concurrent_steps - lead
+      prologue_steps = max_concurrent_steps
 
     def prologue(step, fetch_indices):
       for bref in in_brefs:
@@ -498,32 +435,12 @@ def emit_pipeline[T](
     # In the loop body, `max_concurrent_steps` may be larger than `num_steps` in
     # the dynamic grid case. This is fine, since in that case, we will never
     # need to fetch more data anyway.
-    def next_slot(slot):
-      # The ring's slot one step on, carried rather than recomputed as
-      # `step % max_concurrent_steps`. With three stages on an A100 (cp.async),
-      # the remainder in every step left the kernel at 13.3 ms, 8.2 GB of DRAM
-      # reads and 60% tensor-pipe activity; the carried slot, with outputs
-      # bitwise identical, at 9.1 ms, 2.5 GB and 87%.
-      wrapped = slot + 1
-      return jnp.where(wrapped == max_concurrent_steps, 0, wrapped)
+    def loop_body(step, carry, *, wait_count=0):
+      slot = lax.rem(
+          step, jnp.asarray(max_concurrent_steps, dtype=step.dtype)
+      )
+      indices, fetch_index_levels, last_store_indices, prev_body_carry = carry
 
-    def fetch(step, fetch_index_levels, fetch_slots):
-      for delay_release, fetch_indices, fetch_slot in zip(
-          delay_release_levels, fetch_index_levels, fetch_slots
-      ):
-        fetch_step = step + (max_concurrent_steps - delay_release - lead)
-        def do_fetch(fetch_slot=fetch_slot):
-          for bref in in_brefs:
-            if getattr(bref.spec, "delay_release", 0) == delay_release:
-              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
-
-        jax.lax.cond(
-            lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
-            do_fetch,
-            lambda: None,
-        )
-
-    def await_slot(slot, wait_count):
       if barrier_ref is not None:
         # Wait for the current GMEM->SMEM copy to complete, if any.
         gpu_primitives.barrier_wait(barrier_ref.at[slot])
@@ -531,60 +448,11 @@ def emit_pipeline[T](
         # Pre-Hopper: await cp.async copies. The wait-group count must be a
         # compile-time constant, so it is threaded in via ``wait_count``.
         gpu_primitives.wait_gmem_to_smem(wait_count)
-
-    def prefetched_at(indices, slot):
-      assert prefetch is not None
-      return prefetch(
-          indices, *(bref.get_ref_for_slot(slot) for bref in in_brefs)
-      )
-
-    def loop_body(step, carry, *, wait_count=0, next_wait_count=0):
-      (indices, fetch_index_levels, last_store_indices, prev_body_carry,
-       slot, fetch_slots, prefetched) = carry
-
-      if prefetch is None:
-        await_slot(slot, wait_count)
-      # Else the step before awaited this step's slot (its ``boundary``), or
-      # the pipeline did before its first step.
-      if lead:
-        fetch(step, fetch_index_levels, fetch_slots)
       # Wait for the previous output SMEM->GMEM copy to complete.
       if copies_out_in_loop:
         gpu_primitives.wait_smem_to_gmem(
             max_concurrent_steps - 1, wait_read_only=True
         )
-
-      extra: tuple[Any, ...] = ()
-      called = []
-      # The body's own trace: a boundary called under a `lax.cond` branch or a
-      # loop's body traces in another, so its wait would run on some paths or
-      # some iterations alone while the next step skips its own.
-      outer = core.trace_ctx.trace
-      if prefetch is not None:
-        def boundary():
-          if core.trace_ctx.trace is not outer:
-            raise ValueError(
-                "a pipeline body calls its boundary in its own trace, never under"
-                " a cond or a loop: every execution of the step waits once"
-            )
-          if called:
-            raise ValueError("a pipeline body calls its boundary once")
-          called.append(True)
-          following = next_slot(slot)
-
-          def read():
-            if barrier_ref is not None:
-              gpu_primitives.barrier_wait(barrier_ref.at[following])
-            return prefetched_at(_inc_grid_by_1(indices, grid), following)
-
-          if barrier_ref is None:
-            await_slot(following, next_wait_count)
-          # Past the last step no copy fills `following`: neither its barrier
-          # is awaited nor the prefetch run, and the step's own prefetched
-          # values stand in, unused, their registers' layout and types the
-          # prefetch's own (where values made up would lower otherwise).
-          return lax.cond(step + 1 < num_steps, read, lambda: prefetched)
-        extra = (prefetched, boundary)
 
       next_body_carry = body(
           indices,
@@ -593,25 +461,7 @@ def emit_pipeline[T](
               for bref in it.chain(in_brefs, out_brefs)
           ),
           *(prev_body_carry,) if init_carry is not None else (),
-          *extra,
       )
-      next_prefetched = None
-      if prefetch is not None:
-        if not called:
-          raise ValueError(
-              "a pipeline body with prefetch calls its boundary on every path,"
-              " before its last reads of its step's slots: the next step does"
-              " not wait for its slots"
-          )
-        if init_carry is not None:
-          if not (isinstance(next_body_carry, tuple) and len(next_body_carry) == 2):
-            raise ValueError(
-                "a pipeline body with prefetch and a carry returns"
-                " (next_carry, next_prefetched)"
-            )
-          next_body_carry, next_prefetched = next_body_carry
-        else:
-          next_body_carry, next_prefetched = None, next_body_carry
 
       if copies_out_in_loop:
         gpu_primitives.commit_smem()
@@ -646,8 +496,24 @@ def emit_pipeline[T](
       if copies_out_in_loop:
         gpu_primitives.commit_smem_to_gmem_group()
 
-      if not lead:
-        fetch(step, fetch_index_levels, fetch_slots)
+      for delay_release, fetch_indices in zip(
+          delay_release_levels, fetch_index_levels
+      ):
+        fetch_step = step + (max_concurrent_steps - delay_release)
+        fetch_slot = lax.rem(
+            fetch_step,
+            jnp.asarray(max_concurrent_steps, dtype=fetch_step.dtype),
+        )
+        def do_fetch():
+          for bref in in_brefs:
+            if getattr(bref.spec, "delay_release", 0) == delay_release:
+              bref.copy_in(fetch_slot, fetch_indices, barrier_ref)
+
+        jax.lax.cond(
+            lax.bitwise_and(step >= delay_release, fetch_step < num_steps),
+            do_fetch,
+            lambda: None,
+        )
 
       next_fetch_indices_levels = [
           _inc_grid_by_1(fetch_indices, grid)
@@ -658,15 +524,12 @@ def emit_pipeline[T](
           next_fetch_indices_levels,
           new_store_indices,
           next_body_carry if init_carry is not None else None,
-          next_slot(slot),
-          tuple(next_slot(fetch_slot) for fetch_slot in fetch_slots),
-          next_prefetched,
       )
 
     fetch_index_levels = []
     for delay_release in delay_release_levels:
       fetch_indices = indices
-      for _ in range(max_concurrent_steps - delay_release - lead):
+      for _ in range(max_concurrent_steps - delay_release):
         fetch_indices = _inc_grid_by_1(fetch_indices, grid)
       fetch_index_levels.append(fetch_indices)
 
@@ -678,115 +541,54 @@ def emit_pipeline[T](
         else (jnp.array(-1),) * len(bref.spec.block_shape)
         for bref in out_brefs
     ]
-    def run(carry):
-      first_prefetched = None
-      if prefetch is not None:
-        # The first step's slots, awaited before the loop as each later step's
-        # are by the step before it (``boundary``): on cp.async, past the
-        # groups the prologue issued after the first step's (a dynamic grid's
-        # count is not known, so all of them).
-        if is_cp_async:
-          first_wait = 0 if has_dynamic_grid else (
-              (prologue_steps - 1) * copies_per_step
-          )
-          await_slot(jnp.asarray(0, dtype=jnp.int32), first_wait)
-        elif barrier_ref is not None:
-          gpu_primitives.barrier_wait(barrier_ref.at[0])
-        first_prefetched = prefetched_at(
-            indices, jnp.asarray(0, dtype=jnp.int32)
+    init_loop_carry = (
+        indices,
+        fetch_index_levels,
+        last_store_indices,
+        init_carry,
+    )
+    if is_cp_async and copies_per_step > 0:
+      if has_dynamic_grid:
+        steady_steps = lax.max(
+            jnp.zeros_like(num_steps), num_steps - (max_concurrent_steps - 1)
         )
-      init_loop_carry = (
-          indices,
-          fetch_index_levels,
-          last_store_indices,
-          carry,
-          jnp.asarray(0, dtype=jnp.int32),
-          tuple(
-              jnp.asarray(
-                  (max_concurrent_steps - delay_release - lead)
-                  % max_concurrent_steps,
-                  dtype=jnp.int32,
-              )
-              for delay_release in delay_release_levels
-          ),
-          first_prefetched,
-      )
-      if is_cp_async and copies_per_step > 0:
-        if has_dynamic_grid:
-          # A weakly typed literal (the count's dtype under x64 too), not
-          # `zeros_like(num_steps)`, which inherits the count's sharding where
-          # its operands sit on a concrete mesh and binds a reshard of the
-          # literal inside the kernel.
-          steady_steps = jnp.maximum(
-              num_steps - (max_concurrent_steps - 1 - lead), 0
-          )
-        else:
-          steady_steps = max(0, num_steps - (max_concurrent_steps - 1 - lead))
-        steady_wait = (max_concurrent_steps - 1 - lead) * copies_per_step
-        if prefetch is not None:
-          # A steady step's ``boundary`` awaits the next step's slots at the
-          # steady count, as the next step itself would, but the last steady
-          # step's next one is the drain's first, which waits for one group
-          # fewer (no step past the grid fetched): it drains with exact counts.
-          steady_steps = (
-              jnp.maximum(steady_steps - 1, 0) if has_dynamic_grid
-              else max(0, steady_steps - 1)
-          )
-        loop_carry = lax.fori_loop(
-            0,
-            steady_steps,
-            functools.partial(
-                loop_body, wait_count=steady_wait, next_wait_count=steady_wait,
-            ),
-            init_loop_carry,
-        )
-        if has_dynamic_grid:
-          # cp.async.wait_group requires an immediate operand. We await all
-          # in-flight copies upfront to avoid unrolling the drain.
-          # TODO(slebedev): Consider branching on the number of remaining
-          # steps via ``pl.when`` to generate unrolled drain variants with
-          # precise wait counts, recovering the copy-compute overlap.
-          loop_carry = lax.fori_loop(
-              steady_steps,
-              num_steps,
-              functools.partial(loop_body, wait_count=0, next_wait_count=0),
-              loop_carry,
-          )
-        else:
-          # cp.async wait-group must be a compile-time constant. Drain steps are
-          # unrolled with decreasing wait counts (down to 0).
-          for step in range(steady_steps, num_steps):
-            loop_carry = loop_body(
-                jnp.asarray(step),
-                loop_carry,
-                wait_count=(num_steps - 1 - step) * copies_per_step,
-                next_wait_count=max(0, num_steps - 2 - step) * copies_per_step,
-            )
-        last_indices, _, _, final_carry, _, _, _ = loop_carry
       else:
-        last_indices, _, _, final_carry, _, _, _ = lax.fori_loop(
-            0, num_steps, loop_body, init_loop_carry,
+        steady_steps = max(0, num_steps - (max_concurrent_steps - 1))
+      loop_carry = lax.fori_loop(
+          0,
+          steady_steps,
+          functools.partial(
+              loop_body,
+              wait_count=(max_concurrent_steps - 1) * copies_per_step,
+          ),
+          init_loop_carry,
+      )
+      if has_dynamic_grid:
+        # cp.async.wait_group requires an immediate operand. We await all
+        # in-flight copies upfront to avoid unrolling the drain.
+        # TODO(slebedev): Consider branching on the number of remaining steps
+        # via ``pl.when`` to generate unrolled drain variants with precise wait
+        # counts, recovering the copy-compute overlap.
+        loop_carry = lax.fori_loop(
+            steady_steps,
+            num_steps,
+            functools.partial(loop_body, wait_count=0),
+            loop_carry,
         )
-      return last_indices, final_carry
-
-    if prefetch is not None and has_dynamic_grid:
-      # A dynamic grid of no steps fills no slot: its first prefetch and its
-      # loop run under the grid's count, so no prefetch runs and no slot is
-      # read, and only the body's carry crosses the guard. The loop gives its
-      # carry the types its body does (a weak float's promoted to a narrower
-      # one), which the guard's other arm gives the initial carry too.
-      _, carried = jax.eval_shape(run, init_carry)
-
-      def skip(carry):
-        return indices, jax.tree.map(
-            lambda value, aval: lax.convert_element_type(value, aval.dtype),
-            carry,
-            carried,
-        )
-
-      last_indices, final_carry = lax.cond(num_steps > 0, run, skip, init_carry)
+      else:
+        # cp.async wait-group must be a compile-time constant. Drain steps are
+        # unrolled with decreasing wait counts (down to 0).
+        for step in range(steady_steps, num_steps):
+          loop_carry = loop_body(
+              jnp.asarray(step),
+              loop_carry,
+              wait_count=(num_steps - 1 - step) * copies_per_step,
+          )
+      last_indices, _, _, final_carry = loop_carry
     else:
-      last_indices, final_carry = run(init_carry)
+      last_indices, _, _, final_carry = lax.fori_loop(
+          0, num_steps, loop_body, init_loop_carry,
+      )
 
     # Outputs invariant to the sequential axis are never written from inside the
     # loop. This is the only place where we store them.
@@ -807,8 +609,7 @@ def emit_pipeline[T](
       gpu_primitives.wait_smem_to_gmem(0)
     return final_carry if init_carry is not None else None
 
-  # Type checkers do not understand the get_allocations assignment above.
-  return pipeline  # pyrefly: ignore[bad-return]
+  return pipeline
 
 
 class ComputeContext(Protocol):

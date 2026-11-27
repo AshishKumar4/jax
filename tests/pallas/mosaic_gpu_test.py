@@ -167,53 +167,6 @@ def run_on_sm80(method):
   return method
 
 
-class PipelineAllocationsTest(jtu.JaxTestCase):
-  """A pipeline's scoped buffers stated before it runs (`get_allocations`)."""
-
-  @parameterized.parameters(("8.0", None, 3), ("9.0", None, 3), ("9.0", 2, 2))
-  def test_emit_pipeline_states_its_scoped_allocations(
-      self, capability, steps, slots
-  ):
-    # Three steps' slots of each block, as many as a static grid's steps where
-    # it has fewer, and TMA's barriers alone from Hopper on (cp.async before it
-    # waits on its groups).
-    device = jax.sharding.AbstractDevice(
-        device_kind="GPU", num_cores=None, platform="cuda",
-        compute_capability=capability,
-    )
-    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=device)
-    specs = [
-        plgpu.BlockSpec((64, 32), lambda i: (i, 0)),
-        plgpu.BlockSpec((32,), lambda i: (i,)),
-    ]
-    refs = [
-        jax.ShapeDtypeStruct((256, 32), jnp.float16),
-        jax.ShapeDtypeStruct((128,), jnp.float32),
-    ]
-    found = []
-
-    def stated(dynamic):
-      # Within a trace, as a kernel states it: the grid a traced extent
-      # where it is dynamic.
-      pipeline = plgpu.emit_pipeline(
-          lambda *_: None,
-          grid=(dynamic if steps is None else steps,),
-          in_specs=specs,
-          max_concurrent_steps=3,
-      )
-      found.append(pipeline.get_allocations(*refs))
-
-    with jax.sharding.use_abstract_mesh(mesh):
-      jax.make_jaxpr(stated)(jax.ShapeDtypeStruct((), jnp.int32))
-    [allocations] = found
-    self.assertEqual(
-        [(ref.shape, ref.dtype) for ref in allocations["in_smem_refs"]],
-        [((slots, 64, 32), jnp.float16), ((slots, 32), jnp.float32)],
-    )
-    self.assertEqual(allocations["out_smem_refs"], [])
-    self.assertEqual(allocations["barrier_ref"] is None, capability == "8.0")
-
-
 class CtaBarrierLoweringTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
@@ -5277,54 +5230,6 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     x, y = (jnp.arange(128).astype(jnp.float32) for _ in range(2))
     np.testing.assert_array_equal(kernel(x, y), x + y)
-
-  @parameterized.parameters((2, 3, 4), (2, 3, 4, 5))
-  def test_fresh_axis_index(self, *grid):
-    # A squashed grid (more than three axes) unravels its third block coordinate.
-    names = tuple("abcd"[: len(grid)])
-
-    @self.kernel(
-        out_type=jax.ShapeDtypeStruct((*grid, len(grid), 128), jnp.int32),
-        grid=grid,
-        grid_names=names,
-    )
-    def kernel(o_ref):
-      place = tuple(lax.axis_index(name) for name in names)
-      for axis, name in enumerate(names):
-        o_ref[(*place, axis)] = lax.broadcast(
-            plgpu.fresh_axis_index(name), (128,)
-        )
-
-    coordinates = np.stack(
-        np.meshgrid(*map(np.arange, grid), indexing="ij"), axis=-1
-    )
-    np.testing.assert_array_equal(
-        kernel(), np.broadcast_to(coordinates[..., None], (*grid, len(grid), 128))
-    )
-
-  def test_fresh_axis_index_reads_at_each_use(self):
-    # Each fresh read is its own: none is merged with another, so the PTX reads
-    # the coordinate once more for each one more.
-    def reads(count):
-      @self.kernel(
-          out_type=jax.ShapeDtypeStruct((2, 3, 128), jnp.int32),
-          grid=(2, 3),
-          grid_names=("a", "b"),
-      )
-      def kernel(o_ref):
-        total = sum(plgpu.fresh_axis_index("b") for _ in range(count))
-        o_ref[lax.axis_index("a"), lax.axis_index("b")] = lax.broadcast(
-            total, (128,)
-        )
-
-      with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
-        np.testing.assert_array_equal(
-            kernel(),
-            np.broadcast_to(count * np.arange(3)[None, :, None], (2, 3, 128)),
-        )
-      return ptx().count("%ctaid")
-
-    self.assertEqual(reads(3) - reads(1), 2)
 
   @parameterized.product(
       sm_steps=(1, 2, 3),
@@ -10867,46 +10772,6 @@ class PipelineTest(PallasTest):
     np.testing.assert_array_equal(
         kernel(jnp.int32(num_steps), x),
         jnp.full(block_size, num_steps, dtype=dtype)
-    )
-
-  @parameterized.product(num_steps=[0, 1, 5], max_concurrent_steps=[2, 3])
-  @run_on_sm80
-  def test_emit_pipeline_prefetch_over_a_dynamic_grid(
-      self, num_steps, max_concurrent_steps
-  ):
-    # A vector read prefetched across each step's boundary, the last step's
-    # included, lowers natively (its strided fragments carried from step to
-    # step) and gives each step its own block's first row.
-    self.skip_if_wg_semantics()
-    dtype = jnp.float32
-    rows, width = 8, 128
-
-    @self.kernel(
-        out_type=jax.ShapeDtypeStruct((width,), dtype),
-        scratch_types=[plgpu.SMEM((width,), dtype)],
-    )
-    def kernel(num_steps_gmem, x_gmem, o_gmem, acc_ref):
-      acc_ref[...] = jnp.zeros_like(acc_ref)
-
-      def body(_, x_smem, prefetched, boundary):
-        del x_smem
-        acc_ref[...] += prefetched
-        return boundary()
-
-      plgpu.emit_pipeline(
-          body,
-          in_specs=[pl.BlockSpec((rows, width), lambda i: (i, 0))],
-          grid=(num_steps_gmem[...],),
-          max_concurrent_steps=max_concurrent_steps,
-          prefetch=lambda _, x_smem: x_smem[0],
-      )(x_gmem)
-      o_gmem[...] = acc_ref[...]
-
-    blocks = jnp.arange(1, max(num_steps, 1) + 1, dtype=dtype)
-    x = jnp.repeat(blocks, rows)[:, None] * jnp.ones((1, width), dtype)
-    np.testing.assert_array_equal(
-        kernel(jnp.int32(num_steps), x),
-        jnp.full(width, num_steps * (num_steps + 1) / 2, dtype=dtype),
     )
 
   @parameterized.product(num_steps=[0, 5], max_concurrent_steps=[2, 3])

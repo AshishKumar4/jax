@@ -2214,20 +2214,9 @@ def dyn_dot(x, y):
 
 
 def shfl_bfly(x: ir.Value, distance: int | ir.Value):
-  """`x` as the lane `distance` apart in a butterfly holds it."""
-  return _shfl(x, distance, nvvm.ShflKind.bfly)
-
-
-def shfl_idx(x: ir.Value, lane: int | ir.Value):
-  """`x` as lane `lane` of the warp holds it."""
-  return _shfl(x, lane, nvvm.ShflKind.idx)
-
-
-def _shfl(x: ir.Value, value: int | ir.Value, kind: nvvm.ShflKind):
-  """A warp shuffle of `x` of any bitwidth, a 32-bit word at a time."""
   i32 = ir.IntegerType.get_signless(32)
-  if isinstance(value, int):
-    value = c(value, i32)
+  if isinstance(distance, int):
+    distance = c(distance, i32)
   if (result_type := x.type) != i32:
     if (x_bitwidth := bitwidth(x.type)) < 32:  # Pad to 32-bits if necessary.
       assert 32 % x_bitwidth == 0
@@ -2250,7 +2239,7 @@ def _shfl(x: ir.Value, value: int | ir.Value, kind: nvvm.ShflKind):
             dynamic_position=[],
             static_position=ir.DenseI64ArrayAttr.get([i]),
         )
-        y_elem = _shfl(x_elem, value, kind)
+        y_elem = shfl_bfly(x_elem, distance)
         y = vector.insert(
             y_elem,
             y,
@@ -2259,7 +2248,13 @@ def _shfl(x: ir.Value, value: int | ir.Value, kind: nvvm.ShflKind):
         )
       return bitcast(y, result_type)
     x = bitcast(x, i32)
-  y = nvvm.shfl_sync(c(0xFFFFFFFF, i32), x, value, c(0x1F, i32), kind)
+  y = nvvm.shfl_sync(
+      c(0xFFFFFFFF, i32),
+      x,
+      distance,
+      c(0x1F, i32),
+      nvvm.ShflKind.bfly
+  )
   if (x_bitwidth := bitwidth(result_type)) < 32:
     bits_ty = ir.IntegerType.get_signless(x_bitwidth)
     y_vec = bitcast(y, ir.VectorType.get((32 // x_bitwidth,), bits_ty))

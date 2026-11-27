@@ -808,15 +808,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         meshed = self.lower(kernel="context_mesh", mesh=mesh, env=verify)
         self.assertCountEqual(meshed["events"], ["verified", "hit"], meshed)
 
-  def test_a_kernel_that_reads_a_fresh_axis_index_is_keyed_by_its_mesh(self):
-    # Its lowering reads the axis's size and stride (`lowering.axis_index`),
-    # as an `axis_index`'s does.
-    devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
-    abstract = self.lower(kernel="fresh_axis", mesh="abstract2", env=devices)
-    concrete = self.lower(kernel="fresh_axis", mesh="concrete2", env=devices)
-    self.assertEqual(abstract["events"], ["miss"], abstract)
-    self.assertEqual(concrete["events"], ["miss"], concrete)
-
   def test_a_kernel_that_reads_its_mesh_is_keyed_by_it(self):
     devices = {"XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
     abstract = self.lower(kernel="mesh_axis", mesh="abstract2", env=devices)
