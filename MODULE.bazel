@@ -63,18 +63,16 @@ archive_override(
         # cuDNN frontend 1.32.3: the packed d256 attention backward's plan holds 577 MiB of engine workspace
         # where 1.26.0's held 9.68 GB at a 12,288-token call (Dew row 5916).
         "//third_party:xla/cudnn_frontend_1_32_3.patch",
-        # A compile stops after buffer assignment and states its memory (xla_gpu_experimental_early_exit's
-        # EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT): a planner's probe at the cost of the HLO passes alone.
-        "//third_party:xla/early_exit_buffer_assignment.patch",
         # The CUDA plugin serves its executables' metadata (PJRT_ExecutableMetadata_Extension), and the C API
         # client reads their buffer assignment from it into memory_analysis().
         "//third_party:xla/executable_metadata_gpu.patch",
         # FFI handlers that instantiate concurrently (Mosaic GPU's) are instantiated together on the compile
         # threads before thunk emission, a program's Mosaic kernels compiled in parallel.
         "//third_party:xla/instantiate_concurrently.patch",
-        # A compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment: its executable
-        # states its memory and buffer assignment and refuses to run; within the limit it finishes. A start
-        # compiles its step once whether it fits or not.
+        # A compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment: one check there,
+        # whose bytes the executable carries (and serializes), states its memory and buffer assignment and
+        # refuses to run; within the limit it finishes. A start compiles its step once whether it fits or not.
+        # An early exit's overrides are read in every form XLA parses them (IsEarlyExitCompilation).
         "//third_party:xla/memory_limit_early_exit.patch",
         # YNNPACK's unary kernels read an input of any innermost stride as given, a broadcast's stride zero among
         # them, gathering it into a buffer of the call's own: a bf16 convert of a broadcast scalar read past it
@@ -132,14 +130,6 @@ archive_override(
         # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
         # converts a mixed dot's operands (no other pass makes one at this pin).
         "//third_party:xla/mixed_index_dot.patch",
-        # A finished GPU compile serializes no memory limit and its memory stats
-        # say whether it stopped at one, so its bytes are one under any limit it
-        # fits and jax writes no stopped compile to its cache.
-        "//third_party:xla/memory_limit_canonical.patch",
-        # A compile whose entry's arguments and new outputs alone pass its memory
-        # limit is hollowed right after layout assignment: its autotuning and
-        # scheduling run over nothing, and it stops stating those bytes alone.
-        "//third_party:xla/memory_limit_hollow.patch",
         # A rank whose collective kernel fails before its local clique's
         # rendezvous (its scratch past the device's memory) joins it carrying
         # the failure, which its peers return rather than wait for it; and a
@@ -169,6 +159,11 @@ archive_override(
         # row's own selected, where the zero-masked contraction over groups made 0 * inf NaN in every other
         # group's rows (Dew row 13562). Delete when upstream's rewriter selects each row's own group.
         "//third_party:xla/ragged_dot_own_group.patch",
+        # A finished GPU compile serializes no memory limit, and its memory stats
+        # and compiled module say whether it stopped at one (the executable's own
+        # bit), so its bytes are one under any limit it fits and jax writes no
+        # stopped compile to its cache.
+        "//third_party:xla/memory_limit_canonical.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],

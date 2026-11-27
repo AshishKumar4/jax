@@ -455,7 +455,7 @@ def register_xla_runtime_error_handler(
 
 
 def _is_early_exit(compile_options: xc.CompileOptions) -> bool:
-  return getattr(compile_options, "is_early_exit", False)
+  return compile_options.is_early_exit
 
 
 def compile_or_get_cached(
