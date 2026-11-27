@@ -244,13 +244,19 @@ def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
     return {"main": main, "external": outer, "patches": patches}
 
 
-def merged(cells: dict[str, dict]) -> dict:
-    """One machine's record of its build (`SOURCES`): each cell's (`recorded`), by its name, and the patches their
-    one tree applies."""
+def merged(cells: dict[str, dict], commit: str, wheels: list[Path]) -> dict:
+    """One machine's record of its build (`SOURCES`): the commit it checked out and built (`commit`, which a
+    release's tag may not be: an attach names the version, not the tree), each wheel it made by name and digest
+    (`wheels`, which bind the record to the assets it describes, `bound`), each cell's (`recorded`) by its name,
+    and the patches their one tree applies."""
     patches = [cell["patches"] for cell in cells.values()]
     if any(other != patches[0] for other in patches):
         raise ValueError("a build's cells applied different patches")
-    return {"cells": {name: {"main": cell["main"], "external": cell["external"]} for name, cell in cells.items()},
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not wheels:
+        raise ValueError("a build's record names its commit, a full sha, and at least one wheel")
+    return {"commit": commit,
+            "wheels": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest() for wheel in wheels},
+            "cells": {name: {"main": cell["main"], "external": cell["external"]} for name, cell in cells.items()},
             "patches": patches[0] if patches else {}}
 
 
@@ -296,8 +302,15 @@ def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
             held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
             if held.returncode != 0 or digest(held.stdout) != wanted:
                 differing.append(f"{name}: {path}")
+    # A .bzl file anywhere, and any other Starlark file (`starlark`) in a package holding a file a cell read,
+    # changed or added: a BUILD.bazel beside a recorded BUILD takes its place, and a new BUILD file below a
+    # recorded package takes files from its globs, though no recorded byte moves. A package no cell read (a test
+    # package's BUILD) pairs.
+    read_main = {path for cell in record["cells"].values() for path in cell["main"]}
     changed = git("diff", "--name-only", built, commit).split()
-    differing += [f"{path}: Starlark" for path in changed if path.endswith(".bzl")]
+    differing += [f"{path}: Starlark" for path in changed if path.endswith(".bzl") or starlark(path) and any(
+        (package := str(Path(path).parent)) == "." or read == package or read.startswith(f"{package}/")
+        for read in read_main)]
     if differing:
         return sorted(set(differing))
     module = subprocess.run(["git", "show", f"{commit}:MODULE.bazel"], capture_output=True, text=True).stdout
@@ -323,6 +336,24 @@ def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
             if why:
                 differing.append(f"@{name}//{path}: {why}")
     return differing
+
+
+def assets(tag: str) -> dict[str, str]:
+    """Plugin release `tag`'s uploaded files by name: each one's sha256 as GitHub's release API states it ("" where
+    it states none, which binds nothing, `bound`)."""
+    address = f"https://api.github.com/repos/AshishKumar4/jax/releases/tags/{tag}"
+    with urllib.request.urlopen(address, timeout=120) as response:
+        found = json.loads(response.read())
+    return {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in found["assets"]}
+
+
+def bound(record: dict, uploaded: dict[str, str]) -> bool:
+    """Whether a machine's record (`merged`) describes the wheels release assets `uploaded` (`assets`) hold: each
+    wheel it made is there under its name at its digest. An attach uploads each file apart: a record of one build
+    beside another build's wheels of the same version (the first attach's record failed, a rebuild's took its
+    place, its wheels kept by the no-replace upload) pairs nothing."""
+    return bool(record.get("wheels")) and all(uploaded.get(name) == wanted for name, wanted in
+                                              record["wheels"].items())
 
 
 def built_from(tag: str) -> dict[str, dict]:
@@ -358,16 +389,24 @@ def plugins(version: str) -> str:
                  if (match := PLUGINS.match(tag)) and match.group(1) == release and int(match.group(2)) <= int(post)}
     for found in sorted(published, reverse=True):
         tag = published[found]
-        if found == int(post):
-            return tag.removeprefix("refs/tags/")
-        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
-        # A release built since its builds record what they read pairs only through every machine's record, HEAD
-        # holding all of each as it was read; an earlier one, by the path rule below.
-        records = built_from(tag.removeprefix("refs/tags/"))
+        name = tag.removeprefix("refs/tags/")
+        # A release built since its builds record what they read pairs only through every machine's record,
+        # each bound to the wheels the release holds (`bound`), HEAD holding all of each as it was read at the
+        # commit the record names (its tag names the version alone); an earlier one, by the path rule below. Its
+        # own version's release too: a record of another build than its wheels' is no evidence of them.
+        records = built_from(name)
         if records or found > LEGACY_THROUGH:
-            if set(records) == set(MACHINES) and not any(differences(record, tag) for record in records.values()):
-                return tag.removeprefix("refs/tags/")
+            uploaded = assets(name) if records else {}
+            if set(records) != set(MACHINES) or not all(bound(record, uploaded) for record in records.values()):
+                continue
+            for record in records.values():
+                git("fetch", "-q", "--no-tags", "origin", record["commit"])
+            if found == int(post) or not any(differences(record, record["commit"]) for record in records.values()):
+                return name
             continue
+        if found == int(post):
+            return name
+        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
         stack = f"refs/remotes/origin/release/{release}.post{found}"
         git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
         held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
@@ -734,6 +773,8 @@ def main() -> int:
     recording.add_argument("output_base", type=Path)
     recording.add_argument("read", type=Path, help="the cell's queries' output")
     merging = commands.add_parser("merged", help="a machine's cells' records, as sources-<machine>.json")
+    merging.add_argument("commit", help="the commit the build checked out (its commit.txt)")
+    merging.add_argument("dist", type=Path, help="the directory of the wheels it made")
     merging.add_argument("cells", type=Path, nargs="+", help="each cell's record, named <cell>.json")
     commands.add_parser("native").add_argument("release")
     indexing = commands.add_parser("index")
@@ -777,7 +818,8 @@ def main() -> int:
                          sort_keys=True))
         return 0
     if args.command == "merged":
-        print(json.dumps(merged({path.stem: json.loads(path.read_text()) for path in args.cells}), sort_keys=True))
+        print(json.dumps(merged({path.stem: json.loads(path.read_text()) for path in args.cells}, args.commit,
+                                sorted(args.dist.glob("*.whl"))), sort_keys=True))
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))

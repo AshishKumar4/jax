@@ -137,26 +137,34 @@ if [ -n "${DEW_PLUGIN_TESTS_BUILT:-}" ]; then
   done
 fi
 # What one cell's build read (row 5670), taken right after it, its repositories as it fetched them, before the next
-# cell's options fetch others: its configured source files (cquery, which reads the `build` options build.py wrote
-# to .jax_configure.bazelrc and the cell's own), the BUILD and .bzl files loaded for them (query, which reads no
-# `build` option, given every --repo_env cquery announced, so it fetches the cell's repositories and no other), and
-# its repositories' markers and the lockfile (`patch_stack.py record`). A query that fails fails the build: a record
-# short of a file would pair a release that changed it.
+# cell's options fetch others. Its configured source files by cquery under each wheel's own invocation as build.py
+# ran it (its log's [EXECUTING] lines: the options build.py appends itself, --config=cuda_libraries_from_stubs among
+# them, beside the `build` options it wrote to .jax_configure.bazelrc, which cquery reads too); the BUILD and .bzl
+# files loaded for them (query, which reads no `build` option, given every --repo_env cquery announced, so it
+# fetches the cell's repositories and no other); and its repositories' markers and the lockfile
+# (`patch_stack.py record`). A query that fails fails the build: a record short of a file would pair a release that
+# changed it.
 record_cell() {
-  local python=$1 cuda=$2 config=$3 wheels=$4 cell="cp${1/./}-cuda$2" targets="" wheel envs
-  for wheel in ${wheels//,/ }; do
-    case $wheel in
-      jaxlib) targets="$targets + //jaxlib/tools:jaxlib_wheel" ;;
-      jax-cuda-plugin) targets="$targets + //jaxlib/tools:jax_cuda${cuda}_plugin_wheel" ;;
-      jax-cuda-pjrt) targets="$targets + //jaxlib/tools:jax_cuda${cuda}_pjrt_wheel" ;;
-    esac
-  done
-  targets=${targets# + }
+  local cell="cp${1/./}-cuda$2" invocations options target targets="" envs
   mkdir -p "$out/read"
-  "${DEW_BAZEL:-bazel}" cquery --config="$config" --repo_env=HERMETIC_PYTHON_VERSION="$python" \
-    --repo_env=ML_WHEEL_TYPE=release --repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" --announce_rc \
-    --consistent_labels --output=label "kind('source file', deps($targets))" > "$out/read/$cell.txt" \
-    2> "$out/read/$cell.log" || { tail -20 "$out/read/$cell.log"; return 1; }
+  : > "$out/read/$cell.txt"
+  : > "$out/read/$cell.log"
+  invocations=$(python3 - "$out/plugin-$cell.log" <<'PY'
+import re, shlex, sys
+for line in open(sys.argv[1], errors="replace"):
+    if found := re.search(r"\[EXECUTING\] \S+ build (.*)$", line):
+        words = shlex.split(found[1])
+        print(" ".join(map(shlex.quote, words[:-1])) + "\t" + words[-1])
+PY
+)
+  [ -n "$invocations" ] || { echo "build_plugin: no wheel build in $out/plugin-$cell.log to record" >&2; return 1; }
+  while IFS=$'\t' read -r options target; do
+    targets="$targets${targets:+ + }$target"
+    # shellcheck disable=SC2086 # Each option its own word, as build.py gave it.
+    eval "\"\${DEW_BAZEL:-bazel}\" cquery $options --announce_rc --consistent_labels --output=label" \
+      "\"kind('source file', deps($target))\"" >> "$out/read/$cell.txt" 2>> "$out/read/$cell.log" ||
+      { tail -20 "$out/read/$cell.log"; return 1; }
+  done <<< "$invocations"
   envs=$(grep -oE -- "--repo_env[= ][^ ']+" "$out/read/$cell.log" | sed -E 's/^--repo_env[= ]/--repo_env=/' | sort -u)
   # shellcheck disable=SC2086 # Each announced --repo_env its own word.
   "${DEW_BAZEL:-bazel}" query $envs --consistent_labels --output=label "buildfiles(deps($targets))" \
@@ -186,7 +194,7 @@ for python in $pythons; do
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
-    [ "$code" != 0 ] || record_cell "$python" "$cuda" "$config" "$wheels" || code=$?
+    [ "$code" != 0 ] || record_cell "$python" "$cuda" || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
     # Each error with the lines after it, where Bazel says why (an analysis failure's "Error in fail: ..." follows
     # its "ERROR: ... in <rule> rule" line, 2026-11-18: two red builds said only that the rule failed).
@@ -197,7 +205,8 @@ done
 # What the build read, each cell's (row 5670), merged: a later release ships beside these plugins only where it holds
 # every file of every cell's as read (`patch_stack.py plugins`). DEW_PATCH_STACK names patch_stack.py where this
 # script is staged apart from it (a fleet job's extra/).
-python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" merged "$out"/read/*.json > "$out/sources-$(uname -m).json"
+python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" merged "$(cat "$out/commit.txt")" "$out/dist" "$out"/read/*.json \
+  > "$out/sources-$(uname -m).json"
 # Every wheel carries VERSION, or none is published: an OUT reused with an older build's wheels fails here,
 # before anything is summed or attached.
 for wheel in "$out"/dist/*.whl; do
