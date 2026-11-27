@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import types
 import threading
 import unittest
 from unittest import mock
@@ -558,8 +559,9 @@ class CompilationCacheTest(CompilationCacheTestCase):
   def test_hosts_share_a_compile_by_its_key_and_the_limit_it_takes(self):
     # The disk cache keys a compile without its limit; what hosts share, and a
     # process keeps, is keyed by the limit the compile takes too (its last
-    # override, its debug option, XLA_FLAGS'), and by nothing else a host may
-    # set alone (a dump directory).
+    # override, else its debug option, which XLA_FLAGS set as the options were
+    # made: an explicit 0, no limit, is never read past to XLA_FLAGS' value),
+    # and by nothing else a host may set alone (a dump directory).
     def options(*limits):
       found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
       found.env_option_overrides = [
@@ -574,12 +576,20 @@ class CompilationCacheTest(CompilationCacheTestCase):
     debug_options = debug.executable_build_options.debug_options
     debug_options.xla_gpu_memory_limit_early_exit_bytes = 7
     self.assertEqual(compiler._shared_key("key", debug), "key-limit7")
-    for flags, shared in (
-        ("--xla_dump_to=/host0", "key-limit0"),
-        ("--xla_dump_to=/host1 --xla_gpu_memory_limit_early_exit_bytes=9",
-         "key-limit9")):
+    unlimited = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    build_options = unlimited.executable_build_options
+    build_options.debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
+    for flags in ("--xla_dump_to=/host0",
+                  "--xla_dump_to=/host1"
+                  " --xla_gpu_memory_limit_early_exit_bytes=1"):
       with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
-        self.assertEqual(compiler._shared_key("key", options()), shared)
+        self.assertEqual(compiler._shared_key("key", unlimited), "key-limit0")
+    # A jaxlib without the option (a stock one) keys by overrides alone.
+    stock = types.SimpleNamespace(
+        env_option_overrides=[],
+        executable_build_options=types.SimpleNamespace(
+            debug_options=types.SimpleNamespace()))
+    self.assertEqual(compiler._shared_key("key", stock), "key-limit0")
 
   @jtu.run_on_devices("gpu")
   def test_a_finished_compile_is_read_under_any_limit(self):
