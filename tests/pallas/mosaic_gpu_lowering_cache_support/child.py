@@ -502,6 +502,9 @@ def run(case):
   if case.get("mode") == "jaxpr once":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"jaxpr once": encoder_cases.jaxpr_once()}
+  if case.get("mode") == "declared":
+    from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
+    return {"declared": encoder_cases.declared()}
   if case.get("mode") == "rules":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"rules": encoder_cases.rules()}

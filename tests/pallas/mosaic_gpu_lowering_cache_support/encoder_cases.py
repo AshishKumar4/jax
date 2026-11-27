@@ -146,16 +146,10 @@ def cases():
        np.asfortranarray(np.arange(4.).reshape(2, 2).T), "different"),
       ("array writeability", np.arange(2.), np.arange(2.).view(), "equal"),
       ("array read-only", np.arange(2.), _read_only(np.arange(2.)), "different"),
-      # An array a callable holds (an inline_mgpu body's closure, a partial's
-      # argument) may be read for anything of it: none is encoded.
-      ("a callable holding an array", functools.partial(lax.add, np.arange(2.)),
-       functools.partial(lax.add, np.arange(2.)), "uncacheable"),
-      ("a callable holding a scalar", functools.partial(lax.add, 2.0),
-       functools.partial(lax.add, 2.0), "equal"),
-      # A dict a callable holds, in another order: the callable may iterate it.
-      ("a callable's dict in another order",
-       functools.partial(lax.add, y={"a": 1, "b": 2}),
-       functools.partial(lax.add, y={"b": 2, "a": 1}), "different"),
+      # A program's Python callable, which its lowering runs and which may emit
+      # from anything it observes: never cached, whatever it holds.
+      ("a program's callable", functools.partial(lax.add, 1),
+       functools.partial(lax.add, 1), "uncacheable"),
       ("a dict in another order", {"a": 1, "b": 2}, {"b": 2, "a": 1}, "equal"),
       ("weak and strong type", jax_core.ShapedArray((), f32, weak_type=True),
        jax_core.ShapedArray((), f32, weak_type=False), "different"),
@@ -289,3 +283,19 @@ def rules():
       "how many": len(discharged),
       "no rule": outcome(linalg.cholesky_p),
   }
+
+
+def declared():
+  """Whether each form of a callable an inline_mgpu body may take runs code of
+  a declared package (`lowering_cache_encoding._declared`): what runs, not its
+  wrapper. This process declares none."""
+  from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as cache_encoding  # pylint: disable=g-import-not-at-top
+
+  forms = {
+      "a function": lax.add,
+      "a partial": functools.partial(lax.add, 1),
+      "a jitted function": jax.jit(lax.add),
+      "a callable object": jnp.add,
+      "a partial of a callable object": functools.partial(jnp.add, 1),
+  }
+  return {name: cache_encoding._declared(form) for name, form in forms.items()}

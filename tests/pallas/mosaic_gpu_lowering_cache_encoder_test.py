@@ -65,5 +65,15 @@ class RulesTest(harness.LoweringCacheTestCase):
     self.assertEqual(result["no rule"], "refused")
 
 
+class DeclaredTest(harness.LoweringCacheTestCase):
+
+  def test_what_an_inline_body_runs_is_checked_not_its_wrapper(self):
+    # A function, and what a partial, a jitted function or a callable object
+    # runs: none of a declared package here, so none is admitted.
+    found = self.run_child(mode="declared")["declared"]
+    self.assertEqual(found, dict.fromkeys(found, False))
+    self.assertLen(found, 5)
+
+
 if __name__ == "__main__":
   absltest.main()

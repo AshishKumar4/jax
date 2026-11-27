@@ -115,10 +115,17 @@ Remember to align the itemized text with the first line of an item within a list
     CUDA plugin files (each must match its wheel's `RECORD`) and what the
     lowering is given, encoded strictly: the kernel's jaxpr, params and avals,
     the GPU and what the process says of its devices, every `jax.config` value,
-    the rules registered for the lowering, and the lowering's constants. What
-    can be seen to differ from the installed code (a file that is not its
-    wheel's, an unsealed rule or constant) or cannot be encoded exactly (a
-    layout class of the user's) is lowered afresh, and counted by the
+    and the rules registered for the lowering. The cache assumes the
+    lowering's module constants hold their installed values, and that rule
+    registration is done before a cached lowering: a rule replaced, even for a
+    moment, while another thread lowers through the cache is out of contract.
+    What can be seen to differ from the installed code (a file that is not its
+    wheel's, an unsealed rule) or cannot be encoded exactly (a layout class of
+    the user's, a kernel holding a Python callable its lowering runs, such as
+    an `inline_mgpu` body, but one of a package the process declares in
+    `JAX_PALLAS_LOWERING_CACHE_SOURCES`, which promises its emission follows
+    from its inputs' values alone) is
+    lowered afresh, and counted by the
     `/jax/pallas/mosaic_gpu/lowering_cache/*` {mod}`jax.monitoring` events. A
     process that rebinds functions of JAX is out of contract, and is not
     detected. A cached lowering carries no source locations, whether it is a
