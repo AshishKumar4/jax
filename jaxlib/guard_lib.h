@@ -106,6 +106,13 @@ absl::Status ApplyTransferGuardToDeviceToDevice(
 absl::Status ApplyTransferGuardToDeviceToHost(
     absl::FunctionRef<std::string()> formatter);
 
+// Guards a host read that copies nothing (a CPU buffer read in place) as the
+// device-to-host transfer it stands for: one inside an explicit device_put
+// (its value read to be sent to another client's device) is explicit as well
+// as one inside an explicit device_get.
+absl::Status ApplyTransferGuardToInPlaceHostRead(
+    absl::FunctionRef<std::string()> formatter);
+
 // Returns the garbage collection guard level for "jax.Array" objects.
 // Protected by the GIL in GIL mode, and by ft_mutex in free-threaded mode.
 GarbageCollectionGuardLevel GetGarbageCollectArrayGuard();

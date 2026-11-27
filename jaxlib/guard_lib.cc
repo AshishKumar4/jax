@@ -190,6 +190,28 @@ absl::Status ApplyTransferGuardToDeviceToHost(
   return absl::OkStatus();
 }
 
+absl::Status ApplyTransferGuardToInPlaceHostRead(
+    absl::FunctionRef<std::string()> formatter) {
+  auto level = thread_local_state.device_to_host;
+  if (!level.has_value()) {
+    ft_lock_guard lock(global_state_mu);
+    level = global_state.device_to_host;
+  }
+  switch (GetTransferGuardAction(level.value_or(kDefaultGuardLevel),
+                                 thread_local_state.explicit_device_get ||
+                                     thread_local_state.explicit_device_put)) {
+    case TransferGuardAction::kAllow:
+      break;
+    case TransferGuardAction::kLog:
+      LOG(WARNING) << "device-to-host transfer: " << formatter();
+      break;
+    case TransferGuardAction::kDisallow:
+      return xla::InvalidArgument("Disallowed device-to-host transfer: %s",
+                                  formatter());
+  }
+  return absl::OkStatus();
+}
+
 GarbageCollectionGuardLevel GetGarbageCollectArrayGuard() {
   auto level = thread_local_state.garbage_collect_array;
   if (!level.has_value()) {
