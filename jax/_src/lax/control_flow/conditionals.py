@@ -504,9 +504,9 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     in_batched  = [True] * len(branches[0].in_avals)
     out_batched = [True] * len(branches[0].out_avals)
 
-    branches_batched = [
-        batching.batch_jaxpr(jaxpr, axis_data, in_batched, out_batched)[0]
-        for jaxpr in branches]
+    branches_batched, branches_out_bat = unzip2(
+        batching.batch_jaxpr(jaxpr, axis_data, in_batched, out_batched)
+        for jaxpr in branches)
 
     branch_outs = []
     for i, jaxpr in enumerate(branches_batched):
@@ -516,7 +516,8 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
       ops_ = [_bcast_select(predicate, x, lax.stop_gradient(x)) for x in ops]
       branch_outs.append(core.jaxpr_as_fun(jaxpr)(*ops_))
     out = [_bcast_select_n(index, *outs) for outs in zip(*branch_outs)]
-    return out, [0 if b else None for b in out_batched]
+    return out, batching.staged_dims([0 if b else None for b in out_batched],
+                                     *branches_out_bat)
   else:
     ops_bat = [d is not None for d in op_dims]
     ops = [batching.moveaxis(x, d, 0) if b else x
@@ -530,7 +531,8 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
         batching.batch_jaxpr(jaxpr, axis_data, ops_bat, out_bat)[0]
         for jaxpr in branches)
 
-    out_dims = [0 if b else None for b in out_bat]
+    out_dims = batching.staged_dims([0 if b else None for b in out_bat],
+                                    *branches_out_bat)
     out = cond_p.bind(index, *ops, branches=branches_batched,
                       **params)
     return out, out_dims
@@ -1124,22 +1126,26 @@ def _cond_to_lojax(pred, *hi_args, branches, **kwds):
 
 cond_p.to_lojax = _cond_to_lojax
 
-def _platform_branch_lowering(ctx, jaxpr, args):
-  """`jaxpr`, a platform_dependent conditional's one kept branch, lowered in
-  place of the conditional."""
-  ordered_effects = list(effects.ordered_effects.filter_in(jaxpr.effects))
-  tokens_in = ctx.tokens_in.subset(ordered_effects)
-  consts = mlir.ir_consts(jaxpr.consts, [v.aval for v in jaxpr.constvars])
-  out_vals, tokens_out = mlir.jaxpr_subcomp(
-      ctx.module_context, jaxpr, ctx.name_stack.extend('platform'), tokens_in,
+def _cond_branch_lowering(ctx, jaxpr, name_stack, tokens_in, args, *,
+                          module_context=None):
+  """`jaxpr`, one branch of a conditional, lowered at the insertion point (for
+  `module_context`'s platforms, the conditional's where None): its outputs and
+  the tokens its ordered effects leave."""
+  consts = mlir.ir_consts(
+      jaxpr.consts, [v.aval for v in jaxpr.constvars],
+      const_lowering=ctx.const_lowering)
+  return mlir.jaxpr_subcomp(
+      module_context or ctx.module_context, jaxpr, name_stack, tokens_in,
       consts, *args, dim_var_values=ctx.dim_var_values,
       const_lowering=ctx.const_lowering, outer_traceback=ctx.traceback)
-  ctx.set_tokens_out(tokens_out)
-  return [mlir.lower_with_sharding_in_types(ctx, o, aval)
-          for o, aval in zip(out_vals, ctx.avals_out)]
 
 
 def _cond_lowering(ctx, index, *args, branches, **params):
+  # The tokens of every branch's ordered effects, the conditional's own: a
+  # branch the lowering platforms drop (a platform_dependent's CPU branch
+  # calling back to the host, lowered for a GPU) still states its effects in
+  # the conditional's, so the kept branches pass those tokens through.
+  joined_effects = core.join_effects(*(branch.effects for branch in branches))
   # The lowering platforms of each branch, if this is a multi-platform
   # lowering of a `platform_dependent` conditional.
   branches_lowering_platforms: list[tuple[str, ...]] | None = None
@@ -1162,31 +1168,39 @@ def _cond_lowering(ctx, index, *args, branches, **params):
       else:
         assert False, p
 
-    if len(branches_kept) == 1:
-      # Inline the sole surviving branch: its index cannot affect execution on
-      # the selected platforms.
-      return _platform_branch_lowering(ctx, branches_kept[0], args)
+    if len(branches_kept) > 1:
+      # Compute the new index into branches_keep
+      i32_type = ir.RankedTensorType.get([], mlir.dtype_to_ir_type(dtypes.dtype(np.int32)))
+      kept_index_case_op = hlo.CaseOp([i32_type],
+                                      index=index,
+                                      num_branches=len(branches))
+      for i in range(len(branches)):
+        branch = kept_index_case_op.regions[i].blocks.append()
+        with ir.InsertionPoint(branch):
+          kept_i = np.int32(index_to_kept_index.get(i, 0))
+          hlo.return_([mlir.ir_constant(kept_i)])
 
-    # Compute the new index into branches_keep
-    i32_type = ir.RankedTensorType.get([], mlir.dtype_to_ir_type(dtypes.dtype(np.int32)))
-    kept_index_case_op = hlo.CaseOp([i32_type],
-                                    index=index,
-                                    num_branches=len(branches))
-    for i in range(len(branches)):
-      branch = kept_index_case_op.regions[i].blocks.append()
-      with ir.InsertionPoint(branch):
-        kept_i = np.int32(index_to_kept_index.get(i, 0))
-        hlo.return_([mlir.ir_constant(kept_i)])
-
-    index = kept_index_case_op
+      index = kept_index_case_op
     branches = branches_kept
     branches_lowering_platforms = [tuple(ps) for ps in kept_platforms]
     assert branches, "platform_index lowering should have failed first"
 
-  joined_effects = core.join_effects(*(branch.effects for branch in branches))
   ordered_effects = list(effects.ordered_effects.filter_in(joined_effects))
   num_tokens = len(ordered_effects)
   tokens_in = ctx.tokens_in.subset(ordered_effects)
+  name_stack = ctx.name_stack.extend('cond')
+  if len(branches) == 1:
+    # One branch, as where a platform_dependent's lowering platforms keep one,
+    # is the computation, with no conditional around it. A conditional would
+    # compute its index at run time from a case of constants, and XLA keeps a
+    # conditional whose branch holds collectives, so every platform_dependent
+    # around a collective (the cotangent conditionals AD makes of it included)
+    # would reach the compiled program as a conditional fed by a conditional.
+    outputs, tokens_out = _cond_branch_lowering(
+        ctx, branches[0], name_stack.extend('branch_0_fun'), tokens_in, args)
+    ctx.set_tokens_out(tokens_out)
+    return [mlir.lower_with_sharding_in_types(ctx, o, aval)
+            for o, aval in zip(outputs, ctx.avals_out)]
   output_token_types = [mlir.token_type() for _ in ordered_effects]
   output_types = [
       *output_token_types, *map(partial(mlir._aval_to_ir_types, ctx.module_context), ctx.avals_out)]
@@ -1197,7 +1211,6 @@ def _cond_lowering(ctx, index, *args, branches, **params):
   # captures.
   case_op = hlo.CaseOp(flat_output_types, index=index,
                        num_branches=len(branches))
-  name_stack = ctx.name_stack.extend('cond')
   for i, jaxpr in enumerate(branches):
     branch = case_op.regions[i].blocks.append()
     # Lower each branch of a multi-platform `platform_dependent` only for the
@@ -1209,14 +1222,9 @@ def _cond_lowering(ctx, index, *args, branches, **params):
         else ctx.module_context
     )
     with ir.InsertionPoint(branch):
-      consts = mlir.ir_consts(
-          jaxpr.consts, [v.aval for v in jaxpr.constvars],
-          const_lowering=ctx.const_lowering)
-      out_vals, tokens_out = mlir.jaxpr_subcomp(
-          branch_module_context, jaxpr, name_stack.extend(f'branch_{i}_fun'),
-          tokens_in, consts, *args,
-          dim_var_values=ctx.dim_var_values, const_lowering=ctx.const_lowering,
-          outer_traceback=ctx.traceback)
+      out_vals, tokens_out = _cond_branch_lowering(
+          ctx, jaxpr, name_stack.extend(f'branch_{i}_fun'), tokens_in, args,
+          module_context=branch_module_context)
       out_tokens = [tokens_out.get(eff) for eff in ordered_effects]
       out_vals = [*out_tokens, *out_vals]
       flat_out_vals, _ = mlir.ir_tree_registry.flatten(out_vals)

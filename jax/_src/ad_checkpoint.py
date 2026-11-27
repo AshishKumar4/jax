@@ -39,6 +39,7 @@ from jax._src.interpreters.remat import remat_transform, reduce_precision as rem
 from jax._src.hijax import HiPrim, call_hi_primitive_p, Static
 from jax._src.lax import lax as lax_internal
 from jax._src.lax import convolution as lax_convolution
+from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.state import discharge
 from jax._src.state.types import AbstractRef
@@ -686,6 +687,15 @@ def _insert_reduce_precision(jaxpr: core.Jaxpr, num_res: int) -> core.Jaxpr:
       if (eqn.primitive == lax_internal.reduce_precision_p and
           eqn.params == params):
         continue
+      if eqn.primitive is name_p and isinstance(eqn.invars[0], core.Var):
+        # A named residual is reduced before it is named, so its name tags
+        # the op defining the residual's buffer (`_name_lowering`).
+        new_eqn = core.new_jaxpr_eqn(
+            [eqn.invars[0]], [newvar], lax_internal.reduce_precision_p, params,
+            set(), eqn.source_info, eqn.ctx)
+        eqns[eqn_idx] = eqn.replace(invars=[newvar])
+        eqns.insert(eqn_idx, new_eqn)
+        continue
       replace_eqn = eqn.replace(outvars=[v_ if v_ != v else newvar
                                          for v_ in eqn.outvars])
       new_eqn = core.new_jaxpr_eqn(
@@ -928,8 +938,60 @@ def name_jvp(primals, tangents, *, name):
   return name_p.bind(x, name=name), xdot  # don't name the tangent value
 ad.primitive_jvps[name_p] = name_jvp
 
+def _name_lowering(ctx, x, *, name):
+  # The value's defining op carries its names (frontend attribute
+  # `checkpoint_name`, comma-separated), which XLA keeps on the instruction
+  # defining its buffer: a compile's live buffers name the residuals a policy
+  # saves (`Compiled.buffer_assignment`). A parameter has no defining op to
+  # carry them.
+  # A reshape holds its operand's elements in their order, and XLA makes most
+  # reshapes bitcasts of their operand's buffer, folding reshapes of reshapes
+  # into one, so the instruction defining the buffer is the operand's producer
+  # and the reshape that carried the name is gone: the producer is named too,
+  # through each reshape in turn. This is approximate: a reshape XLA copies
+  # keeps its own name and its operand's buffer is named beside it, though the
+  # two are allocations of their own. A producer of several results (a
+  # custom call's, a variadic sort's) is not named, since XLA reads one
+  # instruction's attribute for each of its results' buffers. A sharding
+  # constraint is no defining op: XLA replaces it and keeps only its sharding,
+  # so its operand's producer carries the names (`mlir._get_owner`).
+  del ctx
+  op = _defining(x)
+  while op is not None and _one_array(op):
+    _named(op, name)
+    if op.name != "stablehlo.reshape":
+      break
+    op = _defining(op.operands[0])
+  return [x]
+
+def _defining(value):
+  """The operation defining ``value``, through any sharding constraint on it
+  (`mlir._get_owner`); None for a block's argument (a parameter, a loop's
+  carry), which no operation defines."""
+  op = mlir._get_owner(value)
+  return op if isinstance(op, ir.Operation) else None
+
+def _one_array(op):
+  """Whether ``op`` makes one result, an array: its buffer is that result's."""
+  return len(op.results) == 1 and not isinstance(op.results[0].type, ir.TupleType)
+
+def _named(op, name):
+  """``op`` with ``name`` among its ``checkpoint_name`` names, once."""
+  attributes = (
+      {a.name: a.attr for a in ir.DictAttr(op.attributes["mhlo.frontend_attributes"])}
+      if "mhlo.frontend_attributes" in op.attributes else {})
+  held = attributes.get("checkpoint_name")
+  names = tuple(ir.StringAttr(held).value.split(",")) if held else ()
+  if name in names:
+    return
+  attributes["checkpoint_name"] = ir.StringAttr.get(",".join((*names, name)))
+  op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(attributes)
+
+# Lowered in its caller's function, not a cached one of its own, where its
+# operand would be an argument with no defining op to tag (as
+# `xla_metadata_value_p`'s rule is).
 mlir.register_lowering(
-    name_p, lambda ctx, x, *, name: [x],
+    name_p, _name_lowering, cacheable=False,
     shard_map_collective_rule=lambda *_, **__: None)
 
 def name_batcher(args, dims, *, name):

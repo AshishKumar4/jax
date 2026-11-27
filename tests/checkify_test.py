@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import concurrent.futures
+import contextlib
 from functools import partial
 import unittest
 
@@ -31,6 +32,7 @@ from jax._src import core
 from jax._src.interpreters import ad
 from jax._src import test_util as jtu
 from jax._src.checkify import JaxRuntimeError, FailedCheckError, ErrorEffect, OOBError
+import jax.extend as jex
 import jax.numpy as jnp
 
 config.parse_flags_with_absl()
@@ -605,6 +607,73 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     self.assertIsNotNone(b_err.get())
     self.assertEqual(b_err.get(), expected_err)
 
+  @parameterized.product(
+      context=[True, False], check_first=[False, True],
+      manual=[("b",), ("a", "b")])
+  def test_check_flows_into_partially_manual_shard_map(
+      self, context, check_first, manual):
+    # A check whose error reaches a shard_map, manual over some of a mesh's
+    # axes or all of them, under a context mesh or with the mesh given.
+    mesh = jtu.create_mesh((2, 2), ("a", "b"),
+                           axis_types=(jax.sharding.AxisType.Auto,) * 2)
+    spec = P(manual)
+
+    def f(x):
+      if check_first:
+        checkify.check(jnp.all(x > -1.0), "x must be above -1")
+      mapped = partial(jax.shard_map, axis_names=set(manual), in_specs=spec,
+                       out_specs=spec)
+      doubled = (mapped if context else partial(mapped, mesh=mesh))(
+          lambda y: y * 2.0)
+      return doubled(x)
+
+    x = jnp.arange(8, dtype=jnp.float32)
+    with jax.set_mesh(mesh) if context else contextlib.nullcontext():
+      error, out = jax.jit(checkify.checkify(f))(x)
+      failed, _ = jax.jit(checkify.checkify(f))(x - 10.0)
+    error.throw()
+    self.assertArraysEqual(out, 2.0 * x)
+    if check_first:
+      self.assertIsNotNone(failed.get())
+      self.assertIn("x must be above -1", failed.get())
+
+  @parameterized.product(construct=["scan", "while", "cond"],
+                         nested=[False, True])
+  def test_a_check_in_a_shard_map_in_a_loop_or_a_cond(self, construct, nested):
+    # A check under a shard_map (nested in another, over the mesh's other
+    # axis) in a loop's body or a cond's branch: the shard_map's errors, one a
+    # shard, carried as the scalar error the loop or cond was given.
+    mesh = jtu.create_mesh((2, 2), ("a", "b"))
+
+    def checked(y):
+      checkify.check(jnp.all(y > 0.0), "y must be positive")
+      return y * 2.0
+
+    mapped = jax.shard_map(checked, mesh=mesh, in_specs=P("a", "b"),
+                           out_specs=P("a", "b"))
+    if nested:
+      # The inner shard_map's mesh the outer's body's context, axis "a" manual.
+      inner = jax.shard_map(checked, in_specs=P("b"), out_specs=P("b"),
+                            axis_names={"b"})
+      mapped = jax.shard_map(inner, mesh=mesh, in_specs=P("a"),
+                             out_specs=P("a"), axis_names={"a"})
+
+    def f(x):
+      if construct == "scan":
+        return lax.scan(lambda c, _: (mapped(c), None), x, length=2)[0]
+      if construct == "while":
+        return lax.while_loop(lambda c: c[0] < 2,
+                              lambda c: (c[0] + 1, mapped(c[1])), (0, x))[1]
+      return lax.cond(x[0, 0] > -100.0, mapped, lambda y: y, x)
+
+    x = jnp.arange(1.0, 17.0).reshape(4, 4)
+    error, out = jax.jit(checkify.checkify(f))(x)
+    error.throw()
+    self.assertArraysEqual(out, x * (2.0 if construct == "cond" else 4.0))
+    failed, _ = jax.jit(checkify.checkify(f))(x - 5.0)
+    self.assertIsNotNone(failed.get())
+    self.assertIn("y must be positive", failed.get())
+
   def test_empty_enabled_errors(self):
     def multi_errors(x):
       x = x/0         # DIV
@@ -1067,6 +1136,28 @@ class CheckifyTransformTests(jtu.JaxTestCase):
     f = checkify.checkify(jax.grad(summify(jax.remat(
         partial(partial, jax.lax.map)(lambda x: jnp.sin(x * y))))))
     f(jnp.array([3.]))  # don't crash
+
+  @parameterized.parameters(True, False)
+  def test_call_primitive_checks_within_and_is_kept(self, jit):
+    # A primitive create_call_primitive makes, as a library marks a span with:
+    # checkify checks within its body and keeps the call.
+    marked_p = jex.core.create_call_primitive("marked")
+
+    def marked(x):
+      body = jax.make_jaxpr(jnp.log)(x)
+      return marked_p.bind(x, call_jaxpr=body)[0]
+
+    checked = checkify.checkify(marked, errors=checkify.nan_checks)
+    if jit:
+      checked = jax.jit(checked)
+    err, out = checked(jnp.float32(-1.))
+    self.assertIsNotNone(err.get())
+    err, out = checked(jnp.float32(1.))
+    self.assertIsNone(err.get())
+    self.assertEqual(out, 0.)
+    jaxpr = jax.make_jaxpr(checkify.checkify(marked, errors=checkify.nan_checks))(
+        jnp.float32(1.))
+    self.assertIn(marked_p, {eqn.primitive for eqn in jaxpr.eqns})
 
   def test_while_loop_leaks(self):
     def f(x):

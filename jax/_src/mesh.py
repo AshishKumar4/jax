@@ -453,26 +453,37 @@ class AbstractDevice:
   device_kind: str
   num_cores: int | None
   platform: str
+  # A GPU's compute capability (e.g. "8.0"): the architecture that lowering for
+  # this device targets where no such device is attached (Mosaic GPU's).
+  compute_capability: str | None = None
 
   def __repr__(self):
     return (f"AbstractDevice({self._repr()})")
 
   def _repr(self):
+    capability = ("" if self.compute_capability is None
+                  else f", compute_capability={self.compute_capability}")
     return (f"device_kind={self.device_kind}, num_cores={self.num_cores}, "
-            f"platform={self.platform}")
+            f"platform={self.platform}{capability}")
 
 
 def abstract_device_from(d) -> AbstractDevice | None:
+  """`d`'s abstract device: its kind, cores and platform, and a GPU's compute
+  capability, so a mesh of compile-only GPUs lowers for the GPU they state
+  (Mosaic GPU's `utils._infer_arch`), not the one a host with none takes."""
   if d is None:
     return None
+  compute_capability = None
   if d.platform == 'tpu':
     num_cores = getattr(d, 'num_cores', None)
   elif d.platform == 'gpu':
     num_cores = getattr(d, 'core_count', None)
+    compute_capability = getattr(d, 'compute_capability', None)
   else:
     num_cores = None
   return AbstractDevice(device_kind=d.device_kind, num_cores=num_cores,
-                        platform=d.platform)
+                        platform=d.platform,
+                        compute_capability=compute_capability)
 
 
 @immutable
