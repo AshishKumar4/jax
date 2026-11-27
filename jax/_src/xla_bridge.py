@@ -273,6 +273,11 @@ class BackendRegistration:
   # The C API (`PJRT_Api*`) if this backend is a plugin.
   c_api: Any | None = None
 
+  # The plugin's own build (its package's version) where it states one: the
+  # persistent compilation cache keys an executable by it (`cache_key`), since
+  # a plugin rebuilt under one jax and jaxlib compiles with its own XLA.
+  build: str = ""
+
 _backend_factories: dict[str, BackendRegistration] = {}
 _default_backend: xla_client.Client | None = None
 _backends : dict[str, xla_client.Client] = {}
@@ -302,12 +307,13 @@ def register_backend_factory(name: str, factory: BackendFactory, *,
                              fail_quietly: bool = True,
                              experimental: bool = False,
                              make_topology: TopologyFactory | None = None,
-                             c_api: Any | None = None) -> None:
+                             c_api: Any | None = None,
+                             build: str = "") -> None:
   with _backend_lock:
     if name in _backends:
       raise RuntimeError(f"Backend {name} already initialized")
   _backend_factories[name] = BackendRegistration(
-    factory, priority, fail_quietly, experimental, c_api)
+    factory, priority, fail_quietly, experimental, c_api, build)
   if make_topology is not None:
     _topology_factories[name] = make_topology
 
@@ -614,6 +620,7 @@ def register_plugin(
     c_api: Any | None = None,
     factory: BackendFactory | None = None,
     make_topology: TopologyFactory | None = None,
+    build: str | None = None,
 ) -> Any:
   """Registers a backend factory for the PJRT plugin.
 
@@ -629,6 +636,9 @@ def register_plugin(
     c_api: Optional. The plugin can provide a PJRT C API to be registered.
     factory: Optional. A factory function that creates a PJRT client. If not
       provided, a default factory will be used.
+    build: Optional. The plugin's own build (its package's version), which the
+      persistent compilation cache keys an executable by
+      (`BackendRegistration.build`).
   """
 
   if library_path and c_api:
@@ -669,7 +679,8 @@ def register_plugin(
   experimental = plugin_name not in _nonexperimental_plugins
   register_backend_factory(plugin_name, factory, priority=priority,
                            fail_quietly=False, experimental=experimental,
-                           make_topology=make_topology, c_api=c_api)
+                           make_topology=make_topology, c_api=c_api,
+                           build=build or "")
   return c_api
 
 
@@ -1192,6 +1203,23 @@ def host_ids(
 
 def using_pjrt_c_api(backend=None):
   return get_backend(backend).is_c_api
+
+def plugin_build(backend: xla_client.Client) -> str:
+  """The build of the PJRT plugin that compiles for `backend`, a live client or
+  a compile-only one, as it registered ("" where it states none): the plugin a
+  live client was made by, else the one its devices' topology names (a
+  compile-only client's: its topology states the plugin's own platform, which
+  a client's `platform` reports as "gpu" for CUDA and ROCm alike)."""
+  name = next((name for name, client in _backends.items() if client is backend),
+              None)
+  if name is None:
+    try:
+      name = xla_client.get_topology_for_devices(backend.devices()).platform
+    except Exception:  # A client whose devices state no topology.
+      return ""
+  registration = _backend_factories.get(name)
+  return registration.build if registration is not None else ""
+
 
 def make_pjrt_topology(platform: str, topology_name='', **kwargs):
   _discover_and_register_pjrt_plugins()

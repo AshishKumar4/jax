@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent.futures
 import hashlib
 import os
 import re
 import sys
+import io
+import types
 import unittest
+from unittest import mock
 from typing import cast as type_cast
 
 import numpy as np
@@ -26,11 +30,14 @@ from absl.testing import parameterized
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pl_triton
 from jax._src import cache_key
 from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
+from jax._src.interpreters import mlir
+from jax._src.lib import _jax
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.mesh import Mesh
@@ -75,6 +82,45 @@ class CacheKeyTest(jtu.JaxTestCase):
     )
     self.assertEqual(hash1, hash2)
 
+  def test_a_compile_keys_alike_whatever_its_memory_limit(self):
+    # The limit stops a compile past it and changes none that finishes; a
+    # stopped one is never cached (compiler._stopped_by_memory_limit).
+    keyed = []
+    for limit in (None, 6 << 30, 12 << 30):
+      options = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      if limit is not None:
+        options.env_option_overrides = [
+            ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+      keyed.append(self.get_hashed_value(
+          cache_key._hash_serialized_compile_options, options))
+    flagged = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    debug_options = flagged.executable_build_options.debug_options
+    if not hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+      # A stock jaxlib has no such option, and keys its overrides alike.
+      self.assertLen(set(keyed), 1)
+      self.skipTest("this jaxlib has no GPU memory limit option")
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 3 << 30
+    keyed.append(self.get_hashed_value(
+        cache_key._hash_serialized_compile_options, flagged))
+    self.assertLen(set(keyed), 1)
+    flagged_keys = []
+    for flags in ("", "--xla_gpu_memory_limit_early_exit_bytes=6442450944"):
+      with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
+        flagged_keys.append(
+            self.get_hashed_value(cache_key._hash_xla_flags, []))
+    self.assertLen(set(flagged_keys), 1)
+
+  def test_a_compile_requiring_its_autotune_results_keys_as_one_without(self):
+    plain = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    required = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    required.env_option_overrides = [
+        ("xla_gpu_require_complete_aot_autotune_results", True)]
+    self.assertEqual(
+        self.get_hashed_value(cache_key._hash_serialized_compile_options, plain),
+        self.get_hashed_value(
+            cache_key._hash_serialized_compile_options, required),
+    )
+
   @jtu.skip_on_devices("cpu")
   def test_hash_accelerator_devices(self):
     devices = np.array([[jax.local_devices()[0]]])
@@ -101,6 +147,56 @@ class CacheKeyTest(jtu.JaxTestCase):
       cpu_backend = xla_bridge.get_backend("cpu")
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
+
+  @jtu.thread_unsafe_test()  # patches the topology and host_cpu for the process
+  def test_a_cpu_key_with_no_topology_names_the_host_s_cpu(self):
+    # XLA:CPU compiles for the CPU its topology states, which the topology's
+    # fingerprint holds; a backend that serves no topology keys a CPU program
+    # by the host's CPU, and an accelerator's by its devices alone.
+    def no_topology(_):
+      raise _jax.JaxRuntimeError("no topology")
+
+    original = (cache_key.xla_client.get_topology_for_devices,
+                cache_key.host_cpu)
+    cache_key.xla_client.get_topology_for_devices = no_topology
+    try:
+      for platform_name, differs in (("cpu", True), ("gpu", False)):
+        devices = [types.SimpleNamespace(platform=platform_name,
+                                         device_kind="kind")]
+        hashes = []
+        for described in ("vendor_id: AuthenticAMD\nflags: avx2 avx512f",
+                          "vendor_id: AuthenticAMD\nflags: avx2"):
+          cache_key.host_cpu = lambda described=described: described
+          hash_obj = hashlib.sha256()
+          cache_key._hash_accelerator_config(hash_obj, devices)
+          hashes.append(hash_obj.digest())
+        self.assertEqual(hashes[0] != hashes[1], differs, platform_name)
+    finally:
+      cache_key.xla_client.get_topology_for_devices, cache_key.host_cpu = (
+          original)
+    if os.path.exists("/proc/cpuinfo"):
+      self.assertRegex(cache_key.host_cpu(), "flags: |Features: ")
+
+  @jtu.thread_unsafe_test()  # patches cache_key.jax_version for the process
+  def test_a_program_s_key_names_its_jax_build(self):
+    # A patch stack's releases over one jaxlib are builds of their own: one's
+    # cache entries are not another's to read.
+    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
+    devices = xla_client.DeviceList((jax.local_devices()[0],))
+    compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+    )
+    backend = xla_bridge.get_backend()
+    original_jax_version = cache_key.jax_version
+    keys = []
+    try:
+      for build in ("0.12.0.1.post13", "0.12.0.1.post14"):
+        cache_key.jax_version = lambda build=build: build
+        keys.append(cache_key.get(computation, devices, compile_options, backend))
+    finally:
+      cache_key.jax_version = original_jax_version
+    self.assertNotEqual(keys[0], keys[1])
+    self.assertEqual(cache_key.jax_version(), jax.__version__)
 
   def test_hash_string(self):
     hash1 = self.get_hashed_value(cache_key._hash_string, "foo")
@@ -151,6 +247,45 @@ class CacheKeyTest(jtu.JaxTestCase):
     key2 = cache_key.get(computation, devices, compile_options, backend)
     cache_key.custom_hook = original_custom_hook
     self.assertNotEqual(key1, key2)
+
+  @jtu.thread_unsafe_test()
+  def test_a_rebuilt_plugin_keys_its_own_entries(self):
+    # A client is keyed by the build of the plugin that made it, as the plugin
+    # registered it: two builds of one plugin under one jax and jaxlib key
+    # apart, the same build alike, and a client no registration states a build
+    # for keys as one with none. Its platform version (the CUDA runtime the
+    # plugin loads) and its `platform` ("gpu" for CUDA and ROCm alike) tell no
+    # build apart.
+    class Client:
+      platform = "gpu"
+      platform_version = "cuda 12090"
+
+      def devices(self):
+        raise RuntimeError("no topology")
+
+    client = Client()
+
+    def platform_hash(build):
+      registrations = dict(xla_bridge._backend_factories)
+      backends = dict(xla_bridge._backends)
+      try:
+        if build is not None:
+          xla_bridge._backend_factories["fake_plugin"] = (
+              xla_bridge.BackendRegistration(lambda: client, 0, build=build))
+          xla_bridge._backends["fake_plugin"] = client
+        hash_obj = hashlib.sha256()
+        cache_key._hash_platform(hash_obj, client)
+        return hash_obj.digest()
+      finally:
+        xla_bridge._backend_factories.clear()
+        xla_bridge._backend_factories.update(registrations)
+        xla_bridge._backends.clear()
+        xla_bridge._backends.update(backends)
+
+    earlier = platform_hash("0.12.0.1.post71")
+    self.assertEqual(earlier, platform_hash("0.12.0.1.post71"))
+    self.assertNotEqual(earlier, platform_hash("0.12.0.1.post72"))
+    self.assertEqual(platform_hash(None), platform_hash(""))
 
   def test_different_computations(self):
     computation1 = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
@@ -267,22 +402,30 @@ class CacheKeyTest(jtu.JaxTestCase):
     self.assertEqual(include_metadata, key1 != key2)
 
   @parameterized.parameters([False, True])
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="The Pallas Triton backend is deprecated")
   def test_identical_pallas_kernels_different_metadata(self, include_metadata):
-    if not jtu.test_device_matches(["tpu"]):
-      self.skipTest("Pallas TPU lowering requires TPU backend")
+    if jtu.test_device_matches(["tpu"]):
+      compiler_params = None
+    elif jtu.test_device_matches(["cuda"]):
+      compiler_params = pl_triton.CompilerParams()
+    else:
+      self.skipTest("Pallas lowers its kernels for TPU and CUDA")
 
     # Same kernel body at different source lines; same __name__ to avoid kernel_name diff
     def make_caller_a():
       def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
       return jax.jit(lambda x: pl.pallas_call(
-          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          compiler_params=compiler_params)(x))
 
     def make_caller_b():
       def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
       return jax.jit(lambda x: pl.pallas_call(
-          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x))
+          kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          compiler_params=compiler_params)(x))
 
     x = np.ones((128,), dtype=np.float32)
     computation1 = make_caller_a().lower(x).compiler_ir()
@@ -296,6 +439,176 @@ class CacheKeyTest(jtu.JaxTestCase):
       key1 = cache_key.get(computation1, devices, compile_options, backend)
       key2 = cache_key.get(computation2, devices, compile_options, backend)
     self.assertEqual(include_metadata, key1 != key2)
+
+  @parameterized.parameters(("mosaic_gpu_v2", "module", "kernel_hash"),
+                            ("__gpu$xla.gpu.triton", "ir", None))
+  def test_identical_gpu_kernels_from_two_checkouts_key_alike(
+      self, target, field, digest):
+    # A Mosaic GPU or Pallas Triton kernel's module is serialized into its
+    # custom call with its source locations, and a Mosaic GPU kernel's
+    # kernel_hash is that serialization's digest: the same kernel compiled
+    # from two checkouts must key alike.
+    def program(path):
+      with mlir.make_ir_context(), ir.Location.unknown():
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  func.func @kernel() {\n"
+            f'    return loc("{path}/src/kernels.py":3:5)\n'
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out, desired_version=0)
+        body = out.getvalue()
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            f"    %0 = stablehlo.custom_call @{target}(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        config = {field: ir.StringAttr.get(body)}
+        if digest is not None:
+          config[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(config)
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+
+  def test_a_mosaic_gpu_kernel_written_at_two_places_keys_alike(self):
+    # A real Pallas Mosaic GPU kernel, lowered for an H100 on any host, its
+    # source lines moved: its module carries their locations, which the key
+    # leaves out.
+    try:
+      from jax.experimental.pallas import mosaic_gpu as plgpu
+    except ImportError:
+      self.skipTest("this jaxlib has no Mosaic GPU")
+    # A TMA copy and its barrier: operations whose properties only Mosaic
+    # GPU's dialect reads.
+    source = ("def kernel(x_ref, o_ref, smem, barrier):\n"
+              "  plgpu.copy_gmem_to_smem(x_ref, smem, barrier)\n"
+              "  plgpu.barrier_wait(barrier)\n"
+              "  o_ref[...] = smem[...] + 1.0\n")
+
+    def lowered(pad):
+      namespace = {"plgpu": plgpu}
+      exec(compile("\n" * pad + source, "kernels.py", "exec"), namespace)
+      call = plgpu.kernel(
+          namespace["kernel"],
+          out_type=jax.ShapeDtypeStruct((128,), np.float32),
+          scratch_types=[plgpu.SMEM((128,), np.float32), plgpu.Barrier()],
+          num_threads=1, thread_name="wg")
+      device = jax.sharding.AbstractDevice(
+          device_kind="NVIDIA H100 80GB HBM3", platform="gpu", num_cores=132,
+          compute_capability="9.0")
+      mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+      with jax.sharding.use_abstract_mesh(mesh):
+        return jax.jit(call).trace(
+            jax.ShapeDtypeStruct((128,), np.float32)).lower(
+                lowering_platforms=("cuda",)).compiler_ir("stablehlo")
+
+    first, second = lowered(0), lowered(7)
+    self.assertEqual(cache_key._canonicalize_ir(first, False),
+                     cache_key._canonicalize_ir(second, False))
+
+  def test_kernels_key_alike_from_threads_sharing_one_context(self):
+    # Programs lowered back to back on a thread share one MLIR context
+    # (`mlir.make_ir_context`), which another thread's lowerings may share too:
+    # threads keying programs whose Mosaic GPU kernels need unregistered
+    # dialects key each as one thread alone keys it, none failing to read its
+    # kernel.
+    with ir.Context() as kernel_ctx, ir.Location.unknown():
+      kernel_ctx.allow_unregistered_dialects = True
+      kernel = ir.Module.parse(
+          "module {\n"
+          '  "stable_mosaic_gpu.func"() ({\n'
+          '    "stable_mosaic_gpu.return"() : () -> () '
+          'loc("/home/ubuntu/s/trees/0/src/kernels.py":3:5)\n'
+          "  }) : () -> ()\n"
+          "}\n")
+      out = io.BytesIO()
+      kernel.operation.write_bytecode(out, desired_version=0)
+      body = out.getvalue()
+
+    with mlir.make_ir_context() as ctx, ir.Location.unknown():
+      def program():
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @mosaic_gpu_v2(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(
+            {"module": ir.StringAttr.get(body),
+             "kernel_hash": ir.StringAttr.get(hashlib.sha256(body).digest())})
+        return module
+
+      alone = cache_key._canonicalize_ir(program(), False)
+      self.assertFalse(ctx.allow_unregistered_dialects)
+      programs = [program() for _ in range(1024)]
+
+    def keyed(module):
+      return cache_key._canonicalize_ir(module, False)
+
+    # Threads switch as often as the interpreter lets them, so one's keying
+    # runs between another's steps.
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+      with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        keys = list(pool.map(keyed, programs))
+    finally:
+      sys.setswitchinterval(interval)
+    self.assertEqual(keys, [alone] * len(programs))
+
+  def test_triton_kernels_differing_in_a_property_key_apart(self):
+    # Pallas Triton writes its kernels at the default bytecode version, which
+    # keeps an operation's properties (a transpose's order) in a form only
+    # Triton's dialect reads: the key reads them through it, so kernels that
+    # differ only in one key apart, and one kernel from two checkouts alike.
+    try:
+      from jax._src.lib.triton import dialect as tt_dialect  # pytype: disable=import-error
+    except ImportError:
+      self.skipTest("this jaxlib has no Triton dialect")
+
+    def program(order, path):
+      with ir.Context() as kernel_ctx, ir.Location.unknown():
+        tt_dialect.register_dialect(kernel_ctx)
+        kernel = ir.Module.parse(
+            "module {\n"
+            "  tt.func @kernel(%arg0: tensor<4x4x4xf32>) -> tensor<4x4x4xf32> {\n"
+            f"    %0 = tt.trans %arg0 {{order = array<i32: {order}>}} : "
+            "tensor<4x4x4xf32> -> tensor<4x4x4xf32> "
+            f'loc("{path}/src/kernels.py":3:5)\n'
+            "    tt.return %0 : tensor<4x4x4xf32>\n"
+            "  }\n"
+            "}\n")
+        out = io.BytesIO()
+        kernel.operation.write_bytecode(out)
+        body = out.getvalue()
+      with mlir.make_ir_context(), ir.Location.unknown():
+        module = ir.Module.parse(
+            "module {\n"
+            "  func.func public @main(%arg0: tensor<f32>) -> tensor<f32> {\n"
+            "    %0 = stablehlo.custom_call @__gpu$xla.gpu.triton(%arg0) "
+            "{backend_config = \"\"} : (tensor<f32>) -> tensor<f32>\n"
+            "    return %0 : tensor<f32>\n"
+            "  }\n"
+            "}\n")
+        call = module.body.operations[0].regions[0].blocks[0].operations[0]
+        call.attributes["mhlo.backend_config"] = ir.DictAttr.get(
+            {"ir": ir.StringAttr.get(body)})
+        return cache_key._canonicalize_ir(module, False)
+
+    self.assertEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                     program("1, 0, 2", "/home/ubuntu/s/trees/b7bd6a6dbee7-1"))
+    self.assertNotEqual(program("1, 0, 2", "/home/ubuntu/s/trees/caea5dc4fa46-1"),
+                        program("2, 1, 0", "/home/ubuntu/s/trees/caea5dc4fa46-1"))
 
   @jtu.thread_unsafe_test()  # env vars are not thread-safe
   def test_xla_flags(self):

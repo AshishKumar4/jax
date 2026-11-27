@@ -14,15 +14,21 @@
 
 import base64
 import copy
+import functools
 import hashlib
 import io
 import json
 import logging
 import os
+import platform
 import sys
+from collections.abc import Callable
 from typing import cast as type_cast
 
+from jax import version as jax_version_module
 from jax._src import config
+from jax._src import custom_call_targets
+from jax._src import xla_bridge
 from jax._src.lib import version_str as jaxlib_version_str
 from jax._src.lib import _jax
 from jax._src.lib import xla_client
@@ -103,6 +109,7 @@ def get(
               jaxlib_version_str.encode("utf-8")
           ),
       ),
+      ("jax version", lambda hash_obj: _hash_string(hash_obj, jax_version())),
       (
           "backend version",
           lambda hash_obj: _hash_platform(hash_obj, backend)
@@ -192,7 +199,7 @@ def _strip_mosaic_debug_info(m: ir.Module) -> None:
         op.name != "stablehlo.custom_call"
         or "call_target_name" not in op.attributes
         or op.attributes["call_target_name"]
-        != ir.StringAttr.get("tpu_custom_call")
+        != ir.StringAttr.get(custom_call_targets.TPU_CUSTOM_CALL)
     ):
       return ir.WalkResult.ADVANCE
     bc = json.loads(ir.StringAttr(op.attributes["backend_config"]).value)
@@ -207,28 +214,129 @@ def _strip_mosaic_debug_info(m: ir.Module) -> None:
       return ir.WalkResult.ADVANCE
 
     # Fallback for when debug_locations are still embedded in the kernel bytecode
-    # (e.g. when jax_mosaic_unzip_debug_locations is disabled).
+    # (e.g. when jax_mosaic_unzip_debug_locations is disabled). The kernel is
+    # read in a context of its own (`_kernel_context`): the module's context
+    # may be another thread's too.
     body = custom_call_config["body"]
-    ctx = m.context
-    tpu.register_dialect(ctx)
-    ctx.allow_unregistered_dialects = True
-    with ctx:
-      try:
-        kernel = ir.Module.parse(base64.b64decode(body), context=ctx)
-      except ir.MLIRError:
-        return ir.WalkResult.ADVANCE
-      pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
-          kernel.operation
+    stripped = _stripped_kernel(base64.b64decode(body), tpu.register_dialect)
+    if stripped is None:
+      return ir.WalkResult.ADVANCE
+    custom_call_config["body"] = base64.b64encode(stripped).decode()
+    with m.context:
+      op.attributes["backend_config"] = ir.StringAttr.get(
+          json.dumps(bc, separators=(",", ":"))
       )
-      out = io.BytesIO()
-      kernel.operation.write_bytecode(out)
-    custom_call_config["body"] = base64.b64encode(out.getvalue()).decode()
-    op.attributes["backend_config"] = ir.StringAttr.get(
-        json.dumps(bc, separators=(",", ":"))
-    )
     return ir.WalkResult.ADVANCE
 
   m.operation.walk(_strip_kernel)
+
+
+def _stripped_kernel(serialized: bytes,
+                     dialect: Callable[[ir.Context], object] | None = None,
+                     version: int | None = None) -> bytes | None:
+  """A serialized kernel module without its debug info, at bytecode `version`
+  (the writer's default where None); None where it does not parse, or its
+  `dialect` cannot be registered (a callable returning False).
+
+  The kernel is read in a context of its own, unregistered dialects allowed
+  there and its `dialect` registered there, never in the program's: a program's
+  context is shared with other lowerings on its thread and may be another
+  thread's too (`mlir.make_ir_context`), and a setting toggled on it while
+  another thread parses there lets that thread's parse fail ("created with
+  unregistered dialect") or its key change.
+  """
+  ctx = ir.Context()
+  ctx.allow_unregistered_dialects = True
+  if dialect is not None and dialect(ctx) is False:
+    return None
+  with ctx, ir.Location.unknown():
+    try:
+      kernel = ir.Module.parse(serialized)
+    except ir.MLIRError:
+      return None
+    pm.PassManager.parse("builtin.module(strip-debuginfo)").run(
+        kernel.operation)
+    out = io.BytesIO()
+    if version is None:
+      kernel.operation.write_bytecode(out)
+    else:
+      kernel.operation.write_bytecode(out, desired_version=version)
+  return out.getvalue()
+
+
+def _strip_kernel_debug_info(m: ir.Module, target: str, field: str,
+                             digest: str | None = None,
+                             dialect: Callable[[ir.Context], bool] | None = None
+                             ) -> None:
+  """Strips debug info from the kernel each custom call to `target` serializes
+  in its `mhlo.backend_config`'s `field`, and takes the kernel's digest in
+  `digest` again, where it has one, as the kernel's producer takes it.
+
+  The top-level strip-debuginfo pass does not reach into a kernel serialized in
+  an attribute, so a kernel's source locations leak into the cache key: the
+  same kernel compiled from two checkouts keyed differently. The kernel is
+  read in a context of its own with unregistered dialects allowed
+  (`_stripped_kernel`), and only its key is written, at
+  bytecode version 0, which holds every operation's properties as attributes.
+  A kernel written at a later version holds its operations' properties in a
+  form only their dialect reads, so `dialect` registers it first, and a kernel
+  whose dialect cannot be registered keeps its call as it is.
+  """
+
+  def _strip_kernel(op: ir.Operation) -> ir.WalkResult:
+    if (op.name != "stablehlo.custom_call"
+        or op.attributes["call_target_name"].value != target  # type: ignore
+        or "mhlo.backend_config" not in op.attributes):
+      return ir.WalkResult.ADVANCE
+    config = ir.DictAttr(op.attributes["mhlo.backend_config"])
+    if field not in config:
+      return ir.WalkResult.ADVANCE
+    body = _stripped_kernel(ir.StringAttr(config[field]).value_bytes, dialect,
+                            version=0)
+    if body is None:
+      return ir.WalkResult.ADVANCE
+    with m.context:
+      entries = {entry.name: entry.attr for entry in config}
+      entries[field] = ir.StringAttr.get(body)
+      if digest is not None:
+        entries[digest] = ir.StringAttr.get(hashlib.sha256(body).digest())
+      op.attributes["mhlo.backend_config"] = ir.DictAttr.get(entries)
+    return ir.WalkResult.ADVANCE
+
+  m.operation.walk(_strip_kernel)
+
+
+def _mosaic_gpu_dialect(ctx: ir.Context) -> bool:
+  """Registers Mosaic GPU's dialect in `ctx`, where this jaxlib has it.
+
+  A Mosaic GPU kernel is serialized at the default bytecode version, whose
+  operations keep their properties in a form only its dialect reads: read
+  without it, the kernel did not parse and kept its source locations in the
+  key, so one kernel keyed apart from two places in a file, or from two
+  processes that interned its locations in another order.
+  """
+  try:
+    from jax._src.lib import mosaic_gpu_dialect  # pytype: disable=import-error
+  except ImportError:
+    return False
+  mosaic_gpu_dialect.register_dialect(ctx)
+  return True
+
+
+def _triton_dialect(ctx: ir.Context) -> bool:
+  """Registers Triton's dialect in `ctx`, where this jaxlib has it.
+
+  Pallas Triton writes its kernels at the default bytecode version, whose
+  operations keep their properties (a transpose's order, say) in a form only
+  Triton's dialect reads: read unregistered, they would leave the key, and
+  kernels that differ only in them would key alike.
+  """
+  try:
+    from jax._src.lib.triton import dialect as tt_dialect  # pytype: disable=import-error
+  except ImportError:
+    return False
+  tt_dialect.register_dialect(ctx)
+  return True
 
 
 def _serialize_ir(m: ir.Module, ignore_custom_partitioning: bool) -> bytes:
@@ -251,6 +359,10 @@ def _canonicalize_ir(
     )
     passes.run(m.operation)
     _strip_mosaic_debug_info(m)
+    _strip_kernel_debug_info(m, custom_call_targets.TRITON, "ir",
+                             dialect=_triton_dialect)
+    _strip_kernel_debug_info(m, custom_call_targets.MOSAIC_GPU, "module", digest="kernel_hash",
+                             dialect=_mosaic_gpu_dialect)
     return _serialize_ir(m, ignore_custom_partitioning)
 
 
@@ -281,6 +393,12 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
                 "accelerator config, falling back to hashing "
                 "devices %s (type %s)", ex, type(ex))
     _hash_devices(hash_obj, accelerators)
+    # XLA:CPU compiles for the CPU its topology states (its target machine,
+    # which the fingerprint holds): with none, the host's, so an executable
+    # from a host of another CPU, which need not link or run here, is another
+    # key.
+    if any(device.platform == "cpu" for device in accelerators):
+      _hash_string(hash_obj, host_cpu())
 
 # LINT.IfChange(xla_flags)
 xla_flags_to_exclude_from_cache_key = [
@@ -309,7 +427,19 @@ xla_flags_to_exclude_from_cache_key = [
     "--xla_gpu_cuda_data_dir",
     "--xla_gpu_experimental_autotune_cache_mode",
     "--xla_gpu_per_fusion_autotune_cache_dir",
+    # A compile without a device that requires each autotuned instruction's
+    # config from the autotune cache fails where one is missing and otherwise
+    # applies the config the device compile stored there: the requirement
+    # changes no compile that succeeds, so a host compiling ahead (the option
+    # its program's, `compiler_options`) writes the entries its device's run
+    # reads.
+    "--xla_gpu_require_complete_aot_autotune_results",
     "--xla_tpu_compiler_variant",
+    # A GPU compile's memory limit stops a compile whose executable would hold
+    # more and changes no compile that finishes; a stopped one is never
+    # written to the cache (compiler.py's `_stopped_by_memory_limit`), so a
+    # finished one serves every limit it fits.
+    "--xla_gpu_memory_limit_early_exit_bytes",
 ]
 
 env_override_flags_to_exclude_from_cache_key = {
@@ -358,6 +488,9 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   # here.
   debug_options.xla_gpu_cuda_data_dir = ""
   debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
+  # A stock jaxlib (macOS, Windows) has no such option to clear.
+  if hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
   # LINT.ThenChange(:xla_flags)
 
   compile_options_copy.env_option_overrides = [
@@ -378,6 +511,44 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
   _hash_string(hash_obj, backend.platform_version)
+  _hash_string(hash_obj, xla_bridge.plugin_build(backend))
+
+
+def jax_version() -> str:
+  """This jax's own build, its post-release among it.
+
+  A patch stack's releases over one jaxlib (0.11.2.post10 to post12 over
+  jaxlib 0.11.2) are builds of their own, whose programs need not be one
+  another's, and jaxlib's version alone does not tell them apart: a cache
+  directory one process of each read and wrote failed reads of the other's
+  entries ("Invalid metadata payload id"). The key names jax's version too.
+  """
+  return jax_version_module.__version__
+
+
+@functools.cache
+def host_cpu() -> str:
+  """This host's CPU, as XLA:CPU compiles for it.
+
+  On Linux, the first processor's vendor, family, model and feature flags on
+  x86, or its implementer, architecture, part and features on Arm, as
+  /proc/cpuinfo gives them; elsewhere, the platform's system, machine and
+  processor names.
+  """
+  try:
+    with open("/proc/cpuinfo") as f:
+      text = f.read()
+  except OSError:
+    text = ""
+  fields = {}
+  for line in text.splitlines():
+    key, _, value = line.partition(":")
+    fields.setdefault(key.strip(), value.strip())
+  for keys in (("vendor_id", "cpu family", "model", "flags"),
+               ("CPU implementer", "CPU architecture", "CPU part", "Features")):
+    if keys[0] in fields:
+      return "\n".join(f"{key}: {fields.get(key, '')}" for key in keys)
+  return " ".join((platform.system(), platform.machine(), platform.processor()))
 
 
 def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):

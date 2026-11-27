@@ -213,6 +213,12 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .def_ro("executable_build_options",
               &CompileOptions::executable_build_options)
       .def_rw("env_option_overrides", &CompileOptions::env_option_overrides)
+      // Whether XLA stops the compile after a pass (an early exit, by its
+      // debug options or their overrides), its executable no runnable one.
+      .def_prop_ro("is_early_exit",
+                   [](const CompileOptions& options) {
+                     return xla::IsEarlyExitCompilation(options);
+                   })
       .def_prop_rw(
           "num_replicas",
           [](const CompileOptions& options) {
@@ -295,6 +301,9 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                    [](DebugOptions* self, std::string value) {
                      self->set_xla_gpu_load_autotune_results_from(value);
                    })
+      .def_prop_rw("xla_gpu_memory_limit_early_exit_bytes",
+                   &DebugOptions::xla_gpu_memory_limit_early_exit_bytes,
+                   &DebugOptions::set_xla_gpu_memory_limit_early_exit_bytes)
       .def_prop_rw("xla_gpu_cuda_data_dir",
                    &DebugOptions::xla_gpu_cuda_data_dir,
                    [](DebugOptions* self, std::string value) {
