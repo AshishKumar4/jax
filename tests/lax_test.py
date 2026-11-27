@@ -6158,6 +6158,53 @@ class RaggedTest(jtu.JaxTestCase):
     np.testing.assert_array_equal(d_lhs[:2], ct[:2] @ rhs[0].T)
     self.assertTrue(np.isposinf(np.asarray(d_lhs[2:])).all())
 
+  def test_ragged_dot_takes_each_rows_value_bit_for_bit(self):
+    # A row's value is its own group's product itself, no sum with zeros of
+    # the others: its signed zero stays (-1 * 0 is -0), and a row in no group
+    # is +0.
+    lhs = jnp.array([[-1.0], [2.0], [3.0], [4.0], [5.0]], jnp.float32)
+    rhs = jnp.array([[[0.0]], [[jnp.inf]]], jnp.float32)
+    sizes = jnp.array([2, 2], jnp.int32)
+    with config.jax_ragged_dot_use_ragged_dot_instruction(False):
+      out = np.asarray(lax.ragged_dot(lhs, rhs, sizes))
+    self.assertTrue(np.signbit(out[0, 0]) and out[0, 0] == 0)
+    self.assertTrue(np.isposinf(out[2:4]).all())
+    self.assertEqual(out[4, 0], 0.0)
+    self.assertFalse(np.signbit(out[4, 0]))
+
+  @parameterized.parameters(np.bool_, np.float16, dtypes.bfloat16)
+  def test_ragged_dot_decomposed_takes_predicates_and_narrow_floats(
+      self, dtype):
+    # Each row selects its own group's product, so no reduction over the
+    # groups is asked of a predicate or of a float narrower than 32 bits.
+    rng = np.random.RandomState(0)
+    draw = ((lambda *s: rng.randint(0, 2, s)) if dtype == np.bool_
+            else (lambda *s: rng.randn(*s)))
+    lhs, rhs = draw(6, 4).astype(dtype), draw(3, 4, 5).astype(dtype)
+    sizes = np.array([2, 1, 3], np.int32)
+    with (config.jax_ragged_dot_use_ragged_dot_instruction(False),
+          config.allow_f16_reductions(False)):
+      out = lax.ragged_dot(lhs, rhs, sizes)
+    starts = np.cumsum(sizes) - sizes
+    want = np.concatenate([
+        np.asarray(lax.dot(lhs[a:a + n], rhs[g]))
+        for g, (a, n) in enumerate(zip(starts, sizes))])
+    self.assertEqual(out.dtype, want.dtype)
+    self.assertAllClose(out, want, atol=0, rtol=0)
+
+  @jtu.run_on_devices("cpu")
+  def test_ragged_dot_decomposed_holds_no_product_for_each_group(self):
+    # The products need the output's size twice, not once for each group:
+    # 16 groups of a 512x1024 f32 output would be 32 MiB.
+    m, k, n, groups = 512, 8, 1024, 16
+    lhs = core.ShapedArray((m, k), jnp.float32)
+    rhs = core.ShapedArray((groups, k, n), jnp.float32)
+    sizes = core.ShapedArray((groups,), jnp.int32)
+    with config.jax_ragged_dot_use_ragged_dot_instruction(False):
+      compiled = jax.jit(lax.ragged_dot).lower(lhs, rhs, sizes).compile()
+    temporaries = compiled.memory_analysis().temp_size_in_bytes
+    self.assertLess(temporaries, 4 * m * n * 4)
+
   @parameterized.parameters([True, False])
   def test_ragged_dot_use_ragged_dot_instruction(self, use_instruction):
     with config.jax_ragged_dot_use_ragged_dot_instruction(use_instruction):
