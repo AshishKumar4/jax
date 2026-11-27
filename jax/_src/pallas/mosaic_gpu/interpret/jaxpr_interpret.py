@@ -541,7 +541,8 @@ class JaxprInterpreter:
     # `eqn.params['jaxpr'].invars`. It is assumed that each thread runs the same
     # sequence of `run_scoped`s (except for allocations of MemorySpace.REGS,
     # which are WGMMA accumulators).
-    invars = eqn.params["jaxpr"].invars
+    # Its scoped refs: its body's invars past its operands, which lead them.
+    invars = eqn.params["jaxpr"].invars[len(eqn.invars):]
     memory_spaces = {v.aval.memory_space for v in invars}
     if mosaic_gpu_core.MemorySpace.REGS in memory_spaces:
       if len(memory_spaces) > 1:

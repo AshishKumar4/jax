@@ -3236,5 +3236,42 @@ class PallasDeviceIdTest(jtu.JaxTestCase):
       pallas_primitives.canonicalize_device_id({"x": 0, ("x",): 1})
 
 
+
+class RunScopedTest(jtu.JaxTestCase):
+
+  def test_a_cond_branch_s_run_scoped_keeps_none_of_its_tracers(self):
+    # A branch's run_scoped closes over a value the branch made: the value is
+    # its eqn's operand alone, so its body holds none of the branch's tracers
+    # past the cond's closure conversion, where an enclosing trace took them
+    # as stale constants.
+    from jax.experimental.pallas import tpu as pltpu
+
+    def branch(x):
+      y = x * 2
+
+      def body(ref):
+        ref[...] = jnp.full((8,), y)
+        return ref[...]
+
+      return pl.run_scoped(body, pltpu.VMEM((8,), jnp.int32))
+
+    def f(pred, x):
+      return lax.cond(pred, branch, lambda x: jnp.zeros((8,), jnp.int32), x)
+
+    def nested_consts(jaxpr):
+      for eqn in jaxpr.eqns:
+        for inner in jax_core.jaxprs_in_params(eqn.params):
+          yield from inner.consts
+          yield from nested_consts(inner)
+
+    traced = jax.make_jaxpr(f)(True, jnp.int32(3))
+    held = [c for c in nested_consts(traced.jaxpr)
+            if isinstance(c, jax_core.Tracer)]
+    self.assertEmpty(held)
+    np.testing.assert_array_equal(
+        jax.jit(f)(True, jnp.int32(3)), np.full((8,), 6, np.int32)
+    )
+
+
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

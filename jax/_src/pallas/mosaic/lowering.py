@@ -5451,6 +5451,7 @@ def _run_scoped_lowering_rule(
 ):
   if collective_axes:
     raise NotImplementedError("run_scoped lowering does not support collective axes")
+  jaxpr = jaxpr.with_consts(consts)  # Its leading invars are its operands.
   region = tpu.RegionOp(map(ctx.aval_to_ir_type, ctx.avals_out))
   in_avals = [v.aval for v in jaxpr.invars]
   with ctx.lowering_context.grid_name_context():
