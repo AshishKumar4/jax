@@ -3477,45 +3477,6 @@ def _atan2_lowering_rule_wg(ctx: LoweringRuleContext, y, x):
   return math_dialect.atan2(y, x)
 
 
-def _nextafter_f32(x, y):
-  """IEEE-754 float32 nextafter(x, y) from integer bit arithmetic."""
-  x, y = jnp.broadcast_arrays(x, y)
-  xb = lax.bitcast_convert_type(x, jnp.uint32)
-  nan = jnp.isnan(x) | jnp.isnan(y)
-  same = x == y
-  zero = x == jnp.float32(0.0)
-  from_zero = jnp.where(
-      y > jnp.float32(0.0), jnp.uint32(1), jnp.uint32(0x80000001)
-  )
-  away = ((x > jnp.float32(0.0)) & (y > x)) | (
-      (x < jnp.float32(0.0)) & (y < x)
-  )
-  stepped = jnp.where(
-      zero, from_zero, jnp.where(away, xb + jnp.uint32(1), xb - jnp.uint32(1))
-  )
-  out = lax.bitcast_convert_type(stepped, jnp.float32)
-  return jnp.where(nan, x + y, jnp.where(same, y, out))
-
-
-@register_lowering_rule(lax.nextafter_p, mgpu.LoweringSemantics.Warpgroup)
-def _nextafter_lowering_rule_wg(ctx: LoweringRuleContext, x, y):
-  if (
-      ctx.avals_in[0].dtype != jnp.float32
-      or ctx.avals_in[1].dtype != jnp.float32
-  ):
-    raise NotImplementedError(
-        "Mosaic GPU nextafter supports float32, got"
-        f" ({ctx.avals_in[0].dtype}, {ctx.avals_in[1].dtype})"
-    )
-  ir_args = tuple(
-      _ensure_ir_value(v, a.dtype) for v, a in zip((x, y), ctx.avals_in)
-  )
-  closed = jax.make_jaxpr(_nextafter_f32)(*ctx.avals_in)
-  (out,) = lower_jaxpr_to_mosaic_gpu(
-      ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts
-  )
-  return out
-
 @register_lowering_rule(lax.reshape_p, mgpu.LoweringSemantics.Lane)
 def _reshape_lowering_rule(
     ctx: LoweringRuleContext, x, new_sizes, dimensions, sharding

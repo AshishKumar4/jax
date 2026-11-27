@@ -542,7 +542,7 @@ def _layout_3d_reduce():
 
 class WarpgroupLoweringRulesTest(jtu.JaxTestCase):
   """CPU-runnable lowering tests for Warpgroup semantics primitives:
-  stop_gradient, split, nextafter, call_hi_primitive, unit-stride slice, and
+  stop_gradient, split, call_hi_primitive, unit-stride slice, and
   partial-axis reduce_or."""
 
   @staticmethod
@@ -643,60 +643,6 @@ class WarpgroupLoweringRulesTest(jtu.JaxTestCase):
 
     with self.assertRaisesRegex(NotImplementedError, "Zero-sized slices"):
       self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
-
-  @parameterized.product(
-      capability=("8.0", "9.0", "10.0"),
-      mode=("tile_tile", "scalar_tile", "tile_scalar", "scalar_scalar"),
-  )
-  def test_nextafter_lowers_wg(self, capability, mode):
-    if mode == "scalar_scalar":
-      @_kernel(
-          out_type=jax.ShapeDtypeStruct((), jnp.float32),
-          compiler_params=plgpu.CompilerParams(
-              lowering_semantics=plgpu.LoweringSemantics.Warpgroup
-          ),
-      )
-      def scalar_kernel(x_ref, y_ref, o_ref):
-        o_ref[...] = lax.nextafter(x_ref[...], y_ref[...])
-
-      spec = jax.ShapeDtypeStruct((), jnp.float32)
-      self._lower_for(capability, scalar_kernel, spec, spec)
-      return
-
-    @_kernel(
-        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
-        compiler_params=plgpu.CompilerParams(
-            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
-        ),
-    )
-    def kernel(x_ref, y_ref, o_ref):
-      x = x_ref[...] if mode == "scalar_tile" else plgpu.load(x_ref, optimized=False)
-      y = y_ref[...] if mode == "tile_scalar" else plgpu.load(y_ref, optimized=False)
-      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
-
-    tile_spec = jax.ShapeDtypeStruct((64, 64), jnp.float32)
-    scalar_spec = jax.ShapeDtypeStruct((), jnp.float32)
-    x_spec = scalar_spec if mode == "scalar_tile" else tile_spec
-    y_spec = scalar_spec if mode == "tile_scalar" else tile_spec
-    self._lower_for(capability, kernel, x_spec, y_spec)
-
-  @parameterized.parameters(jnp.float16, jnp.bfloat16, jnp.float64)
-  def test_nextafter_rejects_non_float32_wg(self, dtype):
-    with jax.enable_x64(dtype == jnp.float64):
-      @_kernel(
-          out_type=jax.ShapeDtypeStruct((64, 64), dtype),
-          compiler_params=plgpu.CompilerParams(
-              lowering_semantics=plgpu.LoweringSemantics.Warpgroup
-          ),
-      )
-      def kernel(x_ref, y_ref, o_ref):
-        x = plgpu.load(x_ref, optimized=False)
-        y = plgpu.load(y_ref, optimized=False)
-        plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
-
-      spec = jax.ShapeDtypeStruct((64, 64), dtype)
-      with self.assertRaisesRegex(NotImplementedError, "float32"):
-        self._lower_for("9.0", kernel, spec, spec)
 
   @parameterized.parameters("8.0", "9.0", "10.0")
   def test_call_hi_primitive_multi_const_literal_lowers_wg(self, capability):
@@ -7259,69 +7205,6 @@ class PallasCallWGTest(
 
     x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
     np.testing.assert_array_equal(kernel(x), x[:, :32] + 2.0 * x[:, 32:])
-
-  @run_on_sm80
-  def test_nextafter_f32_wg(self):
-    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
-    def kernel(x_ref, y_ref, o_ref):
-      x = plgpu.load(x_ref, optimized=False)
-      y = plgpu.load(y_ref, optimized=False)
-      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
-
-    specials_x = np.array([
-        0.0, 0.0, -0.0, -0.0, -0.0, 0.0,
-        1.0, 1.0, -1.0, -1.0, 1.0,
-        np.float32(np.ldexp(1.0, -149)), -np.float32(np.ldexp(1.0, -149)),
-        np.finfo(np.float32).max, -np.finfo(np.float32).max,
-        np.inf, -np.inf, np.inf, np.nan, 1.0,
-    ], dtype=np.float32)
-    specials_y = np.array([
-        1.0, -1.0, 1.0, -1.0, 0.0, -0.0,
-        2.0, 0.0, -2.0, 0.0, 1.0,
-        0.0, 0.0,
-        np.inf, -np.inf,
-        0.0, 0.0, np.inf, 1.0, np.nan,
-    ], dtype=np.float32)
-    rng = np.random.default_rng(0)
-    pad = 128 - len(specials_x)
-    x = np.concatenate([specials_x, rng.standard_normal(pad).astype(np.float32)])
-    y = np.concatenate([specials_y, rng.standard_normal(pad).astype(np.float32)])
-    got = np.asarray(kernel(jnp.asarray(x), jnp.asarray(y)))
-    ref = np.nextafter(x, y)
-    nan_mask = np.isnan(ref)
-    np.testing.assert_array_equal(np.isnan(got), nan_mask)
-    np.testing.assert_array_equal(
-        got[~nan_mask].view(np.uint32), ref[~nan_mask].view(np.uint32)
-    )
-
-  @parameterized.parameters("scalar_scalar", "scalar_tile", "tile_scalar")
-  @run_on_sm80
-  def test_nextafter_f32_scalar_and_broadcast_wg(self, mode):
-    if mode == "scalar_scalar":
-      @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.float32))
-      def scalar_kernel(x_ref, y_ref, o_ref):
-        o_ref[...] = lax.nextafter(x_ref[...], y_ref[...])
-
-      x = np.float32(1.0)
-      y = np.float32(2.0)
-      got = np.asarray(scalar_kernel(jnp.asarray(x), jnp.asarray(y)))
-      np.testing.assert_array_equal(
-          got.view(np.uint32), np.nextafter(x, y).view(np.uint32)
-      )
-      return
-
-    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
-    def bcast_kernel(x_ref, y_ref, o_ref):
-      x = x_ref[...] if mode == "scalar_tile" else plgpu.load(x_ref, optimized=False)
-      y = y_ref[...] if mode == "tile_scalar" else plgpu.load(y_ref, optimized=False)
-      plgpu.store(o_ref, lax.nextafter(x, y), optimized=False)
-
-    tile = np.linspace(-2.0, 2.0, 128, dtype=np.float32)
-    scalar = np.float32(0.0)
-    x, y = (scalar, tile) if mode == "scalar_tile" else (tile, scalar)
-    got = np.asarray(bcast_kernel(jnp.asarray(x), jnp.asarray(y)))
-    ref = np.nextafter(x, y)
-    np.testing.assert_array_equal(got.view(np.uint32), ref.view(np.uint32))
 
   @run_on_sm80
   def test_call_hi_primitive_wg(self):
