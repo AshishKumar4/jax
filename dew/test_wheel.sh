@@ -31,7 +31,7 @@ for path in "$@" conftest.py pytest.ini; do
 done
 # The checkout's sources a test holds the wheel to, none of them a module the wheel installs: its build scripts and
 # its .proto files (tests/mosaic_gpu_records_test.py: the schema jax ships against the mosaic_gpu.proto the CUDA
-# plugin is built from, described by build/generate_xla_protos.py).
+# plugin is built from, described by build/generate_mosaic_gpu_protos.py; build/generate_xla_protos.py to 0.12.0.1).
 if [ -d "$checkout/build" ]; then
   cp -r "$checkout/build" "$apart/build"
 fi

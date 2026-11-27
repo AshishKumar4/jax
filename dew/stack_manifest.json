@@ -1,0 +1,2011 @@
+{
+ "base": "jax-v0.12.2 (c1e1f0abef)",
+ "history": "history/0.12.2-stack: the 271 commits each fix's `commits` name, at 9191b8a471",
+ "topics": [
+  {
+   "topic": "xla-numerics",
+   "title": "XLA: optimizer, precision, and numerical correctness"
+  },
+  {
+   "topic": "xla-gpu-runtime",
+   "title": "XLA: GPU runtime, collectives, and executable metadata"
+  },
+  {
+   "topic": "core-transforms",
+   "title": "Core JAX: transforms, effects, sharding, and numerical contracts"
+  },
+  {
+   "topic": "core-artifacts",
+   "title": "Core JAX: persistent artifact identity and cache lifecycle"
+  },
+  {
+   "topic": "core-inspection",
+   "title": "Core JAX: minimal compiler inspection and extension facts"
+  },
+  {
+   "topic": "mosaic-gpu",
+   "title": "Mosaic GPU: native kernel semantics and device-targeted assembly"
+  },
+  {
+   "topic": "pallas",
+   "title": "Pallas: portable primitive dispatch and host interpreter"
+  },
+  {
+   "topic": "lowering-cache",
+   "title": "Mosaic/Pallas: deterministic emission, compiled facts, and lowering cache"
+  }
+ ],
+ "fixes": [
+  {
+   "fix": "canonicalizer-gpu-cache-key",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "Strip debug info from Pallas Triton kernels in the cache key (0.12.0.1.post4).",
+   "deleted_when": "Mosaic GPU hunks: none known (open #38623 and #40570 do not replace it). Pallas-Triton hunks: carried while Dew maintains Pallas-Triton (bible \u00a76), whatever upstream does with the backend.",
+   "commits": [
+    "5c7d772710"
+   ]
+  },
+  {
+   "fix": "cpu-transfer-guard",
+   "topic": "core-transforms",
+   "status": "reworked",
+   "why": "C37: held in jaxlib where the read happens (PyArray::GuardInPlaceHostRead)",
+   "subject": "Hold a CPU array's host reads in device memory to the device-to-host transfer guard (0.12.0.1.post10).",
+   "deleted_when": "none known (open #40303 overlaps the cross-client classification, not the CPU host-read guard)",
+   "commits": [
+    "dabf500b49"
+   ]
+  },
+  {
+   "fix": "pallas-triton-lowering",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Divide 16-bit floats and compute erf_inv for them in Pallas Triton, through float32 (0.12.0.1.post11).",
+   "deleted_when": "carried while Dew maintains Pallas-Triton (bible \u00a76); the erf_inv helper is shared with Mosaic TPU",
+   "commits": [
+    "5cfcf2b1ad"
+   ]
+  },
+  {
+   "fix": "cpu-host-cache-key",
+   "topic": "core-artifacts",
+   "status": "reworked",
+   "why": "C10: the CPU target from jaxlib's cpu_target_machine",
+   "subject": "Key a CPU program's persistent cache entry by the host's CPU, which XLA:CPU compiles for (0.12.0.1.post13).",
+   "deleted_when": "none known",
+   "commits": [
+    "f0364aef2e",
+    "56aa0aa7bf"
+   ]
+  },
+  {
+   "fix": "cache-key-jax-build",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "Key a program's persistent cache entry by jax's own build, its post-release among it (0.12.0.1.post14).",
+   "deleted_when": "none known",
+   "commits": [
+    "25abf4dfb6"
+   ]
+  },
+  {
+   "fix": "mma-accumulator-relayout-sm80",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "Relayout the MMA accumulator to the 16-bit MMA LHS in registers (m_warps=4), tested on sm80 (0.12.0.1.post15).",
+   "deleted_when": "none known",
+   "commits": [
+    "a39bc7c291"
+   ]
+  },
+  {
+   "fix": "abstract-device-compute-capability",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "Let an abstract device state its compute capability, which Mosaic GPU lowers for (0.12.0.1.post16).",
+   "deleted_when": "none known",
+   "commits": [
+    "8a42b84d65"
+   ]
+  },
+  {
+   "fix": "mgpu-ceil-floor",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "Lower ceil and floor in Mosaic GPU and Pallas Mosaic GPU, both lowering semantics.",
+   "deleted_when": "none known",
+   "commits": [
+    "45726a069f"
+   ]
+  },
+  {
+   "fix": "pallas-add-any",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Lower add_any in Pallas Mosaic GPU, both lowering semantics, as add.",
+   "deleted_when": "none known",
+   "commits": [
+    "df97873608"
+   ]
+  },
+  {
+   "fix": "pallas-integer-pow",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Lower integer_pow for every integer exponent in Pallas Mosaic GPU: a reciprocal of the positive power below 0, ones at 0, the operand at 1.",
+   "deleted_when": "none known (upstream registers integer_pow for non-negative exponents only)",
+   "commits": [
+    "8589fe2a05"
+   ]
+  },
+  {
+   "fix": "layout-independent-groups",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "Mosaic GPU layout inference: solve the unknowns no constraint relates apart.",
+   "deleted_when": "none known",
+   "commits": [
+    "3fa5b74fc8",
+    "ea88df6b6c"
+   ]
+  },
+  {
+   "fix": "warpgroup-reduction-scratch",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A block's warpgroups each take their own share of the reduction scratch.",
+   "deleted_when": "none known (open #41185 sizes scratch, does not partition it)",
+   "commits": [
+    "d1ec286f7d"
+   ]
+  },
+  {
+   "fix": "compile-only-target-smem",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] a compile-only target is held to the default shared memory limit, not the attached device's",
+   "deleted_when": "none known",
+   "commits": [
+    "01f6e91ece"
+   ]
+  },
+  {
+   "fix": "scoped-x64-dtype",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "Test that a wide trace keeps its dtypes under later transformations",
+   "deleted_when": "none known",
+   "commits": [
+    "f022bed81c"
+   ]
+  },
+  {
+   "fix": "conditional-shared-branch",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "A one-branch conditional lowers through the branch code every conditional uses",
+   "deleted_when": "drop when upstream #42048 lands in a release",
+   "commits": [
+    "8671c659f4"
+   ]
+  },
+  {
+   "fix": "mma-warp-split",
+   "topic": "mosaic-gpu",
+   "status": "reworked",
+   "why": "A07: Lane semantics refuses an m_warps mismatch",
+   "subject": "[Mosaic GPU] An MMA op may state its warpgroup's warp split",
+   "deleted_when": "none known",
+   "commits": [
+    "71732039dc"
+   ]
+  },
+  {
+   "fix": "interpret-thread-map-numpy-callbacks",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU interpret] A thread map transfers its constants and inputs once",
+   "deleted_when": "none known",
+   "commits": [
+    "61f321b2a2"
+   ]
+  },
+  {
+   "fix": "unit-axis",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A unit row or column of a tiled array: slice, pointwise ops and broadcast",
+   "deleted_when": "drop when upstream lands unit-axis layouts (watch #40611, #39966)",
+   "commits": [
+    "9cdca6e4cc"
+   ]
+  },
+  {
+   "fix": "cp-async-squeezed-tile",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A CP_ASYNC copy that squeezes a dimension between its sliced ones (a head's [S, D] block of [B, S, H, D]) applies its tile transform to the squeezed slice: it offsets by the untransformed indices and strides, then squeezes",
+   "deleted_when": "none known",
+   "commits": [
+    "537f48109b"
+   ]
+  },
+  {
+   "fix": "pipeline-carried-slots",
+   "topic": "pallas",
+   "status": "moved",
+   "why": "A18: emit_pipeline's carried ring slots are Dew's",
+   "subject": "[Mosaic GPU] emit_pipeline carries its ring slots rather than recomputing them as a remainder each step",
+   "deleted_when": "none known",
+   "commits": [
+    "e49066457c"
+   ]
+  },
+  {
+   "fix": "wgmma-descriptors",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "A15: kept; its CPU test went with D12's capture, its sm90 spill test and witness follow post1",
+   "subject": "[Mosaic GPU] Form a WGMMA's shared-operand descriptors at its instructions, not hoisted out of an enclosing loop",
+   "deleted_when": "none known",
+   "commits": [
+    "cfd9b2c663"
+   ]
+  },
+  {
+   "fix": "tma-opaque-coords",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "A13: kept; its sm90 ptxas witness follows post1",
+   "subject": "[Mosaic GPU] TMA load coordinates reach ptxas as values it cannot fold",
+   "deleted_when": "drop once the documented ptxas repro (a literal TMA coordinate miscompiled into a misaligned copy) passes without it on the pinned CUDA",
+   "commits": [
+    "c7dd8ff04d"
+   ]
+  },
+  {
+   "fix": "lru-cache-atomic-write",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "lru_cache: an entry is written aside and renamed into place on a local filesystem, so a process reading an unbounded cache beside its writer, which takes no lock, sees the whole entry or none of it",
+   "deleted_when": "drop when upstream #42198 (issue #42197) or an equivalent lands in a release",
+   "commits": [
+    "d23c24fa65"
+   ]
+  },
+  {
+   "fix": "symbolic-zero-variadic-reduce",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "Test a variadic reduce's derivatives beside a constant operand and an integer one.",
+   "deleted_when": "none known",
+   "commits": [
+    "49af1cf454"
+   ]
+  },
+  {
+   "fix": "ragged-dot-adjoint-legalization",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "Exercise all ragged dot modes through repeated reverse differentiation",
+   "deleted_when": "none known (open #41312 adds group_offset; #32207 is precision presets)",
+   "commits": [
+    "e7f0f1e867"
+   ]
+  },
+  {
+   "fix": "compilation-cache-reset",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "compilation_cache: reset_cache clears the cache under the initialization mutex",
+   "deleted_when": "none known",
+   "commits": [
+    "ae9bb02d2f"
+   ]
+  },
+  {
+   "fix": "cp-async-untiled-strides",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] Respect GMEM strides and alignment in untiled CP_ASYNC copies",
+   "deleted_when": "none known",
+   "commits": [
+    "ce97a9db01"
+   ]
+  },
+  {
+   "fix": "min-blocks-per-sm",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A kernel's minimum resident blocks per SM (min_blocks_per_sm)",
+   "deleted_when": "drop when a JAX release lets a Mosaic GPU kernel state its minimum resident blocks per SM (upstream hardcodes minctasm=1)",
+   "commits": [
+    "aa70a151cb"
+   ]
+  },
+  {
+   "fix": "pre-hopper-pipeline-barriers",
+   "topic": "pallas",
+   "status": "reworked",
+   "why": "A18: its emit_pipeline schedule is Dew's; its dialect lowering kept",
+   "subject": "[Mosaic GPU] Pre-Hopper emit_pipeline fetches at a step's start into the slot the previous step read",
+   "deleted_when": "none known",
+   "commits": [
+    "cd1943b9c0"
+   ]
+  },
+  {
+   "fix": "tf32-mma",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "mosaic_gpu mma: f32 operands multiply as TF32 on mma.sync (m16n8k8.tf32), each rounded to nearest first",
+   "deleted_when": "none known",
+   "commits": [
+    "bcbbbc5111"
+   ]
+  },
+  {
+   "fix": "explicit-barrier-parity",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] barrier_wait at an explicit parity",
+   "deleted_when": "none known (open #41787 packs parities, does not expose barrier_wait(parity=))",
+   "commits": [
+    "621e78c9f1"
+   ]
+  },
+  {
+   "fix": "triton-pipeliner-multiuse-load",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "XLA #31: KEEP; its GH200 no-patch witness follows post1",
+   "subject": "Triton's pipeliner gives a load used twice one async-copy buffer, when its local_alloc user feeds a wgmma",
+   "deleted_when": "none stated",
+   "commits": [
+    "b2b0dfe7f6",
+    "8e44aa4482"
+   ]
+  },
+  {
+   "fix": "smem-transfer-check-once",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] Layout inference computes each SMEM <-> registers transfer check once",
+   "deleted_when": "none stated",
+   "commits": [
+    "79355a5d0a"
+   ]
+  },
+  {
+   "fix": "plain-smem-transform",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A scratch SMEM ref can state that it is plain: neither tiled nor swizzled",
+   "deleted_when": "none stated",
+   "commits": [
+    "84cfdbd002"
+   ]
+  },
+  {
+   "fix": "call-primitive-lowering",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas] A call primitive lowers as eval_jaxpr_p, its body inlined",
+   "deleted_when": "none stated",
+   "commits": [
+    "92d460989c"
+   ]
+  },
+  {
+   "fix": "checkify-call-primitives",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "[checkify] A call primitive is checked within its body and kept",
+   "deleted_when": "none stated",
+   "commits": [
+    "3bee01381e"
+   ]
+  },
+  {
+   "fix": "abstract-device-capability",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "[sharding] A mesh's abstract device states its GPUs' compute capability",
+   "deleted_when": "none stated",
+   "commits": [
+    "727afc4070"
+   ]
+  },
+  {
+   "fix": "staged-custom-jvp-batching",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "[vmap] A staged custom_jvp call with a mapped input is batched alike in its primal and its JVP",
+   "deleted_when": "none stated",
+   "commits": [
+    "bf4f78dff2"
+   ]
+  },
+  {
+   "fix": "cuda-root-needs-ptxas",
+   "topic": "core-inspection",
+   "status": "carried",
+   "why": "",
+   "subject": "[lib] A CUDA root is a package that holds ptxas",
+   "deleted_when": "none stated",
+   "commits": [
+    "392f7abfdb"
+   ]
+  },
+  {
+   "fix": "cache-key-kernel-context",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "Read a kernel's serialized module in a context of its own when keying its program",
+   "deleted_when": "none stated",
+   "commits": [
+    "a0b287252e"
+   ]
+  },
+  {
+   "fix": "pipeline-thread-axis",
+   "topic": "pallas",
+   "status": "withdrawn",
+   "why": "E08: Dew no longer pipelines across consumer warpgroups",
+   "subject": "[Mosaic GPU] emit_pipeline runs collectively over a thread axis",
+   "deleted_when": "none stated",
+   "commits": [
+    "9d5045505e"
+   ]
+  },
+  {
+   "fix": "mgpu-warp-multiple-of",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "multiple_of lowers in a warp's code (plgpu.warp_map)",
+   "deleted_when": "none stated",
+   "commits": [
+    "113ba6fac9"
+   ]
+  },
+  {
+   "fix": "ragged-all-to-all-cpu",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "ragged_all_to_all lowers on CPU as one padded all_to_all of each peer's run and of the offsets each sender states, each received run written where the ragged collective lands it",
+   "deleted_when": "none stated",
+   "commits": [
+    "68a40a24e8"
+   ]
+  },
+  {
+   "fix": "checkify-shard-map-manual-axes",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "a check whose error reaches a shard_map manual over some of a mesh's axes traces its errors' leading dimension under the body's manual axes and partitions them over those axes alone",
+   "deleted_when": "none stated",
+   "commits": [
+    "d896ab740f"
+   ]
+  },
+  {
+   "fix": "custom-jvp-call-discharge",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "a custom_jvp whose primal makes and frees its own refs discharges them, rebound on its discharged primal with its custom JVP kept; a ref argument stays refused",
+   "deleted_when": "none stated",
+   "commits": [
+    "7585f115d0"
+   ]
+  },
+  {
+   "fix": "interpret-thread-map-keep-unused",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "reformatted",
+   "subject": "[pallas] A thread map's role body keeps its unused arguments, so its parameters stay as many as their shardings",
+   "deleted_when": "none stated",
+   "commits": [
+    "b320712d97"
+   ]
+  },
+  {
+   "fix": "interpret-tcgen05-scales",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[pallas] Mosaic GPU's interpreter runs a block-scaled tcgen05 MMA, its scales applied per block before the product, and copies scales to TMEM undoing their SMEM tiling (deletion: upstream interprets scales, gpu_callbacks.py's TODO)",
+   "deleted_when": "none stated",
+   "commits": [
+    "043e4ef117"
+   ]
+  },
+  {
+   "fix": "pallas-lowering-cache",
+   "topic": "lowering-cache",
+   "status": "reworked",
+   "why": "D13: one record of the serialized kernel; no constants scan",
+   "subject": "[Mosaic GPU] A lowering is kept under a key of all it reads, for another process to read back",
+   "deleted_when": "none stated",
+   "commits": [
+    "95c9c12417",
+    "060b57380a",
+    "388b767fff",
+    "8f0c573b50",
+    "66a6216366",
+    "08243af6b6",
+    "5a9ee8e446",
+    "8f0b04fc2a",
+    "8b946ddcec",
+    "0e3ee3e047",
+    "17f97673eb"
+   ]
+  },
+  {
+   "fix": "callback-x64",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "A host callback canonicalizes its results under its lowering's x64, not its executing thread's",
+   "deleted_when": "upstream's emit_python_callback canonicalizes under the lowering's x64.",
+   "commits": [
+    "e71a1892e2"
+   ]
+  },
+  {
+   "fix": "float-sign-ops",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A fragmented array's negation and copysign are float instructions",
+   "deleted_when": "none stated",
+   "commits": [
+    "80337c2eb7"
+   ]
+  },
+  {
+   "fix": "resources-named",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A dumped resource estimate names its kernel and the hash its custom call carries",
+   "deleted_when": "upstream Mosaic GPU's resource dump names its kernel.",
+   "commits": [
+    "581929f5f2"
+   ]
+  },
+  {
+   "fix": "assembly-target",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] Each object's PTX assembles for the capability its NVVM target names",
+   "deleted_when": "none stated",
+   "commits": [
+    "457657d41d"
+   ]
+  },
+  {
+   "fix": "interpret-device-barriers",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] The interpreter checks only the ending device's barriers",
+   "deleted_when": "none stated",
+   "commits": [
+    "cfbf222e08"
+   ]
+  },
+  {
+   "fix": "lowering-cache-unread",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] The lowering cache keys no setting a lowering never reads",
+   "deleted_when": "none stated",
+   "commits": [
+    "920b6de32d"
+   ]
+  },
+  {
+   "fix": "lowering-cache-sources",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A process may declare packages of its own sealed by their source",
+   "deleted_when": "none stated",
+   "commits": [
+    "cf7f341279"
+   ]
+  },
+  {
+   "fix": "lowering-cache-race",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] The lowering cache tests' children write the kernels' file whole before reading it",
+   "deleted_when": "none stated",
+   "commits": [
+    "eeefdd306c"
+   ]
+  },
+  {
+   "fix": "cond-dropped-branch-tokens",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "A conditional's lowering threads the tokens of every branch's ordered effects, a branch its lowering platforms drop included: a platform_dependent whose CPU branch calls back to the host, lowered for a GPU, raised for want of the token",
+   "deleted_when": "none stated",
+   "commits": [
+    "bf6f2cc709"
+   ]
+  },
+  {
+   "fix": "lowering-cache-memo",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A lowering's key encodes each interned aval and each dtype once: a jaxpr's equations read the same few thousands of times",
+   "deleted_when": "none stated",
+   "commits": [
+    "162ad4b640"
+   ]
+  },
+  {
+   "fix": "layout-pickle",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "AutoLayout pickles by reference, so a deserialized executable's outputs type as a fresh one's",
+   "deleted_when": "none stated",
+   "commits": [
+    "dd96f9f6de"
+   ]
+  },
+  {
+   "fix": "interpret-exec-gate",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] An interpreted kernel's shared memory admits its own devices alone",
+   "deleted_when": "none stated",
+   "commits": [
+    "8ceb31b8c8"
+   ]
+  },
+  {
+   "fix": "mosaic-dump-kinds",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] MOSAIC_GPU_DUMP_TO dumps the kinds named beside it, every kind where none is",
+   "deleted_when": "none stated",
+   "commits": [
+    "a73baa5fe5"
+   ]
+  },
+  {
+   "fix": "mosaic-launch-capture",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "D11: no caller; every TMA launch paid its descriptor copy",
+   "subject": "[Mosaic GPU] MOSAIC_GPU_CAPTURE_LAUNCHES=<dir> writes each launch as a one-launch spec a simulator runs bit-exactly (nvgpu-lean's NV/Launch/Spec.lean): the cubin, grid, block, cluster and shared memory, every buffer it can address with its bytes before and an operand's after, each tensor map by its encoding's arguments, the parameters by ordinal",
+   "deleted_when": "none stated",
+   "commits": [
+    "7da083397e"
+   ]
+  },
+  {
+   "fix": "mgpu-functional",
+   "topic": "pallas",
+   "status": "withdrawn",
+   "why": "C10: a second interpreter no consumer runs",
+   "subject": "[Pallas:MGPU] Interpret a kernel of one thread a block as one JAX program",
+   "deleted_when": "none stated",
+   "commits": [
+    "62896d93c8"
+   ]
+  },
+  {
+   "fix": "cache-key-plugin",
+   "topic": "core-artifacts",
+   "status": "reworked",
+   "why": "C11: the plugin's build by registration (xla_bridge.plugin_build)",
+   "subject": "the persistent cache keys an executable by the PJRT plugin build that compiled it",
+   "deleted_when": "none stated",
+   "commits": [
+    "18fa92a268"
+   ]
+  },
+  {
+   "fix": "primitive-attributes",
+   "topic": "core-inspection",
+   "status": "reworked",
+   "why": "C44/C45: classifications deleted; the re-exports Dew imports kept",
+   "subject": "Primitive.inlined_call and Primitive.elementwise",
+   "deleted_when": "none stated",
+   "commits": [
+    "a0cd623680"
+   ]
+  },
+  {
+   "fix": "xla-cudnn-graphs",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "[XLA:GPU] a deviceless compile fails at a cuDNN convolution with no chosen algorithm",
+   "deleted_when": "none stated",
+   "commits": [
+    "0f725e078c"
+   ]
+  },
+  {
+   "fix": "custom-call-targets",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "reformatted (post74), its registry jax/_src/custom_call_targets.py",
+   "subject": "each custom-call target JAX's lowerings write named once, writers and readers sharing it",
+   "deleted_when": "none stated",
+   "commits": [
+    "a812879d91"
+   ]
+  },
+  {
+   "fix": "deviceless-capture",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "D12: no caller",
+   "subject": "a Mosaic GPU launch's simulator spec written with no GPU",
+   "deleted_when": "none stated",
+   "commits": [
+    "df271a804e",
+    "5ddda6e21a"
+   ]
+  },
+  {
+   "fix": "kernel-metadata",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a Mosaic GPU kernel's caller-stated metadata, kept in its compiled call's serialization",
+   "deleted_when": "none stated",
+   "commits": [
+    "8cc7e59b4d"
+   ]
+  },
+  {
+   "fix": "post74 candidate",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "formatting of other families",
+   "subject": "unused imports out, custom_call_targets formatted by pyink",
+   "deleted_when": "none stated",
+   "commits": [
+    "9ce091ef24"
+   ]
+  },
+  {
+   "fix": "exact-exp2",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B12",
+   "subject": "FragmentedArray.exp2(approx=False) computes 2^x within an ulp on f32",
+   "deleted_when": "none stated",
+   "commits": [
+    "4480ccdd55"
+   ]
+  },
+  {
+   "fix": "compile-only-cache",
+   "topic": "core-artifacts",
+   "status": "retired",
+   "why": "C18: superseded by unloaded deserialization",
+   "subject": "a compile-only client writes the persistent cache and reads nothing back",
+   "deleted_when": "none stated",
+   "commits": [
+    "794f7302b8"
+   ]
+  },
+  {
+   "fix": "exact-exp",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B12: upstream's libdevice approx=False, Dew's precision.accurate_exp",
+   "subject": "FragmentedArray.exp(approx=False) computes e^x within an ulp on f32",
+   "deleted_when": "none stated",
+   "commits": [
+    "d276b9d792"
+   ]
+  },
+  {
+   "fix": "exact-exp tests",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B12",
+   "subject": "differences taken at the compared elements alone, no infinite one subtracted",
+   "deleted_when": "none stated",
+   "commits": [
+    "5fedb73822"
+   ]
+  },
+  {
+   "fix": "compile-only-cache test",
+   "topic": "core-artifacts",
+   "status": "retired",
+   "why": "C18",
+   "subject": "the attached GPU's run shards its operand as the compile ahead did",
+   "deleted_when": "none stated",
+   "commits": [
+    "d316433ef9"
+   ]
+  },
+  {
+   "fix": "checkify-carried-errors",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "a loop's body or a cond's branch carries the scalar error it was given, a shard_map's errors (one a shard) reduced in it",
+   "deleted_when": "none stated",
+   "commits": [
+    "d426b75c84"
+   ]
+  },
+  {
+   "fix": "xla-cudnn-deviceless",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "a default-algorithm convolution runs cuDNN's heuristic engine that needs no workspace (the deviceless refusal retired), and the deviceless device description states the memory bus width cuDNN 9.27 requires",
+   "deleted_when": "none stated",
+   "commits": [
+    "4bad1536ab",
+    "f540c1f4f2"
+   ]
+  },
+  {
+   "fix": "checkify-carried-errors test",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "the nested shard_map takes its mesh from the outer's body",
+   "deleted_when": "none stated",
+   "commits": [
+    "a44facafc1"
+   ]
+  },
+  {
+   "fix": "typed-hlo-reader",
+   "topic": "core-inspection",
+   "status": "moved",
+   "why": "C03: Dew's telemetry reads HLO itself",
+   "subject": "jax declares the protobuf its HLO reader parses a module with",
+   "deleted_when": "none stated",
+   "commits": [
+    "01aae2635e"
+   ]
+  },
+  {
+   "fix": "tma-partial",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a TMA copy over a dimension its tiling does not divide is described untiled with the array's true extents, its reads past them zero-filled and its writes dropped",
+   "deleted_when": "none stated",
+   "commits": [
+    "eb263417f4"
+   ]
+  },
+  {
+   "fix": "exp-accuracy",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B13: a per-primitive accuracy table with no caller",
+   "subject": "Mosaic GPU's exp and exp2 take lax's per-operation accuracy, a tolerance the hardware's form meets taking it and HIGHEST the exact form, none the kernel's approx_math",
+   "deleted_when": "none stated",
+   "commits": [
+    "d306bc013b"
+   ]
+  },
+  {
+   "fix": "exp-accuracy test",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B13",
+   "subject": "one TMA's 256 elements a call",
+   "deleted_when": "none stated",
+   "commits": [
+    "57e12abfd7"
+   ]
+  },
+  {
+   "fix": "exp-accuracy tests",
+   "topic": "mosaic-gpu",
+   "status": "retired",
+   "why": "B13",
+   "subject": "each non-approximate form (libdevice's default, the exact series) held to its stated bound over the whole range",
+   "deleted_when": "none stated",
+   "commits": [
+    "4cc05da708"
+   ]
+  },
+  {
+   "fix": "device-put-copy",
+   "topic": "core-transforms",
+   "status": "reworked",
+   "why": "C36: batched_device_put's copy_semantics owns the copy",
+   "subject": "device_put(may_alias=False) copies a source it reshards, its buffer on a target device no longer wrapped into the result",
+   "deleted_when": "none stated",
+   "commits": [
+    "cf261e2233"
+   ]
+  },
+  {
+   "fix": "is-finite",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Pallas Mosaic GPU lowers is_finite, its magnitude below infinity, in both semantics",
+   "deleted_when": "none stated",
+   "commits": [
+    "9415e208e9"
+   ]
+  },
+  {
+   "fix": "smem-alignment",
+   "topic": "pallas",
+   "status": "withdrawn",
+   "why": "E09: reverted on the line",
+   "subject": "Pallas Mosaic GPU exports the shared-memory allocator's alignment (SMEM_ALIGNMENT)",
+   "deleted_when": "none stated",
+   "commits": [
+    "262a5699be"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-records",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "its peak-live readers moved to Dew (C01-C03)",
+   "subject": "jax reads a compiled Mosaic GPU kernel's record through the plugin's own schema (jax.extend.mosaic_gpu.kernel_record), its descriptor generated from the .proto the plugin is built from",
+   "deleted_when": "none stated",
+   "commits": [
+    "1192fea5cc",
+    "2af4cc6d42"
+   ]
+  },
+  {
+   "fix": "ragged-dot-vmap",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "ragged_dot's batching rule takes operands batched along any dimension or shared, each moved or broadcast to the front",
+   "deleted_when": "none stated",
+   "commits": [
+    "ed704fcd9c"
+   ]
+  },
+  {
+   "fix": "lowering-cache-dumps",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "a lowering is cached unless it dumps as it runs; its resource estimate travels with the module and is dumped at its custom call, of a hit as of a miss",
+   "deleted_when": "none stated",
+   "commits": [
+    "473d415b5a"
+   ]
+  },
+  {
+   "fix": "row-shifted",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "A24: kept",
+   "subject": "a FragmentedArray's rows shifted within their groups by the layout's own lane permutation",
+   "deleted_when": "none stated",
+   "commits": [
+    "017a500f23"
+   ]
+  },
+  {
+   "fix": "fresh-axis-index",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "A23: kept, Main's ruling",
+   "subject": "plgpu.fresh_axis_index reads a grid coordinate where it is used, a side-effecting %ctaid read neither merged nor moved (lax.axis_index interpreted), so no earlier read is held live to a late use",
+   "deleted_when": "none stated",
+   "commits": [
+    "abe4384caa"
+   ]
+  },
+  {
+   "fix": "interpret-packed-access",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU interpret] A load's or store's callback takes its indices as one vector, decoded once a place",
+   "deleted_when": "none stated",
+   "commits": [
+    "0e6507d349"
+   ]
+  },
+  {
+   "fix": "reshard-literal",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A reshard of a literal lowers to the literal as an ir.Value; emit_pipeline's zeros are literals",
+   "deleted_when": "none stated",
+   "commits": [
+    "8739958763"
+   ]
+  },
+  {
+   "fix": "thread-map-own-client",
+   "topic": "pallas",
+   "status": "withdrawn",
+   "why": "C09: XLA 9935144dd3 leases the CPU client",
+   "subject": "[Pallas] thread_map runs its threads' programs on a CPU client of its own",
+   "deleted_when": "none stated",
+   "commits": [
+    "0ba54977b3"
+   ]
+  },
+  {
+   "fix": "lowering-cache-seal",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "the seal answers a file's declared source package once",
+   "deleted_when": "none stated",
+   "commits": [
+    "43ce6ebe73"
+   ]
+  },
+  {
+   "fix": "warpgroup-sync-named",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] a warpgroup sync's inline PTX is a named constant",
+   "deleted_when": "none stated",
+   "commits": [
+    "b47ac51858",
+    "211b1b3062"
+   ]
+  },
+  {
+   "fix": "pipeline-allocations",
+   "topic": "pallas",
+   "status": "moved",
+   "why": "A17: emit_pipeline's allocation introspection is Dew's",
+   "subject": "[Pallas:MGPU] emit_pipeline states the buffers and barriers it scopes (get_allocations)",
+   "deleted_when": "none stated",
+   "commits": [
+    "d03d4f2b89",
+    "dc5b4a4df0"
+   ]
+  },
+  {
+   "fix": "tpu-pipeline-carry",
+   "topic": "pallas",
+   "status": "withdrawn",
+   "why": "C13: reverted on the line",
+   "subject": "[Pallas:TPU] emit_pipeline takes an init_carry, its body returning the next, as the Mosaic GPU pipeline does",
+   "deleted_when": "none stated",
+   "commits": [
+    "4af188aab5"
+   ]
+  },
+  {
+   "fix": "mgpu-kernel-hash",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a kernel's hash reads its operations, not its locations (delete when upstream's kernel_id hashes a location-free module)",
+   "deleted_when": "none stated",
+   "commits": [
+    "d92752a68e"
+   ]
+  },
+  {
+   "fix": "cudnn-capability",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "the fused attention's capability gates read the GPU the traced program runs on (its concrete mesh's, else the default device), not the process's default backend alone, which in a process compiling ahead for compile-only GPUs is the CPU and refused every head dim past 128 (delete when upstream reads the target's capability)",
+   "deleted_when": "none stated",
+   "commits": [
+    "3ec6d42987"
+   ]
+  },
+  {
+   "fix": "sm80-prefetch",
+   "topic": "pallas",
+   "status": "moved",
+   "why": "A16: emit_pipeline's cross-step prefetch is Dew's",
+   "subject": "emit_pipeline's prefetch, a step's first values read under the step before's last products (delete when upstream's pipeline loads across a step boundary)",
+   "deleted_when": "none stated",
+   "commits": [
+    "7a86f2261e",
+    "d33870d374"
+   ]
+  },
+  {
+   "fix": "xla-reducer-copy-root",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "a reducer rooted in a copy of its reduction reduces by the copied operation (delete when upstream's AllReducePromotion and MatchReductionComputation read through a copied root)",
+   "deleted_when": "none stated",
+   "commits": [
+    "d1470b113c"
+   ]
+  },
+  {
+   "fix": "xla-cudnn-frontend",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "XLA's cuDNN frontend at 1.32.3 (delete when XLA's pin is 1.32.3 or later)",
+   "deleted_when": "none stated",
+   "commits": [
+    "e2cd8926de",
+    "3438b613f3"
+   ]
+  },
+  {
+   "fix": "cache-key-aot-autotune",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "a compile ahead that requires its autotune results keys as its device's compile does (delete when upstream's key excludes xla_gpu_require_complete_aot_autotune_results)",
+   "deleted_when": "none stated",
+   "commits": [
+    "620ae1e2dc"
+   ]
+  },
+  {
+   "fix": "tcgen05-tf32",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "tcgen05.mma takes f32 shared-memory operands as .kind::tf32 (delete when upstream's tcgen05 takes tf32)",
+   "deleted_when": "none stated",
+   "commits": [
+    "b822fb4042"
+   ]
+  },
+  {
+   "fix": "lowering-cache-caller-metadata",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "a kernel's caller metadata is no input of the Pallas lowering cache's key (delete when upstream's lowering cache keys what the lowering reads alone)",
+   "deleted_when": "none stated",
+   "commits": [
+    "0780e9bfaa"
+   ]
+  },
+  {
+   "fix": "cache-key-mosaic-gpu-dialect",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "the persistent cache key strips a Mosaic GPU kernel's locations with its dialect registered (delete when upstream's key reads kernels without their debug info)",
+   "deleted_when": "none stated",
+   "commits": [
+    "d5442c9eca"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-kernel-facts",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a Mosaic GPU kernel's compiled call keeps what ptxas noted of a loss of performance as it assembled the kernel (MosaicGpuKernelProto.assembler_notes: code and message) (delete when upstream's kernel proto carries the assembler's notes)",
+   "deleted_when": "none stated",
+   "commits": [
+    "3d1ba03ad1"
+   ]
+  },
+  {
+   "fix": "xla-early-exit-buffer-assignment",
+   "topic": "xla-gpu-runtime",
+   "status": "retired",
+   "why": "XLA #12: one typed stop after assignment (#20)",
+   "subject": "a GPU compile stops after buffer assignment and states its memory, no code emitted (xla_gpu_experimental_early_exit=EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT) (delete when upstream XLA's GPU compiler implements kAfterBufferAssignment)",
+   "deleted_when": "none stated",
+   "commits": [
+    "5e0a72feae",
+    "b93220924b"
+   ]
+  },
+  {
+   "fix": "xla-executable-metadata-gpu",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "regenerated against the pin",
+   "subject": "the CUDA plugin serves its executables' metadata and jaxlib's C API client reads their buffer assignment from it, so memory_analysis().serialized_buffer_assignment_proto is the compile's on GPU (delete when upstream XLA's CUDA plugin registers PJRT_ExecutableMetadata_Extension and its C API client reads the assignment)",
+   "deleted_when": "none stated",
+   "commits": [
+    "2a204c5d17",
+    "f9c6ba4270"
+   ]
+  },
+  {
+   "fix": "peak-live",
+   "topic": "core-inspection",
+   "status": "moved",
+   "why": "C01: Dew's training memory reads memory_analysis and the optimized HLO",
+   "subject": "Compiled.peak_live() reads the buffers live at each of a compile's allocation peaks from the buffer assignment its memory analysis states (bytes, shape as compiled, dtype, parameter/output/temporary, defining instruction, op_name, source), a whole compile's or one stopped after buffer assignment alike, with XLA's own schema (hlo_reader.message_class) (delete when upstream's Compiled exposes the buffers live at its peak)",
+   "deleted_when": "none stated",
+   "commits": [
+    "2f54bbf42e",
+    "745de07617",
+    "1753f1d37f",
+    "dfdfd314d4"
+   ]
+  },
+  {
+   "fix": "jaxlib-bound-by-release",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "a post-release of jax bounds the jaxlib and plugins it takes by its own release version",
+   "deleted_when": "none stated",
+   "commits": [
+    "489906b762"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-parallel-compile",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a program's Mosaic GPU kernels compile in parallel on XLA's compile threads (XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY, which Mosaic GPU's handler states; xla-instantiate-concurrently pre-instantiates such calls together before thunk emission, outside the LLVM options lock, the assembler's errors still the compile's) (delete when upstream XLA instantiates concurrent FFI handlers together and Mosaic GPU's registration states it)",
+   "deleted_when": "none stated",
+   "commits": [
+    "2169d2962e",
+    "6ed4bb483f"
+   ]
+  },
+  {
+   "fix": "xla-memory-limit-early-exit",
+   "topic": "xla-gpu-runtime",
+   "status": "reworked",
+   "why": "XLA #19/#20: a typed stop carrying its bytes",
+   "subject": "a GPU compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment, its executable stating its memory and buffer assignment and refusing to run; within the limit it finishes (the bytes compared: argument + output - alias + temp, CompiledMemoryStats') (delete when upstream XLA's GPU compiler stops a compile past a device memory limit)",
+   "deleted_when": "none stated",
+   "commits": [
+    "9ee652064d",
+    "14b2ade60c",
+    "1542ade2b9"
+   ]
+  },
+  {
+   "fix": "checkpoint-name-attribute",
+   "topic": "core-transforms",
+   "status": "reworked",
+   "why": "C04: names only a one-array result",
+   "subject": "a checkpoint_name tags its value's defining op (frontend attribute checkpoint_name), and Compiled.peak_live's buffers carry their names and, a parameter's, its entry parameter's number (delete when upstream's name_p lowers to an attribute XLA keeps)",
+   "deleted_when": "none stated",
+   "commits": [
+    "1402f49c65",
+    "0a616f2a18",
+    "0d978a5779"
+   ]
+  },
+  {
+   "fix": "peak-live-dims",
+   "topic": "core-inspection",
+   "status": "moved",
+   "why": "C01",
+   "subject": "Compiled.peak_live's buffers state, for each dimension, the (entry parameter, axis) pairs it descends from through the dimension maps its ops state, a custom call's from its output_dims frontend attribute, unknown where none is stated (delete when upstream's Compiled states each live buffer's dimension provenance)",
+   "deleted_when": "none stated",
+   "commits": [
+    "523aaa0643",
+    "e6c0a683e4",
+    "9434bd1d42",
+    "cc389fcaa8"
+   ]
+  },
+  {
+   "fix": "token-memory-kinds",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "a jit whose program holds an ordered effect beside a memory-kind transfer lowers: the main function's propagated output memory kinds are prefixed with its effect tokens' as its result memory kinds are (mlir.lower_jaxpr_to_fun), where safe_zip met one more result kind than propagated ones (delete when upstream prefixes propagated_out_mem_kinds with the tokens')",
+   "deleted_when": "none stated",
+   "commits": [
+    "4290f967a7"
+   ]
+  },
+  {
+   "fix": "named-barriers",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Pallas exposes Mosaic GPU's named CTA barriers (plgpu.CtaBarrier, bar.arrive and bar.sync)",
+   "deleted_when": "none stated",
+   "commits": [
+    "52e75b3ed3"
+   ]
+  },
+  {
+   "fix": "lowering-cache-jaxpr-once",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "a Mosaic GPU kernel's jaxpr met before is read from its encoding, not walked again, the key's later parts encoded on from the encoder's state after it (lowering_cache._jaxpr_encoded): a held kernel trace lowered in each program calling it walked its equations each time, most of its key's time (delete with the lowering cache, or when upstream keys a lowering by its jaxpr's encoding once)",
+   "deleted_when": "none stated",
+   "commits": [
+    "9748786d93"
+   ]
+  },
+  {
+   "fix": "threefry-rolled",
+   "topic": "core-transforms",
+   "status": "carried",
+   "why": "",
+   "subject": "on GPU, threefry lowers as rolled loops over its rounds where jax_threefry_rolled_lowering asks it, as on CPU",
+   "deleted_when": "none stated",
+   "commits": [
+    "02cbed9e5c"
+   ]
+  },
+  {
+   "fix": "build",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "rules_ml_toolchain's compiles name every header they read in their dependency files (-MD, not -MMD)",
+   "deleted_when": "none stated",
+   "commits": [
+    "28bf753b24",
+    "d9f460d5fc"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-compile-once",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a Mosaic GPU kernel asked by threads at once is compiled once, the others waiting for it (GetOrCreateKernel), where each compiled it again: XLA instantiates a program's calls together (mosaic-gpu-parallel-compile), and a program calls one kernel from many places, each layer of a model, so a 32-layer step compiled each kernel up to its layers' count at once (delete when upstream's kernel cache compiles a kernel once however many threads ask it)",
+   "deleted_when": "none stated",
+   "commits": [
+    "e2452b236b"
+   ]
+  },
+  {
+   "fix": "xla-ynn-unary-strided",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "YNNPACK's unary kernels read an input of any innermost stride as given (row 5495), gathering a non-contiguous one into a buffer of the call's own and writing nothing shared (the reverted xla-ynn-unary-contiguous wrote the stride on the shared input and crashed CPU processes, row 6829); XLA's ynn_fusion_test and tests/cpu_ynn_reduce_test.py hold the broadcast, the shared clamp reductions and the norm and softmax rows (delete when upstream YNNPACK's unary kernels take an input stride)",
+   "deleted_when": "none stated",
+   "commits": [
+    "2cd2f0ee2e",
+    "c90651e495"
+   ]
+  },
+  {
+   "fix": "xla-triton-dot-add-kept",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "Triton's combine keeps a float add of a dot's result apart from its accumulator (row 6759): XLA's nested GEMM fusion of a residual add, its K loop a single trip, took the residual as the accumulator's start, every product rounded onto it, 1.7 times the unfused float32 distance from float64 on an A100 and a GH200; compilation_pipeline_test holds the float add kept and an integer one still combined (delete when upstream Triton leaves a float add of a dot uncombined)",
+   "deleted_when": "none stated",
+   "commits": [
+    "83dbcf8d33",
+    "ed3a181588"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-bool-convert",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Mosaic GPU converts a number to a boolean by comparing it with zero, as lax does (a NaN's True), where both its lane and warpgroup lowerings truncated it to its low bit and read 2 or 0.5 as False; mosaic_gpu_test's conversion test holds an int32's, an int8's and a float32's under both semantics (delete when upstream's Mosaic GPU lowering converts to a boolean by a comparison)",
+   "deleted_when": "none stated",
+   "commits": [
+    "48fc7bbb55"
+   ]
+  },
+  {
+   "fix": "xla-evaluator-empty-contraction",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "HloEvaluator's float32 dot over an empty contraction is zeros (row 6942): its fast path's Eigen contraction divided by the depth, and XLA:CPU's constant folding died of SIGFPE on a dot of [m, 0] by [0, n] with the algebraic simplifier off (float32 constants folded die, int32 ones and unfolded ones compile: FS-6942); hlo_evaluator_test holds it, its statuses asserted without the status macros, which XLA's versions name differently (delete when upstream's evaluator returns zeros for an empty contraction)",
+   "deleted_when": "none stated",
+   "commits": [
+    "f72b68b1e4"
+   ]
+  },
+  {
+   "fix": "pallas-tpu-flash-delta",
+   "topic": "pallas",
+   "status": "moved",
+   "why": "C11: Dew's attention_tpu holds the variant",
+   "subject": "the TPU flash attention backward's D is each query's sum of p * dp, formed in its own Pallas pass over the key blocks (_flash_attention_bwd_delta), where it was rowsum(o * do) in XLA (row 6981)",
+   "deleted_when": "none stated",
+   "commits": [
+    "8321cab7f0"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-lowering-cache-unread",
+   "topic": "lowering-cache",
+   "status": "carried",
+   "why": "",
+   "subject": "which devices a process sees is no input of a Mosaic GPU lowering's key",
+   "deleted_when": "none stated",
+   "commits": [
+    "54173e9b9b",
+    "7f97352a5b",
+    "0d8de64619",
+    "878708c12f",
+    "d1605fe968",
+    "8eda13591d",
+    "64b5500a18",
+    "70c3ae39aa",
+    "b0906c60b7"
+   ]
+  },
+  {
+   "fix": "xla-deterministic-keep-triton",
+   "topic": "xla-gpu-runtime",
+   "status": "retired",
+   "why": "XLA #10: Dew's `unchecked` flag covers it",
+   "subject": "[XLA:GPU] Deterministic ops keep the autotuner's Triton backend, a Triton GEMM taking no split-k (delete when Dew's deterministic runs set --xla_gpu_experimental_deterministic_ops_triton=unchecked beside --xla_gpu_deterministic_ops, row 5812)",
+   "deleted_when": "none stated",
+   "commits": [
+    "710e0001a2",
+    "e64f70ad81"
+   ]
+  },
+  {
+   "fix": "pallas-triton-optimization-barrier",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Pallas Triton lowers lax.optimization_barrier, its operands as they are (delete when upstream Pallas Triton lowers optimization_barrier)",
+   "deleted_when": "none stated",
+   "commits": [
+    "e315466aba"
+   ]
+  },
+  {
+   "fix": "pallas-triton-unit-slice-and-reductions",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Pallas Triton slices one element along one axis, reduces booleans, and lowers a hijax primitive as its expansion (delete when upstream Pallas Triton lowers each)",
+   "deleted_when": "none stated",
+   "commits": [
+    "9fad3225d5"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-warpgroup-reduce-pred",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] jnp.any and jnp.all of a boolean array lower in both semantics, reduced over the warpgroup by bar.red.{or,and}.pred",
+   "deleted_when": "none stated",
+   "commits": [
+    "e533be971e"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-gather-issuer",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] A gather or scatter whose indices every thread holds takes a predicate naming its issuing thread",
+   "deleted_when": "none stated",
+   "commits": [
+    "6a4fe2da9f"
+   ]
+  },
+  {
+   "fix": "pallas-tpu-optimization-barrier",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "Pallas TPU lowers lax.optimization_barrier, its operands as they are",
+   "deleted_when": "none stated",
+   "commits": [
+    "0a8f30c37d"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-interpret-refill-order",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] the interpreter orders a TMA copy after the generic proxy's reads by its thread's synchronization, after its writes by a proxy fence",
+   "deleted_when": "none stated",
+   "commits": [
+    "42a4ad3551"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-broadcast-untiled-leading",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] broadcast_in_dim into new leading dimensions a tiled layout leaves untiled",
+   "deleted_when": "none stated",
+   "commits": [
+    "e7632e580e"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-assembler-name",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "Mosaic GPU names the compilation provider that assembles a kernel's PTX",
+   "deleted_when": "none stated",
+   "commits": [
+    "119e552659",
+    "016f6e54ed"
+   ]
+  },
+  {
+   "fix": "optimization-barrier-rearranges",
+   "topic": "core-inspection",
+   "status": "retired",
+   "why": "C44: Dew's programs own the classifications",
+   "subject": "optimization_barrier states that it rearranges, its outputs its operands' entries as they are",
+   "deleted_when": "none stated",
+   "commits": [
+    "52ea420886"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-no-contract",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "XLA #23's Mosaic GPU half",
+   "subject": "[Pallas:MGPU] a float add, subtract or multiply under xla_no_contract metadata rounds on its own, and jax.extend.backend states whether XLA honours the label",
+   "deleted_when": "none stated",
+   "commits": [
+    "01f50b2c7b",
+    "e2bcf66c8d"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-whole-tile-reduction",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] a tiled array reduced whole to a scalar, its sum, extremum or predicate, in either semantics",
+   "deleted_when": "none stated",
+   "commits": [
+    "b97810b1df"
+   ]
+  },
+  {
+   "fix": "pallas-fuser-elementwise",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas fuser] every unary elementwise primitive and an optimization barrier carry their operands' blocks",
+   "deleted_when": "none stated",
+   "commits": [
+    "746f62000a",
+    "e11651748b",
+    "0818d6e9cb",
+    "35c9c70cbb",
+    "98a6b0ed4a",
+    "eb582e4041",
+    "e670e2331e"
+   ]
+  },
+  {
+   "fix": "xla-no-contract-mark",
+   "topic": "xla-numerics",
+   "status": "reworked",
+   "why": "XLA #23: the label is part of instruction identity",
+   "subject": "a float add, subtract or multiply labeled xla_no_contract rounds on its own on the CPU, and this build says so",
+   "deleted_when": "none stated",
+   "commits": [
+    "ad94032981",
+    "e73ad2dc7f",
+    "254490ece5",
+    "a9513109fc",
+    "0d15d42e1f"
+   ]
+  },
+  {
+   "fix": "xla-dot-algorithm-multiply",
+   "topic": "xla-numerics",
+   "status": "retired",
+   "why": "XLA #11: pinned XLA declines an algorithm it cannot expand; its F8 multiply type is gpu_dot_strength_wide's (#15)",
+   "subject": "a small dot strength-reduces as its precision algorithm states (delete with the XLA patch dot_algorithm_multiply: when an A100 build without it computes these cases as stated, row 8554)",
+   "deleted_when": "none stated",
+   "commits": [
+    "7263337628"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-kernel-spills",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "a Mosaic GPU kernel's facts state the bytes ptxas says its launch spilled, apart from its stack frame, where they were measured (delete when an upstream release's kernel proto states a launch's spills, a measured zero apart from none measured, and Dew's certification reads it)",
+   "deleted_when": "none stated",
+   "commits": [
+    "25bca0e0be",
+    "7e5ab41847"
+   ]
+  },
+  {
+   "fix": "the XLA patch set at upstream jax main's pin 2b26bc3432",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "review",
+   "deleted_when": "none stated",
+   "commits": [
+    "ebac143006"
+   ]
+  },
+  {
+   "fix": "xla-mixed-index-dot",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "a scatter's indices are flattened in their own type, and a mixed precision dot multiplies in one (row 10741; carried from post119's 1fb91626e5) (delete when upstream's FlattenIndices converts its strides to the indices' type)",
+   "deleted_when": "none stated",
+   "commits": [
+    "9d4bd50664"
+   ]
+  },
+  {
+   "fix": "thread-map-compile-once",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "a thread map's body compiles once for all its threads and every trace of one text (delete when upstream's thread_map compiles a body once a map and keys it by its contents)",
+   "deleted_when": "none stated",
+   "commits": [
+    "24fb8c96dc",
+    "cad9bf1b71",
+    "f325f588b2",
+    "fbe2aaa612",
+    "910e71a4b3",
+    "f1abede4f4"
+   ]
+  },
+  {
+   "fix": "xla-protos",
+   "topic": "core-inspection",
+   "status": "moved",
+   "why": "C03: XLA's descriptors are Dew's; Mosaic GPU's own are generated here",
+   "subject": "the shipped XLA protos regenerated at XLA 2b26bc3432, the rebase line's pin (build/generate_xla_protos.py; mosaic_gpu_protos.py regenerated unchanged)",
+   "deleted_when": "none stated",
+   "commits": [
+    "a6a31e9859"
+   ]
+  },
+  {
+   "fix": "complex-dot-algorithm",
+   "topic": "core-transforms",
+   "status": "reworked",
+   "why": "C42: a real preferred type refuses a complex dot",
+   "subject": "a complex dot under a dot algorithm keeps its imaginary part, its real products each taken at the algorithm (row 7191)",
+   "deleted_when": "none stated",
+   "commits": [
+    "af0b1b6d3e",
+    "6b03a9283d",
+    "5c33d8fcca"
+   ]
+  },
+  {
+   "fix": "interpret-clock-repr",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas interpret] a race report shows each access's vector clock by its counts (delete when upstream's NpVectorClock has a repr)",
+   "deleted_when": "none stated",
+   "commits": [
+    "bd50ca1546"
+   ]
+  },
+  {
+   "fix": "thread-map-callers-client",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas] thread maps run on the caller's CPU client again, a body compiled once for all the maps running it (withdraws thread-map-own-client, whose deletion condition XLA 9935144dd3 meets)",
+   "deleted_when": "none stated",
+   "commits": [
+    "eb915a9d46",
+    "49568f1734",
+    "125c9c019b"
+   ]
+  },
+  {
+   "fix": "transfer-plan-groups",
+   "topic": "mosaic-gpu",
+   "status": "withdrawn",
+   "why": "held on cf/transfer-plan-groups until measured (M-CF-1)",
+   "subject": "[Mosaic GPU] a tiled transfer staggers four or eight lane groups where two leave bank conflicts (delete when upstream's plan_tiled_transfer tries more groups)",
+   "deleted_when": "none stated",
+   "commits": [
+    "f7d0622169",
+    "8518573d6e"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-interpret-scope-callbacks",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas Mosaic GPU interpret] a run_scoped allocates its buffers and barriers in one callback and releases them in one (delete when upstream's interpreter batches a scope's allocations)",
+   "deleted_when": "none stated",
+   "commits": [
+    "828e82ee74",
+    "a95edb994e"
+   ]
+  },
+  {
+   "fix": "compile-only-deserialize",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "[PJRT/IFRT/jaxlib] a compile-only client reads the persistent cache back as unloaded executables (withdraws compile-only-cache's read skip; delete when upstream's PJRT C API deserializes without a client)",
+   "deleted_when": "none stated",
+   "commits": [
+    "8d7a9e3358",
+    "61c3dc6743",
+    "9949fde7c4",
+    "87f7156b4f"
+   ]
+  },
+  {
+   "fix": "instruction-device-groups",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "[XLA Python] a compiled module's collectives state their device groups and a permute its pairs (delete when upstream's HloInstruction binding states them)",
+   "deleted_when": "none stated",
+   "commits": [
+    "dc6469f9c3"
+   ]
+  },
+  {
+   "fix": "triton-dialect-lookup",
+   "topic": "core-inspection",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas Triton] a Triton operation's Python class is found once, not searched for at every lookup (delete when upstream jaxlib puts the Triton dialect under a dialect search prefix)",
+   "deleted_when": "none stated",
+   "commits": [
+    "1feff34283"
+   ]
+  },
+  {
+   "fix": "stablehlo-dead-reduce",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "a reduce no result of which is used is left as it is, not rebuilt with no inputs (StableHLO's ReduceOpUnusedResultCanon built a reduce of no inputs where dead code elimination kept one whose reducer calls a function, and type inference read its first input's type, a SIGSEGV converting any such program to HLO on every backend) (delete when the pinned StableHLO's ReduceOpUnusedResultCanon refuses a reduce with no used result)",
+   "deleted_when": "none stated",
+   "commits": [
+    "d10dc91ef6"
+   ]
+  },
+  {
+   "fix": "mma-row-bound",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] mma issues no instruction for a warp's 16-row block past a row bound (delete when upstream mgpu.mma takes a row bound)",
+   "deleted_when": "none stated",
+   "commits": [
+    "ff7c1b7047",
+    "40ce8684e1",
+    "f91e601cf2"
+   ]
+  },
+  {
+   "fix": "cache-key-memory-limit",
+   "topic": "core-artifacts",
+   "status": "carried",
+   "why": "",
+   "subject": "a compile's persistent cache key leaves out its GPU memory limit, and a compile stopped at that limit is not written (delete when upstream's key excludes xla_gpu_memory_limit_early_exit_bytes and skips a stopped compile, or upstream stops compiles at a memory limit without this flag)",
+   "deleted_when": "none stated",
+   "commits": [
+    "b7531e0e5b",
+    "531685919e",
+    "2a23e02079",
+    "3a97f22acb",
+    "71a8c47e4f",
+    "fe1795dc94",
+    "b5bbe03c6f"
+   ]
+  },
+  {
+   "fix": "mgpu-warpgroup-lowerings",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] lower stop_gradient, split, nextafter, call_hi_primitive, unit-stride slice and partial-axis reduce_or in Warpgroup semantics (delete when upstream's Warpgroup semantics lower stop_gradient, split, nextafter, call_hi, strided slice and partial reduce_or)",
+   "deleted_when": "none stated",
+   "commits": [
+    "b30ace51d1"
+   ]
+  },
+  {
+   "fix": "nvjitlink-library",
+   "topic": "core-inspection",
+   "status": "retired",
+   "why": "XLA #24: Dew inventories the loader's libraries itself",
+   "subject": "the CUDA plugin names the nvJitLink library XLA's stub loaded, by its mapping's build id (delete when upstream's CUDA plugin names the nvJitLink library its compiler links with)",
+   "deleted_when": "none stated",
+   "commits": [
+    "cf4176349b",
+    "733b07fa73",
+    "28e4218727",
+    "a66f2c1344",
+    "0ea0278214"
+   ]
+  },
+  {
+   "fix": "pallas-tracing-kernel",
+   "topic": "pallas",
+   "status": "retired",
+   "why": "C48: no caller, in every trace cache key",
+   "subject": "jax.extend.pallas.tracing_kernel() tells code it is traced inside a Pallas kernel's body (delete when upstream exposes a public predicate of a Pallas kernel trace)",
+   "deleted_when": "none stated",
+   "commits": [
+    "e320c6925c",
+    "2e9c93da71"
+   ]
+  },
+  {
+   "fix": "interpret-device-cluster-state",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] A finished cluster resets its own device's interpreter state alone (delete when upstream's cluster_finished resets one device's state)",
+   "deleted_when": "none stated",
+   "commits": [
+    "9c9ff2bb7f",
+    "24aba7b759",
+    "bbd948a2ea"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-erf",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:MGPU] math.erf and math.atan2 take the pointwise layout rule, and Pallas Triton lowers lax.erf by the device library's erf at its exact dtype",
+   "deleted_when": "none stated",
+   "commits": [
+    "c1cdb67079"
+   ]
+  },
+  {
+   "fix": "mosaic-gpu-barrier-runs",
+   "topic": "mosaic-gpu",
+   "status": "carried",
+   "why": "",
+   "subject": "[Mosaic GPU] a collective warpgroup barrier repeating the one before it is dropped",
+   "deleted_when": "none stated",
+   "commits": [
+    "cb05045682",
+    "45b3cd94cc"
+   ]
+  },
+  {
+   "fix": "triton-kernel-locations",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas:Triton] a kernel serializes without its source locations unless debugged",
+   "deleted_when": "none stated",
+   "commits": [
+    "6b7dc93842"
+   ]
+  },
+  {
+   "fix": "pallas-run-scoped-consts",
+   "topic": "pallas",
+   "status": "carried",
+   "why": "",
+   "subject": "[Pallas] run_scoped's body holds none of the values it closes over",
+   "deleted_when": "none stated",
+   "commits": [
+    "bb1ed4eef2"
+   ]
+  },
+  {
+   "fix": "peak-live-intervals",
+   "topic": "core-inspection",
+   "status": "moved",
+   "why": "C02",
+   "subject": "Compiled.live_intervals: each buffer over its allocation's heap schedule",
+   "deleted_when": "none stated",
+   "commits": [
+    "49c6c6bfdf"
+   ]
+  },
+  {
+   "fix": "ragged-dot-own-group",
+   "topic": "core-transforms",
+   "status": "reworked",
+   "why": "C41: its decomposition a fori_loop fold",
+   "subject": "a ragged dot's row reads its own group's matrix alone",
+   "deleted_when": "none stated",
+   "commits": [
+    "b334ffe825"
+   ]
+  },
+  {
+   "fix": "the XLA patch set at 0.12.2's pin",
+   "topic": "xla-gpu-runtime",
+   "status": "carried",
+   "why": "",
+   "subject": "the release line's natives since post122, its compiler's",
+   "deleted_when": "none stated",
+   "commits": [
+    "1eec233812",
+    "d24defcc4c",
+    "9191b8a471"
+   ]
+  },
+  {
+   "fix": "xla-ragged-dot-own-group",
+   "topic": "xla-numerics",
+   "status": "carried",
+   "why": "",
+   "subject": "XLA's expanded ragged dot reads each row's own group's matrix alone (delete when upstream's RaggedDotRewriter selects each row's own group)",
+   "deleted_when": "none stated",
+   "commits": [
+    "eac6fe7715"
+   ]
+  }
+ ]
+}

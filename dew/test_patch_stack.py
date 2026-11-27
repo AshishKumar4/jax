@@ -141,7 +141,7 @@ def test_a_post_release_ships_its_own_plugins_or_those_built_from_its_native_cod
     assert patch_stack.plugins("0.12.0.1.post47") == "plugin-0.12.0.1.post45"
     # The schema generator, run by hand to write jax/_src's modules and read by no build, changes no plugin; a
     # build script does.
-    commit({"build/generate_xla_protos.py": "post48"}, "post48")
+    commit({"build/generate_xla_protos.py": "post48", "build/generate_mosaic_gpu_protos.py": "post48"}, "post48")
     assert patch_stack.plugins("0.12.0.1.post48") == "plugin-0.12.0.1.post45"
     commit({"build/build.py": "post49"}, "post49")
     assert patch_stack.plugins("0.12.0.1.post49") == ""
@@ -586,3 +586,33 @@ def test_a_staging_index_lists_the_forks_projects_alone_every_file_hashed(tmp_pa
     with pytest.raises(SystemExit):
         patch_stack.staged(tmp_path, "0.12.0.1.post102", "https://pypi.dewml.dev", manifests,
                            [{**assets[0], "digest": None}])
+
+
+def test_fixes_lists_the_manifests_fixes_by_topic_and_status():
+    """`fixes` lists the manifest's fixes in its topics' order, those of a topic or a status alone where named, and
+    refuses a topic or status the manifest has none of, naming those it has."""
+    manifest = {"topics": [{"topic": "xla", "title": "X"}, {"topic": "pallas", "title": "P"}], "fixes": [
+        {"fix": "b", "topic": "pallas", "status": "carried", "deleted_when": "upstream #2"},
+        {"fix": "a", "topic": "pallas", "status": "retired", "deleted_when": "none stated"},
+        {"fix": "c", "topic": "xla", "status": "carried", "deleted_when": "XLA 1234"}]}
+    assert patch_stack.fixes(manifest) == [
+        "xla carried c: deleted when XLA 1234", "pallas carried b: deleted when upstream #2",
+        "pallas retired a: deleted when none stated"]
+    assert patch_stack.fixes(manifest, topic="pallas", status="carried") == [
+        "pallas carried b: deleted when upstream #2"]
+    with pytest.raises(SystemExit, match="no topic 'mosaic' in the manifest: pallas, xla"):
+        patch_stack.fixes(manifest, topic="mosaic")
+    with pytest.raises(SystemExit, match="no status 'moved'"):
+        patch_stack.fixes(manifest, status="moved")
+
+
+def test_the_manifest_states_every_fix_in_one_of_its_topics():
+    """The stack's own manifest: each fix in one of its topics, with a status and an exit stated."""
+    manifest = json.loads(patch_stack.MANIFEST.read_text())
+    topics = {entry["topic"] for entry in manifest["topics"]}
+    assert len(topics) == len(manifest["topics"])
+    for fix in manifest["fixes"]:
+        assert fix["topic"] in topics, fix["fix"]
+        assert fix["status"] in ("carried", "reworked", "moved", "retired", "withdrawn"), fix["fix"]
+        assert fix["deleted_when"], fix["fix"]
+

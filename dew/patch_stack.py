@@ -5,6 +5,7 @@ release to the next.
     python dew/patch_stack.py rebase OLD NEW    # in a clone holding jax-vOLD, jax-vNEW and the OLD branch
     python dew/patch_stack.py tests RELEASE     # the stack's own test files, in a clone holding jax-vRELEASE
     python dew/patch_stack.py plugins VERSION   # the plugin release the stack at VERSION ships beside its jax
+    python dew/patch_stack.py fixes [--topic T] [--status S]   # the fixes the stack carries, by its manifest
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
     python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
@@ -36,6 +37,12 @@ was dropped, so only a release commit would remain and the fork has nothing left
 `tests` prints the test files the stack checked out adds or changes over jax-vRELEASE: each fix's own
 regressions, which the workflow runs, with the API they change, before it pushes or publishes a stack.
 
+`fixes` prints the stack's manifest (stack_manifest.json, beside this file), a fix a line: the topic commit that
+carries it, what became of it, its name and when it can be deleted. From 0.12.2 the stack is eight topic commits,
+each a family (`[stack] TOPIC: ...`), squashed from the fixes the line carried one family each (the fork audit of
+2026-11-26); the manifest keeps each of those fixes, its commits on the history branch it names, so one can still be
+audited and retired on its own when an upstream release holds it: its entry states its exit.
+
 `plugins` prints the plugin release (plugin-X, its CUDA and PJRT plugins) the stack checked out ships beside its
 jax: its own where the fork has one, else an earlier post release's built from the same native code; nothing
 where neither is, and its plugins are to be built (dew/build_plugin.sh).
@@ -65,12 +72,16 @@ STACK = re.compile(r"refs/heads/v(\d+(?:\.\d+){2,3})-cache-key-pool-fingerprints
 PLUGINS = re.compile(r"refs/tags/plugin-(\d+(?:\.\d+){2,3})\.post(\d+)$")
 FAMILY = re.compile(r"^(?:fixup! )?\[stack\] ([^:]+):")
 """A stack commit's family, from its subject: a family's patch, or a repair of it (`fixup!`)."""
-PYTHON_ONLY = ("jax/", "tests/", "docs/", "build/generate_xla_protos.py", ".pre-commit-config.yaml")
+PYTHON_ONLY = ("jax/", "tests/", "docs/", "build/generate_xla_protos.py", "build/generate_mosaic_gpu_protos.py",
+               ".pre-commit-config.yaml")
 """What a post release changes and still ships plugins built from an earlier one's native code (`plugins`): jax's
-Python package, its tests, its docs, build/generate_xla_protos.py, which is run by hand to write jax/_src's
-schema modules (xla_protos.py, mosaic_gpu_protos.py) and which no Bazel target, build/build.py or
-dew/build_plugin.sh reads (post77's kernel-record schema), and .pre-commit-config.yaml, the commit hooks, which
-no build reads (post108's typecheck-clean line, its hooks' config among its files, asked for plugins of its own)."""
+Python package, its tests, its docs, the schema generator (build/generate_xla_protos.py to 0.12.0.1, writing
+jax/_src's xla_protos.py and mosaic_gpu_protos.py; build/generate_mosaic_gpu_protos.py from 0.12.2, the latter
+alone), which is run by hand and which no Bazel target, build/build.py or dew/build_plugin.sh reads (post77's
+kernel-record schema), and .pre-commit-config.yaml, the commit hooks, which no build reads (post108's
+typecheck-clean line, its hooks' config among its files, asked for plugins of its own)."""
+MANIFEST = Path(__file__).with_name("stack_manifest.json")
+"""The stack's per-fix manifest (`fixes`): its topics, and each fix's topic, status, why and exit."""
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -120,6 +131,19 @@ def plugins(version: str) -> str:
         if any(not native(base) for base in held):
             return tag.removeprefix("refs/tags/")
     return ""
+
+
+def fixes(manifest: dict, topic: str | None = None, status: str | None = None) -> list[str]:
+    """The manifest's fixes, a line each, in its topics' order: `TOPIC STATUS FIX: deleted when EXIT`, those of
+    `topic` and `status` alone where named. A topic or status the manifest has none of is a SystemExit."""
+    order = [entry["topic"] for entry in manifest["topics"]]
+    for name, known in (("topic", order), ("status", {fix["status"] for fix in manifest["fixes"]})):
+        if (wanted := {"topic": topic, "status": status}[name]) is not None and wanted not in known:
+            raise SystemExit(f"no {name} {wanted!r} in the manifest: {', '.join(sorted(known))}")
+    chosen = [fix for fix in manifest["fixes"]
+              if topic in (None, fix["topic"]) and status in (None, fix["status"])]
+    chosen.sort(key=lambda fix: (order.index(fix["topic"]), fix["status"], fix["fix"]))
+    return [f"{fix['topic']} {fix['status']} {fix['fix']}: deleted when {fix['deleted_when']}" for fix in chosen]
 
 
 def upstreamed(old: str, new: str) -> set[str]:
@@ -476,6 +500,9 @@ def main() -> int:
     commands.add_parser("tests").add_argument("release")
     commands.add_parser("plugins").add_argument("version")
     commands.add_parser("native").add_argument("release")
+    listing = commands.add_parser("fixes", help="the fixes the stack carries, by its manifest")
+    listing.add_argument("--topic")
+    listing.add_argument("--status")
     indexing = commands.add_parser("index")
     indexing.add_argument("manifest", type=Path)
     indexing.add_argument("site", type=Path)
@@ -511,6 +538,9 @@ def main() -> int:
         return 0
     if args.command == "plugins":
         print(plugins(args.version))
+        return 0
+    if args.command == "fixes":
+        print("\n".join(fixes(json.loads(MANIFEST.read_text()), args.topic, args.status)))
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))
