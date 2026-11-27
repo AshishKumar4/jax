@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -430,26 +432,59 @@ class TiledLayout:
   def partitioned_lane_dims(self) -> tuple[int, ...]:
     return tuple(d for d in self.lane_dims if isinstance(d, int))
 
+  def _linear_offsets(
+      self, shape: tuple[int, ...]
+  ) -> tuple[tuple[int, ...], list[int]]:
+    """The strides of a thread's tiled warp and lane indices into an array of
+    `shape`, and each of its registers' offsets from them, in register order:
+    together the linear index of the register's first element."""
+    contig_strides = tuple(utils.get_contiguous_strides(shape))
+    tile_strides = self.tiling.tile_strides(contig_strides)
+    register_offsets = [
+        sum(i * s for i, s in zip(tile_idx, tile_strides))
+        for tile_idx in np.ndindex(self.registers_shape(shape))
+    ]
+    return tile_strides[-self.tiled_tiling_rank:], register_offsets
+
   def thread_idxs(self, shape: tuple[int, ...]) -> Iterable[tuple[ir.Value, ...]]:
     # We first find the linear index and then divide by the shape to
     # get the index.
     i32 = ir.IntegerType.get_signless(32)
     index = ir.IndexType.get()
     contig_strides = tuple(utils.get_contiguous_strides(shape))
-    tile_strides = self.tiling.tile_strides(contig_strides)
-    dyn_tile_strides = [c(s, i32) for s in tile_strides[-self.tiled_tiling_rank:]]
+    thread_strides, register_offsets = self._linear_offsets(shape)
+    dyn_tile_strides = [c(s, i32) for s in thread_strides]
     warp_offset = utils.dyn_dot(self.warp_indices(), dyn_tile_strides)
     lane_offset = utils.dyn_dot(self.lane_indices(), dyn_tile_strides)
     dyn_offset = arith.addi(warp_offset, lane_offset)
-    register_shape = self.registers_shape(shape)
-    for tile_idx in np.ndindex(register_shape):
-      tile_lin_idx = sum(i * s for i, s in zip(tile_idx, tile_strides))
+    for tile_lin_idx in register_offsets:
       dyn_lin_idx = arith.addi(dyn_offset, c(tile_lin_idx, i32))
       idx = []
       for stride in contig_strides:
         idx.append(arith.index_castui(index, arith.divui(dyn_lin_idx, c(stride, i32))))
         dyn_lin_idx = arith.remui(dyn_lin_idx, c(stride, i32))
       yield tuple(idx)
+
+  def register_indices(
+      self, shape: tuple[int, ...], warp: int, lane: int
+  ) -> list[tuple[int, ...]]:
+    """The index of each register's first element in lane `lane` of warp
+    `warp` of the warpgroup, in register order, as `thread_idxs` computes it
+    at run time; a vector's elements follow it along the last dimension."""
+    thread_strides, register_offsets = self._linear_offsets(shape)
+    thread_offset = sum(
+        (w + l) * s
+        for w, l, s in zip(
+            self._delinearize_index(warp, self.warp_dims),
+            self._delinearize_index(lane, self.lane_dims),
+            thread_strides,
+            strict=True,
+        )
+    )
+    return [
+        tuple(int(i) for i in np.unravel_index(thread_offset + offset, shape))
+        for offset in register_offsets
+    ]
 
   @property
   def base_tile_shape(self) -> tuple[int, ...]:
@@ -507,24 +542,38 @@ class TiledLayout:
     shape[self.vector_dim] = tiled_tiling[self.vector_dim]
     return self.tiling.untile_shape(tuple(shape))
 
+  @overload
+  def _delinearize_index(
+      self, idx: int, dims: tuple[int | Replicated | Unreduced, ...]
+  ) -> tuple[int, ...]:
+    ...
+
+  @overload
   def _delinearize_index(
       self, idx: ir.Value, dims: tuple[int | Replicated | Unreduced, ...]
   ) -> tuple[ir.Value, ...]:
-    i32 = ir.IntegerType.get_signless(32)
+    ...
+
+  def _delinearize_index(self, idx, dims):
+    """`idx`, a warp's or a lane's index (an i32 value, or a Python integer
+    for the index map evaluated ahead of time), as its tiled indices."""
     tiled_shape = self.tiled_tiling_shape
     dims_shape = tuple(
         tiled_shape[d] if isinstance(d, int) else d.times for d in dims
     )
     dims_strides = utils.get_contiguous_strides(dims_shape)
-    dims_indices = tuple(
-        arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
-        for stride, size in zip(dims_strides, dims_shape)
-    )
-    full_indices = [arith.constant(i32, 0)] * len(tiled_shape)
-    for d, i in zip(dims, dims_indices):
+    if isinstance(idx, int):
+      ints = [0] * len(tiled_shape)
+      for d, stride, size in zip(dims, dims_strides, dims_shape):
+        if isinstance(d, int):
+          ints[d] = idx // stride % size
+      return tuple(ints)
+    i32 = ir.IntegerType.get_signless(32)
+    values = [arith.constant(i32, 0)] * len(tiled_shape)
+    for d, stride, size in zip(dims, dims_strides, dims_shape):
       if isinstance(d, int):
-        full_indices[d] = i
-    return tuple(full_indices)
+        values[d] = arith.remui(arith.divui(idx, c(stride, i32)), c(size, i32))
+    return tuple(values)
 
   def lane_indices(self, lane_idx: ir.Value | None = None) -> tuple[ir.Value, ...]:
     i32 = ir.IntegerType.get_signless(32)
@@ -1092,6 +1141,68 @@ TMA_INDICES_4_LAYOUT = TiledLayout(
     vector_dim=-1,
 )
 
+@dataclasses.dataclass(frozen=True)
+class _RowLanes:
+  """How a layout lays a 2D array's rows over a warp's lanes, as a row shift
+  reads them: in each warp, a register holds a group of `rows` rows, the
+  register's row in its group its `offsets` entry plus `lane // columns` (a
+  row's elements of the register in `columns` consecutive lanes, which hold
+  the same columns in each row); `peers` maps each register to the registers
+  holding the same columns of its group, by their offsets."""
+
+  columns: int
+  rows: int
+  offsets: dict[tuple[int, ...], int]
+  peers: dict[tuple[int, ...], dict[int, tuple[int, ...]]]
+
+
+@functools.cache
+def _row_lanes(layout: TiledLayout, shape: tuple[int, ...]) -> _RowLanes | None:
+  """The rows of a 2D array of `shape` over a warp's lanes (`_RowLanes`), as
+  the layout's own index map places them (`TiledLayout.register_indices`);
+  None for a layout whose warps hold no whole groups of rows so."""
+  registers = list(np.ndindex(layout.registers_shape(shape)))
+  placed = np.array([
+      [layout.register_indices(shape, warp, lane) for lane in range(WARP_SIZE)]
+      for warp in range(WARPS_IN_WARPGROUP)
+  ])  # [warps, lanes, registers, 2]
+  rows, columns = placed[..., 0], placed[..., 1]
+  lane = np.arange(WARP_SIZE)[None, :, None]
+  # A row's lanes: the fewest consecutive lanes apart whose rows differ.
+  per_row = next(
+      n for n in (1, 2, 4, 8, 16, WARP_SIZE)
+      if n == WARP_SIZE or np.any(rows[:, n] != rows[:, 0])
+  )
+  if np.any(columns != columns[:, np.arange(WARP_SIZE) % per_row]):
+    return None
+  # The largest group of rows a warp holds whole.
+  for group in (64, 32, 16, 8):
+    if group < WARP_SIZE // per_row:
+      continue
+    offsets = rows[0, 0] % group
+    base = rows - rows % group
+    if np.all(rows % group == offsets + lane // per_row) and np.all(
+        base == base[:, :1]
+    ):
+      peers = {
+          at: {
+              int(offsets[j]): other
+              for j, other in enumerate(registers)
+              if base[0, 0, j] == base[0, 0, i]
+              and columns[0, 0, j] == columns[0, 0, i]
+          }
+          for i, at in enumerate(registers)
+      }
+      # Each register's group held whole, a lane's rows apart a register.
+      whole = list(range(0, group, WARP_SIZE // per_row))
+      if all(sorted(held) == whole for held in peers.values()):
+        return _RowLanes(
+            per_row, group, {at: int(o) for at, o in zip(registers, offsets)},
+            peers,
+        )
+  return None
+
+
 def can_relayout_wgmma_4x_to_wgmma_2x(bitwidth: int) -> bool:
   return bitwidth == 4
 
@@ -1139,6 +1250,49 @@ def _can_splat_unreduced(value: ir.Value, op: str) -> bool:
       case "prod":
         return const.literal_value == 1
   return False
+
+
+def reshape_unit_axis_layout(layout, source_shape, target_shape):
+  """Preserves existing tiled reshapes, then handles a single unit axis."""
+  tile = layout.base_tile_shape
+  if (
+      tile and len(source_shape) >= len(tile) and len(target_shape) >= len(tile)
+      and all(s % t == 0 for s, t in zip(source_shape[-len(tile):], tile))
+      and source_shape[-len(tile):][1:] == target_shape[-len(tile):][1:]
+      and target_shape[-len(tile)] % tile[0] == 0
+  ):
+    return layout
+  if (
+      len(source_shape) == 2 and len(target_shape) == 1
+      and source_shape.count(1) == 1
+      and len(layout.base_tile_shape) == 2
+  ):
+    return layout.reduce((source_shape.index(1),))
+  if (
+      len(source_shape) != 1 or len(target_shape) != 2
+      or target_shape.count(1) != 1
+      or any(len(t) != 1 for t in layout.tiling.tiles)
+      or layout.unreduced_operation is not None
+  ):
+    return None
+  axis = target_shape.index(1)
+  tiles = tuple(
+      (1, t[0]) if axis == 0 else (t[0], 1)
+      for t in layout.tiling.tiles
+  )
+
+  def remap(d):
+    if isinstance(d, int):
+      return 2 * d + (1 if axis == 0 else 0)
+    return d
+
+  return TiledLayout(
+      Tiling(tiles),
+      tuple(map(remap, layout.warp_dims)),
+      tuple(map(remap, layout.lane_dims)),
+      remap(layout.vector_dim),
+      _check_canonical=False,
+  ).canonicalize()
 
 
 @jax.tree_util.register_pytree_node_class
@@ -1618,12 +1772,80 @@ class FragmentedArray:
       )
     if self.layout == WGMMA_LAYOUT_UPCAST_4X and new_layout == WGMMA_LAYOUT:
       return self.to_layout(WGMMA_LAYOUT_UPCAST_2X).to_layout(new_layout)
+    from .mma import can_relayout_acc_to_lhs
+
+    if can_relayout_acc_to_lhs(self.layout, new_layout, bitwidth):
+      # The accumulator's (row tile, 8-column tile, half) registers are the
+      # LHS's (row tile, 16-column tile, 8-column half, half): the same
+      # registers, the column tile split in two.
+      registers = self.registers.reshape(new_layout.registers_shape(shape))
+      return FragmentedArray(
+          _registers=registers, _layout=new_layout, _is_signed=self.is_signed
+      )
     if not isinstance(self.layout, WGSplatFragLayout):
       raise NotImplementedError(
           f"Cannot convert from {self.layout} to {new_layout}"
       )
     return type(self).splat(
         self.registers.item(), self.shape, new_layout, is_signed=self.is_signed
+    )
+
+  def row_shifted(self, shift: ir.Value, period: int) -> FragmentedArray:
+    """Each row `i` of a 2D array holding row `i - shift`'s values within its
+    group of `period` rows, `shift` an i32 value uniform over the warpgroup;
+    a row whose source lies outside its group holds unspecified values.
+
+    The values move between a warp's lanes by shuffles, so the layout's warps
+    must each hold whole groups of `period` rows, a row's elements of a
+    register in consecutive lanes (`_row_lanes`), as WGMMA_LAYOUT's and
+    TCGEN05_LAYOUT's do.
+    """
+    shape = self.shape
+    if (
+        not isinstance(self.layout, TiledLayout)
+        or self.is_unreduced
+        or len(shape) != 2
+    ):
+      raise NotImplementedError(
+          f"Row shifts take a 2D array in a tiled layout, got {self.layout}"
+          f" of shape {shape}"
+      )
+    form = _row_lanes(self.layout, shape)
+    if form is None or form.rows % period:
+      raise NotImplementedError(
+          f"{self.layout}'s warps hold no whole groups of {period} rows of an"
+          f" array of shape {shape}"
+      )
+    i32 = ir.IntegerType.get_signless(32)
+    lane = arith.remui(utils.thread_idx(), c(WARP_SIZE, i32))
+    lane_row = arith.divui(lane, c(form.columns, i32))
+    lane_column = arith.remui(lane, c(form.columns, i32))
+    warp_rows = WARP_SIZE // form.columns
+    new_regs = np.empty_like(self.registers)
+    for at in np.ndindex(self.registers.shape):
+      # The row of the group this lane's element of the register reads (the
+      # group's size a power of two, so a negative difference's residue too),
+      # the lane holding it and its register's offset among the peers.
+      row = arith.addi(lane_row, c(form.offsets[at], i32))
+      source = arith.remui(arith.subi(row, shift), c(form.rows, i32))
+      within = arith.remui(source, c(warp_rows, i32))
+      source_lane = arith.addi(
+          arith.muli(within, c(form.columns, i32)), lane_column
+      )
+      source_offset = arith.subi(source, within)
+      value = None
+      for offset, peer in sorted(form.peers[at].items()):
+        moved = utils.shfl_idx(self.registers[peer], source_lane)
+        if value is None:
+          value = moved
+        else:
+          taken = arith.cmpi(
+              arith.CmpIPredicate.eq, source_offset, c(offset, i32)
+          )
+          value = arith.select(taken, moved, value)
+      new_regs[at] = value
+    return FragmentedArray(
+        _registers=new_regs, _layout=self.layout, _is_signed=self.is_signed
     )
 
   def _pointwise(
@@ -1741,8 +1963,19 @@ class FragmentedArray:
 
   def __neg__(self):
     if isinstance(self.mlir_dtype, ir.FloatType):
+      # A float instruction, as `abs` emits one: LLVM expands `fneg` of a vector
+      # of registers into a sign-bit `xor`, an integer op that ptxas (12.9)
+      # folds through a WGMMA accumulator's value before the MMA, dropping the
+      # MMA and storing -0.0.
+      negf = arith.negf
+      if isinstance(self.mlir_dtype, ir.F32Type):
+        negf = self._lift_fast_instr("neg.f32")
+      elif isinstance(self.mlir_dtype, ir.F16Type):
+        negf = self._lift_fast_packed_instr("neg.f16x2", "neg.f16")
+      elif isinstance(self.mlir_dtype, ir.BF16Type):
+        negf = self._lift_fast_packed_instr("neg.bf16x2", "neg.bf16")
       # -(a + b) = (-a) + (-b)
-      return self._pointwise(arith.negf, distributes_over=("add",))
+      return self._pointwise(negf, distributes_over=("add",))
     elif isinstance(self.mlir_dtype, ir.IntegerType):
       if utils.bitwidth(self.mlir_dtype) == 8:
         if not (arch := utils.get_arch()).is_sm107f:
@@ -2141,6 +2374,11 @@ class FragmentedArray:
   def copysign(self, other: FragmentedArray) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
       raise NotImplementedError
+    if isinstance(self.mlir_dtype, ir.F32Type):
+      # PTX's float instruction (`__neg__`'s reason): `copysign.f32 d, a, b`
+      # takes a's sign and b's magnitude.
+      signed = self._lift_fast_instr("copysign.f32")
+      return self._pointwise(lambda x, y: signed(y, x), other)
     return self._pointwise(mlir_math.copysign, other)
 
   def exp(self, *, approx: bool = False) -> FragmentedArray:
@@ -2286,6 +2524,18 @@ class FragmentedArray:
     return self._pointwise(
         mlir_math.roundeven, distributes_over=_NON_DECREASING_DISTRIBUTES_OVER
     )
+
+  def ceil(self) -> FragmentedArray:
+    """Same as `lax.ceil`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.ceil)
+
+  def floor(self) -> FragmentedArray:
+    """Same as `lax.floor`."""
+    if not isinstance(self.mlir_dtype, ir.FloatType):
+      raise NotImplementedError
+    return self._pointwise(mlir_math.floor)
 
   def erf(self) -> FragmentedArray:
     if not isinstance(self.mlir_dtype, ir.FloatType):
@@ -3295,6 +3545,37 @@ class FragmentedArray:
         _registers=new_registers, _layout=self.layout, _is_signed=is_signed
     )
 
+  def reduce_pred(self, op: Literal["or", "and"]) -> FragmentedArray:
+    """Whether any (`or`) or every (`and`) element of this boolean array is
+    true, a scalar every thread of the warpgroup holds: each thread's elements
+    combined in its registers, then the warpgroup's by one `bar.red.{op}.pred`
+    (`utils.warpgroup_reduce_pred`), which every thread of the warpgroup
+    reaches. An element several threads hold counts alike in each, so any
+    layout reduces so, a row's replicated across its lanes among them."""
+    if self.mlir_dtype != ir.IntegerType.get_signless(1):
+      raise NotImplementedError(
+          f"A predicate reduction takes booleans, not {self.mlir_dtype}"
+      )
+    if self.is_unreduced:
+      raise NotImplementedError("A predicate reduction of an unreduced array")
+    combine = arith.ori if op == "or" else arith.andi
+    own = functools.reduce(combine, self.registers.flat)
+    if isinstance(own.type, ir.VectorType):
+      own = functools.reduce(
+          combine,
+          (
+              vector.extract(
+                  own,
+                  dynamic_position=[],
+                  static_position=ir.DenseI64ArrayAttr.get([i]),
+              )
+              for i in range(ir.VectorType(own.type).shape[0])
+          ),
+      )
+    return FragmentedArray.splat(
+        utils.warpgroup_reduce_pred(own, op), (), is_signed=self.is_signed
+    )
+
   def reduce(
       self,
       op: str | Callable[[ir.Value, ir.Value], ir.Value],
@@ -3916,6 +4197,15 @@ class FragmentedArray:
             _is_signed=self.is_signed,
         )
       case TiledLayout():
+        unit_layout = reshape_unit_axis_layout(self.layout, self.shape, shape)
+        if unit_layout is not None:
+          return FragmentedArray(
+              _registers=self.registers.reshape(
+                  unit_layout.registers_shape(shape)
+              ),
+              _layout=unit_layout,
+              _is_signed=self.is_signed,
+          )
         base_tile_shape = self.layout.base_tile_shape
         assert base_tile_shape
         old_shape_suffix = self.shape[-len(base_tile_shape):]
@@ -4003,12 +4293,43 @@ class FragmentedArray:
       )
     if not isinstance(self.layout, TiledLayout) or not isinstance(layout, TiledLayout):
       raise NotImplementedError(self.layout, layout)
-    if len(layout.base_tile_shape) != len(shape):
+    if len(self.shape) == 2 and self.shape.count(1) == 1:
+      axis = self.shape.index(1)
+      squeezed = self.reshape(
+          tuple(s for i, s in enumerate(self.shape) if i != axis)
+      )
+      return squeezed.broadcast_in_dim(
+          shape,
+          tuple(d for i, d in enumerate(source_dimensions) if i != axis),
+          layout,
+      )
+    new_dimensions = sorted(set(range(len(shape))) - set(source_dimensions))
+    untiled_rank = len(shape) - len(layout.base_tile_shape)
+    if (
+        untiled_rank > 0
+        and layout == self.layout
+        and all(d < untiled_rank for d in new_dimensions)
+        and all(self.shape[i] == shape[d] for i, d in enumerate(source_dimensions))
+    ):
+      # New dimensions the layout leaves untiled, leading its tiled ones: a
+      # thread holds each of their elements, so its registers repeat along
+      # each (a row made a [1, n] one, as layout inference may lay it out).
+      pre_broadcast_registers_shape = list(layout.registers_shape(shape))
+      for new_dim in new_dimensions:
+        pre_broadcast_registers_shape[new_dim] = 1
+      return FragmentedArray(
+          _registers=np.broadcast_to(
+              self.registers.reshape(pre_broadcast_registers_shape),
+              layout.registers_shape(shape),
+          ),
+          _layout=layout,
+          _is_signed=self.is_signed,
+      )
+    if untiled_rank:
       raise NotImplementedError(
           "Tiling rank different than broadcast result rank, "
           f"{layout.base_tile_shape} vs {shape}"
       )
-    new_dimensions = sorted(set(range(len(shape))) - set(source_dimensions))
     expected_layout = layout.reduce(new_dimensions)
     if expected_layout != self.layout:
       raise ValueError(
@@ -5191,6 +5512,13 @@ class FragmentedArray:
     # the MMA instructions consume them. Otherwise, ptxas emits a bunch of extra
     # MOV instructions that destroy the performance.
     from .mma import MMALayouts
+    if utils.bitwidth(dtype) == 32 and any(
+        layout in (MMALayouts(dtype, m_warps=w).lhs, MMALayouts(dtype, m_warps=w).rhs)
+        for w in (1, 2, 4)
+    ):
+      # A 32-bit (TF32) MMA operand's fragments hold one element a register,
+      # in no order ldmatrix produces: such a transfer is a plain one.
+      raise TxMatrixIneligible("32-bit MMA operands are not loaded by ldmatrix")
     if any(layout == MMALayouts(dtype, m_warps=w).lhs for w in (1, 2, 4)):
       assert tiled_nested_shape[-6] == (2,)
       assert tiled_nested_shape[-5] == (2,)
@@ -5752,15 +6080,43 @@ def plan_tiled_transfer(
   )
 
 # We allow contractions, to potentially take advantage of FMA instructions.
-# They can change the results, but the precision should only increase.
+# They can change the results, but the precision should only increase, except
+# where an operation's own rounding is the result: an error-free transform's
+# product and the sums reading it (`contracting`).
+_CONTRACTS = contextvars.ContextVar("mosaic_gpu_contracts", default=True)
+
+
+@contextlib.contextmanager
+def contracting(allowed: bool) -> Iterator[None]:
+  """Within the block, the float adds, subtracts and multiplies emitted may be
+  contracted into fused multiply-adds where `allowed`, else each rounds on its
+  own."""
+  token = _CONTRACTS.set(allowed)
+  try:
+    yield
+  finally:
+    _CONTRACTS.reset(token)
+
+
+def contracts() -> bool:
+  """Whether the float arithmetic emitted here may be contracted (`contracting`)."""
+  return _CONTRACTS.get()
+
+
 def addf(a: ir.Value, b: ir.Value):
-  return arith.addf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.addf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.addf(a, b)
 
 def subf(a: ir.Value, b: ir.Value):
-  return arith.subf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.subf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.subf(a, b)
 
 def mulf(a: ir.Value, b: ir.Value):
-  return arith.mulf(a, b, fastmath=arith.FastMathFlags.contract)
+  if contracts():
+    return arith.mulf(a, b, fastmath=arith.FastMathFlags.contract)
+  return arith.mulf(a, b)
 
 
 @overload

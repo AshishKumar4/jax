@@ -41,6 +41,8 @@ from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
 
+from . import lowering_inputs
+
 logger = logging.getLogger(__name__)
 
 WARP_SIZE: int = 32
@@ -1172,9 +1174,41 @@ def warpgroup_barrier_idx(sync: bool = True) -> ir.Value[ir.IntegerType]:
   return arith.addi(warpgroup_idx(sync=sync), c(1, i32))
 
 
-def warpgroup_barrier():
-  wg_idx = warpgroup_barrier_idx(sync=False)
-  inline_ptx(f"bar.sync $0, {WARPGROUP_SIZE};", wg_idx, convergent=True)
+COLLECTIVE_BARRIER = "mosaic_gpu.collective_barrier"
+"""The attribute marking a warpgroup barrier every thread of the warpgroup
+reaches from the same program point (`warpgroup_barrier(collective=True)`: a
+warpgroup collective store's automatic barriers, a kernel's own warpgroup-wide
+sync), until the lowering drops those repeated back to back
+(`core._drop_repeated_barriers`)."""
+
+
+def warpgroup_barrier(*, collective: bool = False):
+  """A sync of the warpgroup's threads on its own barrier
+  (`warpgroup_barrier_idx`): a typed `nvvm.barrier` of its id and of
+  `WARPGROUP_SIZE` threads, `bar.sync id, 128` in PTX, which a reader of a
+  lowered module finds as an operation. `collective`: one every thread of the
+  warpgroup reaches from the same program point (no branch splits its
+  participants), marked so a repeat of it may be dropped."""
+  i32 = ir.IntegerType.get_signless(32)
+  op = nvvm.barrier(
+      barrier_id=warpgroup_barrier_idx(sync=False),
+      number_of_threads=c(WARPGROUP_SIZE, i32),
+  )
+  if collective:
+    op.attributes[COLLECTIVE_BARRIER] = ir.UnitAttr.get()
+
+
+def warpgroup_reduce_pred(pred: ir.Value, op: Literal["or", "and"]) -> ir.Value:
+  """`pred`, an i1, reduced by `op` over the warpgroup's threads, the result
+  every thread's: one `bar.red.{op}.pred` on the warpgroup's barrier, which
+  every thread of the warpgroup reaches."""
+  return inline_ptx(
+      f"bar.red.{op}.pred $0, $1, {WARPGROUP_SIZE}, $2;",
+      warpgroup_barrier_idx(sync=False),
+      pred,
+      result_types=ir.IntegerType.get_signless(1),
+      has_side_effects=True,
+  )
 
 
 def warp_barrier():
@@ -2180,9 +2214,20 @@ def dyn_dot(x, y):
 
 
 def shfl_bfly(x: ir.Value, distance: int | ir.Value):
+  """`x` as the lane `distance` apart in a butterfly holds it."""
+  return _shfl(x, distance, nvvm.ShflKind.bfly)
+
+
+def shfl_idx(x: ir.Value, lane: int | ir.Value):
+  """`x` as lane `lane` of the warp holds it."""
+  return _shfl(x, lane, nvvm.ShflKind.idx)
+
+
+def _shfl(x: ir.Value, value: int | ir.Value, kind: nvvm.ShflKind):
+  """A warp shuffle of `x` of any bitwidth, a 32-bit word at a time."""
   i32 = ir.IntegerType.get_signless(32)
-  if isinstance(distance, int):
-    distance = c(distance, i32)
+  if isinstance(value, int):
+    value = c(value, i32)
   if (result_type := x.type) != i32:
     if (x_bitwidth := bitwidth(x.type)) < 32:  # Pad to 32-bits if necessary.
       assert 32 % x_bitwidth == 0
@@ -2205,7 +2250,7 @@ def shfl_bfly(x: ir.Value, distance: int | ir.Value):
             dynamic_position=[],
             static_position=ir.DenseI64ArrayAttr.get([i]),
         )
-        y_elem = shfl_bfly(x_elem, distance)
+        y_elem = _shfl(x_elem, value, kind)
         y = vector.insert(
             y_elem,
             y,
@@ -2214,13 +2259,7 @@ def shfl_bfly(x: ir.Value, distance: int | ir.Value):
         )
       return bitcast(y, result_type)
     x = bitcast(x, i32)
-  y = nvvm.shfl_sync(
-      c(0xFFFFFFFF, i32),
-      x,
-      distance,
-      c(0x1F, i32),
-      nvvm.ShflKind.bfly
-  )
+  y = nvvm.shfl_sync(c(0xFFFFFFFF, i32), x, value, c(0x1F, i32), kind)
   if (x_bitwidth := bitwidth(result_type)) < 32:
     bits_ty = ir.IntegerType.get_signless(x_bitwidth)
     y_vec = bitcast(y, ir.VectorType.get((32 // x_bitwidth,), bits_ty))
@@ -2376,13 +2415,38 @@ def _vector_concat_rec(
       return _vector_concat_rec([l, r])
 
 
-def is_known_divisible(value: ir.Value, divisor: int, max_depth=10) -> bool:
-  """Returns True if the value is statically known to be divisible by the divisor."""
+def is_known_divisible(
+    value: ir.Value,
+    divisor: int,
+    max_depth=10,
+    known: dict[tuple[ir.Value, int, int], bool] | None = None,
+) -> bool:
+  """Returns True if the value is statically known to be divisible by the divisor.
+
+  `known` holds the answers of one analysis, by value, divisor and depth: a
+  product tries several splits of a power-of-two divisor, whose subproblems
+  repeat, so each is answered once (a caller asking after several divisors of
+  one value passes one `known` to all of them).
+  """
   if divisor == 1:
     return True
   if max_depth < 0:
     return False
+  known = {} if known is None else known
+  key = (value, divisor, max_depth)
+  if key not in known:
+    known[key] = _is_known_divisible(value, divisor, max_depth, known)
+  return known[key]
 
+
+def _is_known_divisible(
+    value: ir.Value,
+    divisor: int,
+    max_depth: int,
+    known: dict[tuple[ir.Value, int, int], bool],
+) -> bool:
+  """`is_known_divisible`'s analysis of `value`'s defining operation."""
+  divisible = functools.partial(is_known_divisible, known=known)
   new_depth = max_depth - 1
   def_op = value.owner
 
@@ -2392,40 +2456,47 @@ def is_known_divisible(value: ir.Value, divisor: int, max_depth=10) -> bool:
       if isinstance(op, dialect.WarpMapOp):
         arg_index = list(block.arguments).index(value)  # pyrefly: ignore[bad-argument-type]
         operand = op.operands[arg_index]
-        return is_known_divisible(operand, divisor, new_depth)
+        return divisible(operand, divisor, new_depth)
       return False
     case dialect.AssumeMultipleOp() as op2:
       return ir.IntegerAttr(
           op2.multiple
-      ).value % divisor == 0 or is_known_divisible(op2.value, divisor, new_depth)
-    case arith.IndexCastOp():
-      return is_known_divisible(def_op.in_, divisor, max_depth - 1)
+      ).value % divisor == 0 or divisible(op2.value, divisor, new_depth)
+    case arith.IndexCastOp() | arith.IndexCastUIOp():
+      return divisible(def_op.in_, divisor, max_depth - 1)
     case arith.ConstantOp():
       return def_op.literal_value % divisor == 0
     case arith.MulIOp():
-      # Only cover the case where one operand is divisible. It's still possible
-      # that the final product is divisible, but we don't check that here.
-      return is_known_divisible(
-          def_op.lhs, divisor, new_depth
-      ) or is_known_divisible(def_op.rhs, divisor, new_depth)
+      # One operand divisible (the splits 1 and `divisor`); or, for a power of
+      # two, each operand a power of two whose product it is (a product of two
+      # strided indices).
+      factors = (
+          [1 << i for i in range(divisor.bit_length())]
+          if divisor.bit_count() == 1 else [1, divisor]
+      )
+      return any(
+          divisible(def_op.lhs, divisor // factor, new_depth)
+          and divisible(def_op.rhs, factor, new_depth)
+          for factor in factors
+      )
     case arith.SelectOp():
-      return is_known_divisible(
+      return divisible(
           def_op.true_value, divisor, new_depth
-      ) and is_known_divisible(def_op.false_value, divisor, new_depth)
+      ) and divisible(def_op.false_value, divisor, new_depth)
     case arith.MaxSIOp() | arith.MinSIOp() | arith.MaxUIOp() | arith.MinUIOp():
-      return is_known_divisible(
+      return divisible(
           def_op.lhs, divisor, new_depth
-      ) and is_known_divisible(def_op.rhs, divisor, new_depth)
+      ) and divisible(def_op.rhs, divisor, new_depth)
     case arith.AddIOp() | arith.SubIOp() | arith.RemUIOp() | arith.RemSIOp():
       # Only cover the common case where both operands are divisible.
-      return is_known_divisible(
+      return divisible(
           def_op.lhs, divisor, new_depth
-      ) and is_known_divisible(def_op.rhs, divisor, new_depth)
+      ) and divisible(def_op.rhs, divisor, new_depth)
     case arith.AndIOp():
       # Only cover the specific case where the divisor is a power of two.
       return divisor.bit_count() == 1 and (
-          is_known_divisible(def_op.lhs, divisor, new_depth)
-          or is_known_divisible(def_op.rhs, divisor, new_depth)
+          divisible(def_op.lhs, divisor, new_depth)
+          or divisible(def_op.rhs, divisor, new_depth)
       )
     case arith.TruncIOp():
       # Only cover the specific case where the divisor is a power of two.
@@ -2438,7 +2509,7 @@ def is_known_divisible(value: ir.Value, divisor: int, max_depth=10) -> bool:
       #      divisor divides a, then we can conclude that a % 2**bitwidth == 0,
       #      and thus that the divisor also divides the truncated value.
       return (divisor.bit_count() == 1 and
-              is_known_divisible(def_op.in_, divisor, new_depth))
+              divisible(def_op.in_, divisor, new_depth))
 
   logger.debug("Unsupported defining operation %s when "
                "checking divisibility of %s", def_op, value)
@@ -2670,18 +2741,23 @@ RUBIN = Arch(10, 7)
 
 
 def _infer_arch() -> tuple[int, int]:
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.arch
   device: Any = jax.sharding.get_abstract_mesh().abstract_device
   default_device = jex_backend.get_default_device()
   if device is None:
     device = default_device
   elif (
-      hasattr(default_device, "compute_capability")
+      getattr(device, "compute_capability", None) is None
+      and hasattr(default_device, "compute_capability")
       and device.device_kind == default_device.device_kind
   ):
     device = default_device
-  if not hasattr(device, "compute_capability"):
+  # An abstract device that states its compute capability is lowered for it
+  # whatever device is attached (a compile-only target).
+  arch_name = getattr(device, "compute_capability", None)
+  if arch_name is None:
     return (9, 0)  # TODO(apaszke): Remove this once we figure out the export story.
-  arch_name = device.compute_capability
   # Handle ROCm devices that return architecture strings like "gfxXXX".
   if arch_name.startswith("gfx"):
     raise ValueError(

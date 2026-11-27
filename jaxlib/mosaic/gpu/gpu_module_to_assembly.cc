@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,6 +26,8 @@ limitations under the License.
 
 #include "absl/base/call_once.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/CallingConv.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/Casting.h"
@@ -90,8 +93,12 @@ class ModuleToAssembly : public mlir::LLVM::ModuleToObject {
   std::optional<SmallVector<std::unique_ptr<llvm::Module>>> loadBitcodeFiles(
       llvm::Module& module) override;
 
+  // The kernel entries the serialized PTX defines (`kKernelEntriesProperty`).
+  int64_t kernel_entries() const { return kernel_entries_; }
+
  private:
   std::vector<std::string> libraries_to_link_;
+  int64_t kernel_entries_ = 0;
 };
 
 FailureOr<SmallVector<char, 0>> ModuleToAssembly::moduleToObject(
@@ -112,6 +119,13 @@ FailureOr<SmallVector<char, 0>> ModuleToAssembly::moduleToObject(
   if (failed(ptx)) {
     return getOperation().emitError() << "Failed translating the module"
                                          "to PTX.";
+  }
+  kernel_entries_ = 0;
+  for (const llvm::Function& function : llvm_module) {
+    if (!function.isDeclarationForLinker() &&
+        function.getCallingConv() == llvm::CallingConv::PTX_Kernel) {
+      ++kernel_entries_;
+    }
   }
   std::string fixed_ptx = internal::FixInlineAsmLocInfoInPTX(*ptx);
   return SmallVector<char, 0>(fixed_ptx.begin(), fixed_ptx.end());
@@ -171,7 +185,10 @@ LogicalResult LowerGpuModuleToAssembly(
   }
 
   SmallVector<mlir::NamedAttribute> properties{
-      builder.getNamedAttr("O", builder.getI32IntegerAttr(target_attr.getO()))};
+      builder.getNamedAttr("O", builder.getI32IntegerAttr(target_attr.getO())),
+      builder.getNamedAttr(
+          kKernelEntriesProperty,
+          builder.getI64IntegerAttr(serializer.kernel_entries()))};
 
   Attribute object = builder.getAttr<mlir::gpu::ObjectAttr>(
       target_attr, mlir::gpu::CompilationTarget::Assembly,

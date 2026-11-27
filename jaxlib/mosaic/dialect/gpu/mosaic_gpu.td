@@ -913,11 +913,16 @@ def MosaicGPU_MMAOp : Op<MosaicGPU_Dialect, "mma",
     Computes `a @ b + accumulator` synchronously using Ampere MMA instructions.
 
     The output has an identical shape and type as the input accumulator.
+
+    Where `rows` is given (uniform across the warpgroup), a warp issues no
+    instruction for a 16-row block of the accumulator that begins at or past
+    `rows`: those rows of the output are the accumulator's.
   }];
   let arguments = (ins
     VectorOfRankAndType<[2], [MosaicGPU_MMASupportedAccumulatorType]>:$accumulator,
     VectorOfRankAndType<[2], [MosaicGPU_MMASupportedABType]>:$a,
-    VectorOfRankAndType<[2], [MosaicGPU_MMASupportedABType]>:$b
+    VectorOfRankAndType<[2], [MosaicGPU_MMASupportedABType]>:$b,
+    Optional<I32>:$rows
   );
   let results = (outs VectorOfRankAndType<[2], [MosaicGPU_MMASupportedAccumulatorType]>);
 
@@ -925,6 +930,7 @@ def MosaicGPU_MMAOp : Op<MosaicGPU_Dialect, "mma",
     `accumulator` `(` $accumulator `:` type($accumulator) `)`
     `a` `(` $a `:` type($a) `)`
     `b` `(` $b `:` type($b) `)`
+    (`rows` `(` $rows^ `)`)?
     attr-dict
     `->` type(results)
   }];
