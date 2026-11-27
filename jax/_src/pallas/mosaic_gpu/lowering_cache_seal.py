@@ -54,7 +54,9 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import os
+import posixpath
 import re
+import stat
 import struct
 import sys
 import sysconfig
@@ -153,6 +155,8 @@ class Seal:
     # The declared source packages' files (`SOURCES_VARIABLE`), each by its path
     # to its package and its name in it, and each package's tree digest.
     self._sources = sources or {}
+    # Their paths' trailing components (`_source_suffixes`), made at first ask.
+    self._suffixes: frozenset[str] | None = None
     self.source_digests = source_digests or {}
     # By id, with the code kept, as code objects compare by value and not by file.
     self._code_identities: dict[int, tuple[types.CodeType, bytes]] = {}
@@ -179,15 +183,78 @@ class Seal:
     """The declared source package `file` is of and its name in it, if any.
 
     Read for every primitive a key's jaxpr binds, so it is answered once a
-    file: resolving a path's links was 0.15 of a 0.48 s key."""
+    file: resolving a path's links was 0.15 of a 0.48 s key. Asked of every
+    loaded module's file by a holder scan, where most files are of no declared
+    package: one whose path cannot resolve to a declared one
+    (`_may_be_source`) is answered without resolving it."""
     if not file:
       return None
     if file not in self._source_of:
-      self._source_of[file] = (
-          self._sources.get(os.path.normpath(file))
-          or self._sources.get(os.path.realpath(file))
-      )
+      found = self._sources.get(os.path.normpath(file))
+      if found is None and self._may_be_source(file):
+        found = self._sources.get(os.path.realpath(file))
+      self._source_of[file] = found
     return self._source_of[file]
+
+  def _may_be_source(self, file: str) -> bool:
+    """Whether `file`'s resolved path may be a declared source's file (one of
+    `_sources`' paths), answered as resolving it reads it, now.
+
+    Resolving appends each component that is no link as it is, so a resolved
+    path ends in the trailing components of `file` that are no links. Those are
+    read from its end, one ``lstat`` each, and the first suffix no declared path
+    ends in answers that it is none (most files: their name, or their
+    directory's and their name); resolving a path looks up every component, a
+    system call each handing the GIL to the threads tracing beside a holder scan
+    (a 4,800-module compile ahead's scan resolved 3,429 files, 0.22 s quiet). A
+    link, a component the system cannot read (resolving reads the links before
+    it one at a time), or a path other than an exact absolute string of plain
+    components, is resolved. What is kept between calls is the declared paths'
+    suffixes alone, which do not change. A process declaring no package answers
+    an exact string without reading the file system.
+
+    The components before the first rejected suffix are read as the system reads
+    them, which is as resolving reads them through ordinary links but not
+    through a "magic" one (Linux's ``/proc/<pid>/fd/<n>`` and its kin, which the
+    system follows to the open file and resolving to the link's text): a file
+    reached through such a link whose directory another mount now covers may be
+    answered as the open file's. A module's file is the path its import found on
+    ``sys.path``."""
+    if type(file) is not str or os.path is not posixpath:
+      return True
+    if not self._sources:
+      return False
+    parts = file.split("/")
+    if parts[0] or any(part in ("", ".", "..") for part in parts[1:]):
+      return True
+    suffixes = self._source_suffixes()
+    suffix = ""
+    for end in range(len(parts) - 1, 0, -1):
+      try:
+        mode = os.lstat("/".join(parts[:end + 1])).st_mode
+      except (OSError, ValueError):
+        # Read through the links before it, which resolving reads one at a
+        # time: a path the system cannot read (too many links, a missing
+        # component) may still resolve.
+        return True
+      if stat.S_ISLNK(mode):
+        return True
+      suffix = f"/{parts[end]}{suffix}"
+      if suffix not in suffixes:
+        return False
+    return True
+
+  def _source_suffixes(self) -> frozenset[str]:
+    """Every trailing run of components of the declared sources' paths, each
+    as ``/a/b``: what `_may_be_source` reads a file's path's end against."""
+    if self._suffixes is None:
+      found = set()
+      for path in self._sources:
+        parts = path.split("/")
+        for start in range(1, len(parts)):
+          found.add("/" + "/".join(parts[start:]))
+      self._suffixes = frozenset(found)
+    return self._suffixes
 
   def source_identity(self, package: str) -> bytes:
     """A declared source package's identity: its name and its tree's digest."""
