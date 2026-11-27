@@ -117,16 +117,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     fresh = self.lower(cache=False, **spied)
     self.assertEqual(fresh["serialized"], ["serde pass", "kernel hash"])
 
-  def test_an_entry_without_a_serialized_kernel_is_a_hit_that_serializes(self):
-    # An entry of the fields alone (as a damaged serialized part leaves none):
-    # its hit makes the call from the module, as a miss does.
-    self.lower()
-    entry, = self.entries()
-    harness.rewrite_entry(entry, header={"serialized": None})
-    hit = self.lower(serialization=True)
-    self.assertEqual(hit["events"], ["hit"])
-    self.assertEqual(hit["serialized"], ["serde pass", "kernel hash"])
-
   def test_the_flag_is_the_environment_variable(self):
     flag = {"jax_pallas_lowering_cache_dir": str(self.cache_dir)}
     first = self.lower(cache=False, config=flag)
@@ -145,14 +135,14 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
 
   def test_a_difference_a_verified_hit_finds_raises(self):
     # An entry that is whole (its checksum is of what it holds now) and holds
-    # the module of another kernel: only a fresh lowering says it is not this one's.
+    # the kernel of another: only a fresh lowering says it is not this one's.
     self.lower()
     (entry,) = self.entries()
     other = self.lower(scale=3.0)
     self.assertEqual(other["events"], ["miss"])
     (other_entry,) = (e for e in self.entries() if e != entry)
-    _, _, other_module = harness.split_entry(other_entry.read_bytes())
-    harness.rewrite_entry(entry, module=other_module)
+    _, _, other_kernel = harness.split_entry(other_entry.read_bytes())
+    harness.rewrite_entry(entry, kernel=other_kernel)
     unverified = self.lower()
     self.assertEqual(unverified["events"], ["hit"])
     run = self.lower(env={"JAX_PALLAS_LOWERING_CACHE_VERIFY": "1"})
@@ -587,13 +577,13 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     first = self.lower()
     (entry,) = self.entries()
     data = entry.read_bytes()
-    module_start = harness.module_start(data)
+    kernel_start = harness.kernel_start(data)
     damages = {
         "empty": b"",
         "not an entry": b"not an entry",
         "truncated": data[:40],
-        "a module that is not bytecode": (
-            data[:module_start] + b"garbage!" + data[module_start + 8:]),
+        "a kernel that is not what was stored": (
+            data[:kernel_start] + b"garbage!" + data[kernel_start + 8:]),
     }
     for name, damage in damages.items():
       with self.subTest(name):
@@ -609,9 +599,8 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     (entry,) = self.entries()
     data = entry.read_bytes()
     magic = data[:data.index(b"\n") + 1]
-    version, header, module = harness.split_entry(data)
-    entry.write_bytes(harness.join_entry(
-        magic, version + 1, header, module, harness.serialized_part(data)))
+    version, header, kernel = harness.split_entry(data)
+    entry.write_bytes(harness.join_entry(magic, version + 1, header, kernel))
     run = self.lower()
     self.assertEqual(run["events"], ["miss"], run)
     self.assertEqual(run["normalized"], first["normalized"])
@@ -622,10 +611,9 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     (entry,) = self.entries()
     data = entry.read_bytes()
     magic = data[:data.index(b"\n") + 1]
-    version, header, module = harness.split_entry(data)
+    version, header, kernel = harness.split_entry(data)
     header["key"] = "0" * 64
-    entry.write_bytes(harness.join_entry(
-        magic, version, header, module, harness.serialized_part(data)))
+    entry.write_bytes(harness.join_entry(magic, version, header, kernel))
     self.assertEqual(self.lower()["events"], ["miss"])
 
   # -- an entry that is whole is the one that was stored
@@ -638,11 +626,11 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     (other_entry,) = (e for e in self.entries() if e != entry)
     _, _, original = harness.split_entry(entry.read_bytes())
     _, _, altered = harness.split_entry(other_entry.read_bytes())
-    # The module of the kernel with another constant in it: as long, as valid
-    # as bytecode, and not what was stored. Only a checksum says so.
+    # The kernel with another constant in it: as long, as valid as bytecode,
+    # and not what was stored. Only a checksum says so.
     self.assertEqual(len(altered), len(original))
     self.assertNotEqual(altered, original)
-    harness.rewrite_entry(entry, module=altered, digest=False)
+    harness.rewrite_entry(entry, kernel=altered, digest=False)
     run = self.lower()
     self.assertEqual(run["events"], ["miss"], run)
     self.assertEqual(run["normalized"], first["normalized"])
@@ -700,6 +688,7 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
       return {"serialized": {**held["serialized"], **fields}}
 
     for name, header in {
+        "no serialized kernel": lambda: {"serialized": None},
         "a serialized kernel missing a field": lambda: {
             "serialized": {"sym_name": "k"}},
         "a serialized kernel of the wrong type": lambda: {
@@ -719,14 +708,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         run = self.lower()
         self.assertEqual(run["events"], ["miss"], run)
         self.assertEqual(run["normalized"], first["normalized"])
-    with self.subTest("a module that is not bytecode"):
-      if not self.entries():
-        self.lower()
-      (entry,) = self.entries()
-      harness.rewrite_entry(entry, module=b"this is not a Mosaic GPU module" * 20)
-      run = self.lower()
-      self.assertEqual(run["events"], ["miss"], run)
-      self.assertEqual(run["normalized"], first["normalized"])
 
   # -- what the cache expects to fail, and what it does not
 

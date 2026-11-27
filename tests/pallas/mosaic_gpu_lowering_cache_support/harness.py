@@ -129,60 +129,44 @@ def _parts(data: bytes) -> tuple[int, dict[str, Any], int]:
 
 
 def split_entry(data: bytes) -> tuple[int, dict[str, Any], bytes]:
-  """An entry's (version, header, module): its magic line, a version and header
-  size, a JSON header, then the module's bytecode (`module_size` bytes), the
-  serialized kernel's after it (`serialized_part`)."""
+  """An entry's (version, header, kernel): its magic line, a version and header
+  size, a JSON header, then the serialized kernel's bytecode."""
   version, header, offset = _parts(data)
-  return version, header, data[offset:offset + header["module_size"]]
+  return version, header, data[offset:]
 
 
-def serialized_part(data: bytes) -> bytes:
-  """The serialized kernel's bytecode an entry holds after its module."""
-  _, header, offset = _parts(data)
-  return data[offset + header["module_size"]:]
-
-
-def module_start(data: bytes) -> int:
-  """Where an entry's module starts."""
+def kernel_start(data: bytes) -> int:
+  """Where an entry's serialized kernel starts."""
   return _parts(data)[2]
 
 
 def join_entry(magic: bytes, version: int, header: dict[str, Any],
-               module: bytes, serialized: bytes = b"") -> bytes:
+               kernel: bytes) -> bytes:
   blob = json.dumps(header, sort_keys=True).encode()
-  return (magic + struct.pack("<II", version, len(blob)) + blob + module
-          + serialized)
+  return magic + struct.pack("<II", version, len(blob)) + blob + kernel
 
 
-def payload_digest(header: dict[str, Any], module: bytes,
-                   serialized: bytes = b"") -> str:
+def payload_digest(header: dict[str, Any], kernel: bytes) -> str:
   """The sha256 an entry holds of its whole payload: the header's fields (but
-  the digest), as canonical JSON, a newline, the module and the serialized
-  kernel's bytecode."""
+  the digest), as canonical JSON, a newline and the kernel's bytecode."""
   fields = {k: v for k, v in header.items() if k != "sha256"}
   canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
-  return hashlib.sha256(
-      canonical.encode() + b"\n" + module + serialized).hexdigest()
+  return hashlib.sha256(canonical.encode() + b"\n" + kernel).hexdigest()
 
 
 def rewrite_entry(path: pathlib.Path, *, header: dict[str, Any] | None = None,
-                  module: bytes | None = None, digest: bool = True) -> None:
-  """Writes an entry again with its header's fields (and its module) changed,
-  its serialized kernel kept (none where the header now says none), and, if
-  `digest`, the digest of what it holds now: a damaged entry that is whole as
-  far as its checksum goes."""
+                  kernel: bytes | None = None, digest: bool = True) -> None:
+  """Writes an entry again with its header's fields (and its kernel) changed,
+  and, if `digest`, the digest of what it holds now: a damaged entry that is
+  whole as far as its checksum goes."""
   data = path.read_bytes()
   magic = data[:data.index(b"\n") + 1]
-  version, current, current_module = split_entry(data)
+  version, current, current_kernel = split_entry(data)
   new_header = {**current, **(header or {})}
-  new_module = current_module if module is None else module
-  serialized = (
-      b"" if new_header.get("serialized") is None else serialized_part(data))
-  new_header["module_size"] = len(new_module)
+  new_kernel = current_kernel if kernel is None else kernel
   if digest:
-    new_header["sha256"] = payload_digest(new_header, new_module, serialized)
-  path.write_bytes(
-      join_entry(magic, version, new_header, new_module, serialized))
+    new_header["sha256"] = payload_digest(new_header, new_kernel)
+  path.write_bytes(join_entry(magic, version, new_header, new_kernel))
 
 
 class LoweringCacheTestCase(absltest.TestCase):

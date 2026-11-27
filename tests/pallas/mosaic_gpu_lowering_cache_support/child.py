@@ -35,7 +35,6 @@ kernel's lowering reaches of the registries).
 import hashlib
 import importlib
 import importlib.util
-import io
 import json
 import os
 import pathlib
@@ -64,7 +63,6 @@ from jax.experimental.mosaic.gpu import lowering_inputs
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 _PREFIX = "/jax/pallas/mosaic_gpu/lowering_cache/"
-_DUMP_BASENAME = "mosaic_gpu.dump_basename"
 _SUPPORT = pathlib.Path(__file__).resolve().parent
 
 
@@ -152,25 +150,28 @@ class Recorder:
       sys.monitoring.set_local_events(tool, code, start)
 
 
+def _kernel_module(kernel):
+  """The module a serialized kernel holds, as its custom call holds it."""
+  with ir.Context() as context:
+    context.allow_unregistered_dialects = True
+    mgpu_core.dialect.register_dialect(context)
+    return ir.Module.parse(kernel.module_asm)
+
+
 def normalize(result):
-  """The result as a cache keeps it: the module without its dump basename, a
-  name of the process, and the rest as plain data."""
-  attributes = result.module.operation.attributes
-  saved_attribute = attributes[_DUMP_BASENAME] if _DUMP_BASENAME in attributes else None
-  if saved_attribute is not None:
-    del attributes[_DUMP_BASENAME]
-  buffer = io.BytesIO()
-  result.module.operation.write_bytecode(buffer)
+  """The kernel as its custom call holds it (a cached lowering's serialized
+  kernel, or the one the call makes of a fresh lowering's module), and the rest
+  of the result as plain data."""
+  kernel = result.serialized
+  if kernel is None:
+    kernel = mgpu_core.serialized_kernel(result.module, False)
   # The module as text, which holds no locations: comparable between a lowering
   # with them and one without.
-  asm = result.module.operation.get_asm()
-  if saved_attribute is not None:
-    attributes[_DUMP_BASENAME] = saved_attribute
-  data = buffer.getvalue()
+  asm = _kernel_module(kernel).operation.get_asm()
   shapes = lambda ss: [[list(s.shape), np.dtype(s.dtype).name] for s in ss]
   return {
-      "module": hashlib.sha256(data).hexdigest(),
-      "module_size": len(data),
+      "module": hashlib.sha256(kernel.module_asm).hexdigest(),
+      "kernel_id": kernel.kernel_id.hex(),
       "grid": list(result.grid),
       "block": list(result.block),
       "new_out_shapes": shapes(result.new_out_shapes),
@@ -270,17 +271,23 @@ def one(case, rec, kernel, x):
     return {"events": list(rec.events), "error": type(e).__name__,
             "message": str(e)[:600]}
   result = rec.results[-1]
-  asm = result.module.operation.get_asm(enable_debug_info=True)
-  return {
+  # What the lowering ran, before the report makes its own serialization.
+  ran = {
       "events": list(rec.events),
       "seconds_saved": list(rec.saved),
+      "reads_in_snapshot": sorted({n for n, inside in rec.reads if inside}),
+      "reads_outside": sorted({n for n, inside in rec.reads if not inside}),
+      "serialized": list(rec.serialized),
+  }
+  module = (result.module if result.module is not None
+            else _kernel_module(result.serialized))
+  asm = module.operation.get_asm(enable_debug_info=True)
+  return {
+      **ran,
       "normalized": normalize(result),
       "text_sha": hashlib.sha256(text.encode()).hexdigest(),
       "caller_metadata": caller_metadata(lowered),
       "has_file_locations": '.py"' in asm,
-      "reads_in_snapshot": sorted({n for n, inside in rec.reads if inside}),
-      "reads_outside": sorted({n for n, inside in rec.reads if not inside}),
-      "serialized": list(rec.serialized),
   }
 
 

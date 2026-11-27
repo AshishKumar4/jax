@@ -757,15 +757,16 @@ class LoweringRuleContext:
 
 @dataclasses.dataclass(frozen=True)
 class LoweringResult:
-  module: ir.Module
+  # None for a lowering a cache holds: its call is made from `serialized`.
+  module: ir.Module | None
   grid: tuple[int, ...]
   block: tuple[int, ...]
   new_out_shapes: tuple[jax.ShapeDtypeStruct, ...]  # Does not include gmem scratch!
   profiler_spec: mgpu_profiler.ProfilerSpec | None
   gmem_scratch_shapes: tuple[jax.ShapeDtypeStruct, ...]
   use_barrier_semaphore: bool = False
-  # What the custom call holds of `module`, where a lowering cache kept it
-  # (`mgpu.core.serialized_kernel`); made from `module` where none.
+  # What the custom call holds of `module` (`mgpu.core.serialized_kernel`),
+  # where a lowering cache made it; made from `module` where none.
   serialized: Any = None
 
 

@@ -14,14 +14,14 @@
 
 """The persistent store of lowerings: a versioned envelope in an ``LRUCache``.
 
-An entry holds a lowering's module (as bytecode, without its dump basename) and
-the plain data of the rest of its result, under the key it was made for. Its
-envelope is a magic line, a version and the size of the header, a JSON header and
-the module. The header holds the result's fields and the sha256 of the whole
-payload (the fields as canonical JSON, a newline and the module), so an entry
-altered anywhere, valid bytecode included, is not the one that was stored; and an
-entry that is whole but is not of the schema is not one either. Either is removed
-to be replaced.
+An entry holds a kernel's lowering as its custom call consumes it, under the key
+it was made for: the serialized kernel (its fields, and its bytecode as the call
+holds it) and the launch the call states. Its envelope is a magic line, a version
+and the size of the header, a JSON header and the kernel's bytecode. The header
+holds the fields and the sha256 of the whole payload (the fields as canonical
+JSON, a newline and the bytecode), so an entry altered anywhere, valid bytecode
+included, is not the one that was stored; and an entry that is whole but is not
+of the schema is not one either. Either is removed to be replaced.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 _SUBDIRECTORY = "mosaic_gpu_lowering"
 
 _ENVELOPE_MAGIC = b"jax-mosaic-gpu-lowering-cache\n"
-_ENVELOPE_VERSION = 4
+_ENVELOPE_VERSION = 5
 _ENVELOPE_PREFIX = struct.Struct("<II")
 
 
@@ -55,25 +55,25 @@ class InvalidEntry(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Entry:
-  module: bytes
+  """One kernel's lowering as its custom call consumes it: the serialized
+  kernel (`mgpu.core.SerializedKernel`'s plain fields, its bytecode apart) and
+  the launch the call states, with no MLIR module of its own."""
   grid: tuple[int, ...]
   block: tuple[int, ...]
   # Each a list of [shape, physical dtype name].
   new_out_shapes: list[Any]
   gmem_scratch_shapes: list[Any]
-  seconds: float
-  # What the custom call holds of the module (`mgpu.core.SerializedKernel`):
-  # its plain fields, its bytecode (`serialized_module`) apart.
-  serialized: dict[str, Any] | None = None
-  serialized_module: bytes = b""
   # Whether the kernel signals through its collective's barrier semaphore,
   # which its call is given only where the lowering says so.
-  use_barrier_semaphore: bool = False
+  use_barrier_semaphore: bool
+  serialized: dict[str, Any]
+  serialized_module: bytes
+  seconds: float = 0.0
 
 
-def _payload(fields: dict[str, Any], module: bytes, serialized: bytes) -> bytes:
+def _payload(fields: dict[str, Any], serialized: bytes) -> bytes:
   canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
-  return canonical.encode() + b"\n" + module + serialized
+  return canonical.encode() + b"\n" + serialized
 
 
 def pack(key: str, entry: Entry) -> bytes:
@@ -81,19 +81,18 @@ def pack(key: str, entry: Entry) -> bytes:
       "key": key, "grid": list(entry.grid), "block": list(entry.block),
       "new_out_shapes": entry.new_out_shapes,
       "gmem_scratch_shapes": entry.gmem_scratch_shapes,
-      "seconds": entry.seconds, "module_size": len(entry.module),
-      "serialized": entry.serialized,
+      "seconds": entry.seconds, "serialized": entry.serialized,
       "use_barrier_semaphore": entry.use_barrier_semaphore,
   }
   header = {
       **fields,
       "sha256": hashlib.sha256(
-          _payload(fields, entry.module, entry.serialized_module)).hexdigest(),
+          _payload(fields, entry.serialized_module)).hexdigest(),
   }
   blob = json.dumps(header, sort_keys=True).encode()
   return (
       _ENVELOPE_MAGIC + _ENVELOPE_PREFIX.pack(_ENVELOPE_VERSION, len(blob))
-      + blob + entry.module + entry.serialized_module
+      + blob + entry.serialized_module
   )
 
 
@@ -143,17 +142,12 @@ def unpack(key: str, data: bytes) -> Entry:
   if not isinstance(header, dict):
     raise InvalidEntry("a header that is not a JSON object")
   fields = {k: v for k, v in header.items() if k != "sha256"}
-  size = fields["module_size"]
-  held = len(data) - prefix_end - header_size
-  if type(size) is not int or not 0 <= size <= held:
-    raise InvalidEntry("a module of another size")
-  module = data[prefix_end + header_size:prefix_end + header_size + size]
-  serialized_module = data[prefix_end + header_size + size:]
+  serialized_module = data[prefix_end + header_size:]
   digest = header["sha256"]
   if (
       not isinstance(digest, str)
       or hashlib.sha256(
-          _payload(fields, module, serialized_module)).hexdigest() != digest
+          _payload(fields, serialized_module)).hexdigest() != digest
   ):
     raise InvalidEntry("an entry that is not what was stored (its checksum)")
   if fields["key"] != key:
@@ -168,7 +162,6 @@ def unpack(key: str, data: bytes) -> Entry:
   if type(use_barrier_semaphore) is not bool:
     raise InvalidEntry(f"{use_barrier_semaphore!r} is not a boolean")
   return Entry(
-      module=module,
       grid=tuple(_dims(fields["grid"], length=3, minimum=1)),
       block=tuple(_dims(fields["block"], length=3, minimum=1)),
       new_out_shapes=_shapes(fields["new_out_shapes"]),
@@ -191,13 +184,8 @@ _SERIALIZED_FIELDS = {
 }
 
 
-def _serialized(value: Any, module: bytes) -> dict[str, Any] | None:
-  """An entry's serialized kernel fields, checked against the schema; none
-  for an entry stored without one (its bytecode then empty)."""
-  if value is None:
-    if module:
-      raise InvalidEntry("a serialized module with no fields")
-    return None
+def _serialized(value: Any, module: bytes) -> dict[str, Any]:
+  """An entry's serialized kernel fields, checked against the schema."""
   if not isinstance(value, dict) or set(value) != set(_SERIALIZED_FIELDS):
     raise InvalidEntry(f"{value!r} is not a serialized kernel of the schema")
   for name, kind in _SERIALIZED_FIELDS.items():

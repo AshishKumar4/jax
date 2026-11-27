@@ -343,11 +343,16 @@ def _mosaic_gpu_lowering_rule(
   call's serialization (MosaicGpuKernelProto.caller_metadata). `serialized`,
   where given, is what the call holds of `module` (`serialized_kernel`, as a
   lowering cache kept it): it is used as it is where it was made for this
-  lowering's forward compatibility, and made from `module` otherwise.
+  lowering's forward compatibility, and made from `module` otherwise. A cached
+  lowering's call holds no module (None), only its serialized kernel.
   """
   if serialized is None or serialized.forward_compatible != (
       ctx.is_forward_compat()
   ):
+    if module is None:
+      raise ValueError(
+          "a cached Mosaic GPU kernel serialized for another forward"
+          " compatibility, with no module to serialize it again")
     serialized = serialized_kernel(module, ctx.is_forward_compat())
   axis_context = ctx.module_context.axis_context
   replica_ids = []
@@ -393,7 +398,11 @@ def _mosaic_gpu_lowering_rule(
       serialized.kernel_id, serialized.module_asm, serialized.resources
   )
   if resources is not None:
-    dump_options = dialect.get_or_set_dump_options(module)
+    # A cached kernel's call holds no module: the process's dump options, as
+    # Mosaic GPU reads them for any module.
+    dump_options = dialect.get_or_set_dump_options(
+        module if module is not None
+        else ir.Module.create(ir.Location.unknown()))
     if dump_options.resources:
       utils.dump_to_file_or_stdout(
           f"{serialized.sym_name} {kernel_id.hex()} {resources}",

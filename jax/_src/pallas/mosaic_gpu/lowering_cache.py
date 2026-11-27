@@ -74,7 +74,6 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import hashlib
-import io
 import logging
 import os
 import re
@@ -191,9 +190,6 @@ def _keyed_environment() -> dict[str, str]:
         continue
     keyed[name] = value
   return keyed
-_DUMP_BASENAME = "mosaic_gpu.dump_basename"
-
-
 class LoweringCacheMismatch(Exception):
   """A cached lowering differs from the same lowering made afresh."""
 
@@ -576,62 +572,44 @@ def _shape_structs(plain: Sequence[Any]) -> tuple[jax.ShapeDtypeStruct, ...]:
   )
 
 
-def _module_bytes(module: ir.Module) -> bytes:
-  """The module's bytecode without its dump basename (a name of this process)."""
-  attributes = module.operation.attributes
-  saved = attributes[_DUMP_BASENAME] if _DUMP_BASENAME in attributes else None
-  if saved is not None:
-    del attributes[_DUMP_BASENAME]
-  try:
-    buffer = io.BytesIO()
-    module.operation.write_bytecode(buffer)
-    return buffer.getvalue()
-  finally:
-    if saved is not None:
-      attributes[_DUMP_BASENAME] = saved
-
-
-def _normalized(result: lowering.LoweringResult) -> store_lib.Entry:
+def _entry(
+    result: lowering.LoweringResult,
+    serialized: mgpu_core.SerializedKernel,
+    seconds: float = 0.0,
+) -> store_lib.Entry:
+  """A lowering as its custom call consumes it: its launch and `serialized`, the
+  kernel the call holds."""
   # A lowering that profiles is not cached (`_eligible`): its result has no
   # profiler to hold.
   assert result.profiler_spec is None
+  symmetric = serialized.symmetric_memory_args
   return store_lib.Entry(
-      module=_module_bytes(result.module),
       grid=tuple(int(g) for g in result.grid),
       block=tuple(int(b) for b in result.block),
       new_out_shapes=_plain_shapes(result.new_out_shapes),
       gmem_scratch_shapes=_plain_shapes(result.gmem_scratch_shapes),
-      seconds=0.0,
       use_barrier_semaphore=result.use_barrier_semaphore,
+      serialized={
+          "forward_compatible": serialized.forward_compatible,
+          "kernel_id": serialized.kernel_id.hex(),
+          "resources": serialized.resources,
+          "sym_name": serialized.sym_name,
+          "has_communication": serialized.has_communication,
+          "uses_collective_metadata": serialized.uses_collective_metadata,
+          "symmetric_memory_args": (
+              None if symmetric is None else list(symmetric)),
+      },
+      serialized_module=serialized.module_asm,
+      seconds=seconds,
   )
 
 
-def _serialized_fields(
-    serialized: mgpu_core.SerializedKernel,
-) -> tuple[dict[str, Any], bytes]:
-  """A serialized kernel as an entry holds it: its fields, its bytecode."""
-  symmetric = serialized.symmetric_memory_args
-  fields: dict[str, Any] = {
-      "forward_compatible": serialized.forward_compatible,
-      "kernel_id": serialized.kernel_id.hex(),
-      "resources": serialized.resources,
-      "sym_name": serialized.sym_name,
-      "has_communication": serialized.has_communication,
-      "uses_collective_metadata": serialized.uses_collective_metadata,
-      "symmetric_memory_args": None if symmetric is None else list(symmetric),
-  }
-  return fields, serialized.module_asm
-
-
-def _serialized_kernel(
-    entry: store_lib.Entry,
-) -> mgpu_core.SerializedKernel | None:
-  """The serialized kernel an entry holds, or none."""
+def _rebuild(entry: store_lib.Entry) -> lowering.LoweringResult:
+  """The lowering an entry holds, with no module: its call is made from the
+  serialized kernel it holds (`_mosaic_gpu_lowering_rule`'s `serialized`)."""
   fields = entry.serialized
-  if fields is None:
-    return None
   symmetric = fields["symmetric_memory_args"]
-  return mgpu_core.SerializedKernel(
+  serialized = mgpu_core.SerializedKernel(
       forward_compatible=fields["forward_compatible"],
       module_asm=entry.serialized_module,
       kernel_id=bytes.fromhex(fields["kernel_id"]),
@@ -641,35 +619,20 @@ def _serialized_kernel(
       uses_collective_metadata=fields["uses_collective_metadata"],
       symmetric_memory_args=None if symmetric is None else tuple(symmetric),
   )
-
-
-def _rebuild(
-    entry: store_lib.Entry, context: ir.Context
-) -> lowering.LoweringResult | None:
-  """The lowering an entry holds, in `context`, with the serialized kernel it
-  holds; none if its module does not parse."""
-  mgpu.dialect.register_dialect(context)
-  try:
-    module = ir.Module.parse(entry.module, context=context)
-  except ir.MLIRError as e:
-    logger.warning("a Mosaic GPU lowering cache entry does not parse: %s", e)
-    return None
-  # As a fresh lowering's, the module takes its dump options of this process.
-  mgpu.dialect.get_or_set_dump_options(module)
   return lowering.LoweringResult(
-      module, entry.grid, entry.block,
+      None, entry.grid, entry.block,
       _shape_structs(entry.new_out_shapes), None,
       _shape_structs(entry.gmem_scratch_shapes),
       use_barrier_semaphore=entry.use_barrier_semaphore,
-      serialized=_serialized_kernel(entry),
+      serialized=serialized,
   )
 
 
 def _differences(hit: store_lib.Entry, fresh: store_lib.Entry) -> list[str]:
   return [
       name for name in (
-          "module", "grid", "block", "new_out_shapes", "gmem_scratch_shapes",
-          "use_barrier_semaphore",
+          "grid", "block", "new_out_shapes", "gmem_scratch_shapes",
+          "use_barrier_semaphore", "serialized", "serialized_module",
       ) if getattr(hit, name) != getattr(fresh, name)
   ]
 
@@ -742,32 +705,25 @@ def lower_unpipelined_jaxpr_to_module(
   store = store_lib.open_store(directory)  # None if the directory cannot be used.
   entry = None if store is None else store.get(key)
   if entry is not None:
-    result = _rebuild(entry, context)
-    if result is None:
-      assert store is not None
-      store.discard(key)
-    else:
-      if config.jax_pallas_lowering_cache_verify.value:
-        lowered = lower_neutral()
-        if not registries_lib.unchanged(dispatch):
-          _count("unsealed")  # Not a lowering to compare the hit with.
-          return lowered
-        differences = _differences(_normalized(result), _normalized(lowered))
-        if result.serialized is not None and (
-            result.serialized != mgpu_core.serialized_kernel(
-                lowered.module, result.serialized.forward_compatible)):
-          differences.append("serialized")
-        if differences:
-          raise LoweringCacheMismatch(
-              f"the cached Mosaic GPU lowering {key} differs from a fresh one"
-              f" in: {', '.join(differences)}"
-          )
-        _count("verified")
-      _count("hit")
-      monitoring.record_event_duration_secs(
-          _EVENT_PREFIX + "seconds_saved", entry.seconds
-      )
-      return result
+    if config.jax_pallas_lowering_cache_verify.value:
+      lowered = lower_neutral()
+      if not registries_lib.unchanged(dispatch):
+        _count("unsealed")  # Not a lowering to compare the hit with.
+        return lowered
+      assert lowered.module is not None  # A fresh lowering holds its module.
+      fresh_entry = _entry(lowered, mgpu_core.serialized_kernel(
+          lowered.module, ctx.is_forward_compat()))
+      if differences := _differences(entry, fresh_entry):
+        raise LoweringCacheMismatch(
+            f"the cached Mosaic GPU lowering {key} differs from a fresh one"
+            f" in: {', '.join(differences)}"
+        )
+      _count("verified")
+    _count("hit")
+    monitoring.record_event_duration_secs(
+        _EVENT_PREFIX + "seconds_saved", entry.seconds
+    )
+    return _rebuild(entry)
 
   started = time.perf_counter()
   result = lower_neutral()
@@ -781,16 +737,14 @@ def lower_unpipelined_jaxpr_to_module(
   # The serialized kernel made once, for the custom call and the entry alike,
   # from the location-neutral lowering (the serde pass runs over a copy of its
   # module): what a hit makes its call from, so a hit's call is the miss's.
-  entry = dataclasses.replace(_normalized(result), seconds=seconds)
+  assert result.module is not None  # A fresh lowering holds its module.
   serialized = mgpu_core.serialized_kernel(
       result.module, ctx.is_forward_compat()
   )
   result = dataclasses.replace(result, serialized=serialized)
   if store is not None:
-    fields, module_asm = _serialized_fields(serialized)
     try:
-      store.put(key, dataclasses.replace(
-          entry, serialized=fields, serialized_module=module_asm))
+      store.put(key, _entry(result, serialized, seconds))
     except OSError as e:
       logger.warning("the Mosaic GPU lowering cache cannot be written: %s", e)
   return result
