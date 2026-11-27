@@ -245,10 +245,10 @@ index cb40993081e..8fdb3253562 100644
   private:
    const GpuExecutableProto& GetExecutableProto() const;
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
-index e832d4167d2..73998217743 100644
+index a802c3c9ffa..229612406aa 100644
 --- a/xla/service/gpu/gpu_executable.cc
 +++ b/xla/service/gpu/gpu_executable.cc
-@@ -1750,6 +1750,14 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+@@ -1791,6 +1791,14 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
    if (has_module()) {
      *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
          HloProtoOptions{/*deduplicate_backend_config=*/true});
@@ -264,7 +264,7 @@ index e832d4167d2..73998217743 100644
  
    proto.mutable_output_info_map()->Reserve(output_info_.size());
 diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
-index 5f00d5d4486..35cb3b675fe 100644
+index 25145a9764c..356025730fa 100644
 --- a/xla/service/gpu/gpu_executable.h
 +++ b/xla/service/gpu/gpu_executable.h
 @@ -150,6 +150,10 @@ class GpuExecutable : public Executable {
