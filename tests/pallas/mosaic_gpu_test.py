@@ -6019,22 +6019,26 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       atol = rtol = 1e-12 if dtype == jnp.float64 else 1e-2
       np.testing.assert_allclose(res, ref, atol=atol, rtol=rtol)
 
-  @parameterized.product(m_warps=(1, 2, 4), rows=(0, 1, 16, 17, 48, 64, 127))
-  def test_mma_row_bound(self, m_warps, rows):
+  @run_on_sm80
+  @parameterized.product(
+      m_warps=(1, 2, 4), bounds=((0, 64), (1, 48), (16, 17), (47, 127))
+  )
+  def test_mma_row_bound(self, m_warps, bounds):
     m = 64
     k = 32
     n = 32
     dtype = jnp.bfloat16
 
+    # Two warpgroups, each its own bound read from memory at run time, each
+    # writing its own output: a warp's row block is its own warpgroup's.
     @functools.partial(
         self.kernel,
-        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
-        grid=(1,),
-        grid_names=("i",),
+        out_type=jax.ShapeDtypeStruct((2, m, n), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
     )
-    def kernel(a_ref, b_ref, acc_ref, o_ref):
-      # The bound read at run time (the one program's index is 0), not folded.
-      bound = lax.axis_index("i") + rows
+    def kernel(a_ref, b_ref, acc_ref, bounds_ref, o_ref):
+      wg = lax.axis_index("wg")
       layouts = dict(m_warps=m_warps)
       acc = plgpu.load(
           acc_ref, layout=plgpu.Layout.MMA_ACC(dtype, **layouts),
@@ -6047,19 +6051,20 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
           b_ref.T, layout=plgpu.Layout.MMA_RHS(dtype, **layouts),
           optimized=False,
       )
-      result = plgpu.mma(acc, a, b, m_warps=m_warps, rows=bound)
-      plgpu.store(o_ref, result, optimized=False)
+      result = plgpu.mma(acc, a, b, m_warps=m_warps, rows=bounds_ref[wg])
+      plgpu.store(o_ref.at[wg], result, optimized=False)
 
     prng = np.random.default_rng(0)
     # Small integers, so every product and sum is exact in fp32.
     a = prng.integers(-4, 4, (m, k)).astype(dtype)
     b = prng.integers(-4, 4, (n, k)).astype(dtype)
     acc = prng.integers(-4, 4, (m, n)).astype(jnp.float32)
-    res = kernel(a, b, acc)
+    res = kernel(a, b, acc, jnp.asarray(bounds, jnp.int32))
     full = acc + a.astype(np.float32) @ b.astype(np.float32).T
-    # A warp's 16-row block that begins at or past `rows` keeps `acc`.
-    issued = np.arange(m)[:, None] // 16 * 16 < rows
-    np.testing.assert_array_equal(res, np.where(issued, full, acc))
+    for wg, rows in enumerate(bounds):
+      # A warp's 16-row block that begins at or past `rows` keeps `acc`.
+      issued = np.arange(m)[:, None] // 16 * 16 < rows
+      np.testing.assert_array_equal(res[wg], np.where(issued, full, acc))
 
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_griddepcontrol_warp_mesh(self):
