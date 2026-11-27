@@ -21,7 +21,7 @@ import dataclasses
 import enum
 import functools
 import math
-from typing import cast, Any, ClassVar, Literal
+from typing import cast, overload, Any, ClassVar, Literal
 
 from jax._src.lib import mosaic_gpu_dialect as mgpu_dialect
 from jaxlib.mlir import ir
@@ -802,6 +802,72 @@ class OOBFillMode(enum.IntEnum):
   ZEROS = 2
 
 
+def _opaque_zero(predicate: ir.Value) -> ir.Value:
+  """Zero on a TMA load's issuing thread, as a value ptxas cannot fold.
+
+  ptxas has miscompiled a TMA load whose coordinate is a literal: it filled
+  the coordinate's uniform register from another uniform register before that
+  register's last write, so the load read another coordinate, misaligned, and
+  the kernel died with CUDA_ERROR_ILLEGAL_INSTRUCTION (an H100 attention
+  forward, its innermost coordinate 0 read as 1). LLVM folds a coordinate
+  computed from constants into a literal, so every coordinate of the load adds
+  this value: the lane id less the lowest lane of the warp's active threads
+  whose `predicate` holds (a ballot over `activemask`, which a partial warp,
+  such as a single-thread branch, takes too). It is zero on the one thread of
+  a warp that issues the copy, and unknown to ptxas.
+  """
+  i32 = ir.IntegerType.get_signless(32)
+  return utils.inline_ptx(
+      "{ .reg .b32 active, issuing, reversed, first;"
+      " activemask.b32 active;"
+      " vote.sync.ballot.b32 issuing, $1, active;"
+      " brev.b32 reversed, issuing;"
+      " bfind.shiftamt.u32 first, reversed;"
+      " mov.u32 $0, %laneid;"
+      " sub.u32 $0, $0, first; }",
+      predicate,
+      result_types=i32,
+      has_side_effects=True,
+      convergent=True,
+  )
+
+
+def _constant(value) -> int | None:
+  """An index `value`'s constant, or None where it is not one."""
+  if isinstance(value, int):
+    return value
+  owner = value.owner
+  if not isinstance(owner, ir.Operation):
+    owner = getattr(owner, "operation", None)
+  if owner is None:
+    return None
+  if owner.name in ("arith.index_cast", "arith.index_castui"):
+    return _constant(owner.operands[0])
+  if owner.name == "arith.constant":
+    return ir.IntegerAttr(owner.attributes["value"]).value
+  return None
+
+
+_MOST_KNOWN_MULTIPLE = 1 << 20
+"""The largest power of two `_known_multiple` asks after: no copy's element
+offset needs a coarser alignment."""
+
+
+def _known_multiple(value) -> int:
+  """The largest power of two, up to `_MOST_KNOWN_MULTIPLE`, an index `value` is
+  known to be a multiple of, as Mosaic GPU's one divisibility analysis proves it
+  (`utils.is_known_divisible`: a constant, a product, a sum, a select, a minimum
+  or maximum, an assumed multiple). A value it proves nothing of is known to be a
+  multiple of 1 alone."""
+  multiple = 1
+  known: dict = {}
+  while multiple < _MOST_KNOWN_MULTIPLE and utils.is_known_divisible(
+      value, 2 * multiple, known=known
+  ):
+    multiple *= 2
+  return multiple
+
+
 @dataclasses.dataclass()
 class LaunchContext:
   module: ir.Module
@@ -1147,6 +1213,83 @@ class LaunchContext:
       return utils.getelementptr(tma_desc, [byte_offset], i8)
     return tma_desc
 
+  @overload
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: ir.Value,
+  ) -> tuple[tuple[MemRefTransform, ...], ir.Value]:
+    ...
+
+  @overload
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: None,
+  ) -> tuple[tuple[MemRefTransform, ...], None]:
+    ...
+
+  def _untile_partial(
+      self,
+      gmem_ref: ir.Value,
+      gmem_slice: tuple[Any, ...],
+      gmem_transform: tuple[MemRefTransform, ...],
+      smem_ref: ir.Value | None,
+  ) -> tuple[tuple[MemRefTransform, ...], ir.Value | None]:
+    """A TMA copy's tiling dropped where it does not divide the GMEM ref.
+
+    A tiled view of the GMEM ref (`TileTransform`) splits each tiled dimension
+    into its tiles, which a TMA descriptor bounds dimension by dimension, so a
+    dimension its tiling does not divide has no tiled view whose bounds are the
+    array's: a tile past its end would read the next row's elements. Where the
+    copy's slice holds one tile along every tiled dimension but the first, its
+    tiled SMEM layout `(..., n, 1, ..., 1, t0, t1, ...)` is the row-major
+    `(..., n * t0, t1, ...)`, so the copy is described untiled, with the
+    array's true extents: TMA zero-fills the elements a load reads past them
+    and drops those a store writes past them. Returns the GMEM transforms with
+    the tiling dropped and the SMEM ref reshaped untiled where that holds, else
+    both as they were.
+    """
+    if (
+        len(gmem_transform) != 1
+        or not isinstance(tiling := gmem_transform[0], TileTransform)
+        or tiling.rounding is not None
+        or any(isinstance(s, fa.FragmentedArray) for s in gmem_slice)
+    ):
+      return gmem_transform, smem_ref
+    _, slice_shape, is_squeezed = utils.parse_indices(
+        gmem_slice, ir.MemRefType(gmem_ref.type).shape, check_oob=False
+    )
+    gmem_shape = [
+        d for d, squeezed in zip(ir.MemRefType(gmem_ref.type).shape, is_squeezed)
+        if not squeezed
+    ]
+    logical = [
+        d for d, squeezed in zip(slice_shape, is_squeezed) if not squeezed
+    ]
+    rank = len(tiling.tiling)
+    tiled = list(zip(gmem_shape[-rank:], logical[-rank:], tiling.tiling))
+    if not any(g > t and g % t for g, _, t in tiled):
+      return gmem_transform, smem_ref
+    if any(s % t for _, s, t in tiled) or any(s != t for _, s, t in tiled[1:]):
+      return gmem_transform, smem_ref
+    if smem_ref is not None:
+      # The SMEM ref's own tiles, `(..., n, 1, ..., 1, t0, t1, ...)`: a copy
+      # partitioned across a cluster (`CopyPartition`) holds its share of the
+      # slice along the partitioned dimension, not the slice.
+      shape = ir.MemRefType(smem_ref.type).shape
+      leading, counts = shape[:-2 * rank], shape[-2 * rank:-rank]
+      if any(n != 1 for n in counts[1:]):
+        return gmem_transform, smem_ref
+      smem_ref = utils.memref_reshape(
+          smem_ref, (*leading, counts[0] * tiling.tiling[0], *tiling.tiling[1:])
+      )
+    return (), smem_ref
+
   def _prepare_async_copy(
       self,
       untransformed_gmem_ref: ir.Value,
@@ -1285,6 +1428,24 @@ class LaunchContext:
                         *(t.batch(len(squeezed_dims)) for t in gmem_transform))
 
     untransformed_slice_shape = tuple(slice_shape)
+    if implementation == AsyncCopyImplementation.CP_ASYNC and squeezed_dims:
+      # CP_ASYNC offsets the slice's base by the untransformed indices and
+      # strides, then squeezes, so the transforms apply to the slice with its
+      # squeezed dimensions gone (which may lie between its sliced ones, as a
+      # head index between a sequence and its features): those lead its shape.
+      logical_shape = tuple(
+          d for d, squeezed in zip(slice_shape, is_squeezed) if not squeezed
+      )
+      for t in gmem_transform:
+        logical_shape = t.transform_shape(logical_shape)
+      return (
+          [1] * len(squeezed_dims) + list(logical_shape),
+          untransformed_slice_shape,
+          dyn_base_indices,
+          squeezed_dims,
+          gather_indices,
+          gmem_transform,
+      )
     slice_shape = untransformed_slice_shape
     for t in gmem_transform:
       dyn_base_indices = t.transform_index(dyn_base_indices)
@@ -1570,6 +1731,15 @@ class LaunchContext:
     if collective and untransformed_gmem_ref is dst_ref:
       raise ValueError("Only GMEM -> SMEM copies can be collective")
 
+    if implementation == AsyncCopyImplementation.TMA:
+      gmem_transform, smem_ref = self._untile_partial(
+          untransformed_gmem_ref, gmem_slice, gmem_transform, smem_ref
+      )
+      if untransformed_gmem_ref is src_ref:
+        dst_ref = smem_ref
+      else:
+        src_ref = smem_ref
+
     (
         slice_shape,
         untransformed_slice_shape,
@@ -1648,11 +1818,21 @@ class LaunchContext:
           untransformed_gmem_ref_ty.get_strides_and_offset()
       )
       transformed_strides = untransformed_gmem_strides
-      for t in gmem_transform:
-        transformed_strides = t.transform_strides(transformed_strides)
+      # A squeezing copy's base indices are untransformed (_prepare_async_copy).
+      if not squeezed_dims:
+        for t in gmem_transform:
+          transformed_strides = t.transform_strides(transformed_strides)
       gmem_offset = utils.dyn_dot(
           dyn_base_indices, [c(s, index) for s in transformed_strides]
       )
+      # The slice's base offset: its constant part, summed exactly, and the
+      # elements each other part is known to be a multiple of.
+      base_constant, base_parts = 0, []
+      for i, s in zip(dyn_base_indices, transformed_strides):
+        if (known := _constant(i)) is not None:
+          base_constant += known * s
+        else:
+          base_parts.append(_known_multiple(i) * s)
       if offset_scale > 1:
         gmem_offset = arith.divui(gmem_offset, c(offset_scale, index))
       gmem_offset = arith.index_castui(i64, gmem_offset)
@@ -1703,6 +1883,42 @@ class LaunchContext:
           raise ValueError(
               "CP_ASYNC requires at least 4 bytes per transfer"
           )
+        # Each transfer's GMEM address must be aligned to its size: the vector
+        # divides the slice's contiguous suffix (singleton dimensions dropped,
+        # contiguous dimensions folded), every other dimension's GMEM stride,
+        # and the slice's base offset.
+        shape = tuple(smem_ref.type.shape)
+        _, ref_offset = ir.MemRefType(
+            untransformed_gmem_ref.type
+        ).get_strides_and_offset()
+        if ref_offset == ir.ShapedType.get_dynamic_stride_or_offset():
+          base_parts.append(1)
+        else:
+          base_constant += ref_offset
+        suffix, folding = 1, True
+        multiple = functools.reduce(math.gcd, base_parts, base_constant)
+        for size, stride in reversed(
+            list(zip(shape, untransformed_gmem_strides))
+        ):
+          if size == 1:
+            continue
+          if folding and stride == suffix:
+            suffix *= size
+          else:
+            folding = False
+            multiple = math.gcd(multiple, stride)
+        vec_size = layout.vec_size
+        while vec_size > 1 and (suffix % vec_size or multiple % vec_size):
+          vec_size //= 2
+        if vec_size * element_bitwidth < 32:
+          raise NotImplementedError(
+              "Untiled CP_ASYNC copies need every transfer's GMEM address"
+              " aligned to at least 4 bytes, but this slice's strides and base"
+              " offset are known to align only"
+              f" {vec_size * element_bitwidth // 8} bytes"
+          )
+        if vec_size != layout.vec_size:
+          layout = fa.WGStridedFragLayout(shape=shape, vec_size=vec_size)
         gmem_base_ptr = utils.memref_ptr(untransformed_gmem_ref)
         gmem_base_ptr = llvm.addrspacecast(
             llvm.PointerType.get(address_space=1), gmem_base_ptr
@@ -1717,12 +1933,35 @@ class LaunchContext:
             if bytes_per_transfer == 16
             else nvvm.LoadCacheModifierKind.CA
         )
+        # A slice of a wider array is strided in GMEM: the element at each
+        # transfer's row-major position in SMEM is at that position's offset by
+        # the slice's strides. Singleton dimensions take no part in contiguity.
+        strided = any(
+            size != 1 and stride != contiguous
+            for size, stride, contiguous in zip(
+                shape, untransformed_gmem_strides,
+                utils.get_contiguous_strides(shape),
+                strict=True,
+            )
+        )
         for linear_idx in layout.linear_thread_idxs():
           idx = arith.index_castui(i32, linear_idx)
+          gmem_idx = idx
+          if strided:
+            gmem_idx, remaining = c(0, i64), arith.index_castui(i64, linear_idx)
+            for size, stride in reversed(
+                list(zip(shape, untransformed_gmem_strides, strict=True))
+            ):
+              coordinate = arith.remui(remaining, c(size, i64))
+              remaining = arith.divui(remaining, c(size, i64))
+              gmem_idx = arith.addi(
+                  gmem_idx, arith.muli(coordinate, c(stride, i64))
+              )
           if offset_scale > 1:
             idx = arith.divui(idx, c(offset_scale, i32))
+            gmem_idx = arith.divui(gmem_idx, c(offset_scale, gmem_idx.type))
           smem_ptr = utils.getelementptr(smem_base_ptr, [idx], gep_type)
-          gmem_ptr = utils.getelementptr(gmem_base_ptr, [idx], gep_type)
+          gmem_ptr = utils.getelementptr(gmem_base_ptr, [gmem_idx], gep_type)
           nvvm.cp_async_shared_global(
               smem_ptr, gmem_ptr, bytes_per_transfer, cache_modifier
           )
@@ -1868,10 +2107,23 @@ class LaunchContext:
         raise NotImplementedError("Gather/scatter unsupported when using integer indexing")
       if reduction_op is not None:
         raise ValueError("Gather/scatter TMA can't perform reductions")
-      if not isinstance(predicate, _DefaultPredicate):
-        raise ValueError("Gather/scatter TMA can't use a predicate")
       if gather_indices.layout not in (fa.TMA_INDICES_LAYOUT, fa.TMA_INDICES_4_LAYOUT):
         raise ValueError(f"Unsupported gather indices layout: {gather_indices.layout}")
+      if (not isinstance(predicate, _DefaultPredicate)
+          and gather_indices.layout != fa.TMA_INDICES_4_LAYOUT):
+        raise ValueError(
+            "Gather/scatter TMA can only use a predicate with indices in"
+            " TMA_INDICES_4_LAYOUT, which every thread holds"
+        )
+      # With indices every thread holds, the copies are issued by the thread
+      # the predicate selects (by default, the first of the warpgroup), which
+      # also arrives on the barrier.
+      if isinstance(predicate, _DefaultPredicate):
+        issuing = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
+      elif predicate is None:
+        issuing = c(1, ir.IntegerType.get_signless(1))
+      else:
+        issuing = predicate
       ROWS_PER_INSTR = 4
       # Make sure we'll always be accessing SMEM with sufficient alignment.
       single_tma_bits = ROWS_PER_INSTR * slice_shape[-1] * element_bitwidth
@@ -1883,11 +2135,10 @@ class LaunchContext:
 
       if untransformed_gmem_ref is src_ref and arrive:
         assert barrier is not None
-        arrive_predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
         nvvm.mbarrier_arrive_expect_tx(
             barrier.get_ptr(),
             transfer_bytes,
-            predicate=arrive_predicate,
+            predicate=issuing,
         )
 
       gmem_strides, _ = untransformed_gmem_ref_ty.get_strides_and_offset()
@@ -1924,7 +2175,7 @@ class LaunchContext:
       # TMA instructions are uniform, so we can't use multiple lanes.
       if gather_indices.layout == fa.TMA_INDICES_4_LAYOUT:
         gather_linear_idx_warp = arith.constant(i32, 0)
-        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
+        issuer = issuing
         indexing_stride = 1
         # Note: If we have several tiles here, we could still issue copies from
         # each warp to increase parallelism, though it's primarily useful for
@@ -1938,7 +2189,7 @@ class LaunchContext:
             arith.constant(i32, utils.WARPS_IN_WARPGROUP),
         )
         gather_linear_idx_warp = arith.muli(warp_idx, c(ROWS_PER_INSTR, i32))
-        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARP)
+        issuer = utils.single_thread_predicate(utils.ThreadSubset.WARP)
         indexing_stride = utils.WARPS_IN_WARPGROUP
 
       # Since the TMA instruction is limited to 2D gathers, we flatten all
@@ -2015,7 +2266,7 @@ class LaunchContext:
                 smem_ptr,
                 col_offset,
                 *gather_rows,
-                predicate=predicate,
+                predicate=issuer,
             )
           else:
             assert barrier is not None
@@ -2027,7 +2278,7 @@ class LaunchContext:
                 barrier.get_ptr(),
                 col_offset,
                 *gather_rows,
-                predicate=predicate,
+                predicate=issuer,
             )
       if untransformed_gmem_ref is dst_ref and arrive:
         nvvm.cp_async_bulk_commit_group()
@@ -2162,6 +2413,10 @@ class LaunchContext:
       assert barrier is not None
       barrier_ptr = barrier.get_ptr()
       assert reduction_op is None
+      zero = _opaque_zero(predicate)
+      rev_dyn_base_indices = [
+          arith.addi(idx, zero) for idx in rev_dyn_base_indices
+      ]
       rank = len(slice_shape)
       idx_operands = ",".join(f"${i}" for i in range(4, 4 + rank))
       if collective_size > 1 and leader_tracked is not None:
@@ -2530,6 +2785,9 @@ class LaunchContext:
       gmem_slice = (gmem_slice,)
 
     impl =  AsyncCopyImplementation.TMA
+    gmem_transform, _ = self._untile_partial(
+        gmem_ref, gmem_slice, gmem_transform, None
+    )
     (
         slice_shape,
         _,

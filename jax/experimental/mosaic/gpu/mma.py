@@ -18,7 +18,9 @@ from jax._src import dtypes
 from jax._src import typing
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
 from . import utils
@@ -89,7 +91,48 @@ class MMALayouts:
     )
 
 
+M_WARPS_ATTRIBUTE = "mosaic_gpu.m_warps"
+"""The discardable attribute an `MMAOp` may carry naming its `m_warps`, which
+then sets its layouts in place of `MMALayouts.for_shape`'s."""
+
+
+def layouts_for_op(op: ir.OpView, element_type, m: int, n: int) -> "MMALayouts":
+  """The `MMALayouts` of an `MMAOp`: its `M_WARPS_ATTRIBUTE`'s split where it
+  states one, else `MMALayouts.for_shape`'s."""
+  if M_WARPS_ATTRIBUTE in op.attributes:
+    m_warps = ir.IntegerAttr(op.attributes[M_WARPS_ATTRIBUTE]).value
+    n_warps = 4 // m_warps
+    if m % (m_warps * 16) or n % (n_warps * 8):
+      raise ValueError(
+          f"An MMA of shape {(m, n)=} cannot split its warps {m_warps=}: the "
+          f"accumulator tile {(m_warps * 16, n_warps * 8)} must evenly divide it."
+      )
+    return MMALayouts(element_type, m_warps=m_warps)
+  return MMALayouts.for_shape(element_type, m, n)
+
+
+def can_relayout_acc_to_lhs(
+    src: fa.FragmentedLayout, dst: fa.FragmentedLayout, bitwidth: int
+) -> bool:
+  """Returns whether `src` -> `dst` takes the accumulator as the next LHS.
+
+  With four warps along M, each warp holds 16 full rows of both layouts, and two
+  adjacent 8-column tiles of the accumulator are one 16-column (k = 16) tile of
+  the 16-bit LHS: every thread already holds the LHS elements it needs, in the
+  same order, so the relayout only renames registers (the m16n8 C fragment as
+  the m16n8k16 A fragment). This is how attention's probabilities feed P @ V
+  from registers.
+  """
+  if bitwidth != 16:
+    return False
+  layouts = MMALayouts(np.float16, m_warps=4)
+  return src == layouts.acc and dst == layouts.lhs
+
+
 def _ptx_dtype_str(dtype: ir.Type, *, is_signed: bool | None = None) -> str:
+  if isinstance(dtype, ir.F32Type):
+    # f32 operands multiply as TF32 (`_rounded_to_tf32`).
+    return "tf32"
   if isinstance(dtype, ir.Float8E4M3FNType):
     return "e4m3"
   elif isinstance(dtype, ir.Float8E5M2Type):
@@ -100,6 +143,36 @@ def _ptx_dtype_str(dtype: ir.Type, *, is_signed: bool | None = None) -> str:
     prefix = "s" if is_signed else "u"
     return f"{prefix}{dtype.width}"
   return str(dtype)
+
+
+def _rounded_to_tf32(x: fa.FragmentedArray) -> fa.FragmentedArray:
+  """`x`'s f32 elements rounded to TF32 (`cvt.rna.tf32.f32`: to nearest, ties
+  away from zero), still f32: the 10-bit significand mma.sync's TF32 operands
+  take, which would otherwise ignore the lower 13 bits (truncate), as CUTLASS
+  and Triton round them first."""
+  i32 = ir.IntegerType.get_signless(32)
+  f32 = ir.F32Type.get()
+
+  def rounded(reg):
+    vector_type = ir.VectorType(reg.type)
+    out = llvm.mlir_undef(vector_type)
+    for i in range(vector_type.shape[0]):
+      element = vector.extract(
+          reg, dynamic_position=[], static_position=ir.DenseI64ArrayAttr.get([i])
+      )
+      bits = llvm.inline_asm(
+          i32, [element], "cvt.rna.tf32.f32 $0, $1;", "=r,f",
+          has_side_effects=False,
+      )
+      assert isinstance(bits, ir.Value)
+      out = llvm.insertelement(out, utils.bitcast(bits, f32),
+                               position=utils.c(i, i32))
+    return out
+
+  registers = np.vectorize(rounded, otypes=[object])(x.registers)
+  return fa.FragmentedArray(
+      _registers=registers, _layout=x.layout, _is_signed=x.is_signed
+  )
 
 
 def _mma_single_tile(
@@ -192,12 +265,16 @@ def mma(
     acc: fa.FragmentedArray,
     a: fa.FragmentedArray,
     b: fa.FragmentedArray,
+    *,
+    rows: ir.Value | None = None,
 ) -> fa.FragmentedArray:
   """Computes `acc + a @ b` using synchronous warp-level MMA instructions.
 
   All operands must have `TiledLayout`s. The layouts must be generated
   by the `MMALayouts` class, which ensures that the tiles are mapped
-  to the warps correctly.
+  to the warps correctly. f32 operands multiply as TF32 (`m16n8k8.tf32`),
+  each rounded to nearest first (`_rounded_to_tf32`), into an f32
+  accumulator.
 
   Args:
     acc: A `FragmentedArray` with a `TiledLayout` generated from
@@ -205,6 +282,11 @@ def mma(
     a: A `FragmentedArray` with a `TiledLayout`  generated from
       `MMALayouts.lhs`.
     b: A `FragmentedArray` with a `TiledLayout` generated from `MMALayouts.rhs`.
+    rows: An i32, uniform across the warpgroup, or None. Where given, a warp
+      issues no instruction for a 16-row block of the accumulator that begins
+      at or past `rows`, and those rows of the result are `acc`'s: a ragged
+      group's rows past its end, padded to whole tiles, cost nothing. Each
+      warp's branch is uniform across its lanes, as `mma.sync` requires.
 
   Returns:
     A new `FragmentedArray` with the result of the computation with
@@ -236,7 +318,7 @@ def mma(
   f8e5m2 = ir.Float8E5M2Type.get()
   if (element_type := a.mlir_dtype) != b.mlir_dtype:
     raise ValueError(f"Dtype mismatch: {a.mlir_dtype} != {b.mlir_dtype}")
-  if element_type not in (bf16, f16, f64, f8e4m3fn, f8e5m2, i8, i4):
+  if element_type not in (bf16, f16, f32, f64, f8e4m3fn, f8e5m2, i8, i4):
     raise NotImplementedError(f"Unsupported operand type: {element_type}")
   if isinstance(element_type, ir.IntegerType):
     if acc.mlir_dtype != i32:
@@ -280,15 +362,57 @@ def mma(
 
   num_m_tiles, num_n_tiles, num_k_tiles = m // m_tile, n // n_tile, k // k_tile
 
+  if element_type == f32:
+    # TF32 operands, rounded once for every tile that reads them.
+    a, b = _rounded_to_tf32(a), _rounded_to_tf32(b)
+
   # Do not modify the accumualtor itself.
   acc = acc.copy()
   s = lambda idx, length: slice(idx * length, (idx + 1) * length)
-  for k_idx in range(num_k_tiles):
-    for m_idx in range(num_m_tiles):
-      for n_idx in range(num_n_tiles):
-        ms = s(m_idx, m_tile)
-        ns = s(n_idx, n_tile)
-        ks = s(k_idx, k_tile)
-        acc[ms, ns] = _mma_single_tile(acc[ms, ns], a[ms, ks], b[ks, ns])
 
+  def stepped(rows_acc, m_idx, k_idx):
+    # One K tile's products into an M tile's accumulator rows, N tile by N tile.
+    ms, ks = s(m_idx, m_tile), s(k_idx, k_tile)
+    for n_idx in range(num_n_tiles):
+      ns = s(n_idx, n_tile)
+      rows_acc[:, ns] = _mma_single_tile(rows_acc[:, ns], a[ms, ks], b[ks, ns])
+    return rows_acc
+
+  if rows is None:
+    for k_idx in range(num_k_tiles):
+      for m_idx in range(num_m_tiles):
+        ms = s(m_idx, m_tile)
+        acc[ms, :] = stepped(acc[ms, :], m_idx, k_idx)
+    return acc
+
+  if rows.type != i32:
+    raise ValueError(f"rows must be an i32, got {rows.type}")
+  # The accumulator's warps are `m_warps` along M, the major warp dimension,
+  # and `n_warps` along N (`MMALayouts.acc`): a warp's 16-row block within an
+  # M tile is its warpgroup index divided by `n_warps`.
+  n_warps = 4 // m_warps
+  warp = arith.remui(utils.warp_idx(sync=False), utils.c(4, i32))
+  first_row = arith.muli(
+      arith.divui(warp, utils.c(n_warps, i32)), utils.c(16, i32)
+  )
+  # Each M tile's products in one branch, each output tile summed along K in
+  # order as above, so a bound past every row gives the unbounded result.
+  for m_idx in range(num_m_tiles):
+    ms = s(m_idx, m_tile)
+    held = acc[ms, :]
+    issued = arith.cmpi(
+        arith.CmpIPredicate.slt,
+        arith.addi(first_row, utils.c(m_idx * m_tile, i32)),
+        rows,
+    )
+    registers, tree = held.tree_flatten()
+    branch = scf.IfOp(issued, [r.type for r in registers], has_else=True)
+    with ir.InsertionPoint(branch.then_block):
+      summed = held.copy()
+      for k_idx in range(num_k_tiles):
+        summed = stepped(summed, m_idx, k_idx)
+      scf.yield_(summed.tree_flatten()[0])
+    with ir.InsertionPoint(branch.else_block):  # pyrefly: ignore[no-matching-overload]
+      scf.yield_(registers)
+    acc[ms, :] = fa.FragmentedArray.tree_unflatten(tree, list(branch.results))
   return acc

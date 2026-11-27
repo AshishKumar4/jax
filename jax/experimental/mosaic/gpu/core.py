@@ -32,6 +32,7 @@ import weakref
 
 import jax
 from jax._src import core as jax_core
+from jax._src import custom_call_targets
 from jax._src import dtypes
 from jax._src import lib
 from jax._src import mesh as mesh_lib
@@ -55,6 +56,7 @@ from . import dialect_lowering
 from . import launch_context
 from . import layout_inference
 from . import layouts
+from . import lowering_inputs
 from . import profiler
 from . import tcgen05
 from . import utils
@@ -138,6 +140,8 @@ else:
 
 
 def is_nvshmem_available():
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.nvshmem_available
   try:
     nvshmem_bc_path = os.environ["MOSAIC_GPU_NVSHMEM_BC_PATH"]
   except KeyError:
@@ -157,6 +161,8 @@ def is_nvshmem_available():
 
 
 def is_single_process_multi_device_topology():
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.single_process_multi_device_topology
   return (jax.device_count() > 1
           and jax.device_count() == jax.local_device_count())
 
@@ -189,6 +195,29 @@ def _has_communication(module, **_):
 KNOWN_KERNELS: dict[bytes, bytes] = {}
 
 
+def kernel_hash(module: ir.Module) -> bytes:
+  """The digest naming `module`'s kernel, which compiles once a process.
+
+  It reads the module's operations, not its locations: one kernel traced in two
+  contexts (alone, and within a program's gradient) names its operations by two
+  name stacks, and is one kernel.
+  """
+  kernel_text = module.operation.get_asm(
+      binary=True, enable_debug_info=False, assume_verified=True
+  )
+  assert isinstance(kernel_text, bytes)
+  kernel_id = hashlib.sha256(kernel_text).digest()
+  # Note that this is technically only a half measure. Someone might load a
+  # compiled module with a hash collision from disk. But that's so unlikely with
+  # SHA256 that it shouldn't be a problem.
+  if (known := KNOWN_KERNELS.get(kernel_id, None)) is not None:
+    if known != kernel_text:
+      raise RuntimeError("Kernel hash collision!")
+  else:
+    KNOWN_KERNELS[kernel_id] = kernel_text
+  return kernel_id
+
+
 # Frontend attributes understood by the XLA:GPU compiler. They let a custom
 # call request a specific memory space for its operands and results. See
 # xla/service/gpu/gpu_memory_space_assignment.h for the definitions.
@@ -208,6 +237,92 @@ def _memory_spaces_attr_value(indices: Sequence[int]) -> str:
   )
 
 
+RESOURCES_ATTR = "mosaic_gpu.resources"
+"""A module attribute holding its kernel's resource estimate (Pallas sets it),
+dumped with the kernel's name and hash once the module is lowered to its custom
+call, where MOSAIC_GPU_DUMP_RESOURCES asks for it."""
+
+
+@dataclasses.dataclass(frozen=True)
+class SerializedKernel:
+  """What the Mosaic GPU custom call holds of a module (`serialized_kernel`):
+  its serde pass's bytecode, the hash naming its kernel, the resource estimate
+  it carried, and what its communication reads. A module's is the same each
+  time it is made, so a lowering cache can keep it with the lowering and a hit
+  makes the custom call with no serde pass, bytecode or hash
+  (`_mosaic_gpu_lowering_rule`'s `serialized`)."""
+
+  forward_compatible: bool
+  module_asm: bytes
+  kernel_id: bytes
+  resources: str | None
+  sym_name: str
+  has_communication: bool
+  uses_collective_metadata: bool
+  symmetric_memory_args: tuple[bool, ...] | None
+
+
+def serialized_kernel(
+    module: ir.Module, forward_compatible: bool
+) -> SerializedKernel:
+  """`module` as its custom call holds it, the serde pass run over `module`
+  in place (`FWD_COMPAT_IR_VERSION` where `forward_compatible`)."""
+  has_communication = _has_communication(module)
+  module = _run_serde_pass(
+      module,
+      serialize=True,
+      ir_version=FWD_COMPAT_IR_VERSION if forward_compatible else None,
+  )
+
+  # A resource estimate (`RESOURCES_ATTR`) is no part of the kernel: it leaves
+  # the module before the hash, and is dumped with the hash that names its
+  # kernel.
+  resources = None
+  if RESOURCES_ATTR in module.operation.attributes:
+    resources = ir.StringAttr(module.operation.attributes[RESOURCES_ATTR]).value
+    del module.operation.attributes[RESOURCES_ATTR]
+
+  # Prior to computing the kernel hash, we temporarily remove the dump basename
+  # attribute from the module. This ensures that modules with different dump
+  # basenames but otherwise identical will have the same kernel hash, and thus
+  # will share the same compiled kernel.
+  dump_basename_attr_name = "mosaic_gpu.dump_basename"
+  if dump_basename_attr_name in module.operation.attributes:
+    dump_basename_attr = module.operation.attributes[dump_basename_attr_name]
+  else:
+    dump_basename_attr = None
+  module.operation.attributes[dump_basename_attr_name] = ir.UnitAttr.get()
+
+  bytecode_buffer = io.BytesIO()
+  module.operation.write_bytecode(bytecode_buffer, desired_version=0)
+  module_asm = bytecode_buffer.getvalue()
+  kernel_id = kernel_hash(module)
+
+  if dump_basename_attr is not None:
+    module.operation.attributes[dump_basename_attr_name] = dump_basename_attr
+
+  symmetric = None
+  if launch_context.SYMMETRIC_MEMORY_ARGS_ATTR in module.operation.attributes:
+    symmetric = tuple(bool(v) for v in np.array(
+        ir.DenseIntElementsAttr(
+            module.operation.attributes[
+                launch_context.SYMMETRIC_MEMORY_ARGS_ATTR
+            ]
+        ),
+        dtype=bool,
+    ))
+  return SerializedKernel(
+      forward_compatible=forward_compatible,
+      module_asm=module_asm,
+      kernel_id=kernel_id,
+      resources=resources,
+      sym_name=ir.StringAttr(module.operation.attributes["sym_name"]).value,
+      has_communication=has_communication,
+      uses_collective_metadata=launch_context.uses_collective_metadata(module),
+      symmetric_memory_args=symmetric,
+  )
+
+
 def _mosaic_gpu_lowering_rule(
     ctx,
     *args,
@@ -218,10 +333,30 @@ def _mosaic_gpu_lowering_rule(
     cost_estimate: Any = None,
     skip_device_barrier: bool = False,
     collective_id: int | None = None,
+    metadata: bytes = b"",
+    serialized: SerializedKernel | None = None,
 ):
+  """`module` as XLA's Mosaic GPU custom call.
+
+  `metadata`, where given, is the caller's statement of the launch (an
+  identity, a resource decision), opaque to Mosaic and kept in the compiled
+  call's serialization (MosaicGpuKernelProto.caller_metadata). `serialized`,
+  where given, is what the call holds of `module` (`serialized_kernel`, as a
+  lowering cache kept it): it is used as it is where it was made for this
+  lowering's forward compatibility, and made from `module` otherwise. A cached
+  lowering's call holds no module (None), only its serialized kernel.
+  """
+  if serialized is None or serialized.forward_compatible != (
+      ctx.is_forward_compat()
+  ):
+    if module is None:
+      raise ValueError(
+          "a cached Mosaic GPU kernel serialized for another forward"
+          " compatibility, with no module to serialize it again")
+    serialized = serialized_kernel(module, ctx.is_forward_compat())
   axis_context = ctx.module_context.axis_context
   replica_ids = []
-  if is_multi_device_module := _has_communication(module):
+  if is_multi_device_module := serialized.has_communication:
     # Those checks are trying to ensure that the logical device ids are
     # consistent with the NVSHMEM PE ids that Mosaic will be using for
     # communication. Any divergence here would require us to implement a logical
@@ -259,50 +394,35 @@ def _mosaic_gpu_lowering_rule(
     )
   assert len(ctx.avals_in) == len(args)
   assert len(ctx.avals_out) == len(out_types) + len(inout_types)
-  module = _run_serde_pass(
-      module,
-      serialize=True,
-      ir_version=FWD_COMPAT_IR_VERSION if ctx.is_forward_compat() else None,
+  kernel_id, module_asm, resources = (
+      serialized.kernel_id, serialized.module_asm, serialized.resources
   )
-
-  # Prior to computing the kernel hash, we temporarily remove the dump basename
-  # attribute from the module. This ensures that modules with different dump
-  # basenames but otherwise identical will have the same kernel hash, and thus
-  # will share the same compiled kernel.
-  dump_basename_attr_name = "mosaic_gpu.dump_basename"
-  if dump_basename_attr_name in module.operation.attributes:
-    dump_basename_attr = module.operation.attributes[dump_basename_attr_name]
-  else:
-    dump_basename_attr = None
-  module.operation.attributes[dump_basename_attr_name] = ir.UnitAttr.get()
-
-  bytecode_buffer = io.BytesIO()
-  module.operation.write_bytecode(bytecode_buffer, desired_version=0)
-  module_asm = bytecode_buffer.getvalue()
-  kernel_id = hashlib.sha256(module_asm).digest()
-  # Note that this is technically only a half measure. Someone might load a
-  # compiled module with a hash collision from disk. But that's so unlikely with
-  # SHA256 that it shouldn't be a problem.
-  if (kernel_text := KNOWN_KERNELS.get(kernel_id, None)) is not None:
-    if kernel_text != module_asm:
-      raise RuntimeError("Kernel hash collision!")
-  else:
-    KNOWN_KERNELS[kernel_id] = module_asm
-
-  if dump_basename_attr is not None:
-    module.operation.attributes[dump_basename_attr_name] = dump_basename_attr
+  if resources is not None:
+    # A cached kernel's call holds no module: the process's dump options, as
+    # Mosaic GPU reads them for any module.
+    dump_options = dialect.get_or_set_dump_options(
+        module if module is not None
+        else ir.Module.create(ir.Location.unknown()))
+    if dump_options.resources:
+      utils.dump_to_file_or_stdout(
+          f"{serialized.sym_name} {kernel_id.hex()} {resources}",
+          f"{dump_options.module_basename}.resources.txt",
+          dump_options.dump_path,
+      )
 
   backend_config: dict[str, ir.Attribute] = dict(
       kernel_hash=ir.StringAttr.get(kernel_id),
       module=ir.StringAttr.get(module_asm),
       skip_device_barrier=ir.BoolAttr.get(skip_device_barrier),
       uses_xla_collective_metadata=ir.BoolAttr.get(
-          launch_context.uses_collective_metadata(module)
+          serialized.uses_collective_metadata
       ),
   )
   # TODO(patrios): Remove once the minimum jaxlib version is >= 0.12.1.
   if lib.version < (0, 12, 1):
     backend_config["use_custom_barrier"] = ir.BoolAttr.get(False)
+  if metadata:
+    backend_config["metadata"] = ir.StringAttr.get(metadata)
   if cost_estimate is not None:
     backend_config["cost_estimate_json"] = ir.StringAttr.get(
         json.dumps(dataclasses.asdict(cost_estimate))
@@ -329,14 +449,9 @@ def _mosaic_gpu_lowering_rule(
         ",".join(map(str, replica_ids))
     )
 
-    if launch_context.SYMMETRIC_MEMORY_ARGS_ATTR in module.operation.attributes:
+    if serialized.symmetric_memory_args is not None:
       symmetric_memory_args = np.array(
-          ir.DenseIntElementsAttr(
-              module.operation.attributes[
-                  launch_context.SYMMETRIC_MEMORY_ARGS_ATTR
-              ]
-          ),
-          dtype=bool,
+          serialized.symmetric_memory_args, dtype=bool
       )
       # The Mosaic runtime uses this to decide which buffers to exchange with
       # the peers through the collective metadata.
@@ -372,7 +487,7 @@ def _mosaic_gpu_lowering_rule(
       mlir.aval_to_ir_type(ctx.module_context, aval) for aval in ctx.avals_out
   ])
   return mlir.custom_call(
-      call_target_name="mosaic_gpu_v2",
+      call_target_name=custom_call_targets.MOSAIC_GPU,
       result_types=result_types,
       operands=args,
       operand_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_in],
@@ -725,6 +840,9 @@ def _is_known_multihost_mesh(
   Returns:
     True if the mesh is a known multihost mesh, False otherwise.
   """
+  inputs = lowering_inputs.current()
+  if inputs is not None and mesh is inputs.mesh:
+    return inputs.known_multihost_mesh
   if mesh is None or mesh.empty or not isinstance(mesh, mesh_lib.Mesh):
     return False
   tasks = {
@@ -744,6 +862,35 @@ def _cluster_arrive_relaxed_aligned():
 
 def _cluster_wait_aligned():
   utils.inline_ptx("barrier.cluster.wait.aligned;", convergent=True)
+
+
+def _max_smem_bytes() -> int:
+  """The shared memory a block may use on the device a kernel is lowered for.
+
+  For ahead-of-time compilation purposes, that is when a CUDA device isn't
+  available to query directly, we default to 227 KB, the maximum amount of
+  shared memory per thread block available in compute capabilities 9.0 and
+  10.x:
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
+  A kernel lowered for an abstract device other than the attached one (a
+  compile-only target) is checked against that default too, not the attached
+  device's limit: one that states another compute capability, or, stating
+  none, is of another kind (an H100, whose capability Mosaic GPU already
+  defaults to, as `utils._infer_arch` reads it). We assume all devices have the
+  same amount of shared memory.
+  """
+  if (inputs := lowering_inputs.current()) is not None:
+    return inputs.max_smem_bytes
+  device = jax.local_devices()[0]
+  target = jax.sharding.get_abstract_mesh().abstract_device
+  stated = getattr(target, "compute_capability", None)
+  if target is not None and (
+      stated != getattr(device, "compute_capability", None)
+      if stated is not None
+      else target.device_kind != device.device_kind
+  ):
+    return 227 * 1024
+  return getattr(device, "shared_memory_per_block_optin", 227 * 1024)
 
 
 # TODO(apaszke): Inline this
@@ -788,17 +935,13 @@ def _launch(
     profiler_start = (smem_bytes + align - 1) & ~(align - 1)
     smem_bytes = profiler_start + profiler_spec.smem_bytes(block=block)
 
-  device = jax.local_devices()[0]
-  # For ahead-of-time compilation purposes, that is when a CUDA device
-  # isn't available to query directly, we default to 227 KB, the
-  # maximum amount of shared memory per thread block available in
-  # compute capabilities 9.0 and 10.x:
-  # https://docs.nvidia.com/cuda/cuda-c-programming-guide/#features-and-technical-specifications-technical-specifications-per-compute-capability
-  # Note in either case we assume all devices have the same amount of
-  # shared memory.
-  max_smem_bytes = getattr(device, "shared_memory_per_block_optin", 227 * 1024)
-  if _SMEM_SIZE_BOUND is not None:
-    max_smem_bytes = min(max_smem_bytes, _SMEM_SIZE_BOUND)
+  max_smem_bytes = _max_smem_bytes()
+  if (inputs := lowering_inputs.current()) is not None:
+    smem_size_bound = inputs.smem_size_bound
+  else:
+    smem_size_bound = _SMEM_SIZE_BOUND
+  if smem_size_bound is not None:
+    max_smem_bytes = min(max_smem_bytes, smem_size_bound)
   if smem_bytes > max_smem_bytes:
     raise ValueError("Mosaic GPU kernel exceeds available shared memory: "
                      f"{smem_bytes=} > {max_smem_bytes=}")
@@ -987,7 +1130,12 @@ def _lower_as_gpu_kernel(
     uses_pdl: bool = False,
     is_multi_process: bool = False,
     use_barrier_semaphore: bool = False,
+    min_blocks_per_sm: int = 1,
 ):
+  if min_blocks_per_sm < 1:
+    raise ValueError(
+        f"min_blocks_per_sm must be positive, got {min_blocks_per_sm}"
+    )
   ptr_ty = llvm.PointerType.get()
   token_ty = gpu.AsyncTokenType.get()
   i8 = ir.IntegerType.get_signless(8)
@@ -1013,6 +1161,10 @@ def _lower_as_gpu_kernel(
   module = ir.Module.create(loc=base_loc)
   dialect.register_dialect(module.context)
   attrs = module.operation.attributes
+  # Read by the LLVM attribute insertion pass, which sets nvvm.minctasm.
+  attrs["mosaic_gpu.min_blocks_per_sm"] = ir.IntegerAttr.get(
+      i32, min_blocks_per_sm
+  )
   attrs["sym_name"] = ir.StringAttr.get(module_name)
   arch_major, arch_minor = utils._infer_arch()
   attrs["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch_major)
@@ -1127,6 +1279,23 @@ def _run_serde_pass(
   return module
 
 
+def deserialized(module: bytes) -> ir.Module:
+  """A kernel's module as a Mosaic GPU custom call holds it (its serialized
+  bytecode, the call's ``module``), its operations in their own dialects again:
+  what a reader of a lowered program's kernels walks."""
+  context = mlir.make_ir_context()
+  dialect.register_dialect(context)
+  # The serialized operations' dialect is the serialization's own until the
+  # pass names them again.
+  allow_unregistered_dialects = context.allow_unregistered_dialects
+  context.allow_unregistered_dialects = True
+  try:
+    with context, ir.Location.unknown():
+      return _run_serde_pass(ir.Module.parse(module), serialize=False)
+  finally:
+    context.allow_unregistered_dialects = allow_unregistered_dialects
+
+
 def _declare_runtime_functions():
   """Declares the runtime functions that can be used by the generated code."""
   ptr_ty = llvm.PointerType.get()
@@ -1145,6 +1314,96 @@ def _declare_runtime_functions():
       init_tma_im2col_desc_type,
       visibility="private",
   )
+
+
+# Operations that touch no memory and synchronize nothing: a collective
+# barrier repeated with only these between it and the one before it syncs
+# nothing new.
+_PURE_DIALECTS = ("arith.", "index.", "math.")
+_PURE_OPS = frozenset({
+    "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "gpu.thread_id",
+    "gpu.block_dim", "gpu.block_id", "gpu.grid_dim",
+})
+
+
+def _pure(op: ir.Operation) -> bool:
+  return not op.regions and (
+      op.name.startswith(_PURE_DIALECTS) or op.name in _PURE_OPS)
+
+
+def _attributes(op: ir.Operation) -> tuple[tuple[str, str], ...]:
+  attributes = op.attributes
+  return tuple(sorted(
+      (attributes[i].name, str(attributes[i].attr))
+      for i in range(len(attributes))))
+
+
+def _same_value(a: ir.Value, b: ir.Value, depth: int = 8) -> bool:
+  """Whether `a` and `b` hold one value: the same SSA value, or the same
+  result, of one type, of alike pure operations of the same values (a
+  barrier's index recomputed alike), at most `depth` operations deep,
+  compared without merging any operation of the module."""
+  if a == b:
+    return True
+  if (depth == 0 or a.type != b.type
+      or not (isinstance(a, ir.OpResult) and isinstance(b, ir.OpResult))):
+    return False
+  x, y = a.owner.operation, b.owner.operation
+  return (
+      a.result_number == b.result_number
+      and x.name == y.name
+      and _pure(x)
+      and _attributes(x) == _attributes(y)
+      and len(x.operands) == len(y.operands)
+      and all(_same_value(p, q, depth - 1)
+              for p, q in zip(x.operands, y.operands))
+  )
+
+
+def _same_barrier(a: ir.Operation, b: ir.Operation) -> bool:
+  return (
+      _attributes(a) == _attributes(b)
+      and len(a.operands) == len(b.operands)
+      and all(_same_value(p, q) for p, q in zip(a.operands, b.operands))
+  )
+
+
+def _drop_repeated_barriers(module: ir.Module) -> None:
+  """Drops each collective warpgroup barrier (`utils.COLLECTIVE_BARRIER`)
+  that repeats one before it in its block, of the same operands and
+  attributes, with only pure operations between (`_PURE_OPS`): the barrier
+  after one store and the one before the next, which ptxas keeps. Both are
+  reached by every thread of the warpgroup from the same program point, so the
+  second syncs nothing the first did not. Other barriers, whose participants a
+  branch may split, are kept. Barrier ids recomputed alike are one
+  (`_same_value`); no operation but a dropped barrier is changed, as the
+  launch context still holds values of the module (its TMA descriptors' host
+  initialization, `finalize_size`). The marks are removed after."""
+  dropped, marked = [], []
+
+  def walk(op: ir.Operation) -> None:
+    for region in op.regions:
+      for block in region.blocks:
+        last = None  # The block's last collective barrier still in force.
+        for inner in block.operations:
+          inner = inner.operation
+          if (inner.name == "nvvm.barrier"
+              and utils.COLLECTIVE_BARRIER in inner.attributes):
+            marked.append(inner)
+            if last is not None and _same_barrier(inner, last):
+              dropped.append(inner)
+            else:
+              last = inner
+            continue
+          if not _pure(inner):
+            last = None
+          walk(inner)
+
+  walk(module.operation)
+  for op in marked:
+    del op.attributes[utils.COLLECTIVE_BARRIER]
+  for op in dropped:
+    op.erase()
 
 
 def lower_mgpu_module(
@@ -1185,6 +1444,7 @@ def lower_mgpu_module(
         module, launch_ctx, auto_barriers=auto_barriers
     )
 
+  _drop_repeated_barriers(module)
   launch_ctx.scratch.finalize_size()
   try:
     module.operation.verify()

@@ -20,6 +20,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import enum
+import functools
 import math
 from typing import Any, TYPE_CHECKING, Literal, assert_never, cast, final
 
@@ -31,6 +32,7 @@ from . import dialect_lowering as lowering
 from . import fragmented_array as fa
 from . import launch_context as lc
 from . import layouts as layouts_lib
+from .mma import can_relayout_acc_to_lhs
 from . import tcgen05
 from . import utils
 
@@ -230,6 +232,11 @@ def reduce_reshape_expression(
               )
           )
         case fa.TiledLayout() as tiled_layout:
+          unit_layout = fa.reshape_unit_axis_layout(
+              tiled_layout, reshape.source_shape, reshape.target_shape
+          )
+          if unit_layout is not None:
+            return RegisterLayout(unit_layout)
           tile_shape = tiled_layout.base_tile_shape
           if len(reshape.target_shape) < len(tile_shape):
             return dataclasses.replace(reshape, expression=reduced_expr)
@@ -301,8 +308,22 @@ def reduce_reduce_expression(
     case Unsatisfiable():
       return Unsatisfiable()
     case RegisterLayout(value=fa.TiledLayout() as layout):
-      # TODO(allanrenucci): Add support for reducing tiled layouts when keep_dims=True.
       if expr.keep_dims:
+        if (
+            expr.rank == 2 and len(expr.axes) == 1
+            and len(layout.base_tile_shape) == 2
+        ):
+          reduced_layout = layout.reduce(expr.axes)
+          # Use a tileable shape so the reshape preserves an existing legal
+          # layout when inserting a leading unit axis.
+          source_shape = reduced_layout.base_tile_shape
+          target_shape = list(source_shape)
+          target_shape.insert(expr.axes[0], 1)
+          result = fa.reshape_unit_axis_layout(
+              reduced_layout, source_shape, tuple(target_shape)
+          )
+          if result is not None:
+            return RegisterLayout(result)
         return default()
       num_untiled_dims = expr.rank - len(layout.base_tile_shape)
       reduced_tiling_axes = [
@@ -495,7 +516,7 @@ def _is_supported_tiled_relayout(
       src.vector_length
   ) and dst == fa.tmem_native_layout(dst.vector_length):
     return True
-  return False
+  return can_relayout_acc_to_lhs(src, dst, bitwidth)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -655,6 +676,91 @@ class IsTransferableTmemRegisters(IsTransferable):
     return f"IsTransferableTmemRegisters({self.source} ⟶ {self.target})"
 
 
+def _target() -> utils.Arch:
+  """The target a transfer check plans for: the one the module stating it names
+  (`utils.get_arch`), else, with no insertion point or one inside an op no module
+  holds yet (a kernel body layout inference reads before it is placed), the one
+  `utils.get_arch` infers with no module: the compile-only mesh's device, else the
+  attached one."""
+  try:
+    return utils.get_arch()
+  except ValueError:  # No module above the insertion point: detached, or none.
+    return utils.Arch(*utils._infer_arch())
+
+
+@functools.cache
+def _is_supported_smem_transfer(
+    smem_layout: SMEMTransforms,
+    reg_layout: fa.FragmentedLayout,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    bitwidth: int,
+    optimized: bool,
+    arch: utils.Arch,
+) -> bool:
+  """Whether SMEM with `smem_layout` transfers to or from registers in `reg_layout`.
+
+  The answer depends on its arguments and the target, `arch` (the caller's,
+  `utils.get_arch`: transposed 8-bit transfers are Blackwell's alone), for which
+  the transfer is planned, in a throwaway function of a module of its own that
+  states it, about a millisecond a call. Layout inference asks it of
+  the same transfers on every reduction of its search, tens of thousands of times
+  for a kernel with a few SMEM refs whose transforms are unknown, so it is
+  computed once per transfer and target: one process compiling a layout for two
+  targets reads each target's own answer.
+  """
+  tiling_transform = smem_layout.tiling
+  swizzle = smem_layout.swizzle
+
+  if not isinstance(reg_layout, fa.TiledLayout):
+    return tiling_transform is None and swizzle is None
+  tiling = tiling_transform.tiling if tiling_transform is not None else ()
+  tiling_rank = len(tiling)
+
+  # If `tiling_rank` is 0, then we tile by the shape. This is the logic that
+  # is implemented in `load_untiled` and `store_untiled`.
+  if tiling_rank == 0:
+    tiling = shape
+    tiling_rank = len(tiling)
+
+  int_ty = ir.IntegerType.get_signless(bitwidth)
+  layout = ir.StridedLayoutAttr.get(0, lowering.tile_strides(strides, tiling))
+  ref_shape = utils.tile_shape(shape, tiling)
+  assert len(layout.strides) == len(ref_shape), (len(layout.strides), len(ref_shape))
+  memref_ty = ir.MemRefType.get(ref_shape, int_ty, layout, utils.smem())
+  # The plan reads its target from its module (`utils.get_arch`): this one's.
+  i32 = ir.IntegerType.get_signless(32)
+  scratch = ir.Module.create()
+  scratch.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch.major)
+  scratch.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, arch.minor)
+  with ir.InsertionPoint(scratch.body):
+    dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
+  dummy_block = dummy_func.add_entry_block()
+  try:
+    with ir.InsertionPoint(dummy_block):
+      fake_ref_op = builtin.UnrealizedConversionCastOp([memref_ty], [])
+      fake_ref = fake_ref_op.results[0]
+      for use_txmatrix in [True, False]:
+        try:
+          next(
+              fa.FragmentedArray.transfer_tiled(
+                  fake_ref,
+                  swizzle or 16,
+                  reg_layout,
+                  shape,
+                  optimized=optimized,
+                  ref_tiling_rank=tiling_rank,
+                  use_txmatrix=use_txmatrix,
+              )
+          )
+          return True
+        except (fa.TxMatrixIneligible, fa.TransferPlanDerivationError, fa.UnsupportedTransferError):
+          continue
+      return False
+  finally:
+    dummy_func.erase()
+
+
 @dataclasses.dataclass(frozen=True)
 class IsTransferableSmemRegisters(IsTransferable):
   """States that `source` layout must be transferable across memory spaces to `target` layout.
@@ -671,50 +777,10 @@ class IsTransferableSmemRegisters(IsTransferable):
       smem_layout: SMEMTransforms,
       reg_layout: fa.FragmentedLayout,
   ) -> bool:
-    tiling_transform = smem_layout.tiling
-    swizzle = smem_layout.swizzle
-
-    if not isinstance(reg_layout, fa.TiledLayout):
-      return tiling_transform is None and swizzle is None
-    tiling = tiling_transform.tiling if tiling_transform is not None else ()
-    tiling_rank = len(tiling)
-
-    # If `tiling_rank` is 0, then we tile by the shape. This is the logic that
-    # is implemented in `load_untiled` and `store_untiled`.
-    if tiling_rank == 0:
-      tiling = self.shape
-      tiling_rank = len(tiling)
-
-    int_ty = ir.IntegerType.get_signless(self.bitwidth)
-    layout = ir.StridedLayoutAttr.get(0, lowering.tile_strides(self.strides, tiling))
-    ref_shape = utils.tile_shape(self.shape, tiling)
-    assert len(layout.strides) == len(ref_shape), (len(layout.strides), len(ref_shape))
-    memref_ty = ir.MemRefType.get(ref_shape, int_ty, layout, utils.smem())
-    dummy_func = func.FuncOp("dummy_transfer_test", ir.FunctionType.get([], []))
-    dummy_block = dummy_func.add_entry_block()
-    try:
-      with ir.InsertionPoint(dummy_block):
-        fake_ref_op = builtin.UnrealizedConversionCastOp([memref_ty], [])
-        fake_ref = fake_ref_op.results[0]
-        for use_txmatrix in [True, False]:
-          try:
-            next(
-                fa.FragmentedArray.transfer_tiled(
-                    fake_ref,
-                    swizzle or 16,
-                    reg_layout,
-                    self.shape,
-                    optimized=self.optimized,
-                    ref_tiling_rank=tiling_rank,
-                    use_txmatrix=use_txmatrix,
-                )
-            )
-            return True
-          except (fa.TxMatrixIneligible, fa.TransferPlanDerivationError, fa.UnsupportedTransferError):
-            continue
-        return False
-    finally:
-      dummy_func.erase()
+    return _is_supported_smem_transfer(
+        smem_layout, reg_layout, self.shape, self.strides, self.bitwidth,
+        self.optimized, _target(),
+    )
 
   def _constant_holds(self) -> bool:
     match self.source, self.target:

@@ -15,7 +15,9 @@
 """Layout inference tests for the Mosaic GPU MLIR dialect."""
 
 import dataclasses
+import types
 from typing import assert_never
+from unittest import mock
 
 from absl.testing import parameterized
 import jax
@@ -34,13 +36,17 @@ from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
+from jax.experimental.mosaic.gpu import dialect_lowering
 from jax.experimental.mosaic.gpu import fragmented_array as fa
+from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import inference_utils
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import layout_inference
 from jax.experimental.mosaic.gpu import layouts
+from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import test_util as mtu
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.mosaic.gpu.mma import MMALayouts
 import numpy as np
 
@@ -116,6 +122,30 @@ def _undef_constraint_system(
 
 
 class LayoutInferenceTest(parameterized.TestCase):
+  @parameterized.parameters(16, 32)
+  def test_reduction_scratch_uses_reserved_byte_stride(self, bitwidth):
+    with ir.InsertionPoint(self.module.body):
+      i32 = ir.IntegerType.get_signless(32)
+      for name, value in (("arch_major", 9), ("arch_minor", 0)):
+        self.module.operation.attributes[f"mosaic_gpu.{name}"] = ir.IntegerAttr.get(
+            i32, value
+        )
+      op = arith.ConstantOp(i32, ir.IntegerAttr.get(i32, 0))
+      for name, value in (
+          ("offset", 0), ("scratch_size", 1024), ("scratch_warpgroups", 2)
+      ):
+        op.attributes[name] = ir.IntegerAttr.get(i32, value)
+      dtype = ir.IntegerType.get_signless(bitwidth)
+      for elements in (4, 1024 * 8 // bitwidth):
+        scratch = dialect_lowering._reduction_scratch(op, dtype, elements, 2048)
+        source_type = ir.MemRefType(scratch.owner.opview.source.type)
+        stride = source_type.get_strides_and_offset()[0][0]
+        self.assertEqual(stride * bitwidth // 8, 1024)
+        self.assertEqual(ir.MemRefType(scratch.type).shape, [elements])
+      del op.attributes["scratch_size"]
+      with self.assertRaisesRegex(ValueError, "scratch_size"):
+        dialect_lowering._reduction_scratch(op, dtype, 4, 2048)
+
   @classmethod
   def setUpClass(cls):
     super().setUpClass()
@@ -287,6 +317,26 @@ class LayoutInferenceTest(parameterized.TestCase):
     layout_attr = layouts.to_layout_attr(layout)
     self.checkInLayouts(add, [layout_attr, layout_attr])
     self.checkOutLayouts(add, [layout_attr])
+
+  @parameterized.product(
+      op=(math_dialect.CeilOp, math_dialect.FloorOp),
+      layout=(
+          mgpu.WGSplatFragLayout(shape=(32, 4)),
+          mgpu.WGStridedFragLayout(shape=(32, 4), vec_size=1),
+      ),
+  )
+  def test_rounding_op_propagates_argument_layouts(self, op, layout):
+
+    with ir.InsertionPoint(self.module.body):
+      ty = ir.VectorType.get(layout.shape, ir.F32Type.get())
+      [x] = undefs(ty)
+      rounded = op(layout_cast(x, layout))
+
+    mgpu.infer_layout(self.module)
+
+    layout_attr = layouts.to_layout_attr(layout)
+    self.checkInLayouts(rounded, [layout_attr])
+    self.checkOutLayouts(rounded, [layout_attr])
 
   def test_vector_load_does_not_allow_splat_result(self):
     shape = (32, 4)
@@ -1101,6 +1151,93 @@ class LayoutInferenceTest(parameterized.TestCase):
         bitwidth in (16, 32),
     )
 
+  def test_find_assignments_for_solves_independent_buffers_apart(self):
+    # Two SMEM buffers, each receiving a tile in the MMA accumulator's layout
+    # and read back as a ladder of row slices, each slice its own register
+    # variable: nothing relates one buffer's variables to the other's, so the
+    # search costs the sum of the two buffers' searches, not their product
+    # (the product exhausted 20000 fuel; the sum takes 42).
+    bf16 = ir.BF16Type.get()
+    acc = MMALayouts(jnp.bfloat16).acc
+    unknowns, constraints = [], []
+    with ir.InsertionPoint(self.module.body):
+      for _ in range(2):
+        smem_ty = ir.MemRefType.get(
+            (128, 128), bf16, memory_space=mgpu_utils.smem()
+        )
+        smem = cs.Variable(layout_inference.ValueSite(
+            builtin.UnrealizedConversionCastOp([smem_ty], []),
+            layout_inference.VariableType.RESULT, 0,
+        ))
+        unknowns.append(smem)
+        constraints.append(cs.IsTransferableSmemRegisters(
+            RL(acc), smem, (128, 128), (128, 1), bitwidth=16,
+            optimized=False,
+        ))
+        rows = 128
+        while rows:
+          [key] = layout_inference.vector_value_sites(
+              llvm.UndefOp(ir.VectorType.get((rows, 128), bf16))
+          )
+          variable = cs.Variable(key)
+          unknowns.append(variable)
+          constraints.append(cs.NotOfType(variable, fa.WGSplatFragLayout))
+          constraints.append(cs.IsTransferableSmemRegisters(
+              smem, variable, (rows, 128), (128, 1), bitwidth=16,
+              optimized=True,
+          ))
+          rows //= 2
+    assignments, _ = layout_inference.find_assignments_for(
+        unknowns,
+        cs.ConstraintSystem(constraints=constraints),
+        fuel=1000,
+        arch=(8, 0),
+    )
+    self.assertNotIsInstance(assignments, cs.Unsatisfiable)
+    self.assertEqual(set(assignments), set(unknowns))
+
+  def test_find_assignments_for_compares_linearly_in_its_independent_groups(
+      self,
+  ):
+    # A system of many groups no constraint relates, beside as many unknowns
+    # already assigned, is split and solved comparing its variables a number
+    # of times linear in their count: twice the groups, about twice the
+    # comparisons (a kernel's thousands of groups made it quadratic, minutes
+    # of a compile).
+    def comparisons(groups):
+      bf16 = ir.BF16Type.get()
+      unknowns, constraints, assigned = [], [], {}
+      with ir.InsertionPoint(self.module.body):
+        for index in range(2 * groups):
+          [key] = layout_inference.vector_value_sites(
+              llvm.UndefOp(ir.VectorType.get((128, 128), bf16))
+          )
+          variable = cs.Variable(key)
+          unknowns.append(variable)
+          if index % 2:
+            assigned[variable] = RL(mgpu.WGMMA_LAYOUT)
+          else:
+            constraints.append(cs.NotOfType(variable, fa.WGSplatFragLayout))
+      counted = [0]
+      compare = cs.Variable.__eq__
+
+      def counting(self, other):
+        counted[0] += 1
+        return compare(self, other)
+
+      with mock.patch.object(cs.Variable, "__eq__", counting):
+        assignments, _ = layout_inference.find_assignments_for(
+            unknowns,
+            cs.ConstraintSystem(assignments=assigned, constraints=constraints),
+            fuel=100 * groups,
+            arch=(9, 0),
+        )
+      self.assertNotIsInstance(assignments, cs.Unsatisfiable)
+      self.assertEqual(set(assignments), set(unknowns))
+      return counted[0]
+
+    self.assertLess(comparisons(400), 3 * max(comparisons(200), 1))
+
   def test_cannot_find_assignments_for_unsatisfiable_constraint_system(self):
     with ir.InsertionPoint(self.module.body):
       x = llvm.UndefOp(ir.VectorType.get((64,), ir.BF16Type.get()))
@@ -1275,6 +1412,39 @@ class LayoutInferenceTest(parameterized.TestCase):
         ValueError, "cannot relayout from register layout WGMMA to WGMMA_ROW"
     ):
       mgpu.infer_layout(self.module)
+
+  @parameterized.parameters(1, 2, 4)
+  def test_mma_op_takes_the_warp_split_it_states(self, m_warps):
+    bf16, f32 = ir.BF16Type.get(), ir.F32Type.get()
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get((128, 128), f32),
+          ir.VectorType.get((128, 32), bf16),
+          ir.VectorType.get((32, 128), bf16),
+      )
+      op = mgpu.dialect.mma(acc, a, b).owner
+      op.attributes[MMA_M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+          ir.IntegerType.get_signless(32), m_warps
+      )
+
+    mgpu.infer_layout(self.module)
+    layouts = MMALayouts(bf16, m_warps=m_warps)
+    self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
+    self.checkOutLayouts(op, [layouts.acc])
+
+  def test_mma_op_without_a_split_takes_the_most_warps_along_its_rows(self):
+    bf16, f32 = ir.BF16Type.get(), ir.F32Type.get()
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get((128, 128), f32),
+          ir.VectorType.get((128, 32), bf16),
+          ir.VectorType.get((32, 128), bf16),
+      )
+      op = mgpu.dialect.mma(acc, a, b).owner
+
+    mgpu.infer_layout(self.module)
+    layouts = MMALayouts(bf16, m_warps=4)
+    self.checkInLayouts(op, [layouts.acc, layouts.lhs, layouts.rhs])
 
   def test_diagnoses_unsupported_strict_relayout(self):
     shape = (64, 64)
@@ -4198,6 +4368,57 @@ class LayoutInferenceTest(parameterized.TestCase):
       v = mgpu.dialect.vector_load(ref)
     mgpu.infer_layout(self.module, arch=arch)
     self.checkOutLayouts(v.owner, [layout])
+
+class ArchInferenceTest(parameterized.TestCase):
+
+  @parameterized.parameters(("8.0", (8, 0)), ("9.0", (9, 0)), ("10.0", (10, 0)))
+  def test_an_abstract_device_states_its_compute_capability(
+      self, capability, arch
+  ):
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA GPU", num_cores=None, platform="cuda",
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("x",), (jax.sharding.AxisType.Explicit,), abstract_device=device
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+      self.assertEqual(mgpu_utils._infer_arch(), arch)
+
+  @parameterized.named_parameters(
+      # Another GPU stated by its capability, or by its kind alone (an H100,
+      # whose capability Mosaic GPU already defaults to): a compile-only
+      # target, held to the 227 KiB default.
+      ("another_capability", "NVIDIA GPU", "12.3", 227 * 1024),
+      ("another_kind", "NVIDIA H100 80GB HBM3", None, 227 * 1024),
+      # The attached device itself, by its capability or by its kind: its own
+      # limit.
+      ("the_attached_capability", "NVIDIA GPU", "8.0", 166912),
+      ("the_attached_kind", "NVIDIA A100-SXM4-40GB", None, 166912),
+  )
+  @jtu.thread_unsafe_test()  # Patches `jax.local_devices`.
+  def test_a_compile_only_target_takes_the_default_shared_memory_limit(
+      self, kind, capability, limit
+  ):
+    # A kernel for an H100 lowered on an A100's host (163 KiB) is checked
+    # against the 227 KiB default, not the attached A100's limit.
+    attached = types.SimpleNamespace(
+        device_kind="NVIDIA A100-SXM4-40GB", compute_capability="8.0",
+        shared_memory_per_block_optin=166912,
+    )
+    device = jax.sharding.AbstractDevice(
+        device_kind=kind, num_cores=None, platform="cuda",
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("x",), (jax.sharding.AxisType.Explicit,), abstract_device=device
+    )
+    with (
+        mock.patch.object(jax, "local_devices", lambda: [attached]),
+        jax.sharding.use_abstract_mesh(mesh),
+    ):
+      self.assertEqual(mgpu_core._max_smem_bytes(), limit)
+
 
 if __name__ == "__main__":
   parameterized.absltest.main(testLoader=jtu.JaxTestLoader())
