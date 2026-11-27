@@ -1,0 +1,154 @@
+diff --git a/xla/backends/gpu/transforms/BUILD b/xla/backends/gpu/transforms/BUILD
+index 5cf4cf6..a496f3c 100644
+--- a/xla/backends/gpu/transforms/BUILD
++++ b/xla/backends/gpu/transforms/BUILD
+@@ -1764,6 +1764,7 @@ xla_cc_test(
+         "//xla:literal",
+         "//xla:literal_util",
+         "//xla/hlo/evaluator:hlo_evaluator",
++        "//xla:xla_data_proto_cc",
+         "//xla/hlo/testlib:filecheck",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/hlo/testlib:verified_hlo_module",
+diff --git a/xla/backends/gpu/transforms/dot_strength_reduction.cc b/xla/backends/gpu/transforms/dot_strength_reduction.cc
+index dcce2e9..392984b 100644
+--- a/xla/backends/gpu/transforms/dot_strength_reduction.cc
++++ b/xla/backends/gpu/transforms/dot_strength_reduction.cc
+@@ -647,23 +647,31 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
+   }
+   const OpMetadata* metadata = &dot->metadata();
+   ABSL_ASSIGN_OR_RETURN(auto dot_dims, DotOperandDims::FromDot(dot));
+-
+-  std::array<HloInstruction*, 2> operands = {dot->mutable_operand(0),
+-                                             dot->mutable_operand(1)};
+-  // An F8 algorithm's operands are exact in F32, its accumulator type, which a
+-  // narrower result type (an E4M3FN result of E5M2 operands) would round.
+   const PrecisionConfig::Algorithm algorithm =
+       dot->precision_config().algorithm();
+-  const PrimitiveType operand_type =
++  const PrimitiveType output_type = dot->shape().element_type();
++  const int64_t contracting_dims = dot_dims[0].Rank(DotOperandDims::kContracting);
++  const PrimitiveType accumulator_type = GetGemmAccumulatorType(dot);
++  // The type the operands multiply in. An F8 algorithm's operands are exact in
++  // F32, its accumulator type, which a narrower result type (an E4M3FN result
++  // of E5M2 operands) would round. A dot with an implicit algorithm must not
++  // round each product to the output type before summation. Outer products and
++  // other explicit algorithms retain the multiply input types they used before.
++  const PrimitiveType multiply_type =
+       algorithm == PrecisionConfig::ALG_DOT_ANY_F8_ANY_F8_F32 ||
+               algorithm == PrecisionConfig::ALG_DOT_ANY_F8_ANY_F8_F32_FAST_ACCUM
+           ? F32
+-          : dot->shape().element_type();
++      : algorithm == PrecisionConfig::ALG_UNSET && contracting_dims != 0
++          ? accumulator_type
++          : output_type;
++
++  std::array<HloInstruction*, 2> operands = {dot->mutable_operand(0),
++                                             dot->mutable_operand(1)};
+   for (int i = 0; i < 2; ++i) {
+     DotOperandDims& our_dims = dot_dims[i];
+     DotOperandDims& other_dims = dot_dims[1 - i];
+     // Convert operands to the type they multiply in.
+-    operands[i] = ConvertTo(operands[i], operand_type, metadata);
++    operands[i] = ConvertTo(operands[i], multiply_type, metadata);
+     // Ensure dimensions are in "batch, non-contracting, contracting" order.
+     operands[i] = PermuteDotOperandDimensions(operands[i], &our_dims, metadata);
+ 
+@@ -686,17 +694,16 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
+   ABSL_ASSIGN_OR_RETURN(
+       HloInstruction * flow,
+       MakeMultiplyForDotPrecisionAlgorithm(
+-          operands[0], operands[1], dot->precision_config().algorithm()));
++          operands[0], operands[1], algorithm));
+   flow->set_metadata(*metadata);
+ 
+   // If there were any contracting dims, we need to reduce them.
+-  flow = ReduceDimensions(flow, dot_dims[0].Rank(DotOperandDims::kContracting),
+-                          GetGemmAccumulatorType(dot), metadata);
++  flow = ReduceDimensions(flow, contracting_dims, accumulator_type, metadata);
+ 
+   // If the output type is different from what it was before (either because
+   // reduction used a different accumulator type, or because types of operand
+   // differed the output type for multiply), convert to the output type.
+-  flow = ConvertTo(flow, dot->shape().element_type(), metadata);
++  flow = ConvertTo(flow, output_type, metadata);
+   return flow;
+ }
+ 
+diff --git a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
+index 303c4d4..f899335 100644
+--- a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
++++ b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
+@@ -34,6 +34,7 @@ limitations under the License.
+ #include "xla/literal_util.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+ #include "xla/stream_executor/device_description.h"
++#include "xla/xla_data.pb.h"
+ #include "xla/stream_executor/rocm/rocm_compute_capability.h"
+ #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
+ 
+@@ -75,6 +76,34 @@ ENTRY test {
+   EXPECT_TRUE(filecheck_result);
+ }
+ 
++TEST_F(DotStrengthReductionTest, NarrowGemvKeepsProductBitsThroughReduction) {
++  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
++HloModule narrow_gemv
++ENTRY main {
++  lhs = bf16[2] parameter(0)
++  rhs = bf16[2,2] parameter(1)
++  ROOT dot = bf16[2] dot(lhs, rhs), lhs_contracting_dims={0},
++      rhs_contracting_dims={0}, operand_precision={highest,highest}
++})"));
++  DotStrengthReduction pass{
++      se::GpuComputeCapability(se::CudaComputeCapability::Hopper())};
++  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&pass, module.get()));
++  ASSERT_TRUE(changed);
++  CHECK_OK(module->Verify());
++
++  ASSERT_OK_AND_ASSIGN(
++      auto lhs, LiteralUtil::CreateR1<float>({1.0078125f, 1.f}).Convert(BF16));
++  ASSERT_OK_AND_ASSIGN(
++      auto rhs,
++      LiteralUtil::CreateR2<float>({{1.0078125f, 1.f}, {-1.015625f, 0.f}})
++          .Convert(BF16));
++  ASSERT_OK_AND_ASSIGN(Literal result,
++                       HloEvaluator().Evaluate(*module, {&lhs, &rhs}));
++  // (1 + 2^-7)^2 - (1 + 2^-6) = 2^-14, but in BF16 the products cancel.
++  EXPECT_EQ(result.GetAsDouble({0}), 0x1p-14);
++  EXPECT_EQ(result.GetAsDouble({1}), 1.0078125);
++}
++
+ TEST_F(DotStrengthReductionTest, UpcastInReduction) {
+   const char* hlo_text = R"(
+ HloModule test
+@@ -95,8 +124,7 @@ ENTRY test {
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: bf16[256,6144]{1,0} multiply
+-// CHECK: f32[256,6144]{1,0} convert
++// CHECK: f32[256,6144]{1,0} multiply
+ // CHECK: f32[] constant(0)
+ // CHECK: f32[256]{0} reduce
+ // CHECK: bf16[256]{0} convert
+@@ -128,8 +156,7 @@ ENTRY test {
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: bf16[256,6144]{1,0} multiply{{.*}}, metadata={op_name="test"}
+-// CHECK: f32[256,6144]{1,0} convert{{.*}}, metadata={op_name="test"}
++// CHECK: f32[256,6144]{1,0} multiply{{.*}}, metadata={op_name="test"}
+ // CHECK: f32[256]{0} reduce{{.*}}, metadata={op_name="test"}
+ // CHECK: bf16[256]{0} convert{{.*}}, metadata={op_name="test"}
+ )";
+@@ -160,8 +187,7 @@ ENTRY test {
+   CHECK_OK(module->Verify());
+ 
+   const char* filecheck_pattern = R"(
+-// CHECK: f8e4m3fn[8,32,16]{2,1,0} multiply
+-// CHECK: f32[8,32,16]{2,1,0} convert
++// CHECK: f32[8,32,16]{2,1,0} multiply
+ // CHECK: f32[] constant(0)
+ // CHECK: f32[8,32]{1,0} reduce
+ // CHECK: f8e4m3fn[8,32]{1,0} convert
