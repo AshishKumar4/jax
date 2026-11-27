@@ -1,0 +1,84 @@
+diff --git a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
+index c03e6c80008..432597da3fd 100644
+--- a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
++++ b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
+@@ -78,9 +78,17 @@ class ReductionDegenerateDimRemoverVisitor : public DfsHloRewriteVisitor {
+       }
+ 
+       if (updated_reduced_dimensions.empty()) {
+-        std::unique_ptr<HloInstruction> reshape =
+-            HloInstruction::CreateBitcast(reduce_shape, reduced_op);
+-        return ReplaceWithNewInstruction(instr, std::move(reshape));
++        // Every reduced dimension is degenerate: its result is its input where
++        // its init is its reducer's identity, as this pass assumes of a reduce
++        // of one input in its own type. A variadic or mixed precision reduce,
++        // whose results that bitcast would not make, is left as it is for the
++        // reduction emitters, which read its init and reducer.
++        if (instr->shape().IsTuple() ||
++            !ShapeUtil::SameElementType(reduce_shape, input_shape)) {
++          return absl::OkStatus();
++        }
++        return ReplaceWithNewInstruction(
++            instr, HloInstruction::CreateBitcast(reduce_shape, reduced_op));
+       }
+ 
+       input_reshapes.push_back(instr->parent()->AddInstruction(
+diff --git a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
+index fa51e54b325..5386ec0b96c 100644
+--- a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
++++ b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
+@@ -131,5 +131,54 @@ ENTRY main {
+       )");
+ }
+ 
++TEST_F(ReductionDegenerateDimRemoverTest,
++       DegenerateVariadicReductionIsLeftForTheEmitters) {
++  // A compensated (hi, lo) sum over a one-element axis: a bitcast of its first
++  // input, as one input's reduce is rewritten, is no result of it.
++  const char* hlo = R"(
++HloModule ReduceVariadicOverDegenerateDimension
++
++add_pair {
++  hi_0 = f32[] parameter(0)
++  lo_0 = f32[] parameter(1)
++  hi_1 = f32[] parameter(2)
++  lo_1 = f32[] parameter(3)
++  hi = f32[] add(hi_0, hi_1)
++  lo = f32[] add(lo_0, lo_1)
++  ROOT out = (f32[], f32[]) tuple(hi, lo)
++}
++
++ENTRY main {
++  hi = f32[32,1] parameter(0)
++  lo = f32[32,1] parameter(1)
++  zero = f32[] constant(0)
++  ROOT out = (f32[32], f32[32]) reduce(hi, lo, zero, zero), dimensions={1}, to_apply=add_pair
++}
++)";
++
++  CheckDegenerateDimRemover(hlo, std::nullopt);
++}
++
++TEST_F(ReductionDegenerateDimRemoverTest,
++       DegenerateMixedPrecisionReductionIsLeftForTheEmitters) {
++  const char* hlo = R"(
++HloModule ReduceMixedPrecisionOverDegenerateDimension
++
++add {
++  accum = f32[] parameter(0)
++  op = f32[] parameter(1)
++  ROOT out = f32[] add(accum, op)
++}
++
++ENTRY main {
++  input = bf16[32,1] parameter(0)
++  zero = f32[] constant(0)
++  ROOT out = f32[32] reduce(input, zero), dimensions={1}, to_apply=add
++}
++)";
++
++  CheckDegenerateDimRemover(hlo, std::nullopt);
++}
++
+ }  // namespace
+ }  // namespace xla
