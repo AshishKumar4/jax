@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 _SUBDIRECTORY = "mosaic_gpu_lowering"
 
 _ENVELOPE_MAGIC = b"jax-mosaic-gpu-lowering-cache\n"
-_ENVELOPE_VERSION = 3
+_ENVELOPE_VERSION = 4
 _ENVELOPE_PREFIX = struct.Struct("<II")
 
 
@@ -66,6 +66,9 @@ class Entry:
   # its plain fields, its bytecode (`serialized_module`) apart.
   serialized: dict[str, Any] | None = None
   serialized_module: bytes = b""
+  # Whether the kernel signals through its collective's barrier semaphore,
+  # which its call is given only where the lowering says so.
+  use_barrier_semaphore: bool = False
 
 
 def _payload(fields: dict[str, Any], module: bytes, serialized: bytes) -> bytes:
@@ -80,6 +83,7 @@ def pack(key: str, entry: Entry) -> bytes:
       "gmem_scratch_shapes": entry.gmem_scratch_shapes,
       "seconds": entry.seconds, "module_size": len(entry.module),
       "serialized": entry.serialized,
+      "use_barrier_semaphore": entry.use_barrier_semaphore,
   }
   header = {
       **fields,
@@ -160,6 +164,9 @@ def unpack(key: str, data: bytes) -> Entry:
       or not math.isfinite(seconds) or seconds < 0
   ):
     raise InvalidEntry(f"{seconds!r} is not a duration")
+  use_barrier_semaphore = fields["use_barrier_semaphore"]
+  if type(use_barrier_semaphore) is not bool:
+    raise InvalidEntry(f"{use_barrier_semaphore!r} is not a boolean")
   return Entry(
       module=module,
       grid=tuple(_dims(fields["grid"], length=3, minimum=1)),
@@ -169,6 +176,7 @@ def unpack(key: str, data: bytes) -> Entry:
       seconds=float(seconds),
       serialized=_serialized(fields["serialized"], serialized_module),
       serialized_module=serialized_module,
+      use_barrier_semaphore=use_barrier_semaphore,
   )
 
 

@@ -681,6 +681,8 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         "an output that is not a pair": {"new_out_shapes": [7]},
         "scratch that is not a list": {"gmem_scratch_shapes": None},
         "seconds that are not a number": {"seconds": "slow"},
+        "a barrier semaphore flag that is not a boolean": {
+            "use_barrier_semaphore": 1},
     }
     for name, header in broken.items():
       with self.subTest(name):
@@ -844,6 +846,22 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertIn("device_count", fresh["reads_outside"])
         self.assertEqual(miss["reads_in_snapshot"], [], miss)
         self.assertEqual(hit["reads_in_snapshot"], [], hit)
+
+  def test_a_hit_keeps_the_barrier_semaphore_its_kernel_uses(self):
+    # Its call is given the collective's barrier semaphore only where the
+    # lowering says the kernel uses one: a hit that said otherwise made a call
+    # without it.
+    case = {"kernel": "barrier_semaphore", "mesh": "abstract2"}
+    fresh = self.lower(cache=False, **case)
+    miss = self.lower(**case)
+    hit = self.lower(**case)
+    for name, run in (("fresh", fresh), ("miss", miss), ("hit", hit)):
+      self.assertNotIn("error", run, (name, run))
+    self.assertEqual([miss["events"], hit["events"]], [["miss"], ["hit"]])
+    self.assertTrue(fresh["normalized"]["use_barrier_semaphore"])
+    self.assertEqual(miss["normalized"], hit["normalized"])
+    self.assertEqual(miss["text_sha"], hit["text_sha"])
+    self.assert_lowers_as_fresh(hit, fresh)
 
   # -- processes that lower the same kernel at once
 

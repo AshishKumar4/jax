@@ -176,6 +176,7 @@ def normalize(result):
       "new_out_shapes": shapes(result.new_out_shapes),
       "gmem_scratch_shapes": shapes(result.gmem_scratch_shapes),
       "profiler_spec_is_none": result.profiler_spec is None,
+      "use_barrier_semaphore": result.use_barrier_semaphore,
       "asm": hashlib.sha256(asm.encode()).hexdigest(),
   }
 

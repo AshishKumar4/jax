@@ -104,6 +104,27 @@ def mesh_axis(size, power, params, scale):
   return kernel
 
 
+def barrier_semaphore(size, power, params, scale):
+  """A kernel that signals the other device of the mesh's axis "x" through its
+  collective's barrier semaphore, which its call is given only where its
+  lowering states it uses one."""
+  del power, params
+
+  @plgpu.kernel(
+      out_type=jax.ShapeDtypeStruct((size,), jnp.float32),
+      num_threads=1,
+      thread_name="wg",
+      compiler_params=plgpu.CompilerParams(collective_id=0),
+  )
+  def kernel(x_ref, o_ref):
+    sem = plgpu.get_barrier_semaphore().at[0]
+    pl.semaphore_signal(sem, device_id=1 - lax.axis_index("x"))
+    pl.semaphore_wait(sem)
+    o_ref[...] = x_ref[...] * scale
+
+  return kernel
+
+
 def smem(size, power, params, scale):
   """A kernel that holds shared memory: `size` float32s of it."""
   del params

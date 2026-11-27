@@ -602,6 +602,7 @@ def _normalized(result: lowering.LoweringResult) -> store_lib.Entry:
       new_out_shapes=_plain_shapes(result.new_out_shapes),
       gmem_scratch_shapes=_plain_shapes(result.gmem_scratch_shapes),
       seconds=0.0,
+      use_barrier_semaphore=result.use_barrier_semaphore,
   )
 
 
@@ -659,6 +660,7 @@ def _rebuild(
       module, entry.grid, entry.block,
       _shape_structs(entry.new_out_shapes), None,
       _shape_structs(entry.gmem_scratch_shapes),
+      use_barrier_semaphore=entry.use_barrier_semaphore,
       serialized=_serialized_kernel(entry),
   )
 
@@ -666,7 +668,8 @@ def _rebuild(
 def _differences(hit: store_lib.Entry, fresh: store_lib.Entry) -> list[str]:
   return [
       name for name in (
-          "module", "grid", "block", "new_out_shapes", "gmem_scratch_shapes"
+          "module", "grid", "block", "new_out_shapes", "gmem_scratch_shapes",
+          "use_barrier_semaphore",
       ) if getattr(hit, name) != getattr(fresh, name)
   ]
 
