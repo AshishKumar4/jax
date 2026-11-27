@@ -1,0 +1,253 @@
+diff --git a/xla/pjrt/cpu/cpu_client.cc b/xla/pjrt/cpu/cpu_client.cc
+index 5e640862dee..4d9fb8b6d13 100644
+--- a/xla/pjrt/cpu/cpu_client.cc
++++ b/xla/pjrt/cpu/cpu_client.cc
+@@ -727,7 +727,8 @@ static absl::StatusOr<std::unique_ptr<xla::Executable>> JitCompile(
+ 
+   // RunHloPasses and RunBackend both look at the LLVM command line options.
+   auto llvm_options = llvm_ir::ExtractXlaBackendExtraOptions(
+-      hlo_module->config().debug_options().xla_backend_extra_options());
++      hlo_module->config().debug_options().xla_backend_extra_options(),
++      llvm_ir::ExtraOptionsFor::kHost);
+   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_options);
+ 
+   // Run Hlo Passes
+diff --git a/xla/service/cpu/cpu_compiler.cc b/xla/service/cpu/cpu_compiler.cc
+index 1ba9f1885d5..747b3402dbf 100644
+--- a/xla/service/cpu/cpu_compiler.cc
++++ b/xla/service/cpu/cpu_compiler.cc
+@@ -1215,7 +1215,8 @@ absl::StatusOr<std::unique_ptr<HloModule>> CpuCompiler::RunHloPasses(
+ 
+   {
+     auto llvm_options = llvm_ir::ExtractXlaBackendExtraOptions(
+-        module->config().debug_options().xla_backend_extra_options());
++        module->config().debug_options().xla_backend_extra_options(),
++        llvm_ir::ExtraOptionsFor::kHost);
+     llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_options);
+ 
+     // Use default target machine options if not specified in the target config.
+@@ -1662,7 +1663,8 @@ absl::StatusOr<std::unique_ptr<Executable>> CpuCompiler::RunBackend(
+       absl::StrCat("Compiling module ", module->name(), " for CPU");
+   auto slow_compile_alarm = SlowCompilationAlarm(slow_compilation_msg);
+   auto llvm_options = llvm_ir::ExtractXlaBackendExtraOptions(
+-      module->config().debug_options().xla_backend_extra_options());
++      module->config().debug_options().xla_backend_extra_options(),
++      llvm_ir::ExtraOptionsFor::kHost);
+   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_options);
+ 
+   TargetMachineOptions target_machine_options(module->config().debug_options());
+@@ -1726,7 +1728,8 @@ absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
+ CpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
+                                 const AotCompilationOptions& aot_options) {
+   auto llvm_options = llvm_ir::ExtractXlaBackendExtraOptions(
+-      hlo_module->config().debug_options().xla_backend_extra_options());
++      hlo_module->config().debug_options().xla_backend_extra_options(),
++      llvm_ir::ExtraOptionsFor::kHost);
+   VlogMaxIsa(hlo_module->config().debug_options().xla_cpu_max_isa());
+   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_options);
+ 
+diff --git a/xla/service/cpu/cpu_compiler_test.cc b/xla/service/cpu/cpu_compiler_test.cc
+index cdef9787c3d..27fdca38455 100644
+--- a/xla/service/cpu/cpu_compiler_test.cc
++++ b/xla/service/cpu/cpu_compiler_test.cc
+@@ -166,6 +166,45 @@ TEST_F(CpuCompilerTest, PermutationSortConvertedToScatter) {
+   EXPECT_TRUE(Run(hlo, /*run_hlo_passes=*/true));
+ }
+ 
++TEST_F(CpuCompilerTest, CompilesUnderAGpuTargetsBackendExtraOptions) {
++  // A process's xla_backend_extra_options are every backend's: an NVPTX
++  // option (a GPU process's fp32 division) is no option of a CPU compile's.
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"(
++    HloModule test
++    ENTRY main {
++      p0 = f32[8]{0} parameter(0)
++      p1 = f32[8]{0} parameter(1)
++      ROOT divide = f32[8]{0} divide(p0, p1)
++    }
++  )"));
++  module->mutable_config().mutable_debug_options()
++      .mutable_xla_backend_extra_options()
++      ->insert({"-nvptx-prec-divf32", "2"});
++
++  EXPECT_TRUE(Run(std::move(module), /*run_hlo_passes=*/true));
++}
++
++using CpuCompilerDeathTest = CpuCompilerTest;
++
++TEST_F(CpuCompilerDeathTest, AnUnknownBackendExtraOptionStillEndsTheProcess) {
++  // The test's client runs thread pools: its death runs in a fresh process.
++  GTEST_FLAG_SET(death_test_style, "threadsafe");
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
++                       ParseAndReturnVerifiedModule(R"(
++    HloModule test
++    ENTRY main {
++      ROOT p0 = f32[8]{0} parameter(0)
++    }
++  )"));
++  module->mutable_config().mutable_debug_options()
++      .mutable_xla_backend_extra_options()
++      ->insert({"-xla-no-such-llvm-option", "1"});
++
++  EXPECT_DEATH(Run(std::move(module), /*run_hlo_passes=*/true),
++               "Unknown command line argument");
++}
++
+ TEST_F(CpuCompilerTest, CompilesElementalOpsWithFusionWrapperPassDisabled) {
+   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                        ParseAndReturnVerifiedModule(R"(
+diff --git a/xla/service/llvm_ir/llvm_command_line_options.h b/xla/service/llvm_ir/llvm_command_line_options.h
+index 9646b236caa..8f301dbe177 100644
+--- a/xla/service/llvm_ir/llvm_command_line_options.h
++++ b/xla/service/llvm_ir/llvm_command_line_options.h
+@@ -28,6 +28,8 @@ limitations under the License.
+ #include "absl/base/const_init.h"
+ #include "absl/base/thread_annotations.h"
+ #include "absl/strings/match.h"
++#include "absl/strings/string_view.h"
++#include "absl/strings/strip.h"
+ #include "absl/synchronization/mutex.h"
+ #include "llvm/IR/LLVMContext.h"
+ #include "llvm/Support/LibraryOptionsContext.h"
+@@ -35,20 +37,55 @@ limitations under the License.
+ namespace xla {
+ namespace llvm_ir {
+ 
++// Whether `key`, an xla_backend_extra_options entry's, is a switch (a leading
++// dash; a value given as an entry of its own is no switch) whose name, its
++// dashes and any =value aside, begins with a prefix the GPU targets' LLVM
++// options are named by: nvptx-, nvvm-, disable-nvptx- (NVPTX), amdgpu-,
++// disable-amdgpu- (AMDGPU). A policy of names, not a registry of the targets'
++// options: a GPU option named otherwise is parsed as any other, and a
++// misspelling under one of these prefixes is skipped where options are the
++// host's. A switch's value goes in its own entry's value (-x=v).
++inline bool HasGpuTargetPrefix(absl::string_view key) {
++  if (!absl::ConsumePrefix(&key, "-")) {
++    return false;
++  }
++  absl::ConsumePrefix(&key, "-");
++  absl::string_view name = key.substr(0, key.find('='));
++  for (absl::string_view target : {"nvptx-", "nvvm-", "disable-nvptx-",
++                                   "amdgpu-", "disable-amdgpu-"}) {
++    if (absl::StartsWith(name, target)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Whom extracted options are for: any target, or the host's CPU, which takes
++// none of a GPU target's (`HasGpuTargetPrefix`). A process's
++// xla_backend_extra_options are every backend's, and a GPU target registers its
++// LLVM options only where it is initialized, which a compile for the host never
++// does: one parsed there is unknown, and LLVM's parser ends the process.
++enum class ExtraOptionsFor { kAnyTarget, kHost };
++
+ // Given a map with options (e.g. originating from xla_backend_extra_options())
+-// pass those that don't start with xla_ to LLVM.
++// pass those that don't start with xla_ to LLVM, those `target` takes alone, a
++// key with a value as key=value.
+ template <typename T>
+-std::vector<std::string> ExtractXlaBackendExtraOptions(const T& options) {
++std::vector<std::string> ExtractXlaBackendExtraOptions(
++    const T& options, ExtraOptionsFor target = ExtraOptionsFor::kAnyTarget) {
+   if (!options.empty()) {
+     std::vector<std::string> backend_extra_opts;
+     for (const auto& it : options) {
+-      // Skip options the XLA backend itself consumes.
+-      if (!absl::StartsWith(it.first, "xla_")) {
+-        if (it.second.empty()) {
+-          backend_extra_opts.push_back(it.first);
+-        } else {
+-          backend_extra_opts.push_back(it.first + "=" + it.second);
+-        }
++      // Skip options the XLA backend itself consumes, and a GPU target's where
++      // the options are the host's.
++      if (absl::StartsWith(it.first, "xla_") ||
++          (target == ExtraOptionsFor::kHost && HasGpuTargetPrefix(it.first))) {
++        continue;
++      }
++      if (it.second.empty()) {
++        backend_extra_opts.push_back(it.first);
++      } else {
++        backend_extra_opts.push_back(it.first + "=" + it.second);
+       }
+     }
+     // We non-deterministically iterated over the proto.
+diff --git a/xla/service/llvm_ir/llvm_command_line_options_test.cc b/xla/service/llvm_ir/llvm_command_line_options_test.cc
+index 0db5034f093..c4b22a59700 100644
+--- a/xla/service/llvm_ir/llvm_command_line_options_test.cc
++++ b/xla/service/llvm_ir/llvm_command_line_options_test.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include <gtest/gtest.h>
+ 
++#include <map>
+ #include <string>
+ #include <vector>
+ 
+@@ -32,6 +33,64 @@ llvm::cl::opt<int>& GetTestIntOption() {
+   return *option;
+ }
+ 
++// A GPU process's xla_backend_extra_options: Dew's fp32 division among them.
++const std::map<std::string, std::string>& GpuProcessOptions() {
++  static const auto* options = new std::map<std::string, std::string>{
++      {"-nvptx-prec-divf32", "2"},
++      {"--disable-nvptx-ir-peephole", ""},
++      {"-amdgpu-early-inline-all", "true"},
++      {"-nvvm-reflect-enable", "false"},
++      {"-pass-remarks", "amdgpu-test"},
++      {"-pass-remarks-missed=amdgpu-test", ""},
++      {"-xla-test-llvm-cl-int-option", "7"},
++      {"xla_is_host_offload", "true"}};
++  return *options;
++}
++
++TEST(ExtractXlaBackendExtraOptionsTest, TheHostTakesNoGpuTargetsSwitch) {
++  // A GPU target's switches alone are not the host's: a generic option whose
++  // value names one is.
++  EXPECT_EQ(ExtractXlaBackendExtraOptions(GpuProcessOptions(),
++                                          ExtraOptionsFor::kHost),
++            (std::vector<std::string>{"-pass-remarks-missed=amdgpu-test",
++                                      "-pass-remarks=amdgpu-test",
++                                      "-xla-test-llvm-cl-int-option=7"}));
++  EXPECT_EQ(ExtractXlaBackendExtraOptions(GpuProcessOptions()),
++            (std::vector<std::string>{
++                "--disable-nvptx-ir-peephole", "-amdgpu-early-inline-all=true",
++                "-nvptx-prec-divf32=2", "-nvvm-reflect-enable=false",
++                "-pass-remarks-missed=amdgpu-test", "-pass-remarks=amdgpu-test",
++                "-xla-test-llvm-cl-int-option=7"}));
++}
++
++TEST(ExtractXlaBackendExtraOptionsTest, AHostCompileParsesAGpuProcesssOptions) {
++  // Parsed here, where no GPU target is initialized, as an XLA:CPU compile
++  // parses them.
++  llvm::cl::opt<int>& test_option = GetTestIntOption();
++  LLVMCommandLineOptionsLock lock(ExtractXlaBackendExtraOptions(
++      GpuProcessOptions(), ExtraOptionsFor::kHost));
++  EXPECT_EQ(test_option.getValue(), 7);
++}
++
++TEST(ExtractXlaBackendExtraOptionsDeathTest, AnOptionNoTargetKnowsEndsIt) {
++  // A GPU target's option where no GPU target is initialized, and an option no
++  // target knows, are unknown to LLVM's parser, which ends the process.
++  GTEST_FLAG_SET(death_test_style, "threadsafe");
++  const std::map<std::string, std::string> division = {
++      {"-nvptx-prec-divf32", "2"}};
++  EXPECT_EXIT(LLVMCommandLineOptionsLock(
++                  ExtractXlaBackendExtraOptions(division)),
++              testing::ExitedWithCode(1),
++              "Unknown command line argument '-nvptx-prec-divf32=2'");
++  // A typo naming a target is no target's option: still the host's, unknown.
++  const std::map<std::string, std::string> typo = {
++      {"-xla-unknown-nvptx-option", "1"}};
++  EXPECT_EXIT(LLVMCommandLineOptionsLock(ExtractXlaBackendExtraOptions(
++                  typo, ExtraOptionsFor::kHost)),
++              testing::ExitedWithCode(1),
++              "Unknown command line argument '-xla-unknown-nvptx-option=1'");
++}
++
+ TEST(LLVMCommandLineOptionsLockTest, ApplyLibraryOptions) {
+   LLVMCommandLineOptionsLock lock(/*client_options=*/{});
+   llvm::LLVMContext context;
