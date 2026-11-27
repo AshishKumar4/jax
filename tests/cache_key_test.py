@@ -94,6 +94,10 @@ class CacheKeyTest(jtu.JaxTestCase):
           cache_key._hash_serialized_compile_options, options))
     flagged = compiler.get_compile_options(num_replicas=1, num_partitions=1)
     debug_options = flagged.executable_build_options.debug_options
+    if not hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+      # A stock jaxlib has no such option, and keys its overrides alike.
+      self.assertLen(set(keyed), 1)
+      self.skipTest("this jaxlib has no GPU memory limit option")
     debug_options.xla_gpu_memory_limit_early_exit_bytes = 3 << 30
     keyed.append(self.get_hashed_value(
         cache_key._hash_serialized_compile_options, flagged))

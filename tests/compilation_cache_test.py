@@ -574,6 +574,8 @@ class CompilationCacheTest(CompilationCacheTestCase):
         ["key-limit1", f"key-limit{4 << 30}", f"key-limit{4 << 30}"])
     debug = compiler.get_compile_options(num_replicas=1, num_partitions=1)
     debug_options = debug.executable_build_options.debug_options
+    if not hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+      self.skipTest("this jaxlib has no GPU memory limit option")
     debug_options.xla_gpu_memory_limit_early_exit_bytes = 7
     self.assertEqual(compiler._shared_key("key", debug), "key-limit7")
     unlimited = compiler.get_compile_options(num_replicas=1, num_partitions=1)
@@ -584,12 +586,17 @@ class CompilationCacheTest(CompilationCacheTestCase):
                   " --xla_gpu_memory_limit_early_exit_bytes=1"):
       with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
         self.assertEqual(compiler._shared_key("key", unlimited), "key-limit0")
-    # A jaxlib without the option (a stock one) keys by overrides alone.
+
+  def test_a_jaxlib_without_the_memory_limit_option_keys_by_overrides(self):
+    # A stock jaxlib's DebugOptions (macOS, Windows) has no such option: a
+    # compile there keys by its overrides alone, and raises nothing.
     stock = types.SimpleNamespace(
         env_option_overrides=[],
         executable_build_options=types.SimpleNamespace(
             debug_options=types.SimpleNamespace()))
     self.assertEqual(compiler._shared_key("key", stock), "key-limit0")
+    stock.env_option_overrides = [("xla_gpu_memory_limit_early_exit_bytes", 5)]
+    self.assertEqual(compiler._shared_key("key", stock), "key-limit5")
 
   @jtu.run_on_devices("gpu")
   def test_a_finished_compile_is_read_under_any_limit(self):
