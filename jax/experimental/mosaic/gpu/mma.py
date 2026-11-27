@@ -18,7 +18,9 @@ from jax._src import dtypes
 from jax._src import typing
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import arith
 from jaxlib.mlir.dialects import llvm
+from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
 from . import utils
@@ -263,6 +265,8 @@ def mma(
     acc: fa.FragmentedArray,
     a: fa.FragmentedArray,
     b: fa.FragmentedArray,
+    *,
+    rows: ir.Value | None = None,
 ) -> fa.FragmentedArray:
   """Computes `acc + a @ b` using synchronous warp-level MMA instructions.
 
@@ -278,6 +282,11 @@ def mma(
     a: A `FragmentedArray` with a `TiledLayout`  generated from
       `MMALayouts.lhs`.
     b: A `FragmentedArray` with a `TiledLayout` generated from `MMALayouts.rhs`.
+    rows: An i32, uniform across the warpgroup, or None. Where given, a warp
+      issues no instruction for a 16-row block of the accumulator that begins
+      at or past `rows`, and those rows of the result are `acc`'s: a ragged
+      group's rows past its end, padded to whole tiles, cost nothing. Each
+      warp's branch is uniform across its lanes, as `mma.sync` requires.
 
   Returns:
     A new `FragmentedArray` with the result of the computation with
@@ -360,12 +369,53 @@ def mma(
   # Do not modify the accumualtor itself.
   acc = acc.copy()
   s = lambda idx, length: slice(idx * length, (idx + 1) * length)
-  for k_idx in range(num_k_tiles):
-    for m_idx in range(num_m_tiles):
-      for n_idx in range(num_n_tiles):
-        ms = s(m_idx, m_tile)
-        ns = s(n_idx, n_tile)
-        ks = s(k_idx, k_tile)
-        acc[ms, ns] = _mma_single_tile(acc[ms, ns], a[ms, ks], b[ks, ns])
+  if rows is None:
+    for k_idx in range(num_k_tiles):
+      for m_idx in range(num_m_tiles):
+        for n_idx in range(num_n_tiles):
+          ms = s(m_idx, m_tile)
+          ns = s(n_idx, n_tile)
+          ks = s(k_idx, k_tile)
+          acc[ms, ns] = _mma_single_tile(acc[ms, ns], a[ms, ks], b[ks, ns])
+    return acc
 
+  if rows.type != i32:
+    raise ValueError(f"rows must be an i32, got {rows.type}")
+  # The accumulator's warps are `m_warps` along M, the major warp dimension,
+  # and `n_warps` along N (`MMALayouts.acc`): a warp's 16-row block within an
+  # M tile is its warpgroup index divided by `n_warps`.
+  n_warps = 4 // m_warps
+  warp = arith.remui(utils.warp_idx(sync=False), utils.c(4, i32))
+  first_row = arith.muli(
+      arith.divui(warp, utils.c(n_warps, i32)), utils.c(16, i32)
+  )
+  # Each M tile's products in one branch, each output tile summed along K in
+  # order as above, so a bound past every row gives the unbounded result.
+  for m_idx in range(num_m_tiles):
+    ms = s(m_idx, m_tile)
+    held = acc[ms, :]
+    issued = arith.cmpi(
+        arith.CmpIPredicate.slt,
+        arith.addi(first_row, utils.c(m_idx * m_tile, i32)),
+        rows,
+    )
+    registers = list(held.registers.flat)
+    branch = scf.IfOp(issued, [r.type for r in registers], has_else=True)
+    with ir.InsertionPoint(branch.then_block):
+      summed = held.copy()
+      for k_idx in range(num_k_tiles):
+        for n_idx in range(num_n_tiles):
+          ns = s(n_idx, n_tile)
+          ks = s(k_idx, k_tile)
+          summed[:, ns] = _mma_single_tile(summed[:, ns], a[ms, ks], b[ks, ns])
+      scf.yield_(list(summed.registers.flat))
+    with ir.InsertionPoint(branch.else_block):  # pyrefly: ignore[no-matching-overload]
+      scf.yield_(registers)
+    acc[ms, :] = fa.FragmentedArray(
+        _registers=np.asarray(list(branch.results), dtype=object).reshape(
+            held.registers.shape
+        ),
+        _layout=held.layout,
+        _is_signed=held.is_signed,
+    )
   return acc

@@ -6019,6 +6019,48 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       atol = rtol = 1e-12 if dtype == jnp.float64 else 1e-2
       np.testing.assert_allclose(res, ref, atol=atol, rtol=rtol)
 
+  @parameterized.product(m_warps=(1, 2, 4), rows=(0, 1, 16, 17, 48, 64, 127))
+  def test_mma_row_bound(self, m_warps, rows):
+    m = 64
+    k = 32
+    n = 32
+    dtype = jnp.bfloat16
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        grid=(1,),
+        grid_names=("i",),
+    )
+    def kernel(a_ref, b_ref, acc_ref, o_ref):
+      # The bound read at run time (the one program's index is 0), not folded.
+      bound = lax.axis_index("i") + rows
+      layouts = dict(m_warps=m_warps)
+      acc = plgpu.load(
+          acc_ref, layout=plgpu.Layout.MMA_ACC(dtype, **layouts),
+          optimized=False,
+      )
+      a = plgpu.load(
+          a_ref, layout=plgpu.Layout.MMA_LHS(dtype, **layouts), optimized=False
+      )
+      b = plgpu.load(
+          b_ref.T, layout=plgpu.Layout.MMA_RHS(dtype, **layouts),
+          optimized=False,
+      )
+      result = plgpu.mma(acc, a, b, m_warps=m_warps, rows=bound)
+      plgpu.store(o_ref, result, optimized=False)
+
+    prng = np.random.default_rng(0)
+    # Small integers, so every product and sum is exact in fp32.
+    a = prng.integers(-4, 4, (m, k)).astype(dtype)
+    b = prng.integers(-4, 4, (n, k)).astype(dtype)
+    acc = prng.integers(-4, 4, (m, n)).astype(jnp.float32)
+    res = kernel(a, b, acc)
+    full = acc + a.astype(np.float32) @ b.astype(np.float32).T
+    # A warp's 16-row block that begins at or past `rows` keeps `acc`.
+    issued = np.arange(m)[:, None] // 16 * 16 < rows
+    np.testing.assert_array_equal(res, np.where(issued, full, acc))
+
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_griddepcontrol_warp_mesh(self):
     @jax.jit
