@@ -555,79 +555,92 @@ class CompilationCacheTest(CompilationCacheTestCase):
              (True, False, "cpu"), (None, True, "tpu"))],
         [True, False, True, True, False, False])
 
-  def test_hosts_share_a_compile_by_its_whole_options_and_its_limit_with_it(
-      self):
+  def test_hosts_share_a_compile_by_its_key_and_the_limit_it_takes(self):
     # The disk cache keys a compile without its limit; what hosts share, and a
-    # process keeps, is keyed by the limit too: a compile stopped at a smaller
-    # limit serves no request at a larger one.
-    def options(limit):
+    # process keeps, is keyed by the limit the compile takes too (its last
+    # override, its debug option, XLA_FLAGS'), and by nothing else a host may
+    # set alone (a dump directory).
+    def options(*limits):
       found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
       found.env_option_overrides = [
-          ("xla_gpu_memory_limit_early_exit_bytes", limit)]
+          ("xla_gpu_memory_limit_early_exit_bytes", limit) for limit in limits]
       return found
 
-    shared = {compiler._shared_key("key", options(limit))
-              for limit in (1, 4 << 30)}
-    self.assertLen(shared, 2)
-    self.assertTrue(all(key.startswith("key-") for key in shared))
-    with mock.patch.dict(os.environ, {
-        "XLA_FLAGS": "--xla_gpu_memory_limit_early_exit_bytes=1"}):
-      flagged = compiler._shared_key("key", options(4 << 30))
-    self.assertNotIn(flagged, shared)
+    self.assertEqual(
+        [compiler._shared_key("key", options(*limits))
+         for limits in ((1,), (4 << 30,), (1, 4 << 30))],
+        ["key-limit1", f"key-limit{4 << 30}", f"key-limit{4 << 30}"])
+    debug = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    debug_options = debug.executable_build_options.debug_options
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 7
+    self.assertEqual(compiler._shared_key("key", debug), "key-limit7")
+    for flags, shared in (
+        ("--xla_dump_to=/host0", "key-limit0"),
+        ("--xla_dump_to=/host1 --xla_gpu_memory_limit_early_exit_bytes=9",
+         "key-limit9")):
+      with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
+        self.assertEqual(compiler._shared_key("key", options()), shared)
 
   @jtu.run_on_devices("gpu")
-  def test_a_finished_compile_is_read_under_any_limit_it_fits(self):
-    with (
-      config.persistent_cache_min_compile_time_secs(0),
-      config.persistent_cache_min_entry_size_bytes(0),
-    ):
-      f = jit(lambda x: (x @ x.T).sum())
-      x = jax.device_put(np.ones((256, 256), np.float32))
-      lowered = f.lower(x)
-      stopped = lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 1})
-      self.assertTrue(stopped.memory_analysis().stopped_at_memory_limit)
-      with self.assertRaises(Exception):
-        stopped(x).block_until_ready()
-      self.assertEqual(count_cache_items(), 0)
-      large = lowered.compile(
-          {"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
-      self.assertFalse(large.memory_analysis().stopped_at_memory_limit)
-      self.assertEqual(count_cache_items(), 1)
-      # A limit never compiled under, smaller and still fitting: read, and run.
-      with jtu.count_compilation_after_persistent_cache_miss() as missed:
-        small = lowered.compile(
-            {"xla_gpu_memory_limit_early_exit_bytes": 4 << 30})
-      self.assertEqual((count_cache_items(), missed()), (1, 0))
-      self.assertEqual(float(small(x)), 256.0 ** 3)
-      # The same bytes under any limit: the contents check finds none differ.
+  def test_a_finished_compile_is_read_under_any_limit(self):
+    path = self.create_tempdir().full_path
+
+    def entries():
+      return len(glob.glob(os.path.join(path, "*-cache")))
+
+    cc.reset_cache()
+    try:
+      with (
+        config.compilation_cache_dir(path),
+        config.persistent_cache_min_compile_time_secs(0),
+        config.persistent_cache_min_entry_size_bytes(0),
+      ):
+        f = jit(lambda x: (x @ x.T).sum())
+        x = jax.device_put(np.ones((256, 256), np.float32))
+        lowered = f.lower(x)
+        stopped = lowered.compile(
+            {"xla_gpu_memory_limit_early_exit_bytes": 1})
+        self.assertTrue(stopped.memory_analysis().stopped_at_memory_limit)
+        with self.assertRaises(Exception):
+          stopped(x).block_until_ready()
+        self.assertEqual(entries(), 0)
+        large = lowered.compile(
+            {"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
+        self.assertFalse(large.memory_analysis().stopped_at_memory_limit)
+        self.assertEqual(entries(), 1)
+        # A limit never compiled under, smaller than what the executable holds:
+        # the finished compile is read all the same, and runs.
+        with jtu.count_compilation_after_persistent_cache_miss() as missed:
+          small = lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 2})
+        self.assertEqual((entries(), missed()), (1, 0))
+        self.assertEqual(float(small(x)), 256.0 ** 3)
+        # The same bytes under any limit: the contents check, compiling again
+        # under another, finds none differ.
+        cc.reset_cache()
+        with config.compilation_cache_check_contents(True):
+          lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 6 << 30})
+        self.assertEqual(entries(), 1)
+    finally:
       cc.reset_cache()
-      with config.compilation_cache_check_contents(True):
-        lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 6 << 30})
-      self.assertEqual(count_cache_items(), 1)
-
-  @jtu.run_on_devices("gpu")
-  def test_a_process_given_its_limit_by_xla_flags_reads_the_same_entry(self):
-    with (
-      config.persistent_cache_min_compile_time_secs(0),
-      config.persistent_cache_min_entry_size_bytes(0),
-    ):
-      f = jit(lambda x: (x @ x.T).sum())
-      f.lower(jax.device_put(np.ones((256, 256), np.float32))).compile()
-      self.assertEqual(count_cache_items(), 1)
+    # A process given its limit by XLA_FLAGS reads the same entry.
     script = (
         "import jax, numpy as np\n"
+        "from jax._src import monitoring\n"
+        "hits = []\n"
+        "monitoring.register_event_listener(\n"
+        "    lambda event, **kwargs: hits.append(event))\n"
         "jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)\n"
         "jax.config.update('jax_persistent_cache_min_entry_size_bytes', 0)\n"
         "f = jax.jit(lambda x: (x @ x.T).sum())\n"
-        "print(float(f(jax.device_put(np.ones((256, 256), np.float32)))))\n")
+        "print(float(f(jax.device_put(np.ones((256, 256), np.float32)))),\n"
+        "      hits.count('/jax/compilation_cache/cache_hits'))\n")
     ran = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True,
         check=True, env={
-            **os.environ,
-            "JAX_COMPILATION_CACHE_DIR": config.compilation_cache_dir.value,
+            **os.environ, "JAX_COMPILATION_CACHE_DIR": path,
             "XLA_FLAGS": "--xla_gpu_memory_limit_early_exit_bytes=4294967296"})
-    self.assertEqual(float(ran.stdout.split()[-1]), 256.0 ** 3)
-    self.assertEqual(count_cache_items(), 1)
+    value, hits = ran.stdout.split()[-2:]
+    self.assertEqual((float(value), int(hits), entries()), (256.0 ** 3, 1, 1))
 
   def test_min_compile_time(self):
     with (
