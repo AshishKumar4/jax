@@ -231,7 +231,8 @@ def test_a_plugin_build_cell_records_every_file_it_read_and_what_configures_it(t
     read (its repository's marker: an escaped path) or a module extension did (the lockfile's recorded inputs), the
     main repository's by path and an external one's by its canonical name, with Bazel's flags, its modules and its
     driver; a version stamp blanked, as a release or the build tree writes it; an archive_override's patches
-    apart, by module; nothing else of the tree. A machine's record holds its cells by name (`merged`, row 5670)."""
+    apart, by module; nothing else of the tree. A machine's record holds its cells by name, the commit it built and
+    each wheel it made by its sha256 (`merged`, row 5670), and is refused without them."""
     workspace, output_base = tmp_path / "jax", tmp_path / "output_base"
     files = {"jaxlib/kernel.cc": "int k;\n", "jax/version.py": "_release_version: str | None = None\n",
              ".bazelrc": "build --copt=-O2\n", "build/build.py": "TARGETS = 1\n", "docs/notes.md": "no build\n",
@@ -259,8 +260,16 @@ def test_a_plugin_build_cell_records_every_file_it_read_and_what_configures_it(t
     assert record["external"] == {"xla+": {name: patch_stack.digest(name.encode()) for name in (
         "xla/compiled.cc", "xla/BUILD", "third_party/gpus/cuda.tpl", "third_party/gpus/a b.json")}}
     assert record["patches"] == {"xla": {"third_party/xla/fix.patch": patch_stack.digest(b"the fix\n")}}
-    machine = patch_stack.merged({"cp312-cuda12": record, "cp312-cuda13": record})
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "jaxlib-1-cp312.whl").write_bytes(b"a wheel")
+    wheels = sorted((tmp_path / "dist").glob("*.whl"))
+    machine = patch_stack.merged({"cp312-cuda12": record, "cp312-cuda13": record}, "c" * 40, wheels)
     assert sorted(machine["cells"]) == ["cp312-cuda12", "cp312-cuda13"] and machine["patches"] == record["patches"]
+    assert machine["commit"] == "c" * 40
+    assert machine["wheels"] == {"jaxlib-1-cp312.whl": hashlib.sha256(b"a wheel").hexdigest()}
+    for commit, made in (("v0.12", wheels), ("c" * 40, [])):
+        with pytest.raises(ValueError):
+            patch_stack.merged({"cp312-cuda12": record}, commit, made)
 
 
 def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_path, monkeypatch):
@@ -270,7 +279,10 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     cell read, that it adds or that Bazel evaluates: the patch's own test changed and its message reworded pair; a
     changed compiled line, an added file, a .bzl the patch or the tree changes, a native source, or a flag over the
     same sources (.bazelrc) does not; one machine's record alone pairs nothing; a release built since the records
-    began (past LEGACY_THROUGH) pairs through its records alone (row 5670: post81's pairing judged by hand)."""
+    began (past LEGACY_THROUGH) pairs through its records alone (row 5670: post81's pairing judged by hand). It is
+    compared at the commit its records name, never its tag's (an attach tags a version, at whatever commit); a
+    BUILD.bazel beside a package a cell read refuses, a test package's BUILD pairs; and a record pairs only beside
+    the wheels it describes, its own version's release too (a partial attach, then a rebuild's record)."""
     archive_root = tmp_path / "archive" / "xla-1"
     (archive_root / "xla").mkdir(parents=True)
     (archive_root / "xla" / "compiled.cc").write_text("int f() { return 1; }\n")
@@ -302,17 +314,26 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         run("commit", "-qm", message)
 
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(origin), "config", "uploadpack.allowAnySHA1InWant", "true"], check=True)
     clone.mkdir()
-    run("init", "-q")
+    run("init", "-q", "-b", "main")
     run("remote", "add", "origin", str(origin))
     commit({"jaxlib/kernel.cc": "int k;\n", "jax/core.py": "post81", ".bazelrc": "build --copt=-O2\n",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n', "MODULE.bazel": module,
             "third_party/xla/fix.patch": fix("int f() { return 2; }")}, "the commit post81's plugins were built at")
+    built = subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone, check=True, capture_output=True,
+                           text=True).stdout.strip()
+    run("push", "-q", "origin", "HEAD:refs/heads/main")
+    # Its tags at another commit, as an attach's tag may be (a tooling commit of the fork's): compared there, its
+    # .bzl would refuse every release.
+    run("checkout", "-q", "-b", "tooling")
+    commit({"jaxlib/tooling.bzl": "Z = 1\n"}, "a tooling commit the tags were made at")
     run("tag", "plugin-0.12.0.1.post81")
     run("tag", "plugin-0.12.0.1.post143")
     run("push", "-q", "origin", "--tags")
     run("tag", "-d", "plugin-0.12.0.1.post81")
     run("tag", "-d", "plugin-0.12.0.1.post143")
+    run("checkout", "-q", "main")
     monkeypatch.chdir(clone)
     # The build's record: its tree as the build stamps it, XLA as its override makes it, what its queries listed.
     output_base = tmp_path / "output_base"
@@ -324,9 +345,13 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         "@@//jaxlib:kernel.cc (null)", "@@//jax:version.py (null)", "@@xla+//xla:compiled.cc (5a1b2c)",
         "@@xla+//xla:BUILD"])
     run("checkout", "--", "jax/version.py")
-    record = patch_stack.merged({"cp312-cuda12": cell})
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "jaxlib-0.12.0.1.post81-cp312.whl").write_bytes(b"post81's jaxlib")
+    record = patch_stack.merged({"cp312-cuda12": cell}, built, sorted((tmp_path / "dist").glob("*.whl")))
     records = {"x86_64": record, "aarch64": record}
+    uploaded = dict(record["wheels"])
     monkeypatch.setattr(patch_stack, "built_from", lambda tag: records if tag == "plugin-0.12.0.1.post81" else {})
+    monkeypatch.setattr(patch_stack, "assets", lambda tag: uploaded)
 
     commit({"jax/core.py": "post82", "tests/core_test.py": "post82",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post82"\n'}, "post82, Python only")
@@ -334,16 +359,25 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     commit({"third_party/xla/fix.patch": fix("int f() { return 2; }", test="TEST(F, Two) {}",
                                              message="its message, reworded\n")}, "the patch's own test")
     assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
+    # A test package's BUILD, which no cell read a file of, pairs.
+    commit({"tests/BUILD": "py_test(name = 'core_test')\n"}, "a test target")
+    assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
     added = "--- /dev/null\n+++ b/xla/new.cc\n@@ -0,0 +1 @@\n+int g;\n"
     starlark = "--- a/xla/defs.bzl\n+++ b/xla/defs.bzl\n@@ -1 +1 @@\n-X = 1\n+X = 2\n"
     for change in ({"third_party/xla/fix.patch": fix("int f() { return 3; }")},
                    {"third_party/xla/fix.patch": fix("int f() { return 2; }", extra=added)},
                    {"third_party/xla/fix.patch": fix("int f() { return 2; }", extra=starlark)},
                    {"jaxlib/kernel.cc": "int k2;\n"}, {".bazelrc": "build --copt=-O3\n"},
-                   {"jaxlib/rules.bzl": "Y = 1\n"}):
+                   {"jaxlib/rules.bzl": "Y = 1\n"}, {"jaxlib/BUILD.bazel": "cc_library(name = 'kernel')\n"},
+                   {"BUILD.bazel": "package()\n"}):
         commit(change, "a change a build could read")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
+    # Records beside other wheels than theirs (an attach's record of a rebuild, its first build's wheels kept)
+    # pair nothing.
+    uploaded["jaxlib-0.12.0.1.post81-cp312.whl"] = hashlib.sha256(b"another build's jaxlib").hexdigest()
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+    uploaded.update(record["wheels"])
     # One machine's record alone pairs nothing.
     records.pop("aarch64")
     assert patch_stack.plugins("0.12.0.1.post82") == ""
@@ -351,6 +385,10 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     assert patch_stack.plugins("0.12.0.1.post144") == ""
     monkeypatch.setattr(patch_stack, "built_from", lambda tag: {"x86_64": record, "aarch64": record})
     assert patch_stack.plugins("0.12.0.1.post144") == "plugin-0.12.0.1.post143"
+    # Its own version's release ships beside its records only where they describe its wheels.
+    assert patch_stack.plugins("0.12.0.1.post143") == "plugin-0.12.0.1.post143"
+    uploaded.clear()
+    assert patch_stack.plugins("0.12.0.1.post143") == ""
 
 
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):
