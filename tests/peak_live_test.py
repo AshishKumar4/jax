@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 from typing import Any
 
 from absl.testing import absltest
@@ -58,6 +59,111 @@ class PeakLiveTest(jtu.JaxTestCase):
     self.assertLessEqual(sum(buffer.bytes for buffer in temporaries),
                          compiled.memory_analysis().temp_size_in_bytes)
 
+  @jtu.run_on_devices("cuda")
+  def test_a_compiles_intervals_hold_its_peak_buffers_at_each_allocations_peak(
+      self):
+    # At the first position a trace's charged intervals hold their most bytes,
+    # those covering it are the buffers peak_live names of it, as XLA's own
+    # count of its peak reads the same simulation (XLA:GPU's, which keeps its
+    # traces; XLA:CPU's assignment states none).
+    def step(x, w):
+      for _ in range(3):
+        x = jnp.tanh(x @ w)
+      return x.sum(), x
+
+    tile = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, has_aux=True)).lower(tile, tile).compile()
+    intervals, live = compiled.live_intervals(), compiled.peak_live()
+    self.assertTrue(intervals)
+    self.assertTrue(all(each.complete for each in intervals))
+    peaked = []
+    for trace in {each.trace for each in intervals}:
+      within = [each for each in intervals if each.trace == trace]
+      at = max(range(max(each.end for each in within)),
+               key=lambda at, within=within: _counted(within, at))
+      peaked += [each for each in within
+                 if each.charged and each.start <= at < each.end]
+    self.assertEqual(_temporaries(peaked), _temporaries(live))
+
+  def test_an_interval_shares_memory_only_with_a_buffer_still_live(self):
+    # A heap simulation's events: an output in place over a live operand
+    # shares its memory; one placed where a freed buffer was is new memory
+    # again (XLA's FREE then SHARE_WITH); a heap's pages each hold their own
+    # buffers of one trace; an allocation simulated per computation has a
+    # trace each, positions from 0 in each; a share of a share, freed or not,
+    # lies in the first's memory.
+    hlo = """
+HloModule m, entry_computation_layout={(f32[4]{0})->f32[4]{0}}
+
+ENTRY e {
+  p = f32[4]{0} parameter(0)
+  a = f32[4]{0} negate(p), frontend_attributes={checkpoint_name="first"}
+  b = f32[4]{0} exponential(a)
+  c = f32[4]{0} sine(b)
+  d = f32[4]{0} cosine(c)
+  e = f32[4]{0} tanh(d)
+  ROOT r = f32[4]{0} add(e, c)
+  z = f32[0]{0} constant({})
+}
+"""
+    module = hlo_reader.module_from_text(hlo).as_serialized_hlo_module_proto()
+    [entry] = hlo_reader.message_class("xla.HloModuleProto").FromString(
+        module).computations
+    defined = {instruction.name: instruction.id
+               for instruction in entry.instructions}
+    assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+    ids = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "p": 6, "z": 7}
+    sizes = {"z": 0}
+    for name, buffer in ids.items():
+      logical = assignment.logical_buffers.add(id=buffer,
+                                               size=sizes.get(name, 16))
+      logical.defined_at.instruction_id = defined[name]
+    # p is placed in the second page unsimulated, as XLA places a reused heap's.
+    for index, names in enumerate(("abz", "cdep")):
+      allocation = assignment.buffer_allocations.add(index=index, size=32)
+      for name in names:
+        allocation.assigned.add(logical_buffer_id=ids[name],
+                                size=sizes.get(name, 16))
+    alloc, free, share = 0, 1, 2
+    events = [(alloc, "a", None), (alloc, "c", None), (free, "a", None),
+              (share, "b", "a"), (share, "d", "c"), (free, "c", None),
+              (free, "d", None), (share, "e", "d"), (free, "e", None),
+              (free, "b", None), (alloc, "z", None), (free, "z", None)]
+    for allocation, steps in ((0, events), (1, events),
+                              (0, [(alloc, "a", None), (free, "a", None)])):
+      trace = assignment.heap_simulator_traces.add(
+          buffer_allocation_index=allocation,
+          whole_module_simulation=steps is events)
+      for kind, name, shared in steps:
+        trace.events.add(kind=kind, buffer_id=ids[name],
+                         share_with_canonical_id=ids[shared] if shared else 0)
+    found = peak_live.intervals(assignment.SerializeToString(), module)
+    self.assertEqual(
+        sorted((each.instruction, each.allocation, each.trace, each.start,
+                each.end, each.storage) for each in found),
+        [("a", 0, 0, 0, 2, 1), ("a", 0, 2, 0, 1, 1), ("b", 0, 0, 3, 9, 1),
+         ("c", 1, 1, 1, 5, 3), ("d", 1, 1, 4, 6, 3), ("e", 1, 1, 7, 8, 3),
+         ("z", 0, 0, 10, 11, 7)])
+    self.assertEqual({each.names for each in found if each.instruction == "a"},
+                     {("first",)})
+    self.assertEqual({(each.trace, each.whole, each.complete)
+                      for each in found},
+                     {(0, True, True), (1, True, False), (2, False, True)})
+    page = [each for each in found if each.trace == 0]
+    # b in a's freed memory holds it anew; d in c's live memory holds none.
+    self.assertEqual([_held(page, at) for at in range(10)],
+                     [16, 16, 0, 16, 16, 16, 16, 16, 16, 0])
+    other = [each for each in found if each.trace == 1]
+    self.assertEqual([_held(other, at) for at in range(10)],
+                     [0, 16, 16, 16, 16, 16, 0, 16, 0, 0])
+    # XLA's count charges d nothing, so once c is freed it counts none of the
+    # memory d holds; e, sharing d with no other instance of d live, it
+    # charges; z, of no bytes, never.
+    self.assertEqual({each.instruction for each in found if not each.charged},
+                     {"d", "z"})
+    self.assertEqual([_counted(other, at) for at in range(10)],
+                     [0, 16, 16, 16, 16, 0, 0, 16, 0, 0])
+
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
     # sin(tanh(x @ w))'s gradient in w under a policy saving the residual
@@ -99,6 +205,45 @@ class PeakLiveTest(jtu.JaxTestCase):
     self.assertTrue(products, text)
     self.assertTrue(
         all('checkpoint_name = "hidden"' in line for line in products), text)
+
+  @jtu.run_on_devices("cuda")
+  def test_a_scans_stacked_residual_is_named_by_what_its_body_writes(self):
+    # A scan saves each step's named residual into a stacked output, a loop
+    # state element whose buffer is the zeros a broadcast makes (Dew row
+    # 13304): that buffer, live at the gradient's peak, is named by the
+    # residual the body writes into it.
+    def step(xs, w):
+      def body(carry, x):
+        hidden = ad_checkpoint.checkpoint_name(jnp.tanh(x @ w), "hidden")
+        return carry + jnp.sum(jnp.sin(hidden)), None
+      saved = jax.checkpoint(
+          body, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+      return jax.lax.scan(saved, 0.0, xs)[0]
+
+    rows = jax.ShapeDtypeStruct((16, 512, 256), jnp.float32)
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+    compiled = jax.jit(jax.grad(step, argnums=1)).lower(rows, weight).compile()
+    live = compiled.peak_live()
+    self.assertIsNotNone(live)
+    stacked = [buffer for buffer in live if buffer.shape == (16, 512, 256)]
+    self.assertTrue(stacked, live)
+    self.assertIn(("hidden",), {buffer.names for buffer in stacked}, stacked)
+
+  def test_a_loops_state_is_named_only_by_a_scans_whole_stack(self):
+    # A scan's stack, which the loop's steps fill a row each, forwards or
+    # backwards, is named by the row it writes; a populated matrix whose one
+    # row each step overwrites is not, nor a filled one written at one row,
+    # nor a square turned by a bitcast to another layout and a copy back
+    # before each write, nor one written at the counter passed through any op
+    # (a bitcast to a signed type of its width may take it negative), nor a
+    # stack whose loop runs fewer steps than its rows.
+    self.assertEqual(_loop_names(4), {"zeros": ("hidden",),
+                                      "ones": ("late",), "populated": (),
+                                      "filled": (), "spread": (),
+                                      "blank": ()})
+    self.assertEqual(_loop_names(2), {"zeros": (), "ones": (),
+                                      "populated": (), "filled": (),
+                                      "spread": (), "blank": ()})
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast(self):
@@ -188,6 +333,138 @@ class PeakLiveTest(jtu.JaxTestCase):
                      whole.memory_analysis().temp_size_in_bytes)
     self.assertIsNotNone(whole.peak_live())
     self.assertEqual(probe.peak_live(), whole.peak_live())
+
+_LOOP = """
+HloModule m, entry_computation_layout={(f32[], f32[4,2]{1,0})->f32[4,2]{1,0}}
+
+forwards {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[2]{0} parameter(1)
+  laid = f32[1,2]{1,0} bitcast(row)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, laid, at, zero)
+}
+
+moved {
+  stack = f32[4,4]{1,0} parameter(0)
+  other = f32[4,4]{0,1} bitcast(stack)
+  back = f32[4,4]{1,0} copy(other)
+  row = f32[1,4]{1,0} parameter(1)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,4]{1,0} dynamic-update-slice(back, row, at, zero)
+}
+
+backwards {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[1,2]{1,0} parameter(1)
+  i = s32[] parameter(2)
+  last = s32[] constant(3)
+  at = s32[] subtract(last, i)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, row, at, zero)
+}
+
+body {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  stack = f32[4,2]{1,0} get-tuple-element(state), index=0
+  back = f32[4,2]{1,0} get-tuple-element(state), index=1
+  matrix = f32[4,2]{1,0} get-tuple-element(state), index=2
+  fixed = f32[4,2]{1,0} get-tuple-element(state), index=3
+  square = f32[4,4]{1,0} get-tuple-element(state), index=4
+  cast = f32[4,2]{1,0} get-tuple-element(state), index=5
+  i = s32[] get-tuple-element(state), index=6
+  hidden = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}
+  written = f32[4,2]{1,0} fusion(stack, hidden, i), kind=kLoop, calls=forwards
+  late = f32[1,2]{1,0} constant({{3, 4}}), frontend_attributes={checkpoint_name="late"}
+  reversed = f32[4,2]{1,0} fusion(back, late, i), kind=kLoop, calls=backwards
+  row = f32[1,2]{1,0} constant({{5, 6}}), frontend_attributes={checkpoint_name="row"}
+  zero = s32[] constant(0)
+  over = f32[4,2]{1,0} dynamic-update-slice(matrix, row, zero, zero)
+  pinned = f32[4,2]{1,0} dynamic-update-slice(fixed, row, zero, zero)
+  line = f32[1,4]{1,0} constant({{7, 8, 9, 10}}), frontend_attributes={checkpoint_name="line"}
+  turned = f32[4,4]{1,0} fusion(square, line, i), kind=kLoop, calls=moved
+  counted = s32[] bitcast(i)
+  through = f32[4,2]{1,0} dynamic-update-slice(cast, row, counted, zero)
+  one = s32[] constant(1)
+  next = s32[] add(i, one)
+  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, reversed, over, pinned, turned, through, next)
+}
+
+condition {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  i = s32[] get-tuple-element(state), index=6
+  bound = s32[] constant(STEPS)
+  ROOT less = pred[] compare(i, bound), direction=LT
+}
+
+ENTRY e {
+  a = f32[] parameter(0)
+  populated = f32[4,2]{1,0} parameter(1)
+  zeros = f32[4,2]{1,0} broadcast(a), dimensions={}
+  unit = f32[] constant(1)
+  ones = f32[4,2]{1,0} broadcast(unit), dimensions={}
+  filled = f32[4,2]{1,0} broadcast(a), dimensions={}
+  spread = f32[4,4]{1,0} broadcast(a), dimensions={}
+  blank = f32[4,2]{1,0} broadcast(a), dimensions={}
+  start = s32[] constant(0)
+  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, ones, populated, filled, spread, blank, start)
+  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"6"}}
+  ROOT x = f32[4,2]{1,0} get-tuple-element(loop), index=0
+}
+"""
+
+
+def _loop_names(steps: int) -> dict[str, tuple[str, ...]]:
+  """The names `peak_live.live` gives each loop state element's buffer of
+  ``_LOOP`` run for ``steps`` steps, by the instruction defining it, each
+  buffer at the loop's output too and all live at one peak."""
+  module = hlo_reader.module_from_text(
+      _LOOP.replace("STEPS", str(steps))).as_serialized_hlo_module_proto()
+  defined = {instruction.name: instruction
+             for computation in hlo_reader.message_class(
+                 "xla.HloModuleProto").FromString(module).computations
+             for instruction in computation.instructions
+             if computation.name == "e"}
+  assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+  assignment.buffer_allocations.add(index=0, size=128)
+  peak = assignment.peak_buffers.add(index=0)
+  for element, name in enumerate(
+      ("zeros", "ones", "populated", "filled", "spread", "blank")):
+    buffer = assignment.logical_buffers.add(id=element, size=32)
+    buffer.defined_at.instruction_id = defined[name].id
+    alias = assignment.buffer_aliases.add(source_buffer_id=element)
+    alias.location.instruction_id = defined["loop"].id
+    alias.location.shape_index.append(element)
+    peak.logical_buffer_ids.append(element)
+  live = peak_live.live(assignment.SerializeToString(), module)
+  return {buffer.instruction: buffer.names for buffer in live}
+
+
+def _held(intervals, at: int) -> int:
+  """The bytes ``intervals``, of one trace, hold at position ``at``: each
+  storage some interval covering it lies in, once, at its members' most."""
+  storages: dict[int, int] = {}
+  for each in intervals:
+    if each.start <= at < each.end:
+      storages[each.storage] = max(storages.get(each.storage, 0), each.bytes)
+  return sum(storages.values())
+
+
+def _counted(intervals, at: int) -> int:
+  """The bytes XLA's count of a peak charges ``intervals``, of one trace, at
+  position ``at``."""
+  return sum(each.bytes for each in intervals
+             if each.charged and each.start <= at < each.end)
+
+
+def _temporaries(buffers) -> collections.Counter:
+  """``buffers``' temporaries by their instruction and size."""
+  return collections.Counter((buffer.instruction, buffer.bytes)
+                             for buffer in buffers
+                             if buffer.kind == "temporary")
+
 
 def _descended(text: str) -> dict[str, Any]:
   """The provenance of each instruction of HLO module ``text``, by name."""
