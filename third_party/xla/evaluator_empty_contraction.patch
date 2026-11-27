@@ -1,0 +1,63 @@
+From 4f9226468354b490b513eb1c480635abbeb91ebf Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Mon, 16 Nov 2026 02:25:42 -0600
+Subject: [PATCH] [XLA] HloEvaluator's float32 dot over an empty contraction is
+ zeros
+
+The float32 fast path contracted through Eigen, which divides by the contraction's depth as it blocks it: a
+dot over an empty contraction, [m, 0] by [0, n], raised SIGFPE, and XLA:CPU's constant folding died on one
+where the algebraic simplifier, which rewrites it first, was off. Its product is its sums of nothing, zeros,
+returned without contracting. hlo_evaluator_test holds it.
+---
+diff --git a/xla/hlo/evaluator/hlo_evaluator.cc b/xla/hlo/evaluator/hlo_evaluator.cc
+index 6f4b276e5c..b848520eb1 100644
+--- a/xla/hlo/evaluator/hlo_evaluator.cc
++++ b/xla/hlo/evaluator/hlo_evaluator.cc
+@@ -5308,6 +5308,12 @@ static std::unique_ptr<Array2D<T>> MatmulArray2DImpl(const Array2D<T>& lhs,
+   int k = lhs.width();
+   int n = rhs.width();
+   auto result = std::make_unique<Array2D<T>>(m, n);
++  if (k == 0) {
++    // A product over an empty contraction is its sums of nothing, zeros:
++    // Eigen's contraction divides by its depth as it blocks it.
++    result->Fill(T(0));
++    return result;
++  }
+ 
+   using ConstTensor = Eigen::Tensor<const T, 2, Eigen::RowMajor>;
+   using Tensor = Eigen::Tensor<T, 2, Eigen::RowMajor>;
+diff --git a/xla/hlo/evaluator/hlo_evaluator_test.cc b/xla/hlo/evaluator/hlo_evaluator_test.cc
+index 852954f212..00180b3777 100644
+--- a/xla/hlo/evaluator/hlo_evaluator_test.cc
++++ b/xla/hlo/evaluator/hlo_evaluator_test.cc
+@@ -3540,6 +3540,30 @@ ENTRY main {
+   EXPECT_TRUE(LiteralTestUtil::Near(expected, result, fft_error_));
+ }
+ 
++// A dot over an empty contraction is zeros, as its sums of nothing are: the
++// float32 fast path's Eigen contraction divided by its depth, and constant
++// folding died of SIGFPE on one (XLA:CPU with the algebraic simplifier off).
++TEST_F(HloEvaluatorTest, DotOverAnEmptyContractionIsZeros) {
++  const char* hlo_text = R"(
++HloModule EmptyContraction
++
++ENTRY main {
++  lhs = f32[3,0] parameter(0)
++  rhs = f32[0,2] parameter(1)
++  ROOT dot = f32[3,2] dot(lhs, rhs), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++}
++)";
++  Literal lhs = LiteralUtil::CreateR2FromArray2D<float>(Array2D<float>(3, 0));
++  Literal rhs = LiteralUtil::CreateR2FromArray2D<float>(Array2D<float>(0, 2));
++  auto parsed = ParseAndReturnVerifiedModule(hlo_text);
++  ASSERT_TRUE(parsed.ok()) << parsed.status();
++  m_ = *std::move(parsed);
++  absl::StatusOr<Literal> result = Evaluate({&lhs, &rhs});
++  ASSERT_TRUE(result.ok()) << result.status();
++  EXPECT_TRUE(LiteralTestUtil::Equal(
++      LiteralUtil::CreateR2<float>({{0, 0}, {0, 0}, {0, 0}}), *result));
++}
++
+ TEST_F(HloEvaluatorTest, 1D_IFFT_4_on_c64x4) {
+   const char* hlo_text = R"(
+ HloModule Fft
