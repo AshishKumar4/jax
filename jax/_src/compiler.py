@@ -453,12 +453,6 @@ def register_xla_runtime_error_handler(
   _XLA_RUNTIME_ERROR_HANDLERS.append(handler_fn)
 
 
-# Dew fork (compile-only-deserialize): features of a jaxlib built with the fork's
-# compile_only_deserialize, detected by its bindings, so this jax runs on
-# jaxlib releases without them. Delete with the family.
-_COMPILE_ONLY_DESERIALIZES = "deserialize_executable" in vars(
-    _jax.CompileOnlyPyClient)
-
 
 def _is_early_exit(compile_options: xc.CompileOptions) -> bool:
   return getattr(compile_options, "is_early_exit", False)
@@ -507,16 +501,11 @@ def compile_or_get_cached(
 
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
-  # A compile-only client reads an entry back as an unloaded executable, where
-  # its jaxlib deserializes one; with an older jaxlib it reads nothing back.
+  # A compile-only client reads an entry back as an unloaded executable.
   cache_retrieval_start = time.monotonic()
-  if (isinstance(backend, _jax.CompileOnlyPyClient)
-      and not _COMPILE_ONLY_DESERIALIZES):
-    retrieved_executable, retrieved_compile_time = None, None
-  else:
-    retrieved_executable, retrieved_compile_time = _cache_read(
-        module_name, cache_key, compile_options, backend, executable_devices,
-        host_callbacks)
+  retrieved_executable, retrieved_compile_time = _cache_read(
+      module_name, cache_key, compile_options, backend, executable_devices,
+      host_callbacks)
   cache_retrieval_time = time.monotonic() - cache_retrieval_start
 
   if retrieved_executable is not None:
