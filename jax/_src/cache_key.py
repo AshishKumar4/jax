@@ -430,6 +430,11 @@ xla_flags_to_exclude_from_cache_key = [
     # reads.
     "--xla_gpu_require_complete_aot_autotune_results",
     "--xla_tpu_compiler_variant",
+    # A GPU compile's memory limit stops a compile whose executable would hold
+    # more and changes no compile that finishes; a stopped one is never
+    # written to the cache (compiler.py's `_stopped_by_memory_limit`), so a
+    # finished one serves every limit it fits.
+    "--xla_gpu_memory_limit_early_exit_bytes",
 ]
 
 env_override_flags_to_exclude_from_cache_key = {
@@ -478,6 +483,9 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   # here.
   debug_options.xla_gpu_cuda_data_dir = ""
   debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
+  # A jaxlib without Dew's xla-memory-limit-early-exit states no such option.
+  if hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
   # LINT.ThenChange(:xla_flags)
 
   compile_options_copy.env_option_overrides = [

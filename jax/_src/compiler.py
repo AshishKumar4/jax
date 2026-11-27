@@ -820,8 +820,44 @@ def _compile_and_write_cache(
       backend, computation, executable_devices, compile_options, host_callbacks
   )
   compile_time = time.monotonic() - start_time
-  _cache_write(cache_key, compile_time, module_name, backend, executable)
+  if _stopped_by_memory_limit(executable, compile_options):
+    logger.log(
+        logging.WARNING if config.explain_cache_misses.value else logging.DEBUG,
+        "Not writing persistent cache entry for '%s': its compile stopped at "
+        "its memory limit", module_name)
+  else:
+    _cache_write(cache_key, compile_time, module_name, backend, executable)
   return executable
+
+
+def _memory_limit(compile_options: xc.CompileOptions) -> int:
+  """The xla_gpu_memory_limit_early_exit_bytes `compile_options` state, as an
+  override or a debug option; 0 where they state none."""
+  for name, value in compile_options.env_option_overrides:
+    if name.strip("-") == "xla_gpu_memory_limit_early_exit_bytes":
+      return int(value)
+  debug_options = compile_options.executable_build_options.debug_options
+  # A jaxlib without Dew's xla-memory-limit-early-exit states no such option.
+  return int(getattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes", 0))
+
+
+def _stopped_by_memory_limit(executable: Any,
+                             compile_options: xc.CompileOptions) -> bool:
+  """Whether `executable`'s compile stopped at its memory limit
+  (xla_gpu_memory_limit_early_exit_bytes): the device bytes its memory stats
+  state at once (argument + output - alias + temp, as XLA compares them) past
+  the limit. Its cache key leaves the limit out, so such an executable, which
+  refuses to run, is never written: a run under a larger limit would read it."""
+  limit = _memory_limit(compile_options)
+  if limit <= 0:
+    return False
+  try:
+    stats = executable.get_compiled_memory_stats()
+  except (xc.XlaRuntimeError, NotImplementedError):
+    return False
+  held = (stats.argument_size_in_bytes + stats.output_size_in_bytes
+          - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
+  return held > limit
 
 
 def _should_raise_persistent_cache_error(ex: Exception) -> bool:
