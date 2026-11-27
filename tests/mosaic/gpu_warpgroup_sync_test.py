@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """A reader of a lowered program's Mosaic GPU kernels finds each warpgroup sync
-by the inline PTX Mosaic emits for one (`WARPGROUP_BARRIER_PTX`), in the
-kernel's module read back into its dialects (`deserialized`). Lowered for a
-compile-only H100, no GPU needed."""
+as the typed operation Mosaic emits for one (`warpgroup_barrier`: an
+`nvvm.barrier` of a warpgroup's threads), in the kernel's module read back into
+its dialects (`deserialized`). Lowered for a compile-only H100, no GPU
+needed."""
 
 from absl.testing import absltest
 import jax
@@ -49,14 +50,20 @@ def _kernel_modules(lowered) -> list[ir.Module]:
 
 
 def _warpgroup_syncs(module: ir.Module) -> int:
+  """The `nvvm.barrier`s of `module` whose thread count is a constant
+  warpgroup's."""
   syncs = 0
 
   def visit(op):
     nonlocal syncs
-    if (op.name == "llvm.inline_asm"
-        and ir.StringAttr(op.attributes["asm_string"]).value
-        == mgpu.utils.WARPGROUP_BARRIER_PTX):
-      syncs += 1
+    if op.name == "nvvm.barrier":
+      # Its operands by segment: barrierId, then numberOfThreads.
+      segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+      count = op.operands[segments[0]].owner.operation
+      if (segments[1] and count.name == "arith.constant"
+          and ir.IntegerAttr(count.attributes["value"]).value
+          == mgpu.utils.WARPGROUP_SIZE):
+        syncs += 1
     return ir.WalkResult.ADVANCE
 
   module.operation.walk(visit)
