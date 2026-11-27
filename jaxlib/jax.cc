@@ -132,6 +132,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/python/ifrt/rtti.h"
 #include "xla/python/logging.h"  // IWYU pragma: keep
+#include "xla/side_effect_util.h"
 #include "xla/python/nb_absl_flat_hash_map.h"  // IWYU pragma: keep
 #include "xla/python/nb_absl_span.h"  // IWYU pragma: keep
 #include "xla/python/pjrt_ifrt/pjrt_client.h"
@@ -682,6 +683,8 @@ NB_MODULE(_jax, m) {
               &xla::CompiledMemoryStats::indefinite_allocations)
       .def_rw("peak_unpadded_heap_bytes",
               &xla::CompiledMemoryStats::peak_unpadded_heap_bytes)
+      .def_rw("stopped_at_memory_limit",
+              &xla::CompiledMemoryStats::stopped_at_memory_limit)
       .def("__str__", &xla::CompiledMemoryStats::DebugString);
 
   m.def("get_execution_stream_id", []() { return GetExecutionStreamId(); });
@@ -1206,6 +1209,14 @@ NB_MODULE(_jax, m) {
 #else
   m.attr("xla_version_number") = JAX_IFRT_VERSION_NUMBER;
 #endif
+
+  // The frontend attribute under which a float add, subtract or multiply rounds
+  // on its own, never contracted into a fused multiply-add: this build's
+  // compilers honour it (jax.extend.backend.no_contract_attribute).
+  // Cast as a string: nanobind has no caster for `const char[]` of unknown
+  // bound (XLA's extern declaration), and assigning it raised std::bad_cast at
+  // import.
+  m.attr("XLA_NO_CONTRACT_ATTRIBUTE") = nb::str(xla::kXlaNoContractAttr);
 
   m.def("approx_top_k_reduction_output_size",
         xla::ValueOrThrowWrapper(xla::ApproxTopKReductionOutputSize),
