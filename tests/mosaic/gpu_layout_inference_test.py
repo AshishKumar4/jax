@@ -1192,6 +1192,48 @@ class LayoutInferenceTest(parameterized.TestCase):
     self.assertNotIsInstance(assignments, cs.Unsatisfiable)
     self.assertEqual(set(assignments), set(unknowns))
 
+  def test_find_assignments_for_compares_linearly_in_its_independent_groups(
+      self,
+  ):
+    # A system of many groups no constraint relates, beside as many unknowns
+    # already assigned, is split and solved comparing its variables a number
+    # of times linear in their count: twice the groups, about twice the
+    # comparisons (a kernel's thousands of groups made it quadratic, minutes
+    # of a compile).
+    def comparisons(groups):
+      bf16 = ir.BF16Type.get()
+      unknowns, constraints, assigned = [], [], {}
+      with ir.InsertionPoint(self.module.body):
+        for index in range(2 * groups):
+          [key] = layout_inference.vector_value_sites(
+              llvm.UndefOp(ir.VectorType.get((128, 128), bf16))
+          )
+          variable = cs.Variable(key)
+          unknowns.append(variable)
+          if index % 2:
+            assigned[variable] = RL(mgpu.WGMMA_LAYOUT)
+          else:
+            constraints.append(cs.NotOfType(variable, fa.WGSplatFragLayout))
+      counted = [0]
+      compare = cs.Variable.__eq__
+
+      def counting(self, other):
+        counted[0] += 1
+        return compare(self, other)
+
+      with mock.patch.object(cs.Variable, "__eq__", counting):
+        assignments, _ = layout_inference.find_assignments_for(
+            unknowns,
+            cs.ConstraintSystem(assignments=assigned, constraints=constraints),
+            fuel=100 * groups,
+            arch=(9, 0),
+        )
+      self.assertNotIsInstance(assignments, cs.Unsatisfiable)
+      self.assertEqual(set(assignments), set(unknowns))
+      return counted[0]
+
+    self.assertLess(comparisons(400), 3 * max(comparisons(200), 1))
+
   def test_cannot_find_assignments_for_unsatisfiable_constraint_system(self):
     with ir.InsertionPoint(self.module.body):
       x = llvm.UndefOp(ir.VectorType.get((64,), ir.BF16Type.get()))
