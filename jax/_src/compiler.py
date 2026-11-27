@@ -454,10 +454,6 @@ def register_xla_runtime_error_handler(
 
 
 
-def _is_early_exit(compile_options: xc.CompileOptions) -> bool:
-  return compile_options.is_early_exit
-
-
 def compile_or_get_cached(
     backend: xc.Client,
     computation: ir.Module,
@@ -475,10 +471,11 @@ def compile_or_get_cached(
   is_multi_process = len(executable_devices.process_indices) > 1
 
   # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
-  # serializes its options alone, which deserialize as no executable: it reads
-  # nothing of the persistent cache (a PGLE profile's entry included) and
-  # writes nothing to it.
-  if _is_early_exit(compile_options):
+  # serializes its options alone, which deserialize as no executable: where the
+  # persistent cache is used, it reads nothing of it (a PGLE profile's entry
+  # included) and writes nothing to it.
+  if (compilation_cache.is_cache_used(backend)
+      and compile_options.is_early_exit):
     return backend_compile_and_load(
         backend, computation, executable_devices, compile_options,
         host_callbacks)
