@@ -68,7 +68,8 @@ def _stub_string(symbol: str) -> str | None:
   not loaded, from before the export, or the stub says none. Opens the plugin
   RTLD_NOLOAD, already loaded, and closes it again: no reference kept."""
   path = _get_library_path()
-  if path is None:
+  # A platform with no RTLD_NOLOAD cannot open the plugin without loading it.
+  if path is None or not hasattr(os, "RTLD_NOLOAD"):
     return None
   try:
     plugin = ctypes.CDLL(str(path), mode=os.RTLD_NOLOAD)
