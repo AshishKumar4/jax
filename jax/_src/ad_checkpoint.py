@@ -549,7 +549,6 @@ def print_saved_residuals(f, *args, **kwargs):
 
 remat_p = core.Primitive('remat2')
 remat_p.multiple_results = True
-remat_p.inlined_call = True
 
 def _remat_bind(*args, jaxpr, prevent_cse, differentiated, policy):
   assert isinstance(prevent_cse, bool) or len(prevent_cse) == len(args)

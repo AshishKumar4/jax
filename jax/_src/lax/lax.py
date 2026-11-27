@@ -4700,7 +4700,6 @@ def unop(result_dtype, accepted_dtypes, name, supports_narrow_ints=True,
       layout_rule=unop_layout_rule)
   batching.defvectorized(prim)
   mlir.shard_map_collective_rules[prim] = _unop_collective_rule
-  prim.elementwise = True
   return prim
 
 standard_unop = partial(unop, _identity)
@@ -4912,7 +4911,6 @@ def naryop(result_dtype, accepted_dtypes, name, allow_extended_dtype=False,
       layout_rule=layout_rule)
   batching.defbroadcasting(prim)
   mlir.shard_map_collective_rules[prim] = _naryop_collective_rule
-  prim.elementwise = True
   return prim
 standard_naryop = partial(naryop, input_dtype)
 
@@ -5839,7 +5837,6 @@ integer_pow_p = standard_primitive(
   sharding_rule=_attrgetter('sharding'), vma_rule=lambda x, **_: x.mat.varying,
   layout_rule=_integer_pow_layout_rule)
 batching.defvectorized(integer_pow_p)
-integer_pow_p.elementwise = True
 ad.defjvp(integer_pow_p, _integer_pow_jvp)
 
 def _integer_pow(x, *, y):
@@ -6561,7 +6558,6 @@ convert_element_type_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'convert_element_type'),
     ur_rule=_convert_element_type_ur_rule,
     layout_rule=_convert_element_type_layout_rule)
-convert_element_type_p.elementwise = True
 
 # TODO(dougalm): I'm overriding bind_with_trace here because that's the closest thing to
 # the old "custom bind" but it might not be the best way to do this.
@@ -8814,7 +8810,6 @@ broadcast_in_dim_p = standard_primitive(
     ur_rule=_broadcast_in_dim_ur_rule,
     memory_space_rule=_broadcast_in_dim_memory_space_rule,
     layout_rule=_broadcast_in_dim_layout_rule)
-broadcast_in_dim_p.rearranges = True
 broadcast_in_dim_p.def_impl(partial(dispatch.apply_primitive, broadcast_in_dim_p))
 ad.primitive_jvps[broadcast_in_dim_p] = _broadcast_in_dim_jvp_rule
 ad.primitive_transposes[broadcast_in_dim_p] = _broadcast_in_dim_transpose_rule
@@ -9004,7 +8999,6 @@ clamp_p = standard_primitive(_clamp_shape_rule, _clamp_dtype_rule, 'clamp',
                              sharding_rule=_clamp_sharding_rule,
                              vma_rule=partial(core.standard_vma_rule, 'clamp'),
                              layout_rule=_clamp_layout_rule)
-clamp_p.elementwise = True
 ad.defjvp(clamp_p,
           lambda g, min, operand, max:
           select(bitwise_and(gt(min, operand), lt(min, max)),
@@ -9123,7 +9117,6 @@ concatenate_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'concatenate'),
     ur_rule=_concatenate_ur_rule,
     layout_rule=_concatenate_layout_rule)
-concatenate_p.rearranges = True
 ad.deflinear2(concatenate_p, _concatenate_transpose_rule)
 ad.primitive_transposes[concatenate_p] = _concatenate_transpose_rule
 batching.primitive_batchers[concatenate_p] = _concatenate_batch_rule
@@ -9265,7 +9258,6 @@ stack_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'stack'),
     ur_rule=_stack_ur_rule,
     layout_rule=_stack_layout_rule)
-stack_p.rearranges = True
 ad.deflinear2(stack_p, _stack_transpose_rule)
 
 def _stack_collective_rule(in_avals, out_avals, *, axis):
@@ -9388,7 +9380,6 @@ def _unstack_batch_rule(batched_args, batch_dims, *, axis):
   return results, (out_bdim,) * len(results)
 
 unstack_p = core.Primitive('unstack')
-unstack_p.rearranges = True
 unstack_p.multiple_results = True
 unstack_p.def_abstract_eval(
     partial(standard_multi_result_abstract_eval, unstack_p, _unstack_shape_rule,
@@ -9478,7 +9469,6 @@ def _split_layout_rule(out_avals, operand, *, sizes, axis):
   return [operand.layout] * len(sizes)
 
 split_p = core.Primitive('split')
-split_p.rearranges = True
 split_p.multiple_results = True
 split_p.def_abstract_eval(
     partial(standard_multi_result_abstract_eval, split_p, _split_shape_rule,
@@ -9601,7 +9591,6 @@ pad_p = standard_primitive(_pad_shape_rule, _pad_dtype_rule, 'pad',
                            sharding_rule=_pad_sharding_rule,
                            vma_rule=partial(core.standard_vma_rule, 'pad'),
                            ur_rule=_pad_ur_rule)
-pad_p.rearranges = True
 ad.deflinear2(pad_p, _pad_transpose)
 batching.primitive_batchers[pad_p] = _pad_batch_rule
 
@@ -9685,7 +9674,6 @@ squeeze_p = standard_primitive(
     sharding_rule=_squeeze_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'squeeze'),
     ur_rule=_squeeze_ur_rule, layout_rule=_squeeze_layout_rule)
-squeeze_p.rearranges = True
 ad.deflinear2(squeeze_p, _squeeze_transpose_rule)
 batching.primitive_batchers[squeeze_p] = _squeeze_batch_rule
 
@@ -10184,7 +10172,6 @@ reshape_p = standard_primitive(
     sharding_rule=_reshape_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'reshape'),
     ur_rule=_reshape_ur_rule, layout_rule=_reshape_layout_rule)
-reshape_p.rearranges = True
 ad.deflinear2(reshape_p, _reshape_transpose_rule)
 batching.fancy_primitive_batchers[reshape_p] = _reshape_batch_rule
 mlir.register_lowering(
@@ -10220,7 +10207,6 @@ def _rev_batch_rule(batched_args, batch_dims, *, dimensions):
 rev_p = standard_primitive(_rev_shape_rule, input_dtype, 'rev',
                            sharding_rule=_rev_sharding_rule,
                            vma_rule=partial(core.standard_vma_rule, 'rev'))
-rev_p.rearranges = True
 ad.deflinear2(rev_p, lambda t, _, dimensions: [rev(t, dimensions)])
 batching.primitive_batchers[rev_p] = _rev_batch_rule
 
@@ -10294,7 +10280,6 @@ transpose_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'transpose'),
     ur_rule=_transpose_ur_rule,
     layout_rule=_transpose_layout_rule)
-transpose_p.rearranges = True
 ad.deflinear2(transpose_p,
               lambda t, _, permutation: [transpose(t, np.argsort(permutation))])
 batching.primitive_batchers[transpose_p] = _transpose_batch_rule
@@ -10526,8 +10511,6 @@ select_n_p = standard_primitive(
     vma_rule=partial(core.standard_vma_rule, 'select_n'),
     ur_rule=_select_ur_rule,
     layout_rule=_select_layout_rule)
-select_n_p.elementwise = True
-select_n_p.rearranges = True
 ad.primitive_jvps[select_n_p] = _select_jvp
 ad.primitive_transposes[select_n_p] = _select_transpose_rule
 batching.fancy_primitive_batchers[select_n_p] = _select_batch_rule
@@ -11267,7 +11250,6 @@ reduce_precision_p = standard_primitive(
     ur_rule=_reduce_precision_ur_rule,
     memory_space_rule=_reduce_precision_memory_space_rule,
     layout_rule=_reduce_precision_layout_rule)
-reduce_precision_p.elementwise = True
 ad.deflinear(reduce_precision_p, lambda t, **kwargs: [reduce_precision_p.bind(t, **kwargs)])
 batching.defvectorized(reduce_precision_p)
 
@@ -11441,7 +11423,6 @@ def _sort_batch_rule(batched_args, batch_dims, *, dimension, is_stable, num_keys
 
 
 sort_p = Primitive('sort')
-sort_p.rearranges = True
 sort_p.multiple_results = True
 sort_p.def_impl(partial(dispatch.apply_primitive, sort_p))
 sort_p.def_abstract_eval(_sort_abstract_eval)
@@ -11894,8 +11875,6 @@ def _copy_impl(prim, *args, **kwargs):
 # For that reason we don't simplify it out of jaxprs (e.g. for jit invariance).
 # It's used in jnp.array(x, copy=True), which is the user-facing API.
 copy_p = core.Primitive('copy')
-copy_p.elementwise = True
-copy_p.rearranges = True
 copy_p.def_impl(partial(_copy_impl, copy_p))
 copy_p.def_abstract_eval(lambda x: x)
 
@@ -12531,7 +12510,6 @@ def optimization_barrier(operand, /):
 optimization_barrier_p = core.Primitive('optimization_barrier')
 optimization_barrier_p.multiple_results = True
 # Each output is its operand's entries as they are: a rearrangement that moves none.
-optimization_barrier_p.rearranges = True
 optimization_barrier_p.def_impl(
     partial(dispatch.apply_primitive, optimization_barrier_p))
 

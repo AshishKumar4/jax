@@ -620,51 +620,6 @@ class Primitive:
   skip_canonicalization: bool = False
   # set for primitives that allocate references
   ref_allocating: bool = False
-  # set for primitives that run a program on their operands one for one and
-  # return its results, which XLA inlines into the caller (a jit's call, which
-  # its CallInliner inlines; a checkpoint's, a custom derivative's primal, a
-  # custom vmap's and an evaluated jaxpr, which lower to their program in
-  # place): an analysis of a jaxpr reads such an equation as its program, with
-  # no call boundary.
-  inlined_call: bool = False
-  # set for inlined calls that carry nothing but their program: no derivative,
-  # batching or rematerialization rule or policy of their own, so every
-  # transformation of such a call is the transformation of its program (a
-  # jit's, whose shardings and donation place its values and change none; an
-  # evaluated jaxpr's). Not a checkpoint's (its policy), a custom derivative's
-  # or custom vmap's (their rules), or a call primitive made to carry a meaning
-  # of its own (`create_call_primitive`'s).
-  transparent_call: bool = False
-  # set for primitives each of whose output entries reads its operands' entries
-  # at its own index and nothing else (each operand of the output's shape, or a
-  # scalar read at every index), so an analysis of a jaxpr's entries carries an
-  # index through it unchanged.
-  elementwise: bool = False
-  # set for primitives that act on each position of their operands' shared
-  # leading shape alone, the positions of every operand aligned (a key's split or
-  # bits, a polynomial, a bitcast): their batching rule maps the primitive over
-  # the batched positions (`batching.defvectorized`, `defbroadcasting`).
-  positionwise: bool = False
-  # set for primitives that reduce their operand over the axes their `axes`
-  # parameter names (a sum, a max, an argmax): `batching.defreducer`'s.
-  reduces: bool = False
-  # set for primitives that reduce their operand cumulatively along the axis
-  # their `axis` parameter names, each output entry the reduction of the entries
-  # up to it (or from it, `reverse`): cumsum, cumprod, cummax, cummin and
-  # cumlogsumexp.
-  cumulative: bool = False
-  # set for primitives that only move entries: each output entry one operand's
-  # entry, or a fill the parameters state, with no arithmetic and no rounding
-  # (a reshape, a broadcast, a transpose, a slice or its update, a gather, a
-  # concatenation, a pad, a split, a stack or an unstack, a copy, a select's
-  # pick among its cases, a sort's permutation), so an analysis may count them
-  # free and know they cannot round. An iota is none: its entries are computed
-  # from their indices, rounded in a float dtype past its mantissa.
-  rearranges: bool = False
-  # set for primitives that write their updates into a copy of their operand at
-  # the indices their scatter dimension numbers place them (a scatter, or one
-  # that combines each update with the entry it lands on).
-  scatters: bool = False
   is_effectful = None
 
   def __init__(self, name: str):
@@ -3480,7 +3435,6 @@ def dim_value_aval() -> AbstractValue:
 # transformation rules live in partial_eval.py and lax/eval_jaxpr.py.
 eval_jaxpr_p = Primitive('eval_jaxpr')
 eval_jaxpr_p.multiple_results = True
-eval_jaxpr_p.transparent_call = True
 eval_jaxpr_p.def_impl(lambda *args, call_jaxpr, **_: jaxpr_as_fun(call_jaxpr)(*args))
 eval_jaxpr_p.def_effectful_abstract_eval(
     lambda *_, call_jaxpr, **__: (call_jaxpr.out_avals, positional_effects(call_jaxpr)))
