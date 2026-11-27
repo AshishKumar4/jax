@@ -370,6 +370,36 @@ _grid_context = config.config_ext.Config[PallasGridContext | None](
     include_in_trace_context=True,
 )
 
+# Whether a Pallas kernel's body is being traced (a pallas_call's kernel, a
+# core_map's or a Mosaic GPU kernel's body): part of the trace context and the
+# jit key, so a function traced outside a kernel is never reused inside one.
+_kernel_trace = config.config_ext.Config[bool](
+    "pallas_kernel_trace",
+    False,
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+
+def tracing_kernel() -> bool:
+  """Whether the code being traced is a Pallas kernel's body: traced inside a
+  `pallas_call`'s kernel, a `core_map`'s body or a Mosaic GPU kernel's, which
+  lower to a kernel rather than to XLA. A function that chooses its lowering by
+  platform (`lax.platform_dependent`) cannot ask a kernel's lowering for its
+  platform index; this tells it it is in one."""
+  return bool(_kernel_trace.value)
+
+
+@contextlib.contextmanager
+def kernel_trace() -> Generator[None]:
+  """Marks what is traced inside as a Pallas kernel's body."""
+  old = _kernel_trace.swap_local(True)
+  try:
+    yield
+  finally:
+    _kernel_trace.set_local(old)
+
+
 _dynamic_shapes = config.config_ext.Config[bool](
     "pallas_dynamic_shapes_export",
     False,
@@ -1188,7 +1218,8 @@ class GridMapping:
       axis_env_ctx = jax_core.extend_axis_env_nd(
           zip(self.grid_names, self.grid)  # pyrefly: ignore[bad-argument-type]
       )
-    with tracing_grid_env(self.grid, self.vmapped_dims), axis_env_ctx, config._check_vma(False):
+    with (tracing_grid_env(self.grid, self.vmapped_dims), axis_env_ctx,
+          config._check_vma(False), kernel_trace()):
       yield
 
   @property

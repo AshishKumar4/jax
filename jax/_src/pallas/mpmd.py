@@ -73,6 +73,7 @@ def mpmd_map_tracing_context(
       config._check_vma(False),
       config.disable_jit(False),
       xla_metadata.clear_xla_metadata(),
+      pallas_core.kernel_trace(),
   ):
     yield
 

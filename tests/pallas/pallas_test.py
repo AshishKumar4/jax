@@ -114,6 +114,37 @@ class PallasTest(ptu.PallasTest):
 
     np.testing.assert_array_equal(add_one(x), x + 1.0)
 
+  def test_a_kernel_body_is_told_it_is_traced_in_a_kernel(self):
+    # jax.extend.pallas.tracing_kernel() is true while a kernel's body is
+    # traced and false outside it; a jitted helper called in both places is
+    # traced for each, the predicate part of its key.
+    from jax.extend import pallas as jex_pallas
+
+    seen = []
+
+    @jax.jit
+    def helper(v):
+      seen.append(("helper", jex_pallas.tracing_kernel()))
+      return v + 1.0
+
+    x = jnp.ones((128,), floatx)
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct.like(x),
+    )
+    def add_one(x_ref, o_ref):
+      seen.append(("body", jex_pallas.tracing_kernel()))
+      o_ref[...] = helper(x_ref[...])
+
+    np.testing.assert_array_equal(helper(x), x + 1.0)
+    np.testing.assert_array_equal(add_one(x), x + 1.0)
+    self.assertFalse(jex_pallas.tracing_kernel())
+    self.assertIn(("body", True), seen)
+    self.assertIn(("helper", True), seen)
+    self.assertIn(("helper", False), seen)
+    self.assertNotIn(("body", False), seen)
+
   def test_add_one_1d(self):
     if jtu.test_device_matches(["tpu"]) and not self.INTERPRET:
       self.skipTest("On TPU the test works only in interpret mode")
