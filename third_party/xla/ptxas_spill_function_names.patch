@@ -1,0 +1,58 @@
+From 9e7853304a4e60854f93b0cac457a17d965f0774 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sat, 21 Nov 2026 06:03:25 -0600
+Subject: [PATCH] [XLA] A spill warning's function is read whatever name ptxas
+ quotes
+
+ExtractModuleStatsFromLog took only \w+ between the warning's quotes, so a
+function whose PTX name holds $ (LLVM's NVPTX backend writes _$_ into a name
+it makes valid) spilled with no stats recorded, and a reader of ModuleStats
+took it for a function that spilled nothing.
+---
+diff --git a/xla/stream_executor/cuda/ptx_compiler_helpers.cc b/xla/stream_executor/cuda/ptx_compiler_helpers.cc
+index 467ac72ff7..a815287636 100644
+--- a/xla/stream_executor/cuda/ptx_compiler_helpers.cc
++++ b/xla/stream_executor/cuda/ptx_compiler_helpers.cc
+@@ -98,8 +98,10 @@ ModuleStats ExtractModuleStatsFromLog(absl::string_view log) {
+   // this line is:
+   // "Registers are spilled to local memory in function 'rr', 1080 bytes spill
+   // stores, 968 bytes spill loads"
++  // The name is whatever ptxas quotes: a PTX identifier may hold `$`, which
++  // LLVM's NVPTX backend writes into a name it makes valid (`_$_` for `.`).
+   static constexpr LazyRE2 kSpillRegex{
+-      R"(function\s+'(\w+)',\s*(\d+)\s+bytes\s+spill\s+stores,\s*(\d+)\s+bytes\s+spill\s+loads)"};
++      R"(function\s+'([^']+)',\s*(\d+)\s+bytes\s+spill\s+stores,\s*(\d+)\s+bytes\s+spill\s+loads)"};
+   ModuleStats kernel_stats_map;
+ 
+   int spill_stores = 0;
+diff --git a/xla/stream_executor/cuda/ptx_compiler_helpers_test.cc b/xla/stream_executor/cuda/ptx_compiler_helpers_test.cc
+index faf843a691..f8a70016ac 100644
+--- a/xla/stream_executor/cuda/ptx_compiler_helpers_test.cc
++++ b/xla/stream_executor/cuda/ptx_compiler_helpers_test.cc
+@@ -63,6 +63,10 @@ ptxas warning : Registers are spilled to local memory in function '__kernel2', 1
+ // Something in the log after the warning.
+ )";
+ 
++constexpr absl::string_view kPtxasLogDollarNamedFunctionSpillingRegisters = R"(
++ptxas warning : Registers are spilled to local memory in function '__internal_trig_reduction_slowpathd_$_1', 8 bytes spill stores, 16 bytes spill loads
++)";
++
+ TEST(PtxCompilerHelpersTest, IsPtxRegisterAllocationError) {
+   EXPECT_TRUE(IsPtxRegisterAllocationError(kPtxasLogRegisterAllocationError));
+   EXPECT_FALSE(IsPtxRegisterAllocationError(kPtxasLogRegisterSpillWarning));
+@@ -133,5 +137,15 @@ TEST(PtxCompilerHelpersTest, ModuleStatsAreCorrectlyExtractedFromLog) {
+   EXPECT_EQ(kernel_stats_map.size(), 0);
+ }
+ 
++TEST(PtxCompilerHelpersTest, ModuleStatsKeepAFunctionNamedWithADollar) {
++  ModuleStats kernel_stats_map =
++      ExtractModuleStatsFromLog(kPtxasLogDollarNamedFunctionSpillingRegisters);
++  ASSERT_EQ(kernel_stats_map.size(), 1);
++  const KernelStats& stats =
++      kernel_stats_map["__internal_trig_reduction_slowpathd_$_1"];
++  EXPECT_EQ(stats.store_bytes_spilled, 8);
++  EXPECT_EQ(stats.load_bytes_spilled, 16);
++}
++
+ }  // namespace
+ }  // namespace stream_executor
