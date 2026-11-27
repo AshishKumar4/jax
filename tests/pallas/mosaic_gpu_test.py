@@ -6409,6 +6409,42 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       issued = np.arange(m)[:, None] // 16 * 16 < rows
       np.testing.assert_array_equal(res[wg], np.where(issued, full, acc))
 
+  def test_mma_m_warps_is_held_to_its_operands_split(self):
+    # Lane semantics reads the split from the operands' layouts: a stated
+    # m_warps they do not carry is refused, never silently another split.
+    # (Warpgroup semantics lays the operands out as the stated split asks.)
+    self.skip_if_wg_semantics()
+    m, k, n = 64, 32, 32
+    dtype = jnp.bfloat16
+
+    def kernel_with(m_warps):
+      @functools.partial(
+          self.kernel, out_type=jax.ShapeDtypeStruct((m, n), jnp.float32)
+      )
+      def kernel(a_ref, b_ref, o_ref):
+        layouts = dict(m_warps=4)
+        acc = plgpu.layout_cast(
+            jnp.zeros((m, n), jnp.float32),
+            plgpu.Layout.MMA_ACC(dtype, **layouts),
+        )
+        a = plgpu.load(
+            a_ref, layout=plgpu.Layout.MMA_LHS(dtype, **layouts),
+            optimized=False,
+        )
+        b = plgpu.load(
+            b_ref.T, layout=plgpu.Layout.MMA_RHS(dtype, **layouts),
+            optimized=False,
+        )
+        plgpu.store(o_ref, plgpu.mma(acc, a, b, m_warps=m_warps),
+                    optimized=False)
+      return kernel
+
+    a = jnp.ones((m, k), dtype)
+    b = jnp.ones((n, k), dtype)
+    jax.jit(kernel_with(4)).lower(a, b)
+    with self.assertRaisesRegex(ValueError, "m_warps=2 is not its operands"):
+      jax.jit(kernel_with(2)).lower(a, b)
+
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_griddepcontrol_warp_mesh(self):
     @jax.jit

@@ -2578,8 +2578,16 @@ def _mma_abstract_eval(acc, a, b, *rows, m_warps):
 def _mma_lowering(
     ctx: lowering.LoweringRuleContext, acc, a, b, *rows, m_warps
 ):
-  # The operands' layouts carry their split, which `mgpu.mma` reads.
-  del ctx, m_warps
+  # The operands' layouts carry their split, which `mgpu.mma` reads; a stated
+  # `m_warps` is held to it (the Warpgroup rule's attribute has layout
+  # inference lay the operands out so).
+  del ctx
+  if m_warps is not None and acc.layout != mgpu.MMALayouts(
+      a.mlir_dtype, m_warps=m_warps).acc:
+    raise ValueError(
+        f"mma's m_warps={m_warps} is not its operands' split: Lane semantics "
+        "reads the split from the accumulator's layout (plgpu.Layout.MMA_ACC)"
+    )
   bound = None
   if rows:
     bound = lowering._ensure_ir_value(rows[0], jnp.int32)
