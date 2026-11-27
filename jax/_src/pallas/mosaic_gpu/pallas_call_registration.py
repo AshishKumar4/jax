@@ -29,6 +29,7 @@ from jax._src import sharding_impls
 from jax._src.interpreters import mlir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
+from jax._src.pallas.mosaic_gpu import lowering_cache
 from jax.experimental.mosaic import gpu as mgpu
 import jax.numpy as jnp
 import numpy as np
@@ -43,6 +44,7 @@ def _emit_mosaic_gpu_custom_call(
     cost_estimate: Any = None,
     skip_device_barrier: bool = False,
     collective_id: int | None = None,
+    metadata: bytes = b"",
 ):
   module = lowering_result.module
   new_avals_in = list(ctx.avals_in)
@@ -82,6 +84,8 @@ def _emit_mosaic_gpu_custom_call(
       collective_id=collective_id
       if lowering_result.use_barrier_semaphore
       else None,
+      metadata=metadata,
+      serialized=lowering_result.serialized,
   )
   if (prof_spec := lowering_result.profiler_spec) is not None:
     *outs, prof_buffer = outs
@@ -183,7 +187,8 @@ def mpmd_map_mgpu_lowering_rule(
   # here we bind them straight from the mesh.
   from jax._src.pallas import mpmd
   with mpmd.mpmd_map_tracing_context(mesh, (*meshes, *external_meshes)):
-    lowering_result = lowering.lower_unpipelined_jaxpr_to_module(
+    lowering_result = lowering_cache.lower_unpipelined_jaxpr_to_module(
+        ctx,
         mesh,
         jax_mesh,
         jaxpr,
@@ -194,7 +199,12 @@ def mpmd_map_mgpu_lowering_rule(
     )
   if debug:
     print(f"\nThe Mosaic GPU module for mpmd_map {jaxpr.debug_info.func_src_info}:")
-    print(lowering_result.module.operation)
+    if lowering_result.module is None:  # A cached lowering's.
+      # Its serialized kernel, its operations in their own dialects again.
+      print(mgpu.core.deserialized(
+          lowering_result.serialized.module_asm).operation)
+    else:
+      print(lowering_result.module.operation)
 
   return _emit_mosaic_gpu_custom_call(
       ctx,
@@ -205,4 +215,5 @@ def mpmd_map_mgpu_lowering_rule(
       cost_estimate=cost_estimate,
       skip_device_barrier=gpu_params.skip_device_barrier,
       collective_id=gpu_params.collective_id,
+      metadata=gpu_params.metadata,
   )

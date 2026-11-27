@@ -29,8 +29,10 @@ pytype_strict_library(
     deps = [
         ":backend",
         ":core",
+        ":custom_call_targets",
         ":linear_util",
         ":lowering",
+        ":mosaic_gpu",
         ":pallas",
         ":random",
         ":sharding",
@@ -55,6 +57,12 @@ py_library_providing_imports_info(
         "//jax/_src:lax",
         "//jax/_src:random",
     ],
+)
+
+pytype_strict_library(
+    name = "custom_call_targets",
+    srcs = ["custom_call_targets.py"],
+    deps = ["//jax/_src:custom_call_targets"],
 )
 
 pytype_strict_library(
@@ -120,6 +128,12 @@ pytype_strict_library(
     name = "ifrt_programs",
     srcs = ["ifrt_programs.py"],
     deps = ["//jax/_src/lib"],
+)
+
+pytype_strict_library(
+    name = "mosaic_gpu",
+    srcs = ["mosaic_gpu.py"],
+    deps = ["//jax/_src:mosaic_gpu_records"],
 )
 
 pytype_strict_library(

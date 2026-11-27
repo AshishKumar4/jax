@@ -1,0 +1,14 @@
+--- a/cc/features/BUILD
++++ b/cc/features/BUILD
+@@ -295,7 +295,10 @@
+     enabled = True,
+     expand_if_available = "dependency_file",
+     flags = [
+-        "-MMD",  # -MMD tells Clang to generate the dependency file, but to filter out any headers found via -isystem
++        # -MD, not -MMD: -MMD leaves out every header found via -isystem, which is how Bazel passes external
++        # repositories' includes, and Bazel keys a compile on the headers its dependency file names, so a
++        # changed external header (xla.pb.h) never rebuilt what includes it in a kept output base (Dew row 6757).
++        "-MD",
+         "-MF",
+         "%{dependency_file}",
+     ],

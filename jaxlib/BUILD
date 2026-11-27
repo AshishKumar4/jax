@@ -449,6 +449,7 @@ nanobind_pywrap_extension(
         "@tsl//tsl/platform",
         "@xla//third_party/python_runtime:headers",  # buildcleaner: keep
         "@xla//xla:literal",
+        "@xla//xla:side_effect_util",
         "@xla//xla:shape_util",
         "@xla//xla:types",
         "@xla//xla:util",
