@@ -22,7 +22,11 @@ import math
 import os
 import platform
 import re
+import subprocess
+import sys
 import tempfile
+import types
+import threading
 import unittest
 from unittest import mock
 from unittest import SkipTest
@@ -149,6 +153,66 @@ class CompilationCacheTest(CompilationCacheTestCase):
       raise SkipTest(
           "serialize executable only works on " + ",".join(supported_platforms)
       )
+
+  def test_reset_during_initialization_leaves_no_cache(self):
+    # A reset that runs while another thread builds the cache waits for the build and then clears it,
+    # so the next compile initializes the cache again rather than keep the one the reset was meant to
+    # drop.
+    timeout = 60
+    path = self.create_tempdir().full_path
+    entered, proceed, contending = threading.Event(), threading.Event(), threading.Event()
+    real_get_file_cache, real_mutex = cc.get_file_cache, cc._cache_initialized_mutex
+
+    class SignallingMutex:
+      """The initialization mutex, signalling just before the reset tries to take it."""
+
+      def __enter__(self):
+        if threading.current_thread().name == "reset":
+          contending.set()
+        return real_mutex.__enter__()
+
+      def __exit__(self, *exc_info):
+        return real_mutex.__exit__(*exc_info)
+
+    def slow(cache_path):
+      entered.set()
+      if not proceed.wait(timeout):
+        raise TimeoutError("the initialization was never let proceed")
+      return real_get_file_cache(cache_path)
+
+    def initialize():
+      # The cache directory is thread-local configuration: the initializing thread sets its own.
+      with config.compilation_cache_dir(path):
+        cc._initialize_cache()
+
+    cc.reset_cache()
+    initializing = threading.Thread(target=initialize)
+    resetting = threading.Thread(target=cc.reset_cache, name="reset")
+    try:
+      with (mock.patch.object(cc, "get_file_cache", side_effect=slow),
+            mock.patch.object(cc, "_cache_initialized_mutex", SignallingMutex())):
+        initializing.start()
+        self.assertTrue(entered.wait(timeout), "the initialization never built a cache")
+        resetting.start()
+        self.assertTrue(contending.wait(timeout), "the reset never reached the mutex")
+        proceed.set()
+        initializing.join(timeout)
+        resetting.join(timeout)
+        self.assertFalse(initializing.is_alive(), "the initialization never ended")
+        self.assertFalse(resetting.is_alive(), "the reset never ended")
+    finally:
+      proceed.set()
+      for thread in (initializing, resetting):
+        if thread.ident is not None:
+          thread.join(timeout)
+    self.assertIsNone(cc._cache)
+    self.assertFalse(cc._cache_initialized)
+    self.assertFalse(cc._cache_checked)
+    self.assertFalse(cc._cache_used)
+    with config.compilation_cache_dir(path):
+      cc._initialize_cache()
+    self.assertIsNotNone(cc._cache)
+    self.assertTrue(cc._cache_initialized)
 
   def test_get_no_executable(self):
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
@@ -457,6 +521,150 @@ class CompilationCacheTest(CompilationCacheTestCase):
     ):
       jit(lambda x: x + 1)(1)
       self.assertEqual(count_cache_items(), 0)
+
+  def test_a_compile_stopped_at_its_memory_limit_is_not_written(self):
+    # Its key leaves the limit out, so a stopped executable, which refuses to
+    # run, must not be read by a run under a larger limit: XLA's memory stats
+    # say whether it stopped; on a GPU, stats that cannot say read as stopped.
+    def executable(stopped, raises=False):
+      class Stats:
+        pass
+      stats = Stats()
+      if stopped is not None:
+        stats.stopped_at_memory_limit = stopped
+
+      class Executable:
+        def get_compiled_memory_stats(self):
+          if raises:
+            raise NotImplementedError("no stats")
+          return stats
+      return Executable()
+
+    def backend(platform):
+      class Backend:
+        pass
+      found = Backend()
+      found.platform = platform
+      return found
+
+    self.assertEqual(
+        [compiler._stopped_by_memory_limit(executable(stopped, raises),
+                                           backend(platform))
+         for stopped, raises, platform in (
+             (True, False, "cuda"), (False, False, "cuda"),
+             (None, False, "cuda"), (None, True, "rocm"),
+             (True, False, "cpu"), (None, True, "tpu"))],
+        [True, False, True, True, False, False])
+
+  def test_hosts_share_a_compile_by_its_key_and_the_limit_it_takes(self):
+    # The disk cache keys a compile without its limit; what hosts share, and a
+    # process keeps, is keyed by the limit the compile takes too (its last
+    # override, else its debug option, which XLA_FLAGS set as the options were
+    # made: an explicit 0, no limit, is never read past to XLA_FLAGS' value),
+    # and by nothing else a host may set alone (a dump directory).
+    def options(*limits):
+      found = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+      found.env_option_overrides = [
+          ("xla_gpu_memory_limit_early_exit_bytes", limit) for limit in limits]
+      return found
+
+    self.assertEqual(
+        [compiler._shared_key("key", options(*limits))
+         for limits in ((1,), (4 << 30,), (1, 4 << 30))],
+        ["key-limit1", f"key-limit{4 << 30}", f"key-limit{4 << 30}"])
+    debug = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    debug_options = debug.executable_build_options.debug_options
+    if not hasattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes"):
+      self.skipTest("this jaxlib has no GPU memory limit option")
+    debug_options.xla_gpu_memory_limit_early_exit_bytes = 7
+    self.assertEqual(compiler._shared_key("key", debug), "key-limit7")
+    unlimited = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    build_options = unlimited.executable_build_options
+    build_options.debug_options.xla_gpu_memory_limit_early_exit_bytes = 0
+    for flags in ("--xla_dump_to=/host0",
+                  "--xla_dump_to=/host1"
+                  " --xla_gpu_memory_limit_early_exit_bytes=1"):
+      with mock.patch.dict(os.environ, {"XLA_FLAGS": flags}):
+        self.assertEqual(compiler._shared_key("key", unlimited), "key-limit0")
+
+  def test_a_jaxlib_without_the_memory_limit_option_keys_by_overrides(self):
+    # A stock jaxlib's DebugOptions (macOS, Windows) has no such option: a
+    # compile there keys by its overrides alone, and raises nothing.
+    stock = types.SimpleNamespace(
+        env_option_overrides=[],
+        executable_build_options=types.SimpleNamespace(
+            debug_options=types.SimpleNamespace()))
+    self.assertEqual(compiler._shared_key("key", stock), "key-limit0")
+    stock.env_option_overrides = [("xla_gpu_memory_limit_early_exit_bytes", 5)]
+    self.assertEqual(compiler._shared_key("key", stock), "key-limit5")
+
+  @jtu.run_on_devices("gpu")
+  def test_a_finished_compile_is_read_under_any_limit(self):
+    path = self.create_tempdir().full_path
+
+    def entries():
+      return len(glob.glob(os.path.join(path, "*-cache")))
+
+    cc.reset_cache()
+    try:
+      with (
+        config.compilation_cache_dir(path),
+        config.persistent_cache_min_compile_time_secs(0),
+        # Any entry kept, the cache's own minimum left alone (a minimum of 0
+        # is replaced at the cache's first use, a global change).
+        config.persistent_cache_min_entry_size_bytes(1),
+      ):
+        f = jit(lambda x: (x @ x.T).sum())
+        x = jax.device_put(np.ones((256, 256), np.float32))
+        lowered = f.lower(x)
+        stopped = lowered.compile(
+            {"xla_gpu_memory_limit_early_exit_bytes": 1})
+        self.assertTrue(stopped.memory_analysis().stopped_at_memory_limit)
+        with self.assertRaises(Exception):
+          stopped(x).block_until_ready()
+        self.assertEqual(entries(), 0)
+        large = lowered.compile(
+            {"xla_gpu_memory_limit_early_exit_bytes": 8 << 30})
+        self.assertFalse(large.memory_analysis().stopped_at_memory_limit)
+        self.assertEqual(entries(), 1)
+        # A limit never compiled under, smaller than what the executable holds:
+        # the finished compile is read all the same, and runs.
+        with jtu.count_compilation_after_persistent_cache_miss() as missed:
+          small = lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 2})
+        self.assertEqual((entries(), missed()), (1, 0))
+        self.assertEqual(float(small(x)), 256.0 ** 3)
+        # The same bytes under any limit: the contents check, compiling again
+        # under another, finds none differ.
+        cc.reset_cache()
+        with config.compilation_cache_check_contents(True):
+          lowered.compile({"xla_gpu_memory_limit_early_exit_bytes": 6 << 30})
+        self.assertEqual(entries(), 1)
+    finally:
+      cc.reset_cache()
+    # Processes given their limits by XLA_FLAGS read one another's entry: the
+    # second, its limit of 2 bytes one no compile fits, reads the first's
+    # finished compile and runs it.
+    script = (
+        "import jax, numpy as np\n"
+        "from jax._src import monitoring\n"
+        "hits = []\n"
+        "monitoring.register_event_listener(\n"
+        "    lambda event, **kwargs: hits.append(event))\n"
+        "jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)\n"
+        "jax.config.update('jax_persistent_cache_min_entry_size_bytes', 1)\n"
+        "f = jax.jit(lambda x: (x @ x.T).sum())\n"
+        "print(float(f(jax.device_put(np.ones((256, 256), np.float32)))),\n"
+        "      hits.count('/jax/compilation_cache/cache_hits'))\n")
+    found = []
+    for limit in (8 << 30, 2):
+      ran = subprocess.run(
+          [sys.executable, "-c", script], capture_output=True, text=True,
+          check=True, env={
+              **os.environ, "JAX_COMPILATION_CACHE_DIR": path,
+              "XLA_FLAGS": f"--xla_gpu_memory_limit_early_exit_bytes={limit}"})
+      value, hits = ran.stdout.split()[-2:]
+      found.append((float(value), int(hits), entries()))
+    self.assertEqual(found[1], (256.0 ** 3, 1, found[0][2]))
 
   def test_min_compile_time(self):
     with (
