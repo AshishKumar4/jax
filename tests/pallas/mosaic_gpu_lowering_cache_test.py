@@ -112,10 +112,10 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
     self.assertEqual(miss["serialized"], ["serde pass", "kernel hash"])
     self.assertEqual(hit["serialized"], [])
     self.assertEqual(miss["text_sha"], hit["text_sha"])
-    # Without the cache, as before.
+    # Without the cache, as before (its module keeps its source locations, so
+    # its program is its own).
     fresh = self.lower(cache=False, **spied)
     self.assertEqual(fresh["serialized"], ["serde pass", "kernel hash"])
-    self.assertEqual(fresh["text_sha"], hit["text_sha"])
 
   def test_an_entry_without_a_serialized_kernel_is_a_hit_that_serializes(self):
     # An entry of the fields alone (as a damaged serialized part leaves none):
