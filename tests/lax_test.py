@@ -5669,6 +5669,19 @@ class RaggedTest(jtu.JaxTestCase):
   def test_ragged_dot(self, m, k, n, num_groups, dtype):
     return self._test_ragged_dot(m, k, n, num_groups, dtype)
 
+  def test_ragged_dot_reads_each_rows_own_groups_matrix_alone(self):
+    # A row's product is its own group's: another group's non-finite weight
+    # leaves it finite, where a sum over every group's product would give
+    # 0 * inf (Dew row 13562: one expert's inf weight poisoned every token).
+    lhs = jnp.arange(8, dtype=jnp.float32).reshape(4, 2) + 1
+    rhs = jnp.stack([jnp.ones((2, 3), jnp.float32),
+                     jnp.full((2, 3), jnp.inf, jnp.float32)])
+    sizes = jnp.array([2, 2], jnp.int32)
+    with config.jax_ragged_dot_use_ragged_dot_instruction(False):
+      out = jax.jit(lax.ragged_dot)(lhs, rhs, sizes)
+    np.testing.assert_array_equal(out[:2], lhs[:2] @ rhs[0])
+    self.assertTrue(np.isposinf(np.asarray(out[2:])).all())
+
   @parameterized.parameters([True, False])
   def test_ragged_dot_use_ragged_dot_instruction(self, use_instruction):
     with config.jax_ragged_dot_use_ragged_dot_instruction(use_instruction):
