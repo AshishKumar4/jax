@@ -27,8 +27,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _generator():
   spec = importlib.util.spec_from_file_location(
-      "generate_xla_protos",
-      os.path.join(ROOT, "build", "generate_xla_protos.py"),
+      "generate_mosaic_gpu_protos",
+      os.path.join(ROOT, "build", "generate_mosaic_gpu_protos.py"),
   )
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)

@@ -56,8 +56,7 @@ repos:
         # jax/_src/lax/lax.py) once a nightly jaxlib with the Triton dialect is
         # published.
         - jaxlib==0.12.0.1
-        # hlo_reader and mosaic_gpu_records read XLA's and Mosaic GPU's protos
-        # with it.
+        # mosaic_gpu_records reads Mosaic GPU's kernel record with it.
         - protobuf==6.33.6
 
 - repo: https://github.com/mwouts/jupytext
