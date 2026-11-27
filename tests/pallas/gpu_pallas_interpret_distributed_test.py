@@ -250,12 +250,10 @@ class InterpretDistributedTest(jtu.JaxTestCase):
       return token
 
     def kernel(x_ref, o_ref):
+      # Each accumulator starts zeroed in the interpreter.
       def outer(acc):
-        acc[...] = x_ref[...]
-
         def inner(again):
-          again[...] = acc[...] + 1.0
-          o_ref[...] = again[...]
+          o_ref[...] = x_ref[...] + acc[...] + again[...] + 1.0
 
         pl.run_scoped(inner, plgpu.ACC((64, 64), jnp.float32))
 
