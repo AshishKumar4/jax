@@ -550,6 +550,7 @@ def interpret_pallas_call(
         functools.partial(gpu_callbacks.cluster_finished),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
+        device=device,
     )
     return token
     # TODO(nrink): Determine if any synchronization between the vector clocks is

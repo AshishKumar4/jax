@@ -2437,13 +2437,14 @@ def kernel_thread_finished(
 def cluster_finished(
     *,
     token: jax.Array,
+    device: memory.Device,
 ):
-  """Called when a cluster finishes execution of a kernel.
+  """Called when a cluster of `device` finishes execution of a kernel.
 
-  Since clusters are executed sequentially in interpret mode, when this
-  function is called no code is running and we can reset shared memory state
-  if needed
+  A device's clusters run one after another, so none of `device`'s code is
+  running and its per-cluster state is reset; the other devices of a mesh run
+  at once, their state untouched (`reset_per_cluster_state`).
   """
   shared_memory = _get_shared_memory()
-  shared_memory.reset_per_cluster_state()
+  shared_memory.reset_per_cluster_state(device)
   return token
