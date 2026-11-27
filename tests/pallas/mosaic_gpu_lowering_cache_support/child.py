@@ -164,7 +164,8 @@ def normalize(result):
   of the result as plain data."""
   kernel = result.serialized
   if kernel is None:
-    kernel = mgpu_core.serialized_kernel(result.module, False)
+    with result.module.context:
+      kernel = mgpu_core.serialized_kernel(result.module, False)
   # The module as text, which holds no locations: comparable between a lowering
   # with them and one without.
   asm = _kernel_module(kernel).operation.get_asm()
