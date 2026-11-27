@@ -322,8 +322,10 @@ jobs:
           fi
           version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
           # shellcheck disable=SC2086 # Each machine its own word.
+          # A release holding every wheel the publish ships (each Python's and CUDA's for each machine): one with a
+          # first batch of Pythons alone is passed over for an older whole one (`lacking`).
           plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version" --machines $MACHINES \
-            --wheels ../verified.json)
+            --pythons $PYTHONS --cudas $CUDAS --wheels ../verified.json)
           if [ -z "$plugins" ]; then
             echo "::error::no plugin release holds $version's native code: build plugin-$version (dew/build_plugin.sh)"
             exit 1
@@ -347,30 +349,6 @@ jobs:
               if got != want:
                   sys.exit(f"::error::{name}: sha256 {got}, its record binds {want}")
           CHECK
-          fi
-          missing=()
-          # Its jaxlib, where the release carries one, for every Python and machine; none, the release's stock one.
-          if ls native/jaxlib-*.whl > /dev/null 2>&1; then
-            for machine in $MACHINES; do
-              for python in $PYTHONS; do
-                ls native/jaxlib-"$version"-"$python"-"$python"-manylinux_*_"$machine".whl > /dev/null 2>&1 \
-                  || missing+=("jaxlib $python $machine")
-              done
-            done
-          fi
-          for cuda in $CUDAS; do
-            for machine in $MACHINES; do
-              ls native/jax_cuda"$cuda"_pjrt-"$version"-py3-none-manylinux_*_"$machine".whl > /dev/null 2>&1 \
-                || missing+=("jax-cuda$cuda-pjrt $machine")
-              for python in $PYTHONS; do
-                ls native/jax_cuda"$cuda"_plugin-"$version"-"$python"-"$python"-manylinux_*_"$machine".whl \
-                  > /dev/null 2>&1 || missing+=("jax-cuda$cuda-plugin $python $machine")
-              done
-            done
-          done
-          if [ ${#missing[@]} -gt 0 ]; then
-            printf '::error::plugin-%s lacks %s\n' "$version" "${missing[@]}"
-            exit 1
           fi
           ls native
       - name: Test the stack's wheel
@@ -473,6 +451,9 @@ jobs:
       PLUGINS: ${{ inputs.staging == '' && needs.assemble.outputs.plugins || '' }}
       VERIFIED: ${{ inputs.staging == '' && needs.assemble.outputs.verified || '' }}
       MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
+      # The wheels a whole plugin release holds, as `assemble` asks them (`lacking`).
+      PYTHONS: "cp312 cp313 cp314"
+      CUDAS: "12 13"
       BUCKET: ${{ secrets.R2_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -504,7 +485,7 @@ jobs:
             git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
             # shellcheck disable=SC2086 # Each machine its own word.
             plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION" --machines $MACHINES \
-              --wheels ../verified.json)
+              --pythons $PYTHONS --cudas $CUDAS --wheels ../verified.json)
           fi
           shipping=()
           if [ -n "$plugins" ]; then

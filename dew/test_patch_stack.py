@@ -3,6 +3,7 @@ the test files it runs, over a repository of its own."""
 
 import base64
 import hashlib
+import io
 import json
 import re
 import shutil
@@ -14,6 +15,9 @@ from pathlib import Path
 import pytest
 
 import patch_stack
+
+RELEASED = patch_stack.released
+"""`released` itself, which the fixture below replaces for every other test."""
 
 
 @pytest.fixture(autouse=True)
@@ -322,6 +326,11 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     clone.mkdir()
     run("init", "-q", "-b", "main")
     run("remote", "add", "origin", str(origin))
+    # A compiled source the checkout holds as a link to one of two implementations.
+    (clone / "jaxlib").mkdir()
+    for impl in ("a", "b"):
+        (clone / "jaxlib" / f"impl_{impl}.cc").write_text(f"int {impl};\n")
+    (clone / "jaxlib" / "target.cc").symlink_to("impl_a.cc")
     commit({"jaxlib/kernel.cc": "int k;\n", "jax/core.py": "post81", ".bazelrc": "build --copt=-O2\n",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n', "MODULE.bazel": module,
             "third_party/xla/fix.patch": fix("int f() { return 2; }")}, "the commit post81's plugins were built at")
@@ -346,7 +355,7 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     (output_base / "external" / "xla+").symlink_to(xla)
     (clone / "jax" / "version.py").write_text("_release_version: str | None = None\n")
     cell = patch_stack.recorded(clone, output_base, [
-        "@@//jaxlib:kernel.cc (null)", "@@//jax:version.py (null)", "@@xla+//xla:compiled.cc (5a1b2c)",
+        "@@//jaxlib:kernel.cc (null)", "@@//jaxlib:target.cc (null)", "@@//jax:version.py (null)", "@@xla+//xla:compiled.cc (5a1b2c)",
         "@@xla+//xla:BUILD"])
     run("checkout", "--", "jax/version.py")
     (tmp_path / "dist").mkdir()
@@ -385,6 +394,13 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         commit(change, "a change a build could read")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
+    # A link retargeted to the other implementation, neither file changed: what the build reads changed.
+    (clone / "jaxlib" / "target.cc").unlink()
+    (clone / "jaxlib" / "target.cc").symlink_to("impl_b.cc")
+    run("add", "-A")
+    run("commit", "-qm", "the link retargeted")
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+    run("reset", "-q", "--hard", "HEAD~1")
     # Records beside other wheels than theirs (an attach's record of a rebuild, its first build's wheels kept)
     # pair nothing.
     uploaded["jaxlib-0.12.0.1.post81-cp312.whl"] = hashlib.sha256(b"another build's jaxlib").hexdigest()
@@ -419,6 +435,11 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     monkeypatch.setattr(patch_stack, "released", unread)
     assert patch_stack.plugins("0.12.0.1.post144") == ""
     monkeypatch.setattr(patch_stack, "released", lambda tag: (uploaded, [("x86_64", record), ("aarch64", record)]))
+    # A release lacking a wheel the publish ships (`lacking`: a first batch of Pythons alone) pairs nothing.
+    monkeypatch.setattr(patch_stack, "lacking", lambda *args: ["jax-cuda12-plugin cp313 x86_64"])
+    assert patch_stack.plugins("0.12.0.1.post144", matrix=(("cp313",), ("12",))) == ""
+    monkeypatch.setattr(patch_stack, "lacking", lambda *args: [])
+    assert patch_stack.plugins("0.12.0.1.post144", matrix=(("cp313",), ("12",))) == "plugin-0.12.0.1.post143"
     # Its own version's release ships beside its records only where they describe its wheels and HEAD holds what
     # they read: a compiled change since its build is no build of it.
     assert patch_stack.plugins("0.12.0.1.post143") == "plugin-0.12.0.1.post143"
@@ -427,6 +448,46 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     run("reset", "-q", "--hard", "HEAD~1")
     uploaded.clear()
     assert patch_stack.plugins("0.12.0.1.post143") == ""
+
+
+def test_a_release_lacks_each_wheel_a_publish_ships_that_it_holds_none_of():
+    """`lacking`: each Python's jaxlib (where the release holds a jaxlib at all) and CUDA plugin, and each CUDA's
+    PJRT plugin, for each machine a publish ships; a first batch of Pythons alone lacks the rest."""
+    version, machine = "0.12.1.post3", "x86_64"
+    whole = {f"jaxlib-{version}-cp312-cp312-manylinux_2_27_{machine}.whl",
+             f"jaxlib-{version}-cp313-cp313-manylinux_2_27_{machine}.whl",
+             f"jax_cuda12_pjrt-{version}-py3-none-manylinux_2_27_{machine}.whl",
+             f"jax_cuda12_plugin-{version}-cp312-cp312-manylinux_2_27_{machine}.whl",
+             f"jax_cuda12_plugin-{version}-cp313-cp313-manylinux_2_27_{machine}.whl"}
+    matrix = (("cp312", "cp313"), ("12",))
+    assert patch_stack.lacking(whole, version, (machine,), *matrix) == []
+    first = {name for name in whole if "cp313" not in name}
+    assert patch_stack.lacking(first, version, (machine,), *matrix) == [
+        "jaxlib cp313 x86_64", "jax-cuda12-plugin cp313 x86_64"]
+    stock = {name for name in whole if not name.startswith("jaxlib")}
+    assert patch_stack.lacking(stock, version, (machine,), *matrix) == []
+    assert patch_stack.lacking(whole, version, (machine, "aarch64"), *matrix) == [
+        "jaxlib cp312 aarch64", "jaxlib cp313 aarch64", "jax-cuda12-pjrt aarch64",
+        "jax-cuda12-plugin cp312 aarch64", "jax-cuda12-plugin cp313 aarch64"]
+
+
+def test_a_releases_failed_uploads_are_none_of_its_files(monkeypatch):
+    """`released` reads a release's uploaded files alone: a failed upload's placeholder (GitHub's state "starter"),
+    a wheel or a record, is neither a file it holds nor a record it fetches."""
+    url = "https://github.com/AshishKumar4/jax/releases/download/plugin-0.12.1.post3"
+    listing = {"assets": [
+        {"name": "jaxlib-0.12.1.post3-cp312.whl", "state": "uploaded", "digest": "sha256:" + "1" * 64,
+         "browser_download_url": f"{url}/jaxlib.whl"},
+        {"name": "jaxlib-0.12.1.post3-cp313.whl", "state": "starter", "digest": None,
+         "browser_download_url": f"{url}/partial.whl"},
+        {"name": "sources-x86_64-py3.13.json", "state": "starter", "digest": None,
+         "browser_download_url": f"{url}/sources.json"}]}
+
+    def opened(address, timeout):
+        assert address.startswith("https://api.github.com/"), f"{address}: a placeholder fetched"
+        return io.BytesIO(json.dumps(listing).encode())
+    monkeypatch.setattr(patch_stack.urllib.request, "urlopen", opened)
+    assert RELEASED("plugin-0.12.1.post3") == ({"jaxlib-0.12.1.post3-cp312.whl": "1" * 64}, [])
 
 
 def test_a_build_is_refused_where_the_index_lacks_its_base_release(tmp_path):

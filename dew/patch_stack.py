@@ -60,6 +60,7 @@ import argparse
 import ast
 import base64
 import contextlib
+import fnmatch
 import hashlib
 import html
 import io
@@ -209,6 +210,14 @@ def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
     def take(path: Path) -> None:
         if not path.is_file():
             return
+        # A checkout's symlink on the way to it by its own path and what it names (as Git holds a link: its target's
+        # text), beside the bytes it reaches: retargeting one to another file both of which stay unchanged is a
+        # change to what the build reads.
+        if path.is_relative_to(workspace):
+            for depth in range(1, len(path.relative_to(workspace).parts) + 1):
+                link = workspace.joinpath(*path.relative_to(workspace).parts[:depth])
+                if link.is_symlink():
+                    main[str(link.relative_to(workspace))] = digest(os.readlink(link).encode())
         real = path.resolve()
         # Keyed where its bytes lie: a repository that vendors another (TSL within XLA's tree, linked as its own
         # repository) records the file as the vendoring repository's, whose patches change it (`differences`).
@@ -443,7 +452,9 @@ def released(tag: str) -> tuple[dict[str, str], list[tuple[str, dict]]]:
     address = f"https://api.github.com/repos/AshishKumar4/jax/releases/tags/{tag}"
     try:
         with urllib.request.urlopen(address, timeout=120) as response:
-            listed = json.loads(response.read())["assets"]
+            # Uploaded files alone: a failed upload leaves a placeholder (state "starter") no build made.
+            listed = [asset for asset in json.loads(response.read())["assets"]
+                      if asset.get("state", "uploaded") == "uploaded"]
         uploaded = {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in listed}
         records = []
         for asset in sorted(listed, key=lambda found: found["name"]):
@@ -464,7 +475,28 @@ def bound(record: dict, uploaded: dict[str, str]) -> bool:
                                               record["wheels"].items())
 
 
-def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[str, str] | None = None) -> str:
+def lacking(names: set[str], version: str, machines: tuple[str, ...], pythons: tuple[str, ...],
+            cudas: tuple[str, ...]) -> list[str]:
+    """What a plugin release of `version` holding files `names` lacks of what a publish ships (patch-stack.yml's
+    native set): jaxlib for every Python and machine where it holds a jaxlib at all (none: the release's stock
+    one), and every CUDA's PJRT plugin for each machine and its CUDA plugin for each Python and machine."""
+    def held(pattern: str) -> bool:
+        return any(fnmatch.fnmatchcase(name, pattern) for name in names)
+    missing = []
+    if held(f"jaxlib-{version}-*.whl"):
+        missing += [f"jaxlib {python} {machine}" for machine in machines for python in pythons
+                    if not held(f"jaxlib-{version}-{python}-{python}-manylinux_*_{machine}.whl")]
+    for cuda in cudas:
+        for machine in machines:
+            if not held(f"jax_cuda{cuda}_pjrt-{version}-py3-none-manylinux_*_{machine}.whl"):
+                missing.append(f"jax-cuda{cuda}-pjrt {machine}")
+            missing += [f"jax-cuda{cuda}-plugin {python} {machine}" for python in pythons
+                        if not held(f"jax_cuda{cuda}_plugin-{version}-{python}-{python}-manylinux_*_{machine}.whl")]
+    return missing
+
+
+def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[str, str] | None = None,
+            matrix: tuple[tuple[str, ...], tuple[str, ...]] | None = None) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
     native code is HEAD's: HEAD differs only in `PYTHON_ONLY` (jax's Python package, its tests, its docs) from
@@ -478,7 +510,10 @@ def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[s
     (X.postN.devM) is never one: the index never listed it. `machines`, those whose plugins the publish ships (its
     `machines`), each with a record where the release's builds record. `verified`, where given, is filled with the
     wheels its records bound by name and digest, which the publish then downloads alone and checks (a release whose
-    builds recorded nothing leaves it empty): an asset uploaded after this read is none of them."""
+    builds recorded nothing leaves it empty): an asset uploaded after this read is none of them. `matrix`, where
+    given, the Pythons and CUDAs a publish ships (cp312 ..., 12 ...): a release lacking any of their wheels for
+    `machines` (`lacking`: one holding a first batch of Pythons alone) pairs nothing, and an older whole one is
+    tried."""
     release, _, post = version.rpartition(".post")
     tags = git("ls-remote", "origin", "refs/tags/plugin-*").split()[1::2]
     published = {int(match.group(2)): tag for tag in tags
@@ -496,6 +531,10 @@ def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[s
             print(f"plugins: {unread}; its plugins pair nothing", file=sys.stderr)
             continue
         records = [record for _, record in built]
+        if matrix is not None and (missing := lacking(set(uploaded), name.removeprefix("plugin-"), machines,
+                                                      *matrix)):
+            print(f"plugins: {name} lacks {', '.join(missing)}; its plugins pair nothing", file=sys.stderr)
+            continue
         if records or found > LEGACY_THROUGH.get(release, 0):
             # Every machine shipped has a record, each bound to its wheels, and the records together cover every
             # wheel the release holds: an upload no record describes pairs nothing.
@@ -909,6 +948,8 @@ def main() -> int:
     shipping.add_argument("version")
     shipping.add_argument("--machines", nargs="+", choices=MACHINES, default=list(MACHINES),
                           help="the machines whose plugins the publish ships (patch-stack.yml's `machines`)")
+    shipping.add_argument("--pythons", nargs="+", help="with --cudas, the wheels a whole release holds (`lacking`)")
+    shipping.add_argument("--cudas", nargs="+")
     shipping.add_argument("--wheels", type=Path,
                           help="where to write the wheels its records bound, by name and sha256 (JSON)")
     recording = commands.add_parser("record", help="what one plugin build cell read (`recorded`, `read_by`)")
@@ -962,7 +1003,8 @@ def main() -> int:
         return 0
     if args.command == "plugins":
         verified: dict[str, str] = {}
-        print(plugins(args.version, tuple(args.machines), verified))
+        matrix = (tuple(args.pythons), tuple(args.cudas)) if args.pythons and args.cudas else None
+        print(plugins(args.version, tuple(args.machines), verified, matrix))
         if args.wheels is not None:
             args.wheels.write_text(json.dumps(verified, sort_keys=True))
         return 0

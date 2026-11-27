@@ -27,9 +27,9 @@
 # seconds (builds.tsv) and the commit built (commit.txt).
 set -euo pipefail
 ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
-# A batch's Pythons in one order, whatever order they were asked in: its files are named by them (`batch`), and a
-# batch asked as "3.14 3.12" is the one asked as "3.12 3.14".
-pythons=$(printf '%s\n' $pythons | sort -V | xargs)
+# A batch's Pythons in one order and each once, however they were asked: its files are named by them (`batch`), as
+# the fleet's attach names them from its wheels' tags, and a batch asked as "3.14 3.12 3.12" is "3.12 3.14".
+pythons=$(printf '%s\n' $pythons | sort -uV | xargs)
 # What names this batch's files beside its wheels (its sums, its debug archive, its record): a machine's builds for
 # other Pythons, attached to one release, each keep their own.
 batch=$(uname -m)-py$(echo "$pythons" | tr ' ' '-')
@@ -211,7 +211,10 @@ tar -C "$out/debug" -czf "$out/debug-$batch.tar.gz" .build-id
 # fleet job's extra/).
 python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" merged "$(cat "$out/commit.txt")" "$out/dist" "$out"/read/*.json \
   > "$out/sources-$batch.json"
-(cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
+# Its sums as its record states them (each wheel hashed once, by `merged`), in sha256sum's form.
+python3 -c 'import json, sys
+for name, sha in sorted(json.load(open(sys.argv[1]))["wheels"].items()):
+    print(f"{sha}  {name}")' "$out/sources-$batch.json" | tee "$out/wheels.sha256"
 cp "$out/wheels.sha256" "$out/wheels-$batch.sha256"
 column -t -s $'\t' "$out/builds.tsv"
 # A red test leaves the wheels built and fails the job.
