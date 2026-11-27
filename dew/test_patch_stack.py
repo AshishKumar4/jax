@@ -389,6 +389,8 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     assert patch_stack.plugins("0.12.0.1.post82", ("x86_64",)) == "plugin-0.12.0.1.post81"
     # A release past LEGACY_THROUGH pairs through its records alone, never by the path rule.
     assert patch_stack.plugins("0.12.0.1.post144") == ""
+    # A series LEGACY_THROUGH names no post of records from its first: its release with none pairs nothing.
+    assert patch_stack.plugins("0.12.9.post1") == ""
     monkeypatch.setattr(patch_stack, "built_from", lambda tag: {"x86_64": record, "aarch64": record})
     assert patch_stack.plugins("0.12.0.1.post144") == "plugin-0.12.0.1.post143"
     # Its own version's release ships beside its records only where they describe its wheels and HEAD holds what
@@ -397,8 +399,6 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     commit({"jaxlib/kernel.cc": "int k2;\n"}, "a compiled change since the build")
     assert patch_stack.plugins("0.12.0.1.post143") == ""
     run("reset", "-q", "--hard", "HEAD~1")
-    # A series LEGACY_THROUGH names no post of records from its first: its release with none pairs nothing.
-    assert patch_stack.plugins("0.12.9.post1") == ""
     uploaded.clear()
     assert patch_stack.plugins("0.12.0.1.post143") == ""
 
