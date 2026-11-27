@@ -140,10 +140,6 @@ archive_override(
         # limit is hollowed right after layout assignment: its autotuning and
         # scheduling run over nothing, and it stops stating those bytes alone.
         "//third_party:xla/memory_limit_hollow.patch",
-        # The nvJitLink stub names the library it loaded, its path and the
-        # build id of its mapping (XlaNvJitLinkLibrary, XlaNvJitLinkBuildId),
-        # which the CUDA plugin exports.
-        "//third_party:xla/nvjitlink_library.patch",
         # A rank whose collective kernel fails before its local clique's
         # rendezvous (its scratch past the device's memory) joins it carrying
         # the failure, which its peers return rather than wait for it; and a
