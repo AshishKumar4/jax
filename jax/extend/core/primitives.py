@@ -48,12 +48,9 @@ from jax._src.custom_derivatives import (
 
 from jax._src.debugging import (
   debug_callback_p as debug_callback_p,
-  debug_print_p as debug_print_p,
 )
 
 from jax._src.dispatch import device_put_p as device_put_p
-
-from jax._src.ffi import ffi_call_p as ffi_call_p
 
 from jax._src.interpreters.ad import (
   add_jaxvals_p as add_jaxvals_p,
@@ -291,14 +288,12 @@ from jax._src.random.threefry2x32 import (
 )
 
 from jax._src.random.core import (
-  random_clone_p as random_clone_p,
   random_gamma_p as random_gamma_p,
 )
 
 from jax._src.shard_map import shard_map_p as shard_map_p
 
 from jax._src.state.primitives import (
-  addupdate_p as addupdate_p,
   get_p as get_p,
   swap_p as swap_p,
 )

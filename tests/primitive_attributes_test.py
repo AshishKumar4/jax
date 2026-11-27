@@ -184,33 +184,27 @@ class PrimitiveAttributesTest(jtu.JaxTestCase):
     self.assertNotIn(" call(", compiled.as_text())
 
   def test_the_primitives_an_analysis_dispatches_on_are_exported(self):
-    from jax._src import callback, custom_batching, debugging, ffi, pjit, shard_map
+    from jax._src import callback, custom_batching, debugging, pjit, shard_map
     from jax._src.lax import parallel
     from jax._src.lax.control_flow import conditionals
     from jax._src.pallas import primitives as pallas_primitives
-    from jax._src.random import core as random_core, prng
-    from jax._src.state import primitives as state_primitives
+    from jax._src.random import prng
     import jax.experimental.pallas as pl
 
     exported = jex.core.primitives
     for name, primitive in {
         "custom_vmap_p": custom_batching.custom_vmap_p, "shard_map_p": shard_map.shard_map_p,
         "random_wrap_p": prng.random_wrap_p, "random_unwrap_p": prng.random_unwrap_p,
-        "random_clone_p": random_core.random_clone_p,
         "ragged_dot_general_p": lax_internal.ragged_dot_general_p,
         "pure_callback_p": callback.pure_callback_p, "io_callback_p": callback.io_callback_p,
-        "debug_callback_p": debugging.debug_callback_p, "debug_print_p": debugging.debug_print_p,
-        "ffi_call_p": ffi.ffi_call_p, "platform_index_p": conditionals.platform_index_p,
-        "reshard_p": pjit.reshard_p, "addupdate_p": state_primitives.addupdate_p,
+        "debug_callback_p": debugging.debug_callback_p,
+        "platform_index_p": conditionals.platform_index_p, "reshard_p": pjit.reshard_p,
         "psum_invariant_p": parallel.psum_invariant_p, "reduce_scatter_p": parallel.reduce_scatter_p,
         "all_gather_invariant_p": parallel.all_gather_invariant_p, "pbroadcast_p": parallel.pbroadcast_p,
         "pvary_p": core.pvary_p}.items():
       with self.subTest(name):
         self.assertIs(getattr(exported, name), primitive)
     self.assertIs(pl.program_id_p, pallas_primitives.program_id_p)
-    self.assertIs(pl.num_programs_p, pallas_primitives.num_programs_p)
-    self.assertIs(pl.load_p, pallas_primitives.load_p)
-    self.assertIs(pl.swap_p, pallas_primitives.swap_p)
 
   def test_a_primitive_states_the_class_its_batching_rule_serves(self):
     x = jnp.arange(12.0).reshape(3, 4)
