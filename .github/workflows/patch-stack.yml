@@ -318,14 +318,16 @@ jobs:
           # publish left out (`machines`) is added by the next (2026-11-08: post67's aarch64 plugins, built after
           # its x86_64 publish, reached the index with post68's).
           mkdir -p native
-          if [ -z "$(cd jax && python3 ../dew/dew/patch_stack.py native "$RELEASE")" ]; then
+          # Its own statement, so a failed comparison fails the step rather than reading as none.
+          changed=$(cd jax && python3 ../dew/dew/patch_stack.py native "$RELEASE")
+          if [ -z "$changed" ]; then
             echo "no native patch: jax alone"
             exit 0
           fi
           version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
-          # shellcheck disable=SC2086 # Each machine its own word.
           # A release holding every wheel the publish ships (each Python's and CUDA's for each machine): one with a
           # first batch of Pythons alone is passed over for an older whole one (`lacking`).
+          # shellcheck disable=SC2086 # Each machine its own word.
           plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version" --machines $MACHINES \
             --pythons $PYTHONS --cudas $CUDAS --wheels ../verified.json)
           if [ -z "$plugins" ]; then
@@ -339,20 +341,16 @@ jobs:
           # The wheels its records bound, or a release from before the records its uploaded wheels (`plugins`), by
           # name, each checked against its digest where GitHub states one: an asset uploaded since the pairing read
           # the release, or a failed upload's placeholder, is none of them.
-          if [ "$(python3 -c 'import json; print(len(json.load(open("verified.json"))))')" = 0 ]; then
-            gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "*.whl"
-          else
-            python3 -c 'import json; print("\n".join(json.load(open("verified.json"))))' | while read -r wheel; do
-              gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "$wheel"
-            done
-            python3 - <<'CHECK'
+          python3 -c 'import json; print("\n".join(json.load(open("verified.json"))))' | while read -r wheel; do
+            gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "$wheel"
+          done
+          python3 - <<'CHECK'
           import hashlib, json, pathlib, sys
           for name, want in json.load(open("verified.json")).items():
               got = hashlib.sha256(pathlib.Path("native", name).read_bytes()).hexdigest()
               if want and got != want:
                   sys.exit(f"::error::{name}: sha256 {got}, its record binds {want}")
           CHECK
-          fi
           ls native
       - name: Test the stack's wheel
         run: |
@@ -492,7 +490,9 @@ jobs:
               release=${VERSION%.post*}
               git -C jax fetch -q --no-tags https://github.com/jax-ml/jax.git \
                 "refs/tags/jax-v$release:refs/tags/jax-v$release"
-              if [ -n "$(cd jax && python3 ../dew/dew/patch_stack.py native "$release")" ]; then
+              # Its own statement, so a failed comparison fails the step rather than reading as none.
+              changed=$(cd jax && python3 ../dew/dew/patch_stack.py native "$release")
+              if [ -n "$changed" ]; then
                 echo "::error::no whole plugin release holds $VERSION's native code for $MACHINES"
                 exit 1
               fi

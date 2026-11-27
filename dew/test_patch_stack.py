@@ -331,7 +331,9 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     for impl in ("a", "b"):
         (clone / "jaxlib" / f"impl_{impl}.cc").write_text(f"int {impl};\n")
     (clone / "jaxlib" / "picked.cc").symlink_to("impl_a.cc")
-    (clone / "jaxlib" / "target.cc").symlink_to("picked.cc")
+    (clone / "jaxlib" / "sub").mkdir()
+    (clone / "jaxlib" / "sub" / "BUILD.txt").write_text("a directory a link steps through\n")
+    (clone / "jaxlib" / "target.cc").symlink_to("sub/../picked.cc")
     commit({"jaxlib/kernel.cc": "int k;\n", "jax/core.py": "post81", ".bazelrc": "build --copt=-O2\n",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n', "MODULE.bazel": module,
             "third_party/xla/fix.patch": fix("int f() { return 2; }")}, "the commit post81's plugins were built at")
@@ -404,6 +406,13 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         run("commit", "-qm", f"{link} retargeted")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
+    # A link replaced by a file of its text (one blob, another mode): a source, not the link it was.
+    (clone / "jaxlib" / "picked.cc").unlink()
+    (clone / "jaxlib" / "picked.cc").write_text("impl_a.cc")
+    run("add", "-A")
+    run("commit", "-qm", "the link a file")
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+    run("reset", "-q", "--hard", "HEAD~1")
     # Records beside other wheels than theirs (an attach's record of a rebuild, its first build's wheels kept)
     # pair nothing.
     uploaded["jaxlib-0.12.0.1.post81-cp312.whl"] = hashlib.sha256(b"another build's jaxlib").hexdigest()
@@ -459,18 +468,25 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
 
 
 def test_a_lookups_links_are_each_keyed_where_git_holds_them(tmp_path):
-    """`hops`: each symlink a lookup passes, a link to a link and a link reached through a directory link, keyed by
-    its real path in the checkout (the path Git holds it at, not the alias it was reached by) and its target's
-    text; none outside the checkout."""
+    """`hops`: each symlink a lookup passes, a link to a link, a link reached through a directory link and one past
+    a parent step, keyed by its real path in the checkout (the path Git holds it at, not the alias it was reached
+    by, nor a path holding ..) and its target's text, as a link (`LINK`); none outside the checkout."""
     (tmp_path / "w" / "real").mkdir(parents=True)
     workspace = (tmp_path / "w").resolve()  # As `recorded` takes it: a link above the checkout is none of its.
     (workspace / "real" / "g.cc").write_text("int g;\n")
     (workspace / "real" / "f.cc").symlink_to("g.cc")
     (workspace / "alias").symlink_to("real")
     (workspace / "chain.cc").symlink_to("alias/f.cc")
+    (workspace / "real" / "sub").mkdir()
+    (workspace / "dotted.cc").symlink_to("real/sub/../f.cc")
+
+    def link(text: bytes) -> str:
+        return patch_stack.LINK + patch_stack.digest(text)
     assert patch_stack.hops(workspace / "chain.cc", workspace) == {
-        "chain.cc": patch_stack.digest(b"alias/f.cc"), "alias": patch_stack.digest(b"real"),
-        "real/f.cc": patch_stack.digest(b"g.cc")}
+        "chain.cc": link(b"alias/f.cc"), "alias": link(b"real"), "real/f.cc": link(b"g.cc")}
+    # A parent step taken from where it stands: real/sub/.. is real, and its f.cc the link Git holds there.
+    assert patch_stack.hops(workspace / "dotted.cc", workspace) == {
+        "dotted.cc": link(b"real/sub/../f.cc"), "real/f.cc": link(b"g.cc")}
     assert patch_stack.hops(workspace / "real" / "g.cc", workspace) == {}
 
 

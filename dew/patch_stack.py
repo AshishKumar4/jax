@@ -192,21 +192,31 @@ def starlark(path: str) -> bool:
     return path.endswith(".bzl") or Path(path).name in STARLARK
 
 
+LINK = "symlink:"
+"""How a record keeps a symlink of the checkout (`hops`) apart from a file of the same bytes: its target's text's
+`digest` after it, as `committed` reads a link Git holds (mode 120000)."""
+
+
 def hops(path: Path, workspace: Path) -> dict[str, str]:
     """Each symlink inside `workspace` that looking up `path` passes through, hop by hop as the kernel follows
-    them (a link to a link, a link through a directory link), by its real path in the checkout, which is the
-    path Git holds it at: the `digest` of the text it names, as `git show` gives a link's blob."""
+    them (a link to a link, a link through a directory link, a parent step after a link taken from where the link
+    led), by its real path in the checkout, which is the path Git holds it at: `LINK` and the `digest` of the text
+    it names."""
     found, current, parts = {}, Path(path.anchor), list(path.parts[1:])
     for _ in range(256):
         if not parts:
             return found
-        step = current / parts.pop(0)
+        part = parts.pop(0)
+        if part in (".", ".."):
+            current = current if part == "." else current.parent
+            continue
+        step = current / part
         if not step.is_symlink():
             current = step
             continue
         target = os.readlink(step)
         if step.is_relative_to(workspace):
-            found[str(step.relative_to(workspace))] = digest(target.encode())
+            found[str(step.relative_to(workspace))] = LINK + digest(target.encode())
         current = Path(step.anchor) if Path(target).is_absolute() else current
         parts = list(Path(target).parts[1:] if Path(target).is_absolute() else Path(target).parts) + parts
     raise ValueError(f"{path}: too many links to follow")
@@ -399,6 +409,29 @@ def tree(root: Path) -> dict[str, str]:
     return {str(path.relative_to(root)): digest(path.read_bytes()) for path in root.rglob("*") if path.is_file()}
 
 
+def committed(commit: str, paths: set[str]) -> dict[str, str]:
+    """Each of `paths` `commit` holds, as a record keeps it: a file's `digest`, a symlink's `LINK` and its text's
+    (Git's mode 120000), so a link and a file of its bytes are two things; none for a path it does not hold. Its
+    tree listed once and its blobs read in one batch."""
+    listed = {}
+    for entry in filter(None, git("ls-tree", "-r", "-z", commit).split("\0")):
+        meta, _, path = entry.partition("\t")
+        if path in paths:
+            mode, _, sha = meta.split()
+            listed[path] = (mode, sha)
+    order = sorted(listed)
+    asked = "".join(f"{listed[path][1]}\n" for path in order).encode()
+    out = subprocess.run(["git", "cat-file", "--batch"], input=asked, capture_output=True, check=True).stdout
+    found, at = {}, 0
+    for path in order:
+        header_end = out.index(b"\n", at)
+        size = int(out[at:header_end].split()[2])
+        body = out[header_end + 1:header_end + 1 + size]
+        at = header_end + 1 + size + 1
+        found[path] = (LINK if listed[path][0] == "120000" else "") + digest(body)
+    return found
+
+
 def differences(record: dict, built: str, commit: str = "HEAD",
                 made: dict[tuple[str, str], dict[str, str] | str] | None = None) -> list[str]:
     """What `commit` holds that could build otherwise than the plugin build at commit `built` did (a machine's
@@ -415,10 +448,10 @@ def differences(record: dict, built: str, commit: str = "HEAD",
     made = {} if made is None else made
     differing = [f"{path}: launches the build" for path in
                  git("diff", "--name-only", built, commit, "--", *LAUNCHING).split()]
+    holds = committed(commit, {path for cell in record["cells"].values() for path in cell["main"]})
     for name, cell in sorted(record["cells"].items()):
         for path, wanted in sorted(cell["main"].items()):
-            held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
-            if held.returncode != 0 or digest(held.stdout) != wanted:
+            if holds.get(path) != wanted:
                 differing.append(f"{name}: {path}")
     # A .bzl file anywhere, and any other Starlark file (`starlark`) in a package holding a file a cell read,
     # changed or added: a BUILD.bazel beside a recorded BUILD takes its place, and a new BUILD file below a
