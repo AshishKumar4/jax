@@ -243,6 +243,86 @@ dumped with the kernel's name and hash once the module is lowered to its custom
 call, where MOSAIC_GPU_DUMP_RESOURCES asks for it."""
 
 
+@dataclasses.dataclass(frozen=True)
+class SerializedKernel:
+  """What the Mosaic GPU custom call holds of a module (`serialized_kernel`):
+  its serde pass's bytecode, the hash naming its kernel, the resource estimate
+  it carried, and what its communication reads. A module's is the same each
+  time it is made, so a lowering cache can keep it with the lowering and a hit
+  makes the custom call with no serde pass, bytecode or hash
+  (`_mosaic_gpu_lowering_rule`'s `serialized`)."""
+
+  forward_compatible: bool
+  module_asm: bytes
+  kernel_id: bytes
+  resources: str | None
+  sym_name: str
+  has_communication: bool
+  uses_collective_metadata: bool
+  symmetric_memory_args: tuple[bool, ...] | None
+
+
+def serialized_kernel(
+    module: ir.Module, forward_compatible: bool
+) -> SerializedKernel:
+  """`module` as its custom call holds it, the serde pass run over `module`
+  in place (`FWD_COMPAT_IR_VERSION` where `forward_compatible`)."""
+  has_communication = _has_communication(module)
+  module = _run_serde_pass(
+      module,
+      serialize=True,
+      ir_version=FWD_COMPAT_IR_VERSION if forward_compatible else None,
+  )
+
+  # A resource estimate (`RESOURCES_ATTR`) is no part of the kernel: it leaves
+  # the module before the hash, and is dumped with the hash that names its
+  # kernel.
+  resources = None
+  if RESOURCES_ATTR in module.operation.attributes:
+    resources = ir.StringAttr(module.operation.attributes[RESOURCES_ATTR]).value
+    del module.operation.attributes[RESOURCES_ATTR]
+
+  # Prior to computing the kernel hash, we temporarily remove the dump basename
+  # attribute from the module. This ensures that modules with different dump
+  # basenames but otherwise identical will have the same kernel hash, and thus
+  # will share the same compiled kernel.
+  dump_basename_attr_name = "mosaic_gpu.dump_basename"
+  if dump_basename_attr_name in module.operation.attributes:
+    dump_basename_attr = module.operation.attributes[dump_basename_attr_name]
+  else:
+    dump_basename_attr = None
+  module.operation.attributes[dump_basename_attr_name] = ir.UnitAttr.get()
+
+  bytecode_buffer = io.BytesIO()
+  module.operation.write_bytecode(bytecode_buffer, desired_version=0)
+  module_asm = bytecode_buffer.getvalue()
+  kernel_id = kernel_hash(module)
+
+  if dump_basename_attr is not None:
+    module.operation.attributes[dump_basename_attr_name] = dump_basename_attr
+
+  symmetric = None
+  if launch_context.SYMMETRIC_MEMORY_ARGS_ATTR in module.operation.attributes:
+    symmetric = tuple(bool(v) for v in np.array(
+        ir.DenseIntElementsAttr(
+            module.operation.attributes[
+                launch_context.SYMMETRIC_MEMORY_ARGS_ATTR
+            ]
+        ),
+        dtype=bool,
+    ))
+  return SerializedKernel(
+      forward_compatible=forward_compatible,
+      module_asm=module_asm,
+      kernel_id=kernel_id,
+      resources=resources,
+      sym_name=ir.StringAttr(module.operation.attributes["sym_name"]).value,
+      has_communication=has_communication,
+      uses_collective_metadata=launch_context.uses_collective_metadata(module),
+      symmetric_memory_args=symmetric,
+  )
+
+
 def _mosaic_gpu_lowering_rule(
     ctx,
     *args,
@@ -254,16 +334,24 @@ def _mosaic_gpu_lowering_rule(
     skip_device_barrier: bool = False,
     collective_id: int | None = None,
     metadata: bytes = b"",
+    serialized: SerializedKernel | None = None,
 ):
   """`module` as XLA's Mosaic GPU custom call.
 
   `metadata`, where given, is the caller's statement of the launch (an
   identity, a resource decision), opaque to Mosaic and kept in the compiled
-  call's serialization (MosaicGpuKernelProto.caller_metadata).
+  call's serialization (MosaicGpuKernelProto.caller_metadata). `serialized`,
+  where given, is what the call holds of `module` (`serialized_kernel`, as a
+  lowering cache kept it): it is used as it is where it was made for this
+  lowering's forward compatibility, and made from `module` otherwise.
   """
+  if serialized is None or serialized.forward_compatible != (
+      ctx.is_forward_compat()
+  ):
+    serialized = serialized_kernel(module, ctx.is_forward_compat())
   axis_context = ctx.module_context.axis_context
   replica_ids = []
-  if is_multi_device_module := _has_communication(module):
+  if is_multi_device_module := serialized.has_communication:
     # Those checks are trying to ensure that the logical device ids are
     # consistent with the NVSHMEM PE ids that Mosaic will be using for
     # communication. Any divergence here would require us to implement a logical
@@ -301,45 +389,14 @@ def _mosaic_gpu_lowering_rule(
     )
   assert len(ctx.avals_in) == len(args)
   assert len(ctx.avals_out) == len(out_types) + len(inout_types)
-  module = _run_serde_pass(
-      module,
-      serialize=True,
-      ir_version=FWD_COMPAT_IR_VERSION if ctx.is_forward_compat() else None,
+  kernel_id, module_asm, resources = (
+      serialized.kernel_id, serialized.module_asm, serialized.resources
   )
-
-  # A resource estimate (`RESOURCES_ATTR`) is no part of the kernel: it leaves
-  # the module before the hash, and is dumped with the hash that names its
-  # kernel.
-  resources = None
-  if RESOURCES_ATTR in module.operation.attributes:
-    resources = ir.StringAttr(module.operation.attributes[RESOURCES_ATTR]).value
-    del module.operation.attributes[RESOURCES_ATTR]
-
-  # Prior to computing the kernel hash, we temporarily remove the dump basename
-  # attribute from the module. This ensures that modules with different dump
-  # basenames but otherwise identical will have the same kernel hash, and thus
-  # will share the same compiled kernel.
-  dump_basename_attr_name = "mosaic_gpu.dump_basename"
-  if dump_basename_attr_name in module.operation.attributes:
-    dump_basename_attr = module.operation.attributes[dump_basename_attr_name]
-  else:
-    dump_basename_attr = None
-  module.operation.attributes[dump_basename_attr_name] = ir.UnitAttr.get()
-
-  bytecode_buffer = io.BytesIO()
-  module.operation.write_bytecode(bytecode_buffer, desired_version=0)
-  module_asm = bytecode_buffer.getvalue()
-  kernel_id = kernel_hash(module)
-
-  if dump_basename_attr is not None:
-    module.operation.attributes[dump_basename_attr_name] = dump_basename_attr
-
   if resources is not None:
     dump_options = dialect.get_or_set_dump_options(module)
     if dump_options.resources:
-      name = ir.StringAttr(module.operation.attributes["sym_name"]).value
       utils.dump_to_file_or_stdout(
-          f"{name} {kernel_id.hex()} {resources}",
+          f"{serialized.sym_name} {kernel_id.hex()} {resources}",
           f"{dump_options.module_basename}.resources.txt",
           dump_options.dump_path,
       )
@@ -349,7 +406,7 @@ def _mosaic_gpu_lowering_rule(
       module=ir.StringAttr.get(module_asm),
       skip_device_barrier=ir.BoolAttr.get(skip_device_barrier),
       uses_xla_collective_metadata=ir.BoolAttr.get(
-          launch_context.uses_collective_metadata(module)
+          serialized.uses_collective_metadata
       ),
   )
   # TODO(patrios): Remove once the minimum jaxlib version is >= 0.12.1.
@@ -383,14 +440,9 @@ def _mosaic_gpu_lowering_rule(
         ",".join(map(str, replica_ids))
     )
 
-    if launch_context.SYMMETRIC_MEMORY_ARGS_ATTR in module.operation.attributes:
+    if serialized.symmetric_memory_args is not None:
       symmetric_memory_args = np.array(
-          ir.DenseIntElementsAttr(
-              module.operation.attributes[
-                  launch_context.SYMMETRIC_MEMORY_ARGS_ATTR
-              ]
-          ),
-          dtype=bool,
+          serialized.symmetric_memory_args, dtype=bool
       )
       # The Mosaic runtime uses this to decide which buffers to exchange with
       # the peers through the collective metadata.

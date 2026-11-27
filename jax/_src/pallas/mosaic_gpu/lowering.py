@@ -764,6 +764,9 @@ class LoweringResult:
   profiler_spec: mgpu_profiler.ProfilerSpec | None
   gmem_scratch_shapes: tuple[jax.ShapeDtypeStruct, ...]
   use_barrier_semaphore: bool = False
+  # What the custom call holds of `module`, where a lowering cache kept it
+  # (`mgpu.core.serialized_kernel`); made from `module` where none.
+  serialized: Any = None
 
 
 class LoweringError(Exception):
