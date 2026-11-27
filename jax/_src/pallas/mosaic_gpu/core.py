@@ -155,6 +155,10 @@ class CompilerParams:
       ``__launch_bounds__``. ptxas limits the registers per thread so that this
       many blocks fit the register file (spilling if it must). Defaults to 1,
       which leaves ptxas free to use up to 255 registers per thread.
+    max_registers_per_thread: The most registers ptxas may allocate a thread
+      of the kernel (the kernel's ``.maxnreg``, CUDA's ``__maxnreg__``), an
+      int in [24, 255], spilling past it; every ``set_max_registers`` count of
+      the kernel at most it. None, the default, leaves ptxas its own choice.
   """
   approx_math: bool = False
   dimension_semantics: Sequence[DimensionSemantics] | None = None
@@ -171,8 +175,17 @@ class CompilerParams:
   collective_id: int | None = None
   metadata: bytes = b""
   min_blocks_per_sm: int = 1
+  max_registers_per_thread: int | None = None
 
   def __post_init__(self):
+    if self.max_registers_per_thread is not None and not (
+        type(self.max_registers_per_thread) is int
+        and 24 <= self.max_registers_per_thread <= 255
+    ):
+      raise ValueError(
+          "max_registers_per_thread must be None or an int in [24, 255], got"
+          f" {self.max_registers_per_thread!r}"
+      )
     if self.collective_id is not None and not (
         0 <= self.collective_id < mgpu.launch_context.MAX_COLLECTIVE_IDS
     ):

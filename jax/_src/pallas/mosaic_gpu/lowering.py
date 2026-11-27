@@ -545,6 +545,8 @@ class ModuleContext:
   # The warpgroups the block runs, which split the reduction scratch between
   # them (`warpgroup_reduction_scratch_bytes`).
   warpgroups: int = 1
+  # See the documentation of max_registers_per_thread in CompilerParams.
+  max_registers_per_thread: int | None = None
 
   @property
   def warpgroup_reduction_scratch_bytes(self) -> int:
@@ -952,6 +954,7 @@ def lower_jaxpr_to_module(
         reduction_scratch_bytes=params.reduction_scratch_bytes,
         warpgroups=block[0] // WARPGROUP_SIZE,
         outer_traceback=outer_traceback,
+        max_registers_per_thread=params.max_registers_per_thread,
     )
     del runtime_smem, grouped_barriers, runtime_barriers
     _ = lower_jaxpr_to_mosaic_gpu(
@@ -1061,6 +1064,7 @@ def lower_jaxpr_to_module(
       is_multi_process=params.is_multi_process,
       use_barrier_semaphore=rs.use_barrier_semaphore,
       min_blocks_per_sm=params.min_blocks_per_sm,
+      max_registers_per_thread=params.max_registers_per_thread,
   )
 
   mgpu_core.lower_mgpu_module(

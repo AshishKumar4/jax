@@ -1122,10 +1122,18 @@ def _lower_as_gpu_kernel(
     is_multi_process: bool = False,
     use_barrier_semaphore: bool = False,
     min_blocks_per_sm: int = 1,
+    max_registers_per_thread: int | None = None,
 ):
   if min_blocks_per_sm < 1:
     raise ValueError(
         f"min_blocks_per_sm must be positive, got {min_blocks_per_sm}"
+    )
+  if max_registers_per_thread is not None and not (
+      24 <= max_registers_per_thread <= 255
+  ):
+    raise ValueError(
+        "max_registers_per_thread must be in [24, 255], got"
+        f" {max_registers_per_thread}"
     )
   ptr_ty = llvm.PointerType.get()
   token_ty = gpu.AsyncTokenType.get()
@@ -1156,6 +1164,11 @@ def _lower_as_gpu_kernel(
   attrs["mosaic_gpu.min_blocks_per_sm"] = ir.IntegerAttr.get(
       i32, min_blocks_per_sm
   )
+  # Read by the same pass, which sets nvvm.maxnreg (the kernel's .maxnreg).
+  if max_registers_per_thread is not None:
+    attrs["mosaic_gpu.max_registers_per_thread"] = ir.IntegerAttr.get(
+        i32, max_registers_per_thread
+    )
   attrs["sym_name"] = ir.StringAttr.get(module_name)
   arch_major, arch_minor = utils._infer_arch()
   attrs["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch_major)

@@ -194,7 +194,9 @@ class ByvalInsertionPass
 // Insert the nvvm.minctasm attribute, which is sometimes required for ptxas
 // to recognize setmaxnreg instructions. Its value is the kernel module's
 // "mosaic_gpu.min_blocks_per_sm" attribute where it has one (Pallas's
-// CompilerParams.min_blocks_per_sm), else 1.
+// CompilerParams.min_blocks_per_sm), else 1. Where the module states
+// "mosaic_gpu.max_registers_per_thread" (CompilerParams'
+// max_registers_per_thread), nvvm.maxnreg too: the kernel's .maxnreg.
 class LLVMAttrInsertionPass
     : public jaxlib::mlir::Pass<LLVMAttrInsertionPass, mlir::gpu::GPUModuleOp> {
  public:
@@ -205,10 +207,17 @@ class LLVMAttrInsertionPass
 
   void runOnOperation() override {
     int64_t min_blocks_per_sm = 1;
+    // The kernel's static register cap where its module states one (Pallas's
+    // CompilerParams.max_registers_per_thread): its .maxnreg.
+    std::optional<int64_t> max_registers;
     if (auto parent = getOperation()->getParentOfType<mlir::ModuleOp>()) {
       if (auto attr = parent->getAttrOfType<mlir::IntegerAttr>(
               "mosaic_gpu.min_blocks_per_sm")) {
         min_blocks_per_sm = attr.getInt();
+      }
+      if (auto attr = parent->getAttrOfType<mlir::IntegerAttr>(
+              "mosaic_gpu.max_registers_per_thread")) {
+        max_registers = attr.getInt();
       }
     }
     auto result = getOperation().walk([&](mlir::LLVM::LLVMFuncOp op) {
@@ -220,6 +229,12 @@ class LLVMAttrInsertionPass
           "nvvm.minctasm",
           mlir::IntegerAttr::get(mlir::IntegerType::get(op.getContext(), 32),
                                  min_blocks_per_sm));
+      if (max_registers.has_value()) {
+        op.getOperation()->setAttr(
+            "nvvm.maxnreg",
+            mlir::IntegerAttr::get(
+                mlir::IntegerType::get(op.getContext(), 32), *max_registers));
+      }
       for (unsigned i = 0; i < op.getNumArguments(); ++i) {
         mlir::BlockArgument arg = op.getArgument(i);
         if (!mlir::isa<mlir::LLVM::LLVMPointerType>(arg.getType())) {

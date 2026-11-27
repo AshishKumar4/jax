@@ -3514,7 +3514,14 @@ def _set_max_registers_abstract_eval(*, n: int, action):
 def _set_max_registers_lowering(
     ctx: lowering.LoweringRuleContext, *, n: int, action
 ):
-  del ctx
+  # A count past the kernel's static cap (CompilerParams'
+  # max_registers_per_thread, its .maxnreg) is one ptxas cannot honor.
+  cap = ctx.module_ctx.max_registers_per_thread
+  if cap is not None and n > cap:
+    raise ValueError(
+        f"set_max_registers({n}) is past the kernel's"
+        f" max_registers_per_thread ({cap})"
+    )
   action_str = "inc" if action == "increase" else "dec"
   mgpu_utils.inline_ptx(
       f"setmaxnreg.{action_str}.sync.aligned.u32 {n};", convergent=True

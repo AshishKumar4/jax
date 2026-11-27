@@ -1400,6 +1400,58 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     self.assertIn(f".minnctapersm {min_blocks_per_sm}", out())
     np.testing.assert_array_equal(y, x + 1.0)
 
+  @parameterized.parameters(32, 128)
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_max_registers_per_thread(self, max_registers):
+    # The kernel's PTX entry states the cap, which ptxas allocates within.
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            max_registers_per_thread=max_registers
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.0
+
+    x = jnp.arange(256).astype(jnp.float32)
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
+      y = jax.block_until_ready(kernel(x))
+    self.assertIn(f".maxnreg {max_registers}", out())
+    np.testing.assert_array_equal(y, x + 1.0)
+
+  def test_max_registers_per_thread_is_none_or_within_ptxas_bounds(self):
+    for refused in (23, 256, 64.0, True):
+      with self.assertRaisesRegex(ValueError, "max_registers_per_thread"):
+        plgpu.CompilerParams(max_registers_per_thread=refused)
+    for kept in (None, 24, 255):
+      self.assertEqual(
+          plgpu.CompilerParams(
+              max_registers_per_thread=kept
+          ).max_registers_per_thread,
+          kept,
+      )
+
+  def test_set_max_registers_past_the_cap_is_refused(self):
+    def body(x_ref, o_ref, count):
+      plgpu.set_max_registers(count, action="increase")
+      o_ref[...] = x_ref[...] + 1.0
+
+    x = jnp.arange(256).astype(jnp.float32)
+    for count, refused in ((128, False), (136, True)):
+      kernel = self.kernel(
+          functools.partial(body, count=count),
+          out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+          compiler_params=plgpu.CompilerParams(max_registers_per_thread=128),
+      )
+      lowered = lambda: jax.jit(kernel).lower(x)
+      if refused:
+        with self.assertRaisesRegex(
+            ValueError, r"set_max_registers\(136\) is past the kernel's"
+        ):
+          lowered()
+      else:
+        lowered()
+
   @parameterized.product(
       approx_math=(False, True),
       dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
