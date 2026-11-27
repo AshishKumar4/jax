@@ -757,7 +757,8 @@ class LoweringRuleContext:
 
 @dataclasses.dataclass(frozen=True)
 class LoweringResult:
-  module: ir.Module
+  # None for a lowering a cache holds: its call is made from `serialized`.
+  module: ir.Module | None
   grid: tuple[int, ...]
   block: tuple[int, ...]
   new_out_shapes: tuple[jax.ShapeDtypeStruct, ...]  # Does not include gmem scratch!

@@ -41,6 +41,23 @@ test_suite(
 )
 
 jax_multiplatform_test(
+    name = "triton_pallas_fork_test",
+    srcs = ["triton_pallas_fork_test.py"],
+    enable_backends = ["cpu"],
+    enable_configs = [
+        "gpu_a100",
+        "gpu_h100",
+    ],
+    deps = [
+        "//jax/experimental:pallas",
+        "//jax/experimental:pallas_triton",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "pallas_lowering_determinism_test",
     srcs = ["pallas_lowering_determinism_test.py"],
     enable_backends = [],

@@ -36,6 +36,9 @@ def load_version_module(pkg_path):
 _version_module = load_version_module(project_name)
 __version__ = _version_module._get_version_for_build()
 _jax_version = _version_module._version  # JAX version, with no .dev suffix.
+# The version jax is released as: a post-release of _jax_version where its jaxlib and plugins are
+# released with it, which a bound of _jax_version would refuse.
+_jax_release_version = _version_module._release_version or _jax_version
 _cmdclass = _version_module._get_cmdclass(project_name)
 _minimum_jaxlib_version = _version_module._minimum_jaxlib_version
 
@@ -74,10 +77,13 @@ setup(
     package_data={'jax': ['py.typed', "*.pyi", "**/*.pyi"]},
     python_requires='>=3.12',
     install_requires=[
-        f'jaxlib >={_minimum_jaxlib_version}, <={_jax_version}',
+        f'jaxlib >={_minimum_jaxlib_version}, <={_jax_release_version}',
         'ml_dtypes>=0.7.0',
         'numpy>=2.2',
         'opt_einsum',
+        # jax.extend.mosaic_gpu's reader of a compiled kernel's record parses Mosaic GPU's kernel record
+        # (jax._src.mosaic_gpu_records, its descriptors jax._src.mosaic_gpu_protos).
+        'protobuf>=5.26',
         'scipy>=1.15',
     ],
     extras_require={
@@ -94,36 +100,36 @@ setup(
         # Cloud TPU VM jaxlib can be installed via:
         # $ pip install "jax[tpu]"
         'tpu': [
-          f'jaxlib>={_current_jaxlib_version},<={_jax_version}',
+          f'jaxlib>={_current_jaxlib_version},<={_jax_release_version}',
           f'libtpu=={_libtpu_version}',
           'requests',  # necessary for jax.distributed.initialize
         ],
 
         'cuda': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         'cuda12': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-cuda12-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         'cuda13': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda13-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-cuda13-plugin[with-cuda]>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         # Target that does not depend on the CUDA pip wheels, for those who want
         # to use a preinstalled CUDA.
         'cuda12-local': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda12-plugin>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-cuda12-plugin>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         'cuda13-local': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-cuda13-plugin>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-cuda13-plugin>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         # TheRock ROCm wheels are not on PyPI; pass --extra-index-url for the
@@ -161,13 +167,13 @@ setup(
 
         # Preinstalled ROCm, typically /opt/rocm. Does not pull TheRock wheels.
         'rocm7-local': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
           f"jax-rocm7-plugin=={_jax_version}.*",
         ],
 
         'oneapi': [
-          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
-          f"jax-oneapi-plugin[with-oneapi]>={_current_jaxlib_version},<={_jax_version}",
+          f"jaxlib>={_current_jaxlib_version},<={_jax_release_version}",
+          f"jax-oneapi-plugin[with-oneapi]>={_current_jaxlib_version},<={_jax_release_version}",
         ],
 
         # For automatic bootstrapping distributed jobs in Kubernetes
