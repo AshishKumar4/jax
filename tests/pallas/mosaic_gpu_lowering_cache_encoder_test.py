@@ -65,6 +65,50 @@ class RulesTest(harness.LoweringCacheTestCase):
     self.assertEqual(result["no rule"], "refused")
 
 
+class SourceTest(harness.LoweringCacheTestCase):
+
+  def test_a_file_whose_path_cannot_resolve_to_a_declared_one_is_not_resolved(self):
+    # The seal answers whether a file is a declared package's by its path and,
+    # where that misses, by its resolved one. A path whose trailing components,
+    # no links, end no declared path is answered without resolving it; a path
+    # through a link (to a directory or to the file), a declared file replaced
+    # by a copy of its bytes and asked through another link, a path with a
+    # component the system cannot read (missing, or through more links than
+    # it follows) and a path of another type are resolved; every answer is
+    # what resolving gives. A seal
+    # declaring no package answers a path without reading the file system.
+    # POSIX paths alone: elsewhere every miss is resolved.
+    if os.name != "posix":
+      self.skipTest("POSIX paths")
+    package = self.tmp / "declaredpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "part.py").write_text("x = 1\n")
+    path = os.pathsep.join(
+        [str(self._site), str(harness.TESTS_PALLAS), str(self.tmp)])
+    found = self.run_child(
+        mode="sources", package="declaredpkg",
+        env={"PYTHONPATH": path,
+             "JAX_PALLAS_LOWERING_CACHE_SOURCES": "declaredpkg"})["sources"]
+    answers = found["answers"]
+    self.assertIsNotNone(answers["declared"])
+    for name in ("declared through a linked directory",
+                 "declared through a link to it",
+                 "through more links than the system follows",
+                 "a string of a class of its own",
+                 "replaced, through another link"):
+      self.assertEqual(answers[name], answers["declared"], name)
+    for name in ("no declared package's", "named as a declared file elsewhere",
+                 "missing", "of a seal declaring no package"):
+      self.assertIsNone(answers[name], name)
+    self.assertEqual(found["resolved"], [
+        "a string of a class of its own", "declared through a link to it",
+        "declared through a linked directory", "missing",
+        "replaced, through another link",
+        "through more links than the system follows"])
+    self.assertNotIn("of a seal declaring no package", found["read"])
+
+
 class DeclaredTest(harness.LoweringCacheTestCase):
 
   def test_what_an_inline_body_runs_is_checked_not_its_wrapper(self):
