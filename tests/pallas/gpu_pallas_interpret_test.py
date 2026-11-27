@@ -221,6 +221,22 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
     np.testing.assert_array_equal(_kernel(x), x)
 
+  def test_fresh_axis_index_is_axis_index(self):
+    def body(o_ref):
+      a, b = jax.lax.axis_index('a'), jax.lax.axis_index('b')
+      o_ref[a, b] = plgpu.fresh_axis_index('a') * 10 + plgpu.fresh_axis_index('b')
+
+    out = plgpu.kernel(
+        body,
+        out_type=jax.ShapeDtypeStruct((2, 3), jnp.int32),
+        grid=(2, 3),
+        grid_names=('a', 'b'),
+        interpret=InterpretParams(),
+    )()
+    np.testing.assert_array_equal(
+        out, np.arange(2)[:, None] * 10 + np.arange(3)[None, :]
+    )
+
   def test_load(self):
     @functools.partial(
         plgpu.kernel,

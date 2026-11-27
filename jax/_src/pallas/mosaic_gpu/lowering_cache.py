@@ -347,9 +347,11 @@ def _placement() -> dict[jax_core.Primitive, tuple[str, ...]]:
 
 def _axis_readers() -> frozenset[jax_core.Primitive]:
   """Primitives whose lowering reads the size and stride of the JAX mesh axis
-  they name (`lowering.axis_index`), by identity: another primitive of one of
-  their names reads nothing of it."""
-  return frozenset({lax_parallel.axis_index_p})
+  they name (`lowering.axis_index`, `fresh` or not), by identity: another
+  primitive of one of their names reads nothing of it."""
+  from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives  # pylint: disable=g-import-not-at-top
+  return frozenset({lax_parallel.axis_index_p,
+                    gpu_primitives.fresh_axis_index_p})
 
 
 def _reads_jax_mesh(jaxpr: jax_core.Jaxpr, jax_mesh: Any) -> bool:
