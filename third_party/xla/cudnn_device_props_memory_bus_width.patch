@@ -1,0 +1,46 @@
+diff --git a/xla/backends/gpu/target_config/cudnn_device_props_json.cc b/xla/backends/gpu/target_config/cudnn_device_props_json.cc
+index 975a04fb53..57723d0e89 100644
+--- a/xla/backends/gpu/target_config/cudnn_device_props_json.cc
++++ b/xla/backends/gpu/target_config/cudnn_device_props_json.cc
+@@ -15,6 +15,7 @@ limitations under the License.
+ 
+ #include "xla/backends/gpu/target_config/cudnn_device_props_json.h"
+ 
++#include <cmath>
+ #include <cstdint>
+ #include <optional>
+ #include <string>
+@@ -37,6 +38,16 @@ std::string FormatDevicePropertiesJson(
+   const bool is_sm107 = cc && cc->major == 10 && cc->minor == 7;
+   const int64_t oversized_shared_memory =
+       is_sm107 ? desc.oversized_shared_memory_per_block() : 0;
++  // cuDNN (9.27 at least) requires the global memory bus width, in bits, of a
++  // deserialized description and refuses one without it ("!json_object
++  // .HasMember(key)"). The description keeps the bandwidth the executor
++  // derived from it (two transfers a memory clock over the bus,
++  // cuda_executor.cc), so the width is that derivation inverted.
++  const double mem_clock_hz = desc.mem_clock_ghz() * 1e9;
++  const int64_t memory_bus_width =
++      desc.memory_bandwidth() > 0 && mem_clock_hz > 0
++          ? std::llround(desc.memory_bandwidth() * 8.0 / (2.0 * mem_clock_hz))
++          : 0;
+   return absl::StrFormat(
+       R"json({
+   "deviceVer":%d,
+@@ -56,6 +67,7 @@ std::string FormatDevicePropertiesJson(
+   "l2CacheSize":%d,
+   "maxBlockSize":[%d,%d,%d],
+   "memClockRateKHz":%d,
++  "memoryBusWidth":%d,
+   "maxGridSize":[%d,%d,%d],
+   "supportCoopLaunch":%d,
+   "pciDeviceId":0,
+@@ -73,7 +85,7 @@ std::string FormatDevicePropertiesJson(
+       static_cast<int64_t>(desc.clock_rate_ghz() * 1e6), desc.l2_cache_size(),
+       desc.thread_dim_limit().x, desc.thread_dim_limit().y,
+       desc.thread_dim_limit().z,
+-      static_cast<int64_t>(desc.mem_clock_ghz() * 1e6),
++      static_cast<int64_t>(desc.mem_clock_ghz() * 1e6), memory_bus_width,
+       desc.block_dim_limit().x, desc.block_dim_limit().y,
+       desc.block_dim_limit().z,
+       /*desc.supports_coop_launch()*/ 1, driver_ver, desc.name());

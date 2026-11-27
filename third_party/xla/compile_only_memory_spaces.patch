@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 20 Nov 2026 22:40:00 -0600
+Subject: [PATCH] [PJRT:GPU] A compile-only GPU device states the client's
+ memory spaces
+
+StreamExecutorGpuTopologyDescription built each device's description with no memory space, so a compile-only
+GPU (the compile-only IFRT client over a topology, or the C API's device descriptions through
+PJRT_MemoryDescriptions_Extension) had no default memory and no host memory: a sharding naming "pinned_host"
+on it was canonicalized to the default memory kind, and a program compiled for it lost every host offload a
+program compiled on the device keeps. PjRtStreamExecutorDeviceDescription now holds the memory spaces a
+description states (memory_spaces, default_memory_space), and the topology's devices state the GPU client's:
+its HBM ("device", the default) and pinned_host, from one table every device shares, each kind id the kind's
+fingerprint as the client's memory spaces' are. The C API hands each memory description out as an opaque handle that is its own pointer, cast one by one into
+an array of handles each C device description holds, and PJRT_MemoryDescription_Kind reads it back as that
+description, and the compile-only IFRT client attaches every device's memories
+whatever its process, so a sharding whose first device is another process's keeps its memory kind.
+
+---
+diff --git a/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc b/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
+index e0e92d861e..b3178c1b0b 100644
+--- a/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
++++ b/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc
+@@ -1639,6 +1639,19 @@ PJRT_Error* PJRT_DeviceDescription_DebugString(
+   return nullptr;
+ }
+ 
++// The opaque handles of `description`'s memory spaces, each the
++// xla::PjRtMemorySpaceDescription's own pointer cast on its own
++// (PJRT_MemoryDescription_Kind casts it back).
++static std::vector<const PJRT_MemoryDescription*>
++PopulateMemoryDescriptions(const xla::PjRtDeviceDescription& description) {
++  std::vector<const PJRT_MemoryDescription*> handles;
++  for (const xla::PjRtMemorySpaceDescription* memory :
++       description.memory_spaces()) {
++    handles.push_back(reinterpret_cast<const PJRT_MemoryDescription*>(memory));
++  }
++  return handles;
++}
++
+ PJRT_Error* PJRT_DeviceDescription_MemoryDescriptions(
+     PJRT_DeviceDescription_MemoryDescriptions_Args* args) {
+   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+@@ -1649,11 +1662,11 @@ PJRT_Error* PJRT_DeviceDescription_MemoryDescriptions(
+   absl::Span<const xla::PjRtMemorySpaceDescription* const> memory_spaces =
+       args->device_description->device_description->memory_spaces();
+ 
+-  // We pass each xla::PjRtMemorySpaceDescriptions to the caller through an
+-  // opaque pointer.
++  // Each xla::PjRtMemorySpaceDescription goes to the caller through an opaque
++  // handle, its own pointer, held in an array of handles of the handle's type
++  // (PopulateMemoryDescriptions).
+   args->memory_descriptions =
+-      reinterpret_cast<const PJRT_MemoryDescription* const*>(
+-          memory_spaces.data());
++      args->device_description->memory_descriptions.data();
+ 
+   absl::StatusOr<const xla::PjRtMemorySpaceDescription*> default_memory =
+       args->device_description->device_description->default_memory_space();
+@@ -1685,11 +1698,16 @@ PJRT_Error* PJRT_MemoryDescription_Kind(
+   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+       "PJRT_MemoryDescription_Kind_Args",
+       PJRT_MemoryDescription_Kind_Args_STRUCT_SIZE, args->struct_size));
+-  absl::string_view kind =
+-      args->memory_description->memory_space_description.kind();
++  // The opaque handle is the description's own pointer
++  // (PJRT_DeviceDescription_MemoryDescriptions hands each out as one), read
++  // back as it was given.
++  const auto* description =
++      reinterpret_cast<const xla::PjRtMemorySpaceDescription*>(
++          args->memory_description);
++  absl::string_view kind = description->kind();
+   args->kind = kind.data();
+   args->kind_size = kind.size();
+-  args->kind_id = args->memory_description->memory_space_description.kind_id();
++  args->kind_id = description->kind_id();
+   return nullptr;
+ }
+ 
+@@ -3624,6 +3642,8 @@ static void PopulatePjrtClientDevices(PJRT_Client* c_client) {
+     c_device->client = c_client;
+     c_device->description.attributes =
+         PopulatePjrtAttributes(device->description().Attributes());
++    c_device->description.memory_descriptions =
++        PopulateMemoryDescriptions(device->description());
+     c_client->devices.push_back(c_device);
+     if (device->IsAddressable()) {
+       c_client->addressable_devices.push_back(c_device);
+@@ -3722,6 +3742,8 @@ PJRT_TopologyDescription* CreateWrapperDeviceTopology(
+         &c_topology->descriptions.back());
+     c_topology->descriptions.back().attributes =
+         PopulatePjrtAttributes(description->Attributes());
++    c_topology->descriptions.back().memory_descriptions =
++        PopulateMemoryDescriptions(*description);
+   }
+   c_topology->attributes =
+       PopulatePjrtAttributes(c_topology->topology->Attributes());
+diff --git a/xla/pjrt/c/pjrt_c_api_wrapper_impl.h b/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
+index 3b955baa10..ae96dc5285 100644
+--- a/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
++++ b/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
+@@ -88,9 +88,6 @@ struct PJRT_Client {
+                        std::unique_ptr<xla::PjRtClient> cpp_client);
+ };
+ 
+-struct PJRT_MemoryDescription {
+-  xla::PjRtMemorySpaceDescription memory_space_description;
+-};
+ 
+ // PJRT_AsyncHostToDeviceTransferManager is owned by its corresponding
+ // PJRT_Client.
+@@ -107,6 +104,10 @@ struct PJRT_DeviceDescription {
+   const xla::PjRtDeviceDescription* device_description;
+   // The device specific attributes which are initialized once per device.
+   std::vector<PJRT_NamedValue> attributes;
++  // Its memory spaces' descriptions, each an opaque handle that is the
++  // xla::PjRtMemorySpaceDescription's own pointer
++  // (PJRT_DeviceDescription_MemoryDescriptions), initialized once per device.
++  std::vector<const PJRT_MemoryDescription*> memory_descriptions;
+ };
+ 
+ // PJRT_Devices are owned by their corresponding PJRT_Client.
+diff --git a/xla/pjrt/gpu/BUILD b/xla/pjrt/gpu/BUILD
+index 72cb19a9d9..7d8feb7586 100644
+--- a/xla/pjrt/gpu/BUILD
++++ b/xla/pjrt/gpu/BUILD
+@@ -1152,6 +1152,7 @@ xla_cc_test(
+         ":se_gpu_topology_description",
+         "//xla:shape_util",
+         "//xla:xla_data_proto_cc",
++        "//xla/pjrt:host_memory_spaces",
+         "//xla/pjrt:pjrt_common",
+         "//xla/pjrt:pjrt_compiler",
+         "//xla/pjrt:pjrt_device_description",
+diff --git a/xla/pjrt/gpu/se_gpu_topology_description.cc b/xla/pjrt/gpu/se_gpu_topology_description.cc
+index 10d85c893b..6828e7cd87 100644
+--- a/xla/pjrt/gpu/se_gpu_topology_description.cc
++++ b/xla/pjrt/gpu/se_gpu_topology_description.cc
+@@ -54,6 +54,28 @@ limitations under the License.
+ 
+ namespace xla {
+ 
++namespace {
++// The memory spaces a StreamExecutor GPU client's device has (its HBM, the
++// default, pinned host memory and unpinned host memory,
++// StreamExecutorGpuClient's), each kind id the kind's fingerprint as the
++// client's are: one table every device of a topology states, and the
++// topology's kind ids (`GetMemorySpaceKindIds`) in its order.
++absl::Span<const PjRtMemorySpaceDescription* const> GpuMemorySpaces() {
++  static const PjRtMemorySpaceDescription* const kDevice =
++      new PjRtMemorySpaceDescription(
++          "device", static_cast<int>(tsl::Fingerprint32("device")));
++  static const PjRtMemorySpaceDescription* const kPinnedHost =
++      new PjRtMemorySpaceDescription(PinnedHostMemorySpace::kKind,
++                                     PinnedHostMemorySpace::kKindId);
++  static const PjRtMemorySpaceDescription* const kUnpinnedHost =
++      new PjRtMemorySpaceDescription(UnpinnedHostMemorySpace::kKind,
++                                     UnpinnedHostMemorySpace::kKindId);
++  static const PjRtMemorySpaceDescription* const kSpaces[] = {
++      kDevice, kPinnedHost, kUnpinnedHost};
++  return kSpaces;
++}
++}  // namespace
++
+ REGISTER_PJRT_TOPOLOGY_DESERIALIZER(
+     Cuda, xla::CudaId(), xla::CudaName(),
+     [](const xla::PjRtTopologyDescriptionProto& proto) {
+@@ -153,6 +175,11 @@ StreamExecutorGpuTopologyDescription::CreateDeviceDescription(
+   auto description = std::make_unique<PjRtStreamExecutorDeviceDescription>(
+       device_id, local_device_id, process_index, process_index_in_partition,
+       partition_index, std::string(gpu_topology_->platform_version()));
++  // So a program compiled for a compile-only device places an array in pinned
++  // host memory as one compiled on the device does, where a sharding naming
++  // "pinned_host" was canonicalized to the default memory and its offload
++  // dropped.
++  description->SetMemorySpaces(GpuMemorySpaces());
+   if (target_config_.has_value()) {
+     std::string compute_capability = "<unknown compute-capability>";
+     std::string gpu_vendor = "<unknown gpu vendor>";
+@@ -331,10 +358,14 @@ StreamExecutorGpuTopologyDescription::MakeCanonicalShapeForMemorySpace(
+ 
+ absl::Span<const int>
+ StreamExecutorGpuTopologyDescription::GetMemorySpaceKindIds() const {
+-  static const int kGpuMemorySpaceKindIds[] = {
+-      static_cast<int>(tsl::Fingerprint32("device")),
+-      PinnedHostMemorySpace::kKindId, UnpinnedHostMemorySpace::kKindId};
+-  return absl::MakeConstSpan(kGpuMemorySpaceKindIds);
++  static const std::vector<int>* const kGpuMemorySpaceKindIds = [] {
++    auto* ids = new std::vector<int>();
++    for (const PjRtMemorySpaceDescription* space : GpuMemorySpaces()) {
++      ids->push_back(space->kind_id());
++    }
++    return ids;
++  }();
++  return *kGpuMemorySpaceKindIds;
+ }
+ 
+ bool StreamExecutorGpuTopologyDescription::IsMemorySpaceOnCpu(
+diff --git a/xla/pjrt/gpu/se_gpu_topology_description_test.cc b/xla/pjrt/gpu/se_gpu_topology_description_test.cc
+index 9d31d364e2..22a4bc1937 100644
+--- a/xla/pjrt/gpu/se_gpu_topology_description_test.cc
++++ b/xla/pjrt/gpu/se_gpu_topology_description_test.cc
+@@ -20,6 +20,7 @@ limitations under the License.
+ 
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -27,6 +28,7 @@ limitations under the License.
+ #include "absl/status/status_matchers.h"
+ #include "xla/layout.h"
+ #include "xla/layout_util.h"
++#include "xla/pjrt/host_memory_spaces.h"
+ #include "xla/pjrt/pjrt_common.h"
+ #include "xla/pjrt/pjrt_compiler.h"
+ #include "xla/pjrt/pjrt_device_description.h"
+@@ -163,6 +165,30 @@ TEST(StreamExecutorGpuTopologyDescriptionTest,
+   }
+ }
+ 
++TEST(StreamExecutorGpuTopologyDescriptionTest,
++     DevicesStateTheClientsMemorySpaces) {
++  std::shared_ptr<xla::GpuTopology> gpu_topology =
++      std::make_shared<xla::GpuTopology>(
++          /*platform_version=*/"12.3", /*num_partitions=*/1,
++          /*num_hosts_per_partition=*/1, /*num_devices_per_host=*/2);
++  StreamExecutorGpuTopologyDescription topology_desc(
++      xla::CudaId(), xla::CudaName(), gpu_topology);
++  for (const auto& device : topology_desc.DeviceDescriptions()) {
++    std::vector<std::string> kinds;
++    for (const PjRtMemorySpaceDescription* memory : device->memory_spaces()) {
++      kinds.push_back(std::string(memory->kind()));
++    }
++    EXPECT_THAT(kinds, ElementsAre("device", "pinned_host", "unpinned_host"));
++    TF_ASSERT_OK_AND_ASSIGN(const PjRtMemorySpaceDescription* default_memory,
++                            device->default_memory_space());
++    EXPECT_EQ(default_memory->kind(), "device");
++    EXPECT_EQ(device->memory_spaces()[1]->kind_id(),
++              PinnedHostMemorySpace::kKindId);
++    EXPECT_EQ(device->memory_spaces()[2]->kind_id(),
++              UnpinnedHostMemorySpace::kKindId);
++  }
++}
++
+ TEST(PjRtTopologyUtilsGPUTest, GetDeviceCoords) {
+   std::shared_ptr<xla::GpuTopology> gpu_topology =
+       std::make_shared<xla::GpuTopology>(
+diff --git a/xla/pjrt/se/BUILD b/xla/pjrt/se/BUILD
+index b26fe1dba6..8758d5d3cb 100644
+--- a/xla/pjrt/se/BUILD
++++ b/xla/pjrt/se/BUILD
+@@ -390,6 +390,8 @@ cc_library(
+         "//xla/pjrt:pjrt_device_description",
+         "//xla/pjrt:utils",
+         "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/strings",
+         "@com_google_absl//absl/strings:string_view",
+         "@com_google_absl//absl/types:span",
+diff --git a/xla/pjrt/se/pjrt_stream_executor_device_description.h b/xla/pjrt/se/pjrt_stream_executor_device_description.h
+index fe59f7ebe7..c3ac5a27d2 100644
+--- a/xla/pjrt/se/pjrt_stream_executor_device_description.h
++++ b/xla/pjrt/se/pjrt_stream_executor_device_description.h
+@@ -17,6 +17,8 @@ limitations under the License.
+ #include <utility>
+ 
+ #include "absl/container/flat_hash_map.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/string_view.h"
+ #include "absl/types/span.h"
+@@ -73,6 +75,30 @@ class PjRtStreamExecutorDeviceDescription : public PjRtDeviceDescription {
+ 
+   void SetToString(std::string to_string) { to_string_ = std::move(to_string); }
+ 
++  absl::Span<const PjRtMemorySpaceDescription* const> memory_spaces()
++      const override {
++    return memory_spaces_;
++  }
++
++  absl::StatusOr<const PjRtMemorySpaceDescription*> default_memory_space()
++      const override {
++    if (default_memory_space_ == nullptr) {
++      return absl::UnimplementedError(
++          "default_memory_space Not implemented.");
++    }
++    return default_memory_space_;
++  }
++
++  // The memory spaces a device of this description has, held where they live
++  // for as long as the description (a topology's one table for all its
++  // devices), the first its default: what a compile-only device states, as
++  // the client's own device holds them.
++  void SetMemorySpaces(
++      absl::Span<const PjRtMemorySpaceDescription* const> memory_spaces) {
++    memory_spaces_ = memory_spaces;
++    default_memory_space_ = memory_spaces.empty() ? nullptr : memory_spaces[0];
++  }
++
+  private:
+   const int id_;
+   const int process_index_;
+@@ -81,6 +107,8 @@ class PjRtStreamExecutorDeviceDescription : public PjRtDeviceDescription {
+   std::string to_string_ = "<unknown SE device>";
+   absl::flat_hash_map<std::string, PjRtDeviceAttribute> attributes_;
+   const std::array<int, 3> coords_;
++  absl::Span<const PjRtMemorySpaceDescription* const> memory_spaces_;
++  const PjRtMemorySpaceDescription* default_memory_space_ = nullptr;
+ };
+ }  // namespace xla
+ 
+diff --git a/xla/python/compile_only_ifrt/client.h b/xla/python/compile_only_ifrt/client.h
+index 4962f4e1ec..01942487bf 100644
+--- a/xla/python/compile_only_ifrt/client.h
++++ b/xla/python/compile_only_ifrt/client.h
+@@ -180,17 +180,18 @@ class CompileOnlyIfRtClient final
+           description.get(), topology_->platform_name()));
+       auto* device = owned_devices_.back().get();
+       devices_.push_back(device);
+-      if (description->process_index() == process_index()) {
+-        auto default_memory = description->default_memory_space();
+-        for (auto* memory_description : description->memory_spaces()) {
+-          auto memory = std::make_unique<CompileOnlyMemory>(
+-              offset, memory_description, device);
+-          if (default_memory.ok() && memory_description == *default_memory) {
+-            device->SetDefaultMemory(memory.get());
+-          }
+-          device->AttachMemory(std::move(memory));
+-          ++offset;
++      // Every device's memories, whatever process it is on: they describe it,
++      // and a sharding over another process's devices reads its first
++      // device's default memory and kinds as one over this process's does.
++      auto default_memory = description->default_memory_space();
++      for (auto* memory_description : description->memory_spaces()) {
++        auto memory = std::make_unique<CompileOnlyMemory>(
++            offset, memory_description, device);
++        if (default_memory.ok() && memory_description == *default_memory) {
++          device->SetDefaultMemory(memory.get());
+         }
++        device->AttachMemory(std::move(memory));
++        ++offset;
+       }
+     }
+   }
