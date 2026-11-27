@@ -1,5 +1,5 @@
 diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
-index e8d09d82151..099abad5ea1 100644
+index e8d09d82151..3479a87c104 100644
 --- a/xla/debug_options_flags.cc
 +++ b/xla/debug_options_flags.cc
 @@ -578,6 +578,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
@@ -10,7 +10,7 @@ index e8d09d82151..099abad5ea1 100644
    opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
    opts.set_xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl(true);
    opts.set_xla_gpu_ragged_all_to_all_mode(
-@@ -4277,6 +4278,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+@@ -4277,6 +4278,15 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
          debug_options->xla_gpu_print_compilation_stats(),
          "Prints statistics about the HLO passes: how many times each pass was "
          "run, and how long it took."));
@@ -21,7 +21,8 @@ index e8d09d82151..099abad5ea1 100644
 +        debug_options->xla_gpu_memory_limit_early_exit_bytes(),
 +        "If positive, a compile whose buffer assignment holds more device "
 +        "bytes (argument + output - alias + temp) than this stops after buffer "
-+        "assignment: no code is emitted and executing it fails."));
++        "assignment, and one whose entry arguments alone hold more stops "
++        "before optimizing: no code is emitted and executing it fails."));
      flag_list->push_back(
          tsl::Flag("xla_gpu_enable_pdl",
                    bool_setter_for(&DebugOptions::set_xla_gpu_enable_pdl),
@@ -128,7 +129,7 @@ index 7e2e02d6965..a9a567adccc 100644
    CompileOptions options;
    options.env_option_overrides = {
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 9616f02594a..031ac8e6215 100644
+index 9616f02594a..837157beafc 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -857,6 +857,7 @@ cc_library(
@@ -139,7 +140,15 @@ index 9616f02594a..031ac8e6215 100644
          "//xla/pjrt/proto:compile_options_proto_cc",
          "//xla/runtime:device_id",
          "//xla/runtime:hang_watchdog",
-@@ -2393,6 +2394,32 @@ xla_test(
+@@ -2242,6 +2243,7 @@ cc_library(
+         "@com_google_absl//absl/strings:string_view",
+         "@com_google_absl//absl/synchronization",
+         "@com_google_absl//absl/types:optional_ref",
++        "@com_google_absl//absl/types:span",
+         "@com_google_protobuf//:protobuf",
+         "@llvm-project//llvm:AsmParser",
+         "@llvm-project//llvm:Core",
+@@ -2393,6 +2395,32 @@ xla_test(
      ],
  )
  
@@ -225,10 +234,117 @@ index f0048ca1527..fcca0500a6a 100644
  
  absl::Status LoadCache(IrEmitterContext& ir_emitter_context,
 diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
-index bd9d29ca3bc..7ce5465c571 100644
+index bd9d29ca3bc..876db306ac7 100644
 --- a/xla/service/gpu/gpu_compiler.cc
 +++ b/xla/service/gpu/gpu_compiler.cc
-@@ -2960,7 +2960,9 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
+@@ -43,6 +43,7 @@ limitations under the License.
+ #include "absl/strings/string_view.h"
+ #include "absl/synchronization/mutex.h"
+ #include "absl/types/optional_ref.h"
++#include "absl/types/span.h"
+ #include "google/protobuf/text_format.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/AsmParser/Parser.h"
+@@ -2298,6 +2299,18 @@ absl::StatusOr<std::unique_ptr<HloModule>> GpuCompiler::RunHloPasses(
+     std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
+     const CompileOptions& options) {
+   const DebugOptions debug_opts = module->config().debug_options();
++  // Entry arguments alone past the compile's memory limit: no optimization
++  // (nor its autotuning) can make it fit, and RunBackend stops it as they
++  // stand (EntryArgumentsOverMemoryLimit). A compile asked for its layouts
++  // goes on to them.
++  if (!options.early_exit_with_layouts &&
++      EntryArgumentsOverMemoryLimit(
++          *module, debug_opts.xla_gpu_memory_limit_early_exit_bytes())) {
++    VLOG(1) << "Module " << module->name()
++            << ": its entry arguments are over its compile's memory limit; "
++               "not optimized";
++    return std::move(module);
++  }
+   ABSL_RETURN_IF_ERROR(LoadAutotuneResultsFromFile(debug_opts));
+ 
+   std::unique_ptr<CompilationStats> compilation_stats;
+@@ -2823,6 +2836,65 @@ GpuCompiler::CompileToBackendResult(
+                                    std::move(compile_module_results)};
+ }
+ 
++absl::StatusOr<std::unique_ptr<Executable>>
++GpuCompiler::StoppedAtItsArguments(std::unique_ptr<HloModule> module,
++                                   absl::Span<const int64_t> arguments,
++                                   const GpuTopology& gpu_topology,
++                                   const CompileOptions& options) {
++  // Its buffer assignment is its entry arguments alone, each the bytes it
++  // holds at least: its memory stats state them, and nothing else.
++  std::vector<BufferAllocation> allocations;
++  BufferAssignmentProto buffer_assignment_proto;
++  int64_t bytes = 0;
++  for (int64_t i = 0; i < arguments.size(); ++i) {
++    BufferAllocation& allocation =
++        allocations.emplace_back(i, arguments[i], /*color=*/0);
++    allocation.set_entry_computation_parameter(
++        i, /*param_shape_index=*/{}, /*parameter_aliased_with_output=*/false);
++    *buffer_assignment_proto.add_buffer_allocations() = allocation.ToProto();
++    bytes += arguments[i];
++  }
++  const se::DeviceDescription& gpu_device_info =
++      gpu_topology.gpu_target_config().device_description;
++  ABSL_ASSIGN_OR_RETURN(
++      stream_executor::ExecutableAbiVersion executable_abi_version,
++      stream_executor::ExecutableAbiVersion::FromDeviceDescription(
++          gpu_device_info));
++  const DebugOptions debug_opts = module->config().debug_options();
++  std::string module_name = module->name();
++  ProgramShape program_shape =
++      module->compute_computation_layout().ComputeProgramShape();
++  return GpuExecutable::Create(GpuExecutable::Params{
++      /*binary=*/{},
++      /*dnn_compiled_graphs=*/{},
++      /*executable=*/std::make_unique<ThunkExecutor>(ThunkSequence{}),
++      /*constants=*/{},
++      /*output_info=*/{},
++      /*module_name=*/std::move(module_name),
++      /*program_shape=*/std::move(program_shape),
++      /*allocations=*/std::move(allocations),
++      /*alias_info=*/GetAliasInfo(gpu_device_info),
++      /*debug_options=*/debug_opts,
++      /*device_description=*/gpu_device_info,
++      /*debug_module=*/options.embed_hlo_module
++          ? std::move(module)
++          : std::unique_ptr<HloModule>(),
++      /*enable_debug_info_manager=*/
++      debug_opts.xla_gpu_executable_embed_debug_info(),
++      /*module_stats=*/{},
++      /*executable_abi_version=*/executable_abi_version,
++      /*cpu_target_machine_options=*/
++      options.cpu_target_config.has_value()
++          ? options.cpu_target_config->cpu_target_machine_options
++          : std::nullopt,
++      /*buffer_assignment_proto=*/std::move(buffer_assignment_proto),
++      /*buffer_allocations_debug_summary=*/
++      absl::StrCat("its entry arguments alone, ", bytes,
++                   " bytes, over its compile's memory limit: not optimized"),
++      /*gpu_topology=*/gpu_topology,
++      /*stopped_over_memory_limit=*/bytes});
++}
++
+ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
+     std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
+     const CompileOptions& options) {
+@@ -2851,6 +2923,13 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
+                         InferGpuTopology(module->config(), stream_exec, options,
+                                          debug_opts, platform_id_));
+ 
++  if (std::optional<std::vector<int64_t>> arguments =
++          EntryArgumentsOverMemoryLimit(
++              *module, debug_opts.xla_gpu_memory_limit_early_exit_bytes())) {
++    return StoppedAtItsArguments(std::move(module), *arguments, gpu_topology,
++                                 options);
++  }
++
+   BinaryMap dnn_compiled_graphs;
+   ABSL_RETURN_IF_ERROR(RunCudnnCompilerPasses(module.get(), stream_exec,
+                                               gpu_topology.gpu_target_config(),
+@@ -2960,7 +3039,9 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
            /*buffer_assignment_proto=*/std::move(buffer_assignment_proto),
            /*buffer_allocations_debug_summary=*/
            std::move(buffer_allocations_debug_summary),
@@ -239,12 +355,39 @@ index bd9d29ca3bc..7ce5465c571 100644
    IncrementCompiledProgramsCount();
  
    if (gpu_executable->has_module() && gpu_executable->module()
+diff --git a/xla/service/gpu/gpu_compiler.h b/xla/service/gpu/gpu_compiler.h
+index 79776319d85..ddc03ba0d01 100644
+--- a/xla/service/gpu/gpu_compiler.h
++++ b/xla/service/gpu/gpu_compiler.h
+@@ -31,6 +31,7 @@ limitations under the License.
+ #include "absl/strings/string_view.h"
+ #include "absl/synchronization/mutex.h"
+ #include "absl/types/optional_ref.h"
++#include "absl/types/span.h"
+ #include "llvm/IR/Module.h"
+ #include "mlir/IR/MLIRContext.h"
+ #include "xla/autotune_results.pb.h"
+@@ -220,6 +221,14 @@ class GpuCompiler : public LLVMCompiler {
+       absl::string_view kernel_fingerprint, bool relocatable,
+       std::optional<int> shard_number);
+ 
++  // `module`'s executable where its entry arguments alone are over its
++  // compile's memory limit (EntryArgumentsOverMemoryLimit, `arguments` each
++  // one's bytes): no code, its memory stats its arguments', and refusing to
++  // run (GpuExecutable::Runnable).
++  absl::StatusOr<std::unique_ptr<Executable>> StoppedAtItsArguments(
++      std::unique_ptr<HloModule> module, absl::Span<const int64_t> arguments,
++      const GpuTopology& gpu_topology, const CompileOptions& options);
++
+   absl::Status LoadAutotuneResultsFromFile(const DebugOptions& debug_options);
+   absl::Status SerializeAutotuneResultsToFile(
+       const DebugOptions& debug_options);
 diff --git a/xla/service/gpu/gpu_compiler_memory_limit_test.cc b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
 new file mode 100644
-index 00000000000..4ae39ba0214
+index 00000000000..3f1ef963090
 --- /dev/null
 +++ b/xla/service/gpu/gpu_compiler_memory_limit_test.cc
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,223 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -262,6 +405,7 @@ index 00000000000..4ae39ba0214
 +
 +#include <cstdint>
 +#include <memory>
++#include <optional>
 +#include <string>
 +#include <utility>
 +#include <vector>
@@ -278,6 +422,7 @@ index 00000000000..4ae39ba0214
 +#include "xla/pjrt/compiled_memory_stats.h"
 +#include "xla/service/compiled_module.h"
 +#include "xla/service/compiler.h"
++#include "xla/service/gpu/gpu_executable.h"
 +#include "xla/service/gpu_topology.h"
 +#include "xla/service/hlo_module_config.h"
 +#include "xla/tests/literal_test_util.h"
@@ -364,8 +509,7 @@ index 00000000000..4ae39ba0214
 +                                                                 0.5f);
 +  absl::StatusOr<Literal> ran = Execute(std::move(module), {&x, &x});
 +  EXPECT_EQ(ran.status().code(), absl::StatusCode::kFailedPrecondition);
-+  EXPECT_THAT(ran.status().message(),
-+              HasSubstr("stopped after buffer assignment"));
++  EXPECT_THAT(ran.status().message(), HasSubstr("emitted no code"));
 +}
 +
 +TEST_F(GpuCompilerMemoryLimitTest, ACompileWithinItsLimitRunsAsAnUnlimitedOne) {
@@ -390,13 +534,96 @@ index 00000000000..4ae39ba0214
 +  EXPECT_TRUE(LiteralTestUtil::Equal(reference, ran));
 +}
 +
++TEST_F(GpuCompilerMemoryLimitTest,
++       ACompileWhoseArgumentsAloneAreOverItsLimitIsNeitherOptimizedNorRun) {
++  // Its two f32[256,256] arguments hold 512 KiB.
++  const int64_t arguments = 2 * 256 * 256 * 4;
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          Limited(arguments - 1));
++  const std::string before = module->ToString();
++  Compiler::CompileOptions options;
++  options.gpu_topology = GetSingleDeviceGpuTopology(
++      /*platform_version=*/"", gpu_target_config());
++  TF_ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<HloModule> passed,
++      compiler()->RunHloPasses(std::move(module), /*executor=*/nullptr,
++                               options));
++  EXPECT_EQ(passed->ToString(), before);
++
++  // Compiled ahead, it states its arguments alone and that it stopped.
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<CompiledModule> stopped,
++                          CompiledAhead(arguments - 1));
++  TF_ASSERT_OK_AND_ASSIGN(CompiledMemoryStats stats,
++                          stopped->GetCompiledMemoryStats());
++  EXPECT_EQ(stats.argument_size_in_bytes, arguments);
++  EXPECT_EQ(stats.output_size_in_bytes, 0);
++  EXPECT_EQ(stats.alias_size_in_bytes, 0);
++  EXPECT_EQ(stats.temp_size_in_bytes, 0);
++  EXPECT_EQ(stats.peak_memory_in_bytes, 0);
++  EXPECT_EQ(stats.stopped_at_memory_limit, true);
++
++  TF_ASSERT_OK_AND_ASSIGN(module, Limited(arguments - 1));
++  Literal x = LiteralUtil::CreateFullWithDescendingLayout<float>({256, 256},
++                                                                 0.5f);
++  absl::StatusOr<Literal> ran = Execute(std::move(module), {&x, &x});
++  EXPECT_EQ(ran.status().code(), absl::StatusCode::kFailedPrecondition);
++  EXPECT_THAT(ran.status().message(), HasSubstr("emitted no code"));
++}
++
++TEST_F(GpuCompilerMemoryLimitTest,
++       AnArgumentIsSizedAsItsPackedStorageAndAHostOneNotAtAll) {
++  // An s4's half byte, a pred's byte, a tuple's leaves, a host array's none.
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(R"hlo(
++    HloModule sized
++
++    ENTRY main {
++      p0 = s4[1000]{0} parameter(0)
++      p1 = pred[1000]{0} parameter(1)
++      p2 = (f32[4]{0}, s8[3]{0}) parameter(2)
++      p3 = f32[1024]{0:S(5)} parameter(3)
++      ROOT out = s4[1000]{0} copy(p0)
++    }
++  )hlo"));
++  EXPECT_EQ(EntryArgumentsOverMemoryLimit(*module, 1),
++            (std::vector<int64_t>{500, 1000, 19, 0}));
++  // Within the limit: nothing, the limit's sum itself included.
++  EXPECT_EQ(EntryArgumentsOverMemoryLimit(*module, 1519), std::nullopt);
++  EXPECT_EQ(EntryArgumentsOverMemoryLimit(*module, 0), std::nullopt);
++}
++
++TEST_F(GpuCompilerMemoryLimitTest,
++       APartitionedOrUnlaidModuleIsNeverStoppedAtItsArguments) {
++  // A partitioned module's arguments are each device's shards only after SPMD
++  // partitioning, and an unset layout leaves its memory spaces unknown.
++  HloModuleConfig config = GetModuleConfigForTest();
++  config.set_num_partitions(2);
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> partitioned,
++                          ParseAndReturnVerifiedModule(kHloText, config));
++  EXPECT_EQ(EntryArgumentsOverMemoryLimit(*partitioned, 1), std::nullopt);
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> unlaid, Limited(1));
++  ASSERT_TRUE(EntryArgumentsOverMemoryLimit(*unlaid, 1).has_value());
++  unlaid->mutable_entry_computation_layout()
++      ->mutable_parameter_layout(0)
++      ->Clear();
++  EXPECT_EQ(EntryArgumentsOverMemoryLimit(*unlaid, 1), std::nullopt);
++}
++
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
-index 7a8d8409815..e832d4167d2 100644
+index 7a8d8409815..a802c3c9ffa 100644
 --- a/xla/service/gpu/gpu_executable.cc
 +++ b/xla/service/gpu/gpu_executable.cc
-@@ -73,6 +73,7 @@ limitations under the License.
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <climits>
+ #include <cstdint>
+ #include <deque>
+ #include <memory>
+@@ -73,6 +74,7 @@ limitations under the License.
  #include "xla/hlo/ir/hlo_input_output_alias_config.h"
  #include "xla/hlo/ir/hlo_instruction.h"
  #include "xla/hlo/ir/hlo_opcode.h"
@@ -404,7 +631,65 @@ index 7a8d8409815..e832d4167d2 100644
  #include "xla/pjrt/proto/compile_options.pb.h"
  #include "xla/runtime/device_id.h"
  #include "xla/runtime/hang_watchdog.h"
-@@ -563,7 +564,7 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::CreateImpl(
+@@ -103,6 +105,8 @@ limitations under the License.
+ #include "xla/service/shaped_slice.h"
+ #include "xla/service/stream_pool.h"
+ #include "xla/service/xla_debug_info_manager.h"
++#include "xla/layout.h"
++#include "xla/primitive_util.h"
+ #include "xla/shape.h"
+ #include "xla/shape_tree.h"
+ #include "xla/shape_util.h"
+@@ -518,24 +522,30 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::CreateImpl(
+   // thunk passes (which operate on SequentialThunk).
+   auto seq_thunk = std::make_unique<SequentialThunk>(
+       Thunk::ThunkInfo(), std::move(params.executable->thunks()));
+-  ABSL_ASSIGN_OR_RETURN(
+-      std::vector<ShapedSlice> module_output_slices,
+-      GetModuleOutputSlices(params.program_shape, params.output_info,
+-                            params.allocations));
+-  const int devices_per_host = params.gpu_topology.has_value()
+-                                   ? params.gpu_topology->num_devices_per_host()
+-                                   : 0;
+-  // Executables serialized before `GpuExecutableProto` had the `gpu_topology`
+-  // field don't have a topology, so we fall back to the slice size from the
+-  // module config metadata.
+-  const int64_t slice_size =
+-      params.gpu_topology.has_value()
+-          ? std::max<int64_t>(params.gpu_topology->slice_size(), 0)
+-          : module_config_metadata->slice_size;
+-  ABSL_RETURN_IF_ERROR(RunThunkPasses(
+-      params.debug_options, params.device_description, seq_thunk.get(),
+-      params.debug_module.get(), module_output_slices, allocator,
+-      devices_per_host, slice_size));
++  // An executable stopped at its memory limit holds no code: no pass runs on
++  // it, nor are its outputs sliced (one stopped at its entry arguments has no
++  // buffer assignment of them).
++  if (!params.stopped_over_memory_limit.has_value()) {
++    ABSL_ASSIGN_OR_RETURN(
++        std::vector<ShapedSlice> module_output_slices,
++        GetModuleOutputSlices(params.program_shape, params.output_info,
++                              params.allocations));
++    const int devices_per_host =
++        params.gpu_topology.has_value()
++            ? params.gpu_topology->num_devices_per_host()
++            : 0;
++    // Executables serialized before `GpuExecutableProto` had the
++    // `gpu_topology` field don't have a topology, so we fall back to the slice
++    // size from the module config metadata.
++    const int64_t slice_size =
++        params.gpu_topology.has_value()
++            ? std::max<int64_t>(params.gpu_topology->slice_size(), 0)
++            : module_config_metadata->slice_size;
++    ABSL_RETURN_IF_ERROR(RunThunkPasses(
++        params.debug_options, params.device_description, seq_thunk.get(),
++        params.debug_module.get(), module_output_slices, allocator,
++        devices_per_host, slice_size));
++  }
+   // Extract modified thunks back into a ThunkExecutor.
+   auto executor =
+       std::make_unique<ThunkExecutor>(std::move(seq_thunk->thunks()));
+@@ -563,7 +573,7 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::CreateImpl(
        std::move(params.buffer_assignment_proto),
        std::move(params.buffer_allocations_debug_summary),
        collective_use_minimal_resource, std::move(params.gpu_topology),
@@ -413,7 +698,7 @@ index 7a8d8409815..e832d4167d2 100644
  }
  
  // Implementation note: HLO profiling is always enabled for GPU executables,
-@@ -585,6 +586,7 @@ GpuExecutable::GpuExecutable(
+@@ -585,6 +595,7 @@ GpuExecutable::GpuExecutable(
      std::string buffer_allocations_debug_summary,
      bool collective_use_minimal_resource,
      std::optional<GpuTopology> gpu_topology,
@@ -421,7 +706,7 @@ index 7a8d8409815..e832d4167d2 100644
      ModuleConfigMetadata module_config_metadata)
      : Executable(std::move(debug_module)),
        binary_(std::move(binary)),
-@@ -633,7 +635,8 @@ GpuExecutable::GpuExecutable(
+@@ -633,7 +644,8 @@ GpuExecutable::GpuExecutable(
        buffer_allocations_debug_summary_(
            std::move(buffer_allocations_debug_summary)),
        collective_use_minimal_resource_(collective_use_minimal_resource),
@@ -431,7 +716,7 @@ index 7a8d8409815..e832d4167d2 100644
    if (has_module() && enable_debug_info_manager_) {
      XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                 buffer_assignment_proto_);
-@@ -1353,6 +1356,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
+@@ -1353,6 +1365,7 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
          param_no};
    };
  
@@ -439,7 +724,7 @@ index 7a8d8409815..e832d4167d2 100644
    ABSL_ASSIGN_OR_RETURN(
        std::unique_ptr<GpuExecutableBufferAllocator::ExecutionScope>
            allocation_scope,
-@@ -1529,6 +1533,17 @@ void GpuExecutable::LogChangedAllocationsInBetweenExecutions(
+@@ -1529,6 +1542,17 @@ void GpuExecutable::LogChangedAllocationsInBetweenExecutions(
  const BufferAssignmentProto& GpuExecutable::buffer_assignment_proto() const {
    return buffer_assignment_proto_;
  }
@@ -450,14 +735,14 @@ index 7a8d8409815..e832d4167d2 100644
 +  return absl::FailedPreconditionError(absl::StrCat(
 +      "Module ", module_name_, " holds ", *stopped_over_memory_limit_,
 +      " bytes of device memory, over its compile's "
-+      "xla_gpu_memory_limit_early_exit_bytes: its compile stopped after buffer "
-+      "assignment and emitted no code"));
++      "xla_gpu_memory_limit_early_exit_bytes: its compile stopped there and "
++      "emitted no code"));
 +}
 +
  absl::Status GpuExecutable::ExecuteThunks(
      const BufferAllocations& buffer_allocations,
      const ServiceExecutableRunOptions* run_options,
-@@ -1583,6 +1598,27 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
+@@ -1583,6 +1607,59 @@ int64_t GpuExecutable::SizeOfGeneratedCodeInBytes() const {
    return size;
  }
  
@@ -482,10 +767,42 @@ index 7a8d8409815..e832d4167d2 100644
 +  return bytes;
 +}
 +
++std::optional<std::vector<int64_t>> EntryArgumentsOverMemoryLimit(
++    const HloModule& module, int64_t limit) {
++  const ComputationLayout& layout = module.entry_computation_layout();
++  if (limit <= 0 || module.config().num_partitions() > 1 ||
++      !layout.LayoutIsSet()) {
++    return std::nullopt;
++  }
++  std::vector<int64_t> arguments;
++  arguments.reserve(layout.parameter_count());
++  int64_t total = 0;
++  for (int64_t i = 0; i < layout.parameter_count(); ++i) {
++    int64_t bytes = 0;
++    ShapeUtil::ForEachLeafShape(
++        layout.parameter_shape(i), [&](const Shape& leaf, const ShapeIndex&) {
++          if (!leaf.IsArray() ||
++              leaf.layout().memory_space() == Layout::kHostMemorySpace) {
++            return;
++          }
++          bytes += CeilOfRatio<int64_t>(
++              ShapeUtil::ElementsIn(leaf) *
++                  primitive_util::StorageBitWidth(leaf.element_type()),
++              CHAR_BIT);
++        });
++    arguments.push_back(bytes);
++    total += bytes;
++  }
++  if (total <= limit) {
++    return std::nullopt;
++  }
++  return arguments;
++}
++
  absl::StatusOr<absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>>
  GetOutputInfo(const HloModule& hlo_module, const BufferAssignment& assignment) {
    const HloInstruction* root =
-@@ -1707,6 +1743,9 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
+@@ -1707,6 +1784,9 @@ absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
  
    *proto.mutable_buffer_assignment() = buffer_assignment_proto_;
    proto.set_buffer_allocations_debug_summary(buffer_allocations_debug_summary_);
@@ -495,7 +812,7 @@ index 7a8d8409815..e832d4167d2 100644
  
    if (has_module()) {
      *proto.mutable_hlo_module_with_config() = module().ToProtoWithConfig(
-@@ -1789,6 +1828,9 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
+@@ -1789,6 +1869,9 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
      std::shared_ptr<HloModule> debug_module) {
    Params params;
    params.debug_options = std::move(debug_options);
@@ -506,7 +823,7 @@ index 7a8d8409815..e832d4167d2 100644
        params.debug_options.xla_gpu_executable_embed_debug_info();
    const std::string& binary = proto.binary();
 diff --git a/xla/service/gpu/gpu_executable.h b/xla/service/gpu/gpu_executable.h
-index 139cb4947f1..5f00d5d4486 100644
+index 139cb4947f1..25145a9764c 100644
 --- a/xla/service/gpu/gpu_executable.h
 +++ b/xla/service/gpu/gpu_executable.h
 @@ -140,6 +140,11 @@ class GpuExecutable : public Executable {
@@ -542,7 +859,7 @@ index 139cb4947f1..5f00d5d4486 100644
        ModuleConfigMetadata module_config_metadata);
  
    // GpuExecutable check with either AMD's ISA version, or Nvidia's major minor
-@@ -518,11 +530,22 @@ class GpuExecutable : public Executable {
+@@ -518,11 +530,35 @@ class GpuExecutable : public Executable {
  
    // The GPU topology the executable was compiled for, if known.
    std::optional<GpuTopology> gpu_topology_;
@@ -561,6 +878,19 @@ index 139cb4947f1..5f00d5d4486 100644
 +// where `limit` is not positive.
 +std::optional<int64_t> DeviceBytesOverMemoryLimit(
 +    absl::Span<const BufferAllocation> allocations, int64_t limit);
++
++// The device bytes each entry argument of `module` holds at least, where their
++// sum exceeds `limit` (DebugOptions::xla_gpu_memory_limit_early_exit_bytes):
++// a compile that cannot fit before it is optimized. Each array is sized as
++// its elements' storage bits, packed (an s4's half byte, a pred's byte), a
++// host-memory one not at all, so the sum is never more than its buffer
++// assignment's arguments, and the same before optimization and after.
++// nullopt within the limit, where `limit` is not positive, where the module is
++// partitioned (its arguments are each device's shards only once SPMD
++// partitioning has run) or where any entry layout is unset (its memory
++// spaces unknown, and its executable's layouts not yet stated).
++std::optional<std::vector<int64_t>> EntryArgumentsOverMemoryLimit(
++    const HloModule& module, int64_t limit);
 +
  }  // namespace gpu
  }  // namespace xla
@@ -581,10 +911,10 @@ index 5b1c40b7c3e..c14c515c6df 100644
    reserved 7;
  }
 diff --git a/xla/xla.proto b/xla/xla.proto
-index 6cb420f86f9..66d4f18bc97 100644
+index 6cb420f86f9..e0f373ed089 100644
 --- a/xla/xla.proto
 +++ b/xla/xla.proto
-@@ -1873,6 +1873,15 @@ message DebugOptions {
+@@ -1873,6 +1873,18 @@ message DebugOptions {
    // xla_early_exit_with_layouts.
    optional EarlyExitPoint xla_gpu_experimental_early_exit = 549;
  
@@ -593,7 +923,10 @@ index 6cb420f86f9..66d4f18bc97 100644
 +  // states the memory and buffer assignment a whole compile does, and executing
 +  // it fails. The bytes compared are its compiled memory stats' device bytes,
 +  // argument + output - alias + temp (CompiledMemoryStats), the device memory a
-+  // run of the program holds at once. Within the limit, the compile finishes.
++  // run of the program holds at once. A compile of one device whose entry
++  // arguments alone hold more (each array its elements' packed storage, a host
++  // one none) stops before optimizing, its stats its arguments' alone. Within
++  // the limit, the compile finishes.
 +  // Numbered apart from upstream's next ids, which a fork's field would meet.
 +  optional int64 xla_gpu_memory_limit_early_exit_bytes = 100001;
 +
