@@ -192,6 +192,9 @@ def starlark(path: str) -> bool:
     return path.endswith(".bzl") or Path(path).name in STARLARK
 
 
+TREE = "tree"
+"""How a record keeps a directory of the checkout a lookup stepped out of by a parent step (`hops`): a directory,
+as `committed` reads one Git holds (mode 040000); a link put in its place leads the same lookup elsewhere."""
 LINK = "symlink:"
 """How a record keeps a symlink of the checkout (`hops`) apart from a file of the same bytes: its target's text's
 `digest` after it, as `committed` reads a link Git holds (mode 120000)."""
@@ -208,6 +211,9 @@ def hops(path: Path, workspace: Path) -> dict[str, str]:
             return found
         part = parts.pop(0)
         if part in (".", ".."):
+            # A directory a parent step leaves is part of the lookup: were it a link, .. would lead elsewhere.
+            if part == ".." and current != workspace and current.is_relative_to(workspace):
+                found[str(current.relative_to(workspace))] = TREE
             current = current if part == "." else current.parent
             continue
         step = current / part
@@ -411,18 +417,22 @@ def tree(root: Path) -> dict[str, str]:
 
 def committed(commit: str, paths: set[str]) -> dict[str, str]:
     """Each of `paths` `commit` holds, as a record keeps it: a file's `digest`, a symlink's `LINK` and its text's
-    (Git's mode 120000), so a link and a file of its bytes are two things; none for a path it does not hold. Its
-    tree listed once and its blobs read in one batch."""
+    (Git's mode 120000), so a link and a file of its bytes are two things, and a directory's `TREE`; none for a
+    path it does not hold. Its tree listed once and its blobs read in one batch."""
     listed = {}
-    for entry in filter(None, git("ls-tree", "-r", "-z", commit).split("\0")):
+    found = {}
+    for entry in filter(None, git("ls-tree", "-r", "-t", "-z", commit).split("\0")):
         meta, _, path = entry.partition("\t")
         if path in paths:
             mode, _, sha = meta.split()
-            listed[path] = (mode, sha)
+            if mode == "040000":
+                found[path] = TREE
+            else:
+                listed[path] = (mode, sha)
     order = sorted(listed)
     asked = "".join(f"{listed[path][1]}\n" for path in order).encode()
     out = subprocess.run(["git", "cat-file", "--batch"], input=asked, capture_output=True, check=True).stdout
-    found, at = {}, 0
+    at = 0
     for path in order:
         header_end = out.index(b"\n", at)
         size = int(out[at:header_end].split()[2])

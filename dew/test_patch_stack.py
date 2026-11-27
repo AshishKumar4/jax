@@ -406,6 +406,17 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         run("commit", "-qm", f"{link} retargeted")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
+    # The directory the link's parent step leaves made a link to another, whose parent holds another picked.cc:
+    # the lookup leads to another source, every recorded link and file unchanged.
+    run("rm", "-rq", "jaxlib/sub")
+    (clone / "jaxlib" / "other" / "sub").mkdir(parents=True)
+    (clone / "jaxlib" / "other" / "sub" / "BUILD.txt").write_text("another directory\n")
+    (clone / "jaxlib" / "other" / "picked.cc").write_text("int other;\n")
+    (clone / "jaxlib" / "sub").symlink_to("other/sub")
+    run("add", "-A")
+    run("commit", "-qm", "the directory a link")
+    assert patch_stack.plugins("0.12.0.1.post82") == ""
+    run("reset", "-q", "--hard", "HEAD~1")
     # A link replaced by a file of its text (one blob, another mode): a source, not the link it was.
     (clone / "jaxlib" / "picked.cc").unlink()
     (clone / "jaxlib" / "picked.cc").write_text("impl_a.cc")
@@ -484,9 +495,10 @@ def test_a_lookups_links_are_each_keyed_where_git_holds_them(tmp_path):
         return patch_stack.LINK + patch_stack.digest(text)
     assert patch_stack.hops(workspace / "chain.cc", workspace) == {
         "chain.cc": link(b"alias/f.cc"), "alias": link(b"real"), "real/f.cc": link(b"g.cc")}
-    # A parent step taken from where it stands: real/sub/.. is real, and its f.cc the link Git holds there.
+    # A parent step taken from where it stands: real/sub/.. is real, and its f.cc the link Git holds there; the
+    # directory it stepped out of, a directory.
     assert patch_stack.hops(workspace / "dotted.cc", workspace) == {
-        "dotted.cc": link(b"real/sub/../f.cc"), "real/f.cc": link(b"g.cc")}
+        "dotted.cc": link(b"real/sub/../f.cc"), "real/sub": patch_stack.TREE, "real/f.cc": link(b"g.cc")}
     assert patch_stack.hops(workspace / "real" / "g.cc", workspace) == {}
 
 
