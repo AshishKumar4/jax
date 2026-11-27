@@ -1,0 +1,280 @@
+From e9245cd990448a4e716b620d5c57f1e003a49334 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Sun, 15 Nov 2026 01:52:08 -0600
+Subject: [PATCH] [PJRT:GPU] The CUDA plugin serves its executables' metadata,
+ and the C API client reads their buffer assignment from it
+
+PJRT_Executable_GetCompiledMemoryStats' struct carries no buffer assignment, so a client over the C API read
+serialized_buffer_assignment empty from every GPU plugin. The plugin registers PJRT_ExecutableMetadata_Extension,
+serving PjRtExecutableMetadata with the executable's compiled memory stats, the assignment among them (a full
+compile's or one stopped after buffer assignment), and PjRtCApiExecutable::GetCompiledMemoryStats fills the
+assignment from it where the plugin serves the extension.
+---
+diff --git a/xla/pjrt/c/BUILD b/xla/pjrt/c/BUILD
+index c7822c081a..2b17fce1b9 100644
+--- a/xla/pjrt/c/BUILD
++++ b/xla/pjrt/c/BUILD
+@@ -702,12 +702,14 @@ cc_library(
+         "//xla/pjrt:pjrt_executable",
+         "//xla/pjrt/extensions/abi_version:gpu_abi_version_extension",
+         "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
++        "//xla/pjrt/extensions/executable_metadata:executable_metadata_extension",
+         "//xla/pjrt/gpu:allocator_config",
+         "//xla/pjrt/gpu:gpu_helpers",
+         "//xla/pjrt/gpu:se_gpu_pjrt_client",
+         "//xla/pjrt/gpu:se_gpu_pjrt_compiler",  # buildcleaner: keep to register GPU AOT compiler
+         "//xla/pjrt/gpu:se_gpu_topology_description",
+         "//xla/pjrt/plugin/xla_gpu:xla_gpu_client_options",
++        "//xla/pjrt/proto:executable_metadata_proto_cc",
+         "//xla/python:custom_call_batch_partitioner",
+         "//xla/python:custom_partition_callback",
+         "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
+@@ -807,6 +809,30 @@ cc_library(
+     ],
+ )
+ 
++xla_test(
++    name = "pjrt_c_api_gpu_executable_metadata_test",
++    srcs = ["pjrt_c_api_gpu_executable_metadata_test.cc"],
++    # The build hides a shared object's symbols (-fvisibility=hidden), so a test linked against its
++    # libraries' shared objects finds none of their functions.
++    linkstatic = True,
++    backends = ["gpu"],
++    tags = if_google([
++        "config-cuda-only",
++    ]),
++    deps = [
++        ":pjrt_c_api_gpu",
++        ":pjrt_c_api_hdrs",
++        ":pjrt_c_api_helpers",
++        ":pjrt_c_api_test_base",
++        ":pjrt_c_api_wrapper_impl",
++        "//xla/pjrt/extensions/executable_metadata:executable_metadata_extension",
++        "//xla/pjrt/proto:executable_metadata_proto_cc",
++        "//xla/service:hlo_proto_cc",
++        "//xla/tsl/platform:statusor",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "pjrt_c_api_gpu_test",
+     srcs = ["pjrt_c_api_gpu_test.cc"],
+diff --git a/xla/pjrt/c/pjrt_c_api_gpu_executable_metadata_test.cc b/xla/pjrt/c/pjrt_c_api_gpu_executable_metadata_test.cc
+new file mode 100644
+index 0000000000..9d30514ebd
+--- /dev/null
++++ b/xla/pjrt/c/pjrt_c_api_gpu_executable_metadata_test.cc
+@@ -0,0 +1,77 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <memory>
++
++#include <gtest/gtest.h>
++#include "xla/pjrt/c/pjrt_c_api.h"
++#include "xla/pjrt/c/pjrt_c_api_gpu.h"
++#include "xla/pjrt/c/pjrt_c_api_helpers.h"
++#include "xla/pjrt/c/pjrt_c_api_test_base.h"
++#include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
++#include "xla/pjrt/extensions/executable_metadata/executable_metadata_extension.h"
++#include "xla/pjrt/proto/executable_metadata.pb.h"
++#include "xla/service/hlo.pb.h"
++#include "xla/tsl/platform/statusor.h"
++
++namespace pjrt {
++namespace {
++
++class PjrtCApiGpuExecutableMetadataTest : public PjrtCApiTestBase {
++ protected:
++  PjrtCApiGpuExecutableMetadataTest() : PjrtCApiTestBase(GetPjrtApi()) {
++    executable_ = create_executable(api_, client_);
++  }
++
++  ~PjrtCApiGpuExecutableMetadataTest() override { executable_.reset(); }
++
++  std::unique_ptr<PJRT_LoadedExecutable, PJRT_LoadedExecutableDeleter>
++      executable_;
++};
++
++TEST_F(PjrtCApiGpuExecutableMetadataTest,
++       GetExecutableMetadataStatesTheBufferAssignment) {
++  auto executable = PjrtCApiTestBase::GetExecutable(executable_.get(), api_);
++  const auto* extension =
++      pjrt::FindExtension<PJRT_ExecutableMetadata_Extension>(
++          api_, PJRT_Extension_Type::PJRT_Extension_Type_ExecutableMetadata);
++  ASSERT_NE(extension, nullptr);
++  PJRT_ExecutableMetadata_GetExecutableMetadata_Args args;
++  args.executable = executable.get();
++  args.metadata = nullptr;
++  ASSERT_EQ(extension->get_executable_metadata(&args), nullptr);
++  ASSERT_NE(args.metadata, nullptr);
++  xla::PjRtExecutableMetadata metadata;
++  ASSERT_TRUE(metadata.ParseFromArray(args.metadata->serialized_metadata,
++                                      args.metadata->serialized_metadata_size));
++  PJRT_ExecutableMetadata_DestroySerializedMetadata_Args free_args;
++  free_args.metadata = args.metadata;
++  extension->destroy_serialized_metadata(&free_args);
++
++  TF_ASSERT_OK_AND_ASSIGN(auto ref_stats,
++                          executable.get()->get()->GetCompiledMemoryStats());
++  ASSERT_FALSE(ref_stats.serialized_buffer_assignment.empty());
++  EXPECT_EQ(metadata.compiled_memory_stats().serialized_buffer_assignment(),
++            ref_stats.serialized_buffer_assignment);
++  EXPECT_EQ(metadata.compiled_memory_stats().temp_size_in_bytes(),
++            ref_stats.temp_size_in_bytes);
++  xla::BufferAssignmentProto assignment;
++  EXPECT_TRUE(assignment.ParseFromString(
++      metadata.compiled_memory_stats().serialized_buffer_assignment()));
++  EXPECT_GT(assignment.logical_buffers_size(), 0);
++}
++
++}  // namespace
++}  // namespace pjrt
+diff --git a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
+index 355c44d4a4..3365f54bb5 100644
+--- a/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
++++ b/xla/pjrt/c/pjrt_c_api_gpu_internal.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ #include <memory>
+ #include <optional>
+ #include <set>
++#include <cstring>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -56,6 +57,7 @@ limitations under the License.
+ #include "xla/pjrt/c/pjrt_c_api_xla_transform_internal.h"
+ #include "xla/pjrt/extensions/abi_version/gpu_abi_version_extension.h"
+ #include "xla/pjrt/extensions/cross_host_transfers/pjrt_c_api_cross_host_transfers_extension.h"
++#include "xla/pjrt/extensions/executable_metadata/executable_metadata_extension.h"
+ #include "xla/pjrt/gpu/allocator_config.h"
+ #include "xla/pjrt/gpu/gpu_helpers.h"
+ #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
+@@ -66,6 +68,7 @@ limitations under the License.
+ #include "xla/pjrt/pjrt_device_description.h"
+ #include "xla/pjrt/pjrt_executable.h"
+ #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
++#include "xla/pjrt/proto/executable_metadata.pb.h"
+ #include "xla/python/custom_call_batch_partitioner.h"
+ #include "xla/python/custom_partition_callback.h"
+ #include "xla/service/compiler.h"
+@@ -517,6 +520,22 @@ PLUGIN_Profiler_Api profiler_api{
+     /*collect_data=*/xla::profiler::PLUGIN_Profiler_CollectData,
+ };
+ 
++// An executable's metadata: its compiled memory stats, the buffer assignment
++// among them, which PJRT_Executable_GetCompiledMemoryStats does not carry.
++PJRT_Error* PJRT_Executable_GetExecutableMetadata(
++    PJRT_ExecutableMetadata_GetExecutableMetadata_Args* args) {
++  PJRT_ASSIGN_OR_RETURN(xla::CompiledMemoryStats stats,
++                        args->executable->executable->GetCompiledMemoryStats());
++  xla::PjRtExecutableMetadata metadata;
++  *metadata.mutable_compiled_memory_stats() = stats.ToProto();
++  std::string serialized = metadata.SerializeAsString();
++  char* bytes = new char[serialized.size()];
++  std::memcpy(bytes, serialized.data(), serialized.size());
++  // Released by the extension's destroy_serialized_metadata.
++  args->metadata = new PJRT_ExecutableMetadata{bytes, serialized.size()};
++  return nullptr;
++}
++
+ PJRT_Profiler_Extension profiler_extension{
+     PJRT_Extension_Base{
+         /*struct_size=*/PJRT_Profiler_Extension_STRUCT_SIZE,
+@@ -679,8 +698,13 @@ const PJRT_Api* GetGpuPjrtApi() {
+   static PJRT_Xla_Transform_Extension xla_transform_extension =
+       pjrt::CreateXlaTransformExtension(&shardings_extension.base);
+ 
++  static PJRT_ExecutableMetadata_Extension executable_metadata_extension =
++      pjrt::CreateExecutableMetadataExtension(
++          &xla_transform_extension.base,
++          pjrt::gpu_plugin::PJRT_Executable_GetExecutableMetadata);
++
+   static PJRT_AbiVersion_Extension abi_version_extension =
+-      pjrt::CreateGpuAbiVersionExtension(&xla_transform_extension.base);
++      pjrt::CreateGpuAbiVersionExtension(&executable_metadata_extension.base);
+ 
+   static const PJRT_Api pjrt_api = pjrt::CreatePjrtApi(
+       pjrt::gpu_plugin::PJRT_Client_Create,
+diff --git a/xla/pjrt/c_api_client/BUILD b/xla/pjrt/c_api_client/BUILD
+index 8572361fca..5492517dea 100644
+--- a/xla/pjrt/c_api_client/BUILD
++++ b/xla/pjrt/c_api_client/BUILD
+@@ -104,6 +104,7 @@ cc_library(
+         "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_extension",
+         "//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_interface_impl",
+         "//xla/pjrt/proto:compile_options_proto_cc",
++        "//xla/pjrt/proto:executable_metadata_proto_cc",
+         "//xla/pjrt/proto:pjrt_abi_version_proto_cc",
+         "//xla/pjrt/proto:pjrt_partial_program_proto_cc",
+         "//xla/pjrt/proto:topology_description_proto_cc",
+diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.cc b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
+index 4fef82cea1..18ea0501f8 100644
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client.cc
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client.cc
+@@ -96,6 +96,7 @@ limitations under the License.
+ #include "xla/pjrt/pjrt_layout.h"
+ #include "xla/pjrt/pjrt_topology_description_registry.h"
+ #include "xla/pjrt/proto/compile_options.pb.h"
++#include "xla/pjrt/proto/executable_metadata.pb.h"
+ #include "xla/pjrt/proto/pjrt_abi_version.pb.h"
+ #include "xla/pjrt/proto/topology_description.pb.h"
+ #include "xla/pjrt/scoped_async_tracking_event.h"
+@@ -2417,6 +2418,26 @@ absl::StatusOr<std::vector<Shape>> PjRtCApiExecutable::GetOutputShapes() const {
+   return std::vector<Shape>{shape};
+ }
+ 
++absl::StatusOr<CompiledMemoryStats> PjRtCApiExecutable::GetCompiledMemoryStats()
++    const {
++  ABSL_ASSIGN_OR_RETURN(CompiledMemoryStats stats,
++                        pjrt::GetCompiledMemoryStats(c_api_, executable_.get()));
++  if (pjrt::FindExtension<PJRT_ExecutableMetadata_Extension>(
++          c_api_, PJRT_Extension_Type::PJRT_Extension_Type_ExecutableMetadata) ==
++      nullptr) {
++    return stats;
++  }
++  ABSL_ASSIGN_OR_RETURN(std::string serialized,
++                        GetSerializedExecutableMetadata());
++  PjRtExecutableMetadata metadata;
++  if (!metadata.ParseFromString(serialized)) {
++    return absl::InternalError("Could not parse the executable's metadata.");
++  }
++  stats.serialized_buffer_assignment =
++      metadata.compiled_memory_stats().serialized_buffer_assignment();
++  return stats;
++}
++
+ absl::StatusOr<std::string>
+ PjRtCApiExecutable::GetSerializedExecutableMetadata() const {
+   auto executable_metadata_extension =
+diff --git a/xla/pjrt/c_api_client/pjrt_c_api_client.h b/xla/pjrt/c_api_client/pjrt_c_api_client.h
+index 94fd25100d..58bb50c700 100644
+--- a/xla/pjrt/c_api_client/pjrt_c_api_client.h
++++ b/xla/pjrt/c_api_client/pjrt_c_api_client.h
+@@ -756,9 +756,10 @@ class PjRtCApiExecutable : public PjRtExecutable {
+ 
+   absl::StatusOr<std::shared_ptr<HloModule>> GetHloModule() const override;
+ 
+-  absl::StatusOr<CompiledMemoryStats> GetCompiledMemoryStats() const override {
+-    return pjrt::GetCompiledMemoryStats(c_api_, executable_.get());
+-  }
++  // The C API's stats, with the buffer assignment where the plugin serves its
++  // executables' metadata (`PJRT_ExecutableMetadata_Extension`), which the
++  // C API's stats do not carry.
++  absl::StatusOr<CompiledMemoryStats> GetCompiledMemoryStats() const override;
+ 
+   std::optional<std::vector<OpSharding>> GetParameterShardings() const override;
+ 
