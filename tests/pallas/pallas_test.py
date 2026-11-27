@@ -145,6 +145,24 @@ class PallasTest(ptu.PallasTest):
     self.assertIn(("helper", False), seen)
     self.assertNotIn(("body", False), seen)
 
+  def test_tracing_kernel_alone_keys_a_jitted_functions_trace(self):
+    # The predicate alone, no grid context about it, gives a jitted function
+    # a trace of its own: inside the marked trace it reads true, outside
+    # false, whichever traced first. Leaving the mark by an exception
+    # restores what was before it.
+    from jax._src.pallas import core as pallas_core
+    from jax.extend import pallas as jex_pallas
+
+    read = jax.jit(lambda: jnp.int32(jex_pallas.tracing_kernel()))
+    outside = int(read())
+    with pallas_core.kernel_trace():
+      inside = int(read())
+    self.assertEqual((outside, inside, int(read())), (0, 1, 0))
+    with self.assertRaises(ValueError):
+      with pallas_core.kernel_trace():
+        raise ValueError("left by an exception")
+    self.assertFalse(jex_pallas.tracing_kernel())
+
   def test_add_one_1d(self):
     if jtu.test_device_matches(["tpu"]) and not self.INTERPRET:
       self.skipTest("On TPU the test works only in interpret mode")

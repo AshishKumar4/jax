@@ -12063,6 +12063,22 @@ class WarpSpecializedPipelineWGTest(
 
 class KernelTest(PallasTest, jtu.CudaArchSpecificTest):
 
+  def test_a_core_maps_body_is_told_it_is_traced_in_a_kernel(self):
+    # jax.extend.pallas.tracing_kernel() is true while a core_map's body (a
+    # Mosaic GPU kernel's) is traced, false outside it.
+    from jax.extend import pallas as jex_pallas
+
+    seen = []
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), np.int32))
+    def kernel(o_ref):
+      seen.append(jex_pallas.tracing_kernel())
+      o_ref[...] = jnp.zeros((128,), np.int32)
+
+    np.testing.assert_array_equal(kernel(), np.zeros(128, np.int32))
+    self.assertTrue(seen and all(seen))
+    self.assertFalse(jex_pallas.tracing_kernel())
+
   def test_multiple_wg(self):
 
     @self.kernel(
