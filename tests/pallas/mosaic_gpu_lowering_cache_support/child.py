@@ -505,6 +505,9 @@ def run(case):
   if case.get("mode") == "declared":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"declared": encoder_cases.declared(case.get("package"))}
+  if case.get("mode") == "holders":
+    from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
+    return {"holders": encoder_cases.holders(case.get("package"))}
   if case.get("mode") == "rules":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"rules": encoder_cases.rules()}

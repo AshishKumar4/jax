@@ -24,6 +24,7 @@ import enum
 import functools
 import importlib
 import struct
+import sys
 
 import jax
 from jax import lax
@@ -312,3 +313,37 @@ def declared(package=None):
         "a jitted declared function": jax.jit(module.body),
     }
   return {name: cache_encoding._declared(form) for name, form in forms.items()}
+
+
+def holders(package=None):
+  """What the scan for a primitive's holder (`lowering_cache_encoding.
+  _PrimitiveHolders`) asks the seal and finds: the files it asked of modules
+  holding no primitive, and the holders of `sin_p` and, where `package` is
+  one this process declares, of its `made_p`."""
+  from jax._src import core as jax_core  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as cache_encoding  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing  # pylint: disable=g-import-not-at-top
+
+  module = None if package is None else importlib.import_module(package)
+  seal = sealing.seal()
+  original, asked = type(seal).source, []
+
+  def source(self, file):
+    asked.append(file)
+    return original(self, file)
+
+  type(seal).source = source
+  try:
+    found = cache_encoding._PrimitiveHolders()
+    sin = found.identity(lax.sin_p)
+    made = None if module is None else found.identity(module.made_p)
+  finally:
+    type(seal).source = original
+  holding = {getattr(held, "__file__", None)
+             for held in list(sys.modules.values())
+             if any(isinstance(value, jax_core.Primitive)
+                    for value in list(getattr(held, "__dict__", {}).values()))}
+  return {"asked of no holder": sorted(str(file) for file in asked
+                                       if file not in holding),
+          "sin": None if sin is None else list(sin),
+          "made": None if made is None else list(made)}

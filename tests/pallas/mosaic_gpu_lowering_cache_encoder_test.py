@@ -65,6 +65,28 @@ class RulesTest(harness.LoweringCacheTestCase):
     self.assertEqual(result["no rule"], "refused")
 
 
+class HoldersTest(harness.LoweringCacheTestCase):
+
+  def test_the_holder_scan_asks_the_seal_of_holding_modules_alone(self):
+    # Whose code a module is, a file the seal answers by resolving its links,
+    # is asked only of a module holding a primitive; a sealed primitive and a
+    # declared package's are each found at their holder.
+    package = self.tmp / "holdingpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from jax.extend import core\nmade_p = core.Primitive('made')\n")
+    path = os.pathsep.join(
+        [str(self._site), str(harness.TESTS_PALLAS), str(self.tmp)])
+    found = self.run_child(
+        mode="holders", package="holdingpkg",
+        env={"PYTHONPATH": path,
+             "JAX_PALLAS_LOWERING_CACHE_SOURCES": "holdingpkg"})["holders"]
+    self.assertEqual(found["asked of no holder"], [])
+    self.assertTrue(found["sin"][0].startswith("jax._src."))
+    self.assertEqual(found["sin"][1], "sin_p")
+    self.assertEqual(found["made"], ["holdingpkg", "made_p"])
+
+
 class DeclaredTest(harness.LoweringCacheTestCase):
 
   def test_what_an_inline_body_runs_is_checked_not_its_wrapper(self):

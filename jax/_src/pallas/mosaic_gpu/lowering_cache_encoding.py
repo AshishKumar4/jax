@@ -94,14 +94,26 @@ class _PrimitiveHolders:
     seal = sealing.seal()
     holders: dict[int, list[tuple[str, str, jax_core.Primitive]]] = {}
     for module_name, module in list(sys.modules.items()):
+      # The primitives it holds, read first: only a module holding one needs
+      # the seal's answer of whose code it is, and a file answered afresh is
+      # its links resolved, system calls each handing the GIL to the threads
+      # tracing beside it (the first scan of a 4,800-module compile ahead
+      # asked 4,000 files: 2.7 s of its wall, 0.3 s of its time).
+      try:
+        attributes = list(vars(module).items())
+      except TypeError:  # No module (None, where an import failed).
+        continue
+      held = [(attribute, value) for attribute, value in attributes
+              if isinstance(value, jax_core.Primitive)]
+      if not held:
+        continue
       file = getattr(module, "__file__", None)
       sealed = (module_name.partition(".")[0] in sealing.SEALED_MODULE_ROOTS
-                and module is not None and seal.holds(file))
-      if not sealed and (module is None or seal.source(file) is None):
+                and seal.holds(file))
+      if not sealed and seal.source(file) is None:
         continue
-      for attribute, value in list(vars(module).items()):
-        if isinstance(value, jax_core.Primitive):
-          holders.setdefault(id(value), []).append((module_name, attribute, value))
+      for attribute, value in held:
+        holders.setdefault(id(value), []).append((module_name, attribute, value))
     self._by_id = {
         i: min(held, key=lambda h: (not h[0].startswith("jax._src"), h[0], h[1]))
         for i, held in holders.items()
