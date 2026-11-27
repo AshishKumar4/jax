@@ -15,9 +15,13 @@
 """The raw facts a compiled executable states for its readers: XLA's buffer
 assignment and which call argument each entry parameter holds."""
 
+import re
+
 from absl.testing import absltest
 import jax
+from jax import lax
 from jax._src import test_util as jtu
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 
 
@@ -43,6 +47,30 @@ class CompiledFactsTest(jtu.JaxTestCase):
     assignment = compiled.buffer_assignment()
     self.assertIsInstance(assignment, bytes)
     self.assertNotEmpty(assignment)
+
+
+class CheckpointNameTest(jtu.JaxTestCase):
+  """A checkpoint name is its value's defining op's frontend attribute, which
+  XLA keeps on the instruction defining the value's buffer."""
+
+  def named_ops(self, f, *args):
+    text = jax.jit(f).lower(*args).as_text()
+    return [re.search(r'= "?(\w+\.\w+)', line).group(1)
+            for line in text.splitlines() if 'checkpoint_name = "' in line]
+
+  def test_a_name_tags_its_values_producer_through_a_reshape(self):
+    named = self.named_ops(
+        lambda x: checkpoint_name((x @ x).reshape(-1), "hidden"),
+        jnp.ones((4, 4)))
+    self.assertEqual(named, ["stablehlo.dot_general", "stablehlo.reshape"])
+
+  def test_a_name_on_one_result_of_a_variadic_op_tags_nothing(self):
+    # sort's two results share one instruction: naming its op would name the
+    # unnamed sibling's buffer too.
+    def f(keys, values):
+      _, sorted_values = lax.sort((keys, values), num_keys=1)
+      return checkpoint_name(sorted_values, "values")
+    self.assertEqual(self.named_ops(f, jnp.arange(8.0), jnp.arange(8.0)), [])
 
 
 if __name__ == "__main__":

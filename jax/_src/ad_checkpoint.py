@@ -958,13 +958,11 @@ def _name_lowering(ctx, x, *, name):
   # so its operand's producer carries the names (`mlir._get_owner`).
   del ctx
   op = _defining(x)
-  while op is not None:
+  while op is not None and _one_array(op):
     _named(op, name)
     if op.name != "stablehlo.reshape":
       break
     op = _defining(op.operands[0])
-    if op is not None and not _one_array(op):
-      break
   return [x]
 
 def _defining(value):
