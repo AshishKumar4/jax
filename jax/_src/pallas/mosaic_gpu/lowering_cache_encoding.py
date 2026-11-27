@@ -419,6 +419,11 @@ class Encoder:
     ])
 
   def _numpy_value(self, x) -> bytes:
+    if isinstance(x, np.ndarray) and self._callables:
+      # A callable a lowering runs (an inline_mgpu body) may read anything of
+      # an array it holds, its ownership and its memory among it, which no key
+      # holds: only an array the program holds as a value is encoded.
+      raise Uncacheable("an array a callable holds has no encoding")
     if isinstance(x, np.ndarray):
       if x.dtype.kind == "O":
         raise Uncacheable("an object array has no encoding")

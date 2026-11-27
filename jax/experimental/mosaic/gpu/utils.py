@@ -1174,6 +1174,12 @@ def warpgroup_barrier_idx(sync: bool = True) -> ir.Value[ir.IntegerType]:
   return arith.addi(warpgroup_idx(sync=sync), c(1, i32))
 
 
+WARPGROUP_BARRIER = "mosaic_gpu.warpgroup_barrier"
+"""The attribute marking the compiler's own warpgroup sync (`warpgroup_barrier`):
+every thread of one warpgroup on that warpgroup's own barrier, which a counted
+barrier alone does not show (two warpgroups could each send half their threads
+to each of two barriers of 128)."""
+
 COLLECTIVE_BARRIER = "mosaic_gpu.collective_barrier"
 """The attribute marking a warpgroup barrier every thread of the warpgroup
 reaches from the same program point (`warpgroup_barrier(collective=True)`: a
@@ -1194,6 +1200,7 @@ def warpgroup_barrier(*, collective: bool = False):
       barrier_id=warpgroup_barrier_idx(sync=False),
       number_of_threads=c(WARPGROUP_SIZE, i32),
   )
+  op.attributes[WARPGROUP_BARRIER] = ir.UnitAttr.get()
   if collective:
     op.attributes[COLLECTIVE_BARRIER] = ir.UnitAttr.get()
 

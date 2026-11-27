@@ -38,10 +38,10 @@ index e22b4de..a5116f9 100644
        std::unique_ptr<gpu::GpuExecutableBufferAllocator::ExecutionScope>
            allocation_scope,
 diff --git a/xla/pjrt/pjrt_executable.cc b/xla/pjrt/pjrt_executable.cc
-index 231e703..720c2ae 100644
+index 231e703..e3f2ac4 100644
 --- a/xla/pjrt/pjrt_executable.cc
 +++ b/xla/pjrt/pjrt_executable.cc
-@@ -164,35 +164,27 @@ absl::StatusOr<CompileOptions> CompileOptions::FromProto(
+@@ -164,35 +164,31 @@ absl::StatusOr<CompileOptions> CompileOptions::FromProto(
  }
  
  bool IsEarlyExitCompilation(const xla::CompileOptions& compile_options) {
@@ -88,6 +88,10 @@ index 231e703..720c2ae 100644
 -
 -  return early_exit_with_layouts ||
 -         early_exit_point != DebugOptions::EARLY_EXIT_POINT_UNSET;
++  // No debug options, and no override of these: no early exit.
++  if (!applied.executable_build_options.has_debug_options()) {
++    return false;
++  }
 +  const xla::DebugOptions& debug_options =
 +      applied.executable_build_options.debug_options();
 +  return debug_options.xla_early_exit_with_layouts() ||
@@ -124,7 +128,7 @@ index 7e2e02d..a9a567a 100644
    CompileOptions options;
    options.env_option_overrides = {
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index ca80bc5..6c8bcd0 100644
+index d71802f..81287c3 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -863,6 +863,7 @@ cc_library(
@@ -135,7 +139,7 @@ index ca80bc5..6c8bcd0 100644
          "//xla/pjrt/proto:compile_options_proto_cc",
          "//xla/runtime:device_id",
          "//xla/runtime:hang_watchdog",
-@@ -2425,6 +2426,32 @@ xla_test(
+@@ -2426,6 +2427,32 @@ xla_test(
      ],
  )
  

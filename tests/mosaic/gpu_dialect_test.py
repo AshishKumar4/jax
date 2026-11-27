@@ -2636,8 +2636,13 @@ class DialectLoweringTest(MosaicGpuTest):
       return marker
 
   @staticmethod
-  def _barrier(threads=mgpu_utils.WARPGROUP_SIZE):
+  def _barrier(threads=None):
+    """The compiler's own warpgroup sync, or inline assembly syncing `threads`
+    on a barrier (which orders no warpgroup it does not name)."""
     def emit():
+      if threads is None:
+        mgpu_utils.warpgroup_barrier()
+        return
       mgpu_utils.inline_ptx(
           f"bar.sync $0, {threads};",
           arith.constant(ir.IntegerType.get_signless(32), 1),
@@ -2696,9 +2701,10 @@ class DialectLoweringTest(MosaicGpuTest):
         lowering._warpgroup_synced_before(self._marked_after(before))
     )
 
-  def test_a_barrier_of_one_warp_does_not_sync_the_warpgroup(self):
-    marker = self._marked_after(self._barrier(threads=32))
-    self.assertFalse(lowering._warpgroup_synced_before(marker))
+  def test_inline_assembly_syncing_a_count_does_not_sync_the_warpgroup(self):
+    for threads in (32, mgpu_utils.WARPGROUP_SIZE):
+      marker = self._marked_after(self._barrier(threads=threads))
+      self.assertFalse(lowering._warpgroup_synced_before(marker))
 
   @staticmethod
   def _nvvm_barrier(threads):
@@ -2722,14 +2728,17 @@ class DialectLoweringTest(MosaicGpuTest):
       )
     return emit
 
+  # A barrier of the whole CTA syncs the warpgroup; one of a count of threads
+  # does not, however many: two warpgroups may each send half their threads to
+  # each of two barriers of 128.
   @parameterized.parameters(
       (None, True),
-      (mgpu_utils.WARPGROUP_SIZE, True),
-      (2 * mgpu_utils.WARPGROUP_SIZE, True),
+      (mgpu_utils.WARPGROUP_SIZE, False),
+      (2 * mgpu_utils.WARPGROUP_SIZE, False),
       (32, False),
       ("unknown", False),
   )
-  def test_an_nvvm_barrier_syncs_the_warpgroup_only_for_a_count_it_proves(
+  def test_an_nvvm_barrier_syncs_the_warpgroup_only_where_it_holds_all_of_it(
       self, threads, synced
   ):
     marker = self._marked_after(self._nvvm_barrier(threads))

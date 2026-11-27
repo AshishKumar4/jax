@@ -134,10 +134,16 @@ def _encode_entry(
 
 def _token() -> tuple[Any, ...]:
   """What the registries are made of, by identity: cheap to make and compare."""
+  return _token_of([(table, (live := table.get()), _entries(live))
+                    for table in tables()])
+
+
+def _token_of(snapshot) -> tuple[Any, ...]:
+  """`_token` of a snapshot of the registries: each table and the entries it
+  held when it was taken."""
   return tuple(
-      (table.name, id(live := table.get()),
-       tuple((id(key), id(rule)) for key, rule in _entries(live)))
-      for table in tables()
+      (table.name, id(live), tuple((id(key), id(rule)) for key, rule in held))
+      for table, live, held in snapshot
   )
 
 
@@ -210,16 +216,17 @@ class State:
     return hashlib.sha256(self.digest + b"".join(sorted(own))).digest(), extended
 
 
-def _lowered() -> set[jax_core.Primitive]:
-  """The primitives every lowering reaches the entries of: each a Mosaic GPU
-  rule lowers or a call primitive, which is what a rule's equations hold; and
-  the state primitives, the only ones holding a ref that JAX's own code makes,
-  so the only ones a body a discharge rule makes could hold for a later
-  discharge."""
-  # Each table copied before it is read: a rule may be registered meanwhile.
-  lowered: set[jax_core.Primitive] = set(eval_jaxpr_lib.call_primitives.copy())
-  for rules in list(lowering.mosaic_lowering_rules.values()):
-    lowered.update(rules.copy())
+def _lowered(snapshot) -> set[jax_core.Primitive]:
+  """The primitives every lowering reaches the entries of, as `snapshot` holds
+  the registries: each a Mosaic GPU rule lowers or a call primitive, which is
+  what a rule's equations hold; and the state primitives, the only ones holding
+  a ref that JAX's own code makes, so the only ones a body a discharge rule
+  makes could hold for a later discharge."""
+  lowered: set[jax_core.Primitive] = {
+      key for table, _, held in snapshot
+      if table.name.startswith("mosaic_lowering_rules[")
+      or table.name == "jax.lax.eval_jaxpr.call_primitives"
+      for key, _ in held}
   lowered.update(value for value in vars(state_primitives).values()
                  if isinstance(value, jax_core.Primitive))
   return lowered
@@ -240,12 +247,14 @@ def current() -> State:
   from jax._src.pallas.mosaic_gpu import primitives  # pylint: disable=unused-import,g-import-not-at-top
   del primitives
   with _lock:
-    token = _token()
-    if _last is not None and _last.token == token:
-      return _last
+    # One capture of the registries, which its token, the primitives every
+    # lowering reaches and the digest are all made of.
     snapshot = [(table, (live := table.get()), tuple(_entries(live)))
                 for table in tables()]
-    lowered = _lowered()
+    token = _token_of(snapshot)
+    if _last is not None and _last.token == token:
+      return _last
+    lowered = _lowered(snapshot)
     enc = encoding.Encoder()
     encoded = []
     for table, _, held in snapshot:
@@ -256,6 +265,10 @@ def current() -> State:
       encoded.append(encoding.seq(
           b"table", [encoding.string(table.name), *sorted(parts)]))
     digest = hashlib.sha256(b"".join(encoded)).digest()
+    if _token() != token:
+      # A rule registered or replaced while the capture was read: no identity
+      # of one state of the registries.
+      raise sealing.Unsealed("a registry changed while its identity was taken")
     # Whatever code the rules run, as their encoding met it (`Encoder.extended`).
     _last = State(
         token, digest, tuple((live, held) for _, live, held in snapshot),

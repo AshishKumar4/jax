@@ -290,7 +290,7 @@ index 517f6fd..15fd9da 100644
  }
  
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 65df6ab..ca80bc5 100644
+index 65df6ab..d71802f 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -544,6 +544,8 @@ cc_library(
@@ -302,7 +302,7 @@ index 65df6ab..ca80bc5 100644
          "//xla/hlo/ir:hlo",
          "//xla/hlo/ir:hlo_instruction_utils",
          "//xla/mlir/utils:error_util",
-@@ -2292,6 +2294,37 @@ xla_test(
+@@ -2292,6 +2294,38 @@ xla_test(
      ],
  )
  
@@ -315,6 +315,7 @@ index 65df6ab..ca80bc5 100644
 +    backends = ["gpu"],
 +    deps = [
 +        "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_emitter_context",
++        "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_handler_registration",
 +        "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_handler_registry",
 +        "//xla/backends/gpu/runtime:thunk",
 +        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
@@ -342,10 +343,10 @@ index 65df6ab..ca80bc5 100644
      srcs = ["gpu_compiler_test.cc"],
 diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
 new file mode 100644
-index 0000000..e20dbd2
+index 0000000..458f592
 --- /dev/null
 +++ b/xla/service/gpu/instantiate_concurrently_test.cc
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,177 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -373,6 +374,7 @@ index 0000000..e20dbd2
 +#include "absl/time/clock.h"
 +#include "absl/time/time.h"
 +#include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_emitter_context.h"
++#include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_handler_registration.h"
 +#include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_handler_registry.h"
 +#include "xla/backends/gpu/runtime/thunk.h"
 +#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"

@@ -146,6 +146,12 @@ def cases():
        np.asfortranarray(np.arange(4.).reshape(2, 2).T), "different"),
       ("array writeability", np.arange(2.), np.arange(2.).view(), "equal"),
       ("array read-only", np.arange(2.), _read_only(np.arange(2.)), "different"),
+      # An array a callable holds (an inline_mgpu body's closure, a partial's
+      # argument) may be read for anything of it: none is encoded.
+      ("a callable holding an array", functools.partial(lax.add, np.arange(2.)),
+       functools.partial(lax.add, np.arange(2.)), "uncacheable"),
+      ("a callable holding a scalar", functools.partial(lax.add, 2.0),
+       functools.partial(lax.add, 2.0), "equal"),
       ("weak and strong type", jax_core.ShapedArray((), f32, weak_type=True),
        jax_core.ShapedArray((), f32, weak_type=False), "different"),
       ("weak aval alike", jax_core.ShapedArray((), f32, weak_type=True),

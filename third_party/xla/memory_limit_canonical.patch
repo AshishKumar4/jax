@@ -57,10 +57,10 @@ index c6edd40..ef84075 100644
  
  // Defining the first virtual non-pure method, which is usually the virtual
 diff --git a/xla/pjrt/pjrt_executable.cc b/xla/pjrt/pjrt_executable.cc
-index 720c2ae..7171810 100644
+index e3f2ac4..d5642c4 100644
 --- a/xla/pjrt/pjrt_executable.cc
 +++ b/xla/pjrt/pjrt_executable.cc
-@@ -292,6 +292,9 @@ CompiledMemoryStatsProto CompiledMemoryStats::ToProto() const {
+@@ -296,6 +296,9 @@ CompiledMemoryStatsProto CompiledMemoryStats::ToProto() const {
    proto.set_total_allocation_bytes(total_allocation_bytes);
    proto.set_indefinite_allocations(indefinite_allocations);
    proto.set_peak_unpadded_heap_bytes(peak_unpadded_heap_bytes);
@@ -70,7 +70,7 @@ index 720c2ae..7171810 100644
    return proto;
  }
  
-@@ -315,6 +318,9 @@ CompiledMemoryStats CompiledMemoryStats::FromProto(
+@@ -319,6 +322,9 @@ CompiledMemoryStats CompiledMemoryStats::FromProto(
    stats.total_allocation_bytes = proto.total_allocation_bytes();
    stats.indefinite_allocations = proto.indefinite_allocations();
    stats.peak_unpadded_heap_bytes = proto.peak_unpadded_heap_bytes();

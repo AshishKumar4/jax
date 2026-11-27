@@ -21,7 +21,6 @@ import dataclasses
 import functools
 import math
 import operator
-import re
 from typing import Any, Literal, assert_never, cast
 
 from jax._src.interpreters import mlir as mlir_interpreter
@@ -1343,13 +1342,6 @@ _NO_THREAD_SMEM_ACCESS = (
     "memref.extract_strided_metadata", "scf.yield",
 )
 _STRUCTURED = ("scf.if", "scf.index_switch", "scf.for")
-# Inline assembly that is one barrier instruction and nothing else: one that
-# goes on past it (a shared memory read after the sync) is an access.
-_WARPGROUP_BARRIER = re.compile(
-    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;\s*$"
-)
-
-
 def _no_thread_smem_access(op: ir.Operation) -> bool:
   """Whether `op`, and every op its regions hold, touches no shared memory."""
   name = op.name
@@ -1363,41 +1355,20 @@ def _no_thread_smem_access(op: ir.Operation) -> bool:
   return name.startswith(_NO_THREAD_SMEM_ACCESS)
 
 
-def _constant_int(value: ir.Value) -> int | None:
-  """`value`'s integer where an `arith.constant` or `llvm.mlir.constant` defines
-  it, else None."""
-  owner = value.owner
-  if not isinstance(owner, (ir.Operation, ir.OpView)):
-    return None
-  operation = owner.operation if isinstance(owner, ir.OpView) else owner
-  if operation.name not in ("arith.constant", "llvm.mlir.constant"):
-    return None
-  attribute = operation.attributes["value"]
-  return attribute.value if isinstance(attribute, ir.IntegerAttr) else None
-
-
 def _is_warpgroup_barrier(op: ir.Operation) -> bool:
   """Whether `op` is a barrier every thread of a warpgroup takes part in: one of
   the whole CTA (`nvvm.barrier0`, `gpu.barrier`, an `nvvm.barrier` that names no
-  thread count), or one whose thread count is a constant of at least a
-  warpgroup. An `nvvm.barrier` of fewer threads (`numberOfThreads=32`, one
-  warp's) or of a count not known here orders no warpgroup."""
+  thread count), or the compiler's own warpgroup sync (`utils.warpgroup_barrier`,
+  marked `utils.WARPGROUP_BARRIER`). A barrier of a count of threads, however
+  many, orders no warpgroup it does not name (two warpgroups may each send half
+  their threads to each of two barriers of 128), nor does inline assembly."""
   if op.name in ("nvvm.barrier0", "gpu.barrier"):
     return True
-  if op.name == "nvvm.barrier":
-    # Its operands by segment: barrierId, then numberOfThreads (each optional).
-    segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
-    if segments[1] == 0:
-      return True
-    threads = _constant_int(op.operands[segments[0]])
-    return threads is not None and threads >= utils.WARPGROUP_SIZE
-  if op.name != "llvm.inline_asm":
+  if op.name != "nvvm.barrier":
     return False
-  asm = ir.StringAttr(op.attributes["asm_string"]).value
-  match = _WARPGROUP_BARRIER.match(asm)
-  return match is not None and (
-      match.group(4) is None or int(match.group(4)) >= utils.WARPGROUP_SIZE
-  )
+  # Its operands by segment: barrierId, then numberOfThreads (each optional).
+  segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+  return segments[1] == 0 or utils.WARPGROUP_BARRIER in op.attributes
 
 
 def _warpgroup_synced_before(op: ir.OpView) -> bool:
