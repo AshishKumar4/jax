@@ -1401,33 +1401,6 @@ def as_slice_indices(arr: Any, idx: Index) -> tuple[
   return tuple(start_indices), tuple(limit_indices), tuple(removed_dims)
 
 
-def _copied_in_place(xs, devices, copy_semantics):
-  """`xs` as `batched_device_put` takes them, each single-device array already
-  on its target device copied there where `copy_semantics` asks a copy
-  (`ALWAYS_COPY`): that call wraps such an array's buffer in the result, which
-  would alias the source a `device_put(..., may_alias=False)` resharded."""
-  if copy_semantics != xc.ArrayCopySemantics.ALWAYS_COPY:
-    return xs
-  kept = [
-      i for i, (x, d) in enumerate(safe_zip(xs, devices))
-      if isinstance(x, ArrayImpl) and x.sharding.num_devices == 1
-      and x.devices() == {d}
-  ]
-  if not kept:
-    return xs
-  copies = xc.batched_copy_array_to_devices_with_sharding(
-      [xs[i] for i in kept],
-      [xs[i].sharding._internal_device_list.addressable_device_list
-       for i in kept],
-      [xs[i].sharding for i in kept],
-      [xc.ArrayCopySemantics.ALWAYS_COPY] * len(kept),
-  )
-  xs = list(xs)
-  for i, copy in safe_zip(kept, copies):
-    xs[i] = copy
-  return xs
-
-
 def shard_device_array(x, devices, indices, sharding,
                        copy_semantics=xc.ArrayCopySemantics.REUSE_INPUT):
   if sharding.is_fully_replicated:
@@ -1451,8 +1424,8 @@ def shard_device_array(x, devices, indices, sharding,
     duplicate_shards = [idx_to_shard[idx] for idx in duplicate_indices]
     shards = merge_lists(is_duplicate, unique_shards, duplicate_shards)
   aval = core.shaped_abstractify(x)
-  shards = _copied_in_place(shards, devices, copy_semantics)
-  return pxla.batched_device_put(aval, sharding, shards, devices)
+  return pxla.batched_device_put(aval, sharding, shards, devices,
+                                 copy_semantics=copy_semantics)
 
 
 def shard_sharded_device_array_slow_path(
@@ -1479,8 +1452,8 @@ def shard_sharded_device_array_slow_path(
         break
     else:
       bufs.append(candidates_list[-1])
-  bufs = _copied_in_place(bufs, devices, copy_semantics)
-  return pxla.batched_device_put(x.aval, sharding, bufs, devices)
+  return pxla.batched_device_put(x.aval, sharding, bufs, devices,
+                                 copy_semantics=copy_semantics)
 
 
 @cache(max_size=4096, trace_context_in_key=False)
