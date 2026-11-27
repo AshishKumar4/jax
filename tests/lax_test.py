@@ -1739,6 +1739,11 @@ class LaxTest(jtu.JaxTestCase):
             jax.numpy_dtype_promotion("standard")):
         self.assertAllClose(jax.jit(jnp.matmul)(left, right), expected,
                             rtol=1e-5)
+    # A real preferred type would drop the imaginary part the result holds:
+    # refused at abstract evaluation, as without an algorithm.
+    with self.assertRaisesRegex(TypeError, "complex preferred_element_type"):
+      lax.dot(lhs, rhs, precision="F32_F32_F32",
+              preferred_element_type=np.float32)
 
   def testDotAlgorithmAllowedOutputStorage(self):
     # see https://github.com/jax-ml/jax/issues/24794

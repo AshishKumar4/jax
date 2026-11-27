@@ -7093,6 +7093,15 @@ def _dot_general_dtype_rule(lhs, rhs, *, dimension_numbers, precision,
       raise TypeError(f'{name} argument type error: {lhs.dtype}, {rhs.dtype}')
     result_dtype = lhs.dtype
   has_algorithm = isinstance(precision, (DotAlgorithm, DotAlgorithmPreset))
+  if (has_algorithm and preferred_element_type is not None
+      and dtypes.issubdtype(result_dtype, np.complexfloating)
+      and not dtypes.issubdtype(preferred_element_type, np.complexfloating)):
+    # A complex dot under an algorithm is its real products at it
+    # (`_complex_dot_by_parts`): complex, as without one, where the bit width
+    # check refuses a real preferred type.
+    raise TypeError(
+        f"{name} of complex operands takes a complex preferred_element_type, "
+        f"got {preferred_element_type} for result type {result_dtype}")
   return _maybe_upcast(result_dtype, preferred_element_type,
                        check_bit_width=not has_algorithm)
 
