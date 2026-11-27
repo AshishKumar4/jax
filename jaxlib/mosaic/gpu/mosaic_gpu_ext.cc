@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/str_cat.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/stl/string.h"  // IWYU pragma: keep
 #include "nanobind/stl/tuple.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "jaxlib/absl_status_casters.h"
@@ -445,6 +446,15 @@ NB_MODULE(_mosaic_gpu_ext, m) {
         return profiler_state.timings;
       },
       nb::arg("finalize") = true);
+  m.def(
+      "_get_assembler",
+      []() -> std::string {
+        return jax::ValueOrThrow(
+                   mosaic::gpu::GetAssemblyToBinaryCompilationProvider())
+            ->name();
+      },
+      "Returns the compilation provider that assembles a kernel's PTX, as it "
+      "names itself: a subprocess provider names the `ptxas` it runs.");
   m.def(
       "_get_ptxas_isa_version",
       []() -> int {

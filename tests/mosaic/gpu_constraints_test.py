@@ -21,11 +21,14 @@ from jax._src import config
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import func
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import constraints as cs
 from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.mosaic.gpu import launch_context as lc
 from jax.experimental.mosaic.gpu import tcgen05
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
+import numpy as np
 
 config.parse_flags_with_absl()
 
@@ -131,6 +134,14 @@ class ConstraintSystemTest(parameterized.TestCase):
   def test_strict_relayout_constraint_holds(self, src, tgt, holds):
     self.assertEqual(
         cs.Relayout(RL(src), RL(tgt), 32, strict=True).holds(), holds
+    )
+
+  @parameterized.parameters((16, 4, True), (32, 4, False), (16, 2, False))
+  def test_relayout_from_mma_accumulator_to_lhs(self, bitwidth, m_warps, holds):
+    dtype = np.float16 if bitwidth == 16 else np.float32
+    layouts = mgpu.MMALayouts(dtype, m_warps=m_warps)
+    self.assertEqual(
+        cs.Relayout(RL(layouts.acc), RL(layouts.lhs), bitwidth).holds(), holds
     )
 
   def test_not_of_type_constraint_holds_for_different_types(self):
@@ -261,9 +272,22 @@ class ConstraintSystemTest(parameterized.TestCase):
         layout,
     )
 
-  # TODO(allanrenucci): Add support for reducing tiled layouts when keep_dims=True.
-  def test_reduce_reduce_expression_does_not_reduce_tiled_layout_if_keep_dims_is_true(self):
-    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=(0,), rank=2, keep_dims=True)
+  @parameterized.named_parameters(
+      ("keep_rows", (0,), mgpu.WGMMA_COL_LAYOUT),
+      ("keep_cols", (1,), mgpu.WGMMA_ROW_LAYOUT),
+  )
+  def test_reduce_reduce_expression_keeps_a_unit_axis_of_a_tiled_layout(self, axes, reduced):
+    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=axes, rank=2, keep_dims=True)
+    shape = list(reduced.base_tile_shape)
+    shape.insert(axes[0], 1)
+    expected = fa.reshape_unit_axis_layout(
+        reduced, reduced.base_tile_shape, tuple(shape)
+    )
+    self.assertIsNotNone(expected)
+    self.assertEqual(cs.reduce_expression(expr, {}), RL(expected))
+
+  def test_reduce_reduce_expression_keeps_dims_of_a_tiled_layout_only_for_one_axis_of_two(self):
+    expr = cs.Reduce(RL(mgpu.WGMMA_LAYOUT), axes=(0,), rank=3, keep_dims=True)
     self.assertEqual(cs.reduce_expression(expr, {}), expr)
 
   @parameterized.parameters(
@@ -580,6 +604,47 @@ class ConstraintSystemTest(parameterized.TestCase):
     )
     self.assertEqual(reg_to_smem.holds(), holds)
     self.assertEqual(smem_to_reg.holds(), holds)
+
+  @parameterized.parameters(
+      ((9, 0), (10, 0)), ((10, 0), (9, 0)), (None, (10, 0)), ("detached", (9, 0))
+  )
+  def test_a_transfer_its_target_decides_is_read_for_each_target_in_one_process(
+      self, first, second
+  ):
+    # Transposed 8-bit transfers are Blackwell's alone: one process asking for
+    # one target, then the other, reads each target's own answer, in either
+    # order, though the check is computed once per transfer and target.
+    cs._is_supported_smem_transfer.cache_clear()
+    smem_layout = cs.SMEMTransforms(lc.TileTransform((64, 64)), None)
+    reg_layout = cs.RegisterLayout(fa.WGMMA_LAYOUT_8BIT)
+
+    def holds(arch):
+      constraint = cs.IsTransferableSmemRegisters(
+          smem_layout, reg_layout, (128, 128), (1, 128), bitwidth=8,
+          optimized=False,
+      )
+      if arch is None:
+        # No module: the target is the device's (`utils.get_arch`).
+        return constraint.holds()
+      if arch == "detached":
+        # Inside an op no module holds yet, as a kernel body layout inference
+        # reads before it is placed: the device's target too.
+        body = func.FuncOp("unplaced", ir.FunctionType.get([], [])).add_entry_block()
+        with ir.InsertionPoint(body):
+          return constraint.holds()
+      module = ir.Module.create()
+      i32 = ir.IntegerType.get_signless(32)
+      module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, arch[0])
+      module.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, arch[1])
+      with ir.InsertionPoint(module.body):
+        return constraint.holds()
+
+    blackwell = lambda arch: (
+        arch if isinstance(arch, tuple) else (mgpu_utils.get_arch().major,)
+    )[0] >= 10
+    self.assertEqual(
+        [holds(first), holds(second)], [blackwell(first), blackwell(second)]
+    )
 
   def test_untiled_swizzled_smem_is_not_transferable_for_strided_layout(self):
     reg_layout = cs.RegisterLayout(mgpu.WGStridedFragLayout((128, 128), vec_size=4))
