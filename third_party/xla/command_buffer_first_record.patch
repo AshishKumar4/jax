@@ -1,0 +1,242 @@
+diff --git a/xla/backends/gpu/runtime/BUILD b/xla/backends/gpu/runtime/BUILD
+index 73eccf2..6cb4620 100644
+--- a/xla/backends/gpu/runtime/BUILD
++++ b/xla/backends/gpu/runtime/BUILD
+@@ -664,6 +664,42 @@ cc_library(
+     ] + xla_internal(["service:execution_graph_visualizer_google"]),
+ )
+ 
++xla_test(
++    name = "command_buffer_thunk_first_record_test",
++    srcs = ["command_buffer_thunk_first_record_test.cc"],
++    backends = ["gpu"],
++    # Linked whole: jax's build hides each library's symbols
++    # (-fvisibility=hidden), so a test linked to them one shared object each
++    # finds none.
++    linkstatic = True,
++    deps = [
++        ":command_buffer_thunk",
++        ":command_executor",
++        ":device_to_device_copy_thunk",
++        ":sequential_thunk",
++        ":thunk",
++        "//xla:shape_util",
++        "//xla:xla_data_proto_cc",
++        "//xla/service:buffer_assignment",
++        "//xla/service:executable",
++        "//xla/service:platform_util",
++        "//xla/service:shaped_slice",
++        "//xla/service/gpu:buffer_allocations",
++        "//xla/stream_executor:command_buffer",
++        "//xla/stream_executor:device_address",
++        "//xla/stream_executor:platform",
++        "//xla/stream_executor:platform_manager",
++        "//xla/stream_executor:stream_executor_address_allocator",
++        "//xla/stream_executor:stream_executor_h",
++        "//xla/tsl/lib/core:status_test_util",
++        "//xla/tsl/platform:statusor",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/types:span",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
+ xla_test(
+     name = "command_buffer_thunk_test",
+     srcs = ["command_buffer_thunk_test.cc"],
+diff --git a/xla/backends/gpu/runtime/command_buffer_thunk.cc b/xla/backends/gpu/runtime/command_buffer_thunk.cc
+index abe1f63..f9c08e2 100644
+--- a/xla/backends/gpu/runtime/command_buffer_thunk.cc
++++ b/xla/backends/gpu/runtime/command_buffer_thunk.cc
+@@ -370,6 +370,20 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
+   bool is_first_record =
+       cmd_buffer->command_buffer->state() == se::CommandBuffer::State::kCreate;
+ 
++  // A command buffer is never created while it executes: its graph would be
++  // instantiated with no rendezvous of the process's devices, while a peer's
++  // collective may wait on this device and the peer's host thread on the
++  // driver lock the instantiation holds (a while loop's next iteration, after
++  // the warmup of a buffer holding a custom call or a collective). Until
++  // `Initialize` records it, before an execution's thunks run, the buffer runs
++  // its thunks.
++  if (is_first_record && thunks_) {
++    XLA_VLOG_DEVICE(2, executor->device_ordinal())
++        << "Execute command buffer thunk as a regular thunk sequence until "
++           "its command buffer is recorded at initialization";
++    return thunks_->ExecuteOnStream(params);
++  }
++
+   bool has_dynamic_allocations = cmd_buffer->HasDynamicAllocations(
+       commands_, *params.persistent_alloc_indices);
+   auto updated_allocs = cmd_buffer->UpdateBufferAllocations(
+diff --git a/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc b/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc
+new file mode 100644
+index 0000000..b99e095
+--- /dev/null
++++ b/xla/backends/gpu/runtime/command_buffer_thunk_first_record_test.cc
+@@ -0,0 +1,164 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include <cstdint>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include <gtest/gtest.h>
++#include "absl/status/statusor.h"
++#include "absl/strings/ascii.h"
++#include "absl/types/span.h"
++#include "xla/backends/gpu/runtime/command_buffer_thunk.h"
++#include "xla/backends/gpu/runtime/command_executor.h"
++#include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
++#include "xla/backends/gpu/runtime/sequential_thunk.h"
++#include "xla/backends/gpu/runtime/thunk.h"
++#include "xla/service/buffer_assignment.h"
++#include "xla/service/gpu/buffer_allocations.h"
++#include "xla/service/platform_util.h"
++#include "xla/service/service_executable_run_options.h"
++#include "xla/service/shaped_slice.h"
++#include "xla/shape.h"
++#include "xla/shape_util.h"
++#include "xla/stream_executor/command_buffer.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/stream_executor/platform.h"
++#include "xla/stream_executor/platform_manager.h"
++#include "xla/stream_executor/stream_executor.h"
++#include "xla/stream_executor/stream_executor_address_allocator.h"
++#include "xla/tsl/lib/core/status_test_util.h"
++#include "xla/tsl/platform/statusor.h"
++#include "xla/xla_data.pb.h"
++
++namespace xla::gpu {
++namespace {
++
++se::StreamExecutor* GpuExecutor() {
++  auto name =
++      absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName("gpu").value());
++  auto* platform = se::PlatformManager::PlatformWithName(name).value();
++  return platform->ExecutorForDevice(0).value();
++}
++
++// A copy that, as a custom call or a collective, runs its first execution as
++// a thunk (`requires_warmup`), counting the times it is recorded.
++class WarmedCopyThunk : public DeviceToDeviceCopyThunk {
++ public:
++  WarmedCopyThunk(const ShapedSlice& source, const ShapedSlice& destination,
++                  int64_t mem_size, int* record_count)
++      : DeviceToDeviceCopyThunk(Thunk::ThunkInfo(), source, destination,
++                                mem_size),
++        record_count_(record_count) {}
++
++  absl::StatusOr<const se::CommandBuffer::Command*> Record(
++      const Thunk::ExecuteParams& execute_params,
++      const RecordParams& record_params, RecordAction record_action,
++      se::CommandBuffer* command_buffer) override {
++    ++*record_count_;
++    return DeviceToDeviceCopyThunk::Record(execute_params, record_params,
++                                           std::move(record_action),
++                                           command_buffer);
++  }
++
++  bool requires_warmup() const override { return true; }
++
++ private:
++  int* record_count_;
++};
++
++// A command buffer whose commands need a warmup runs it as thunks, and its
++// next executions too, a while loop's next iteration among them, until an
++// initialization records it: no execution instantiates a graph, which with
++// no rendezvous of the process's devices waited on the driver lock a peer's
++// instantiation held while that peer's collective waited on this device.
++TEST(CommandBufferThunkFirstRecordTest, OnlyInitializationRecordsAfterWarmup) {
++  se::StreamExecutor* stream_executor = GpuExecutor();
++  TF_ASSERT_OK_AND_ASSIGN(auto stream, stream_executor->CreateStream());
++
++  constexpr int64_t kLength = 4;
++  constexpr int64_t kByteLength = sizeof(int32_t) * kLength;
++  Shape shape = ShapeUtil::MakeShape(S32, {kLength});
++  se::DeviceAddress<int32_t> a =
++      stream_executor->AllocateArray<int32_t>(kLength, 0);
++  se::DeviceAddress<int32_t> b =
++      stream_executor->AllocateArray<int32_t>(kLength, 0);
++  TF_ASSERT_OK(stream->Memset32(&a, 42, kByteLength));
++
++  BufferAllocation source(/*index=*/0, kByteLength, /*color=*/0);
++  BufferAllocation destination(/*index=*/1, kByteLength, /*color=*/0);
++  ShapedSlice from{BufferAllocation::Slice(&source, 0, kByteLength), shape};
++  ShapedSlice to{BufferAllocation::Slice(&destination, 0, kByteLength), shape};
++
++  int record_count = 0;
++  CommandSequence commands;
++  commands.Emplace<WarmedCopyThunk>(from, to, kByteLength, &record_count);
++  constexpr auto kSerialize = CommandExecutor::SynchronizationMode::kSerialize;
++  TF_ASSERT_OK_AND_ASSIGN(
++      CommandExecutor executor,
++      CommandExecutor::Create(std::move(commands), kSerialize));
++  ThunkSequence fallback;
++  fallback.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
++      Thunk::ThunkInfo(), from, to, kByteLength));
++  CommandBufferThunk thunk(
++      std::move(executor), Thunk::ThunkInfo(), /*devices_in_process=*/1,
++      std::make_unique<SequentialThunk>(Thunk::ThunkInfo(),
++                                        std::move(fallback)));
++
++  se::StreamExecutorAddressAllocator allocator(stream_executor);
++  ServiceExecutableRunOptions run_options;
++  BufferAllocations allocations({a, b}, /*device_ordinal=*/0, &allocator);
++  std::vector<BufferAllocation::Index> persistent = {0, 1};
++  Thunk::InitializeParams initialize_params;
++  initialize_params.executor = stream_executor;
++  initialize_params.buffer_allocations = &allocations;
++  initialize_params.stream = stream.get();
++  initialize_params.persistent_alloc_indices = absl::MakeConstSpan(persistent);
++  Thunk::ExecuteParams execute_params = Thunk::ExecuteParams::Create(
++      run_options, allocations, stream.get(), stream.get(), nullptr, nullptr,
++      nullptr, /*additional_compute_streams=*/{},
++      /*execution_scoped_state=*/nullptr, absl::MakeConstSpan(persistent));
++
++  // Each execution copies; the record count after it, and its copy's values.
++  auto executed = [&]() -> std::vector<int32_t> {
++    EXPECT_TRUE(stream->MemZero(&b, kByteLength).ok());
++    EXPECT_TRUE(thunk.ExecuteOnStream(execute_params).ok());
++    std::vector<int32_t> copied(kLength, 0);
++    EXPECT_TRUE(stream->Memcpy(copied.data(), b, kByteLength).ok());
++    EXPECT_TRUE(stream->BlockHostUntilDone().ok());
++    return copied;
++  };
++  const std::vector<int32_t> copied(kLength, 42);
++
++  TF_ASSERT_OK(thunk.Initialize(initialize_params));  // Warmup not done.
++  EXPECT_EQ(record_count, 0);
++  EXPECT_EQ(executed(), copied);  // The warmup.
++  EXPECT_EQ(executed(), copied);  // Its loop's next iteration.
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(record_count, 0);
++
++  TF_ASSERT_OK(thunk.Initialize(initialize_params));  // The next execution's.
++  EXPECT_EQ(record_count, 1);
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(executed(), copied);
++  EXPECT_EQ(record_count, 1);
++
++  stream_executor->Deallocate(&a);
++  stream_executor->Deallocate(&b);
++}
++
++}  // namespace
++}  // namespace xla::gpu
