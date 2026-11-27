@@ -130,6 +130,21 @@ class _PrimitiveHolders:
 _HOLDERS = _PrimitiveHolders()
 
 
+_VALUES = (type(None), bool, int, float, complex, str, bytes, tuple, frozenset,
+           slice, enum.Enum, type, types.ModuleType, np.dtype, np.generic,
+           frozen_dict.FrozenDict, jax_core.AbstractValue, jax_core.Primitive,
+           types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+           functools.partial)
+
+
+def _value(x: Any) -> bool:
+  """Whether `x` is a value a program's callable may hold (`Encoder.program`):
+  one no reader can tell from an equal one, by its identity or by changing it.
+  A callable is one whose own inputs are checked so in turn (a bound method's
+  object among them), a bare `object()` an axis name numbered as it was met."""
+  return isinstance(x, _VALUES) or type(x) is object
+
+
 class Uncacheable(Exception):
   """This lowering cannot be keyed exactly: it is lowered afresh."""
 
@@ -179,7 +194,14 @@ class Encoder:
   """
 
   def __init__(self, placed: bool = True,
-               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None):
+               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None,
+               program: bool = True):
+    # Whether it encodes a program (a kernel's jaxpr and its params), whose
+    # callables a lowering runs (an inline_mgpu body) with what they hold: each
+    # of their inputs must be a value (`_value`), which nothing it holds can
+    # tell from an equal one. A registry's rules are encoded as they are
+    # (`lowering_cache_registries`), their closures sealed code's own.
+    self.program = program
     # Whether an aval's placement (its sharding and its manual axes) is
     # encoded: not for a kernel that reads no mesh (`lowering_cache`'s
     # `_reads_jax_mesh`), whose avals are a shard's or the whole's alike.
@@ -228,6 +250,11 @@ class Encoder:
   def _e(self, x: Any, depth: int) -> bytes:
     if depth > _MAX_DEPTH:
       raise Uncacheable("a value nests too deeply to encode")
+    if self.program and self._callables and not _value(x):
+      # A callable a lowering runs may read anything of what it holds: its
+      # identity (`a is b`), its memory, its state. Only a value is keyed.
+      raise Uncacheable(
+          f"a callable a kernel runs holds a {type(x).__qualname__}, no value")
     t = type(x)
     if x is None:
       return b"N"
@@ -283,10 +310,6 @@ class Encoder:
       # operand: the aval is all it can read of it.
       return seq(b"tr", [self._aval(x.aval, depth + 1)])
     if isinstance(x, jax.Array):
-      if self._callables:
-        # Refused before it is read to the host: a callable a lowering runs may
-        # read anything of it (`_numpy_value`), and reading it is a transfer.
-        raise Uncacheable("an array a callable holds has no encoding")
       value = np.asarray(x)
       return seq(b"jx", [
           self._numpy_value(value), self._e(bool(jax_core.typeof(x).weak_type), depth + 1)
@@ -401,8 +424,9 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    # In order of its keys, but where a callable holds it: one a lowering runs
-    # may iterate it, so its order is part of what it reads.
+    # In order of its keys, but where a callable holds it (a partial's keywords,
+    # an immutable mapping): one a lowering runs may iterate it, so its order is
+    # part of what it reads.
     if not self._callables:
       encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
@@ -426,11 +450,6 @@ class Encoder:
     ])
 
   def _numpy_value(self, x) -> bytes:
-    if isinstance(x, np.ndarray) and self._callables:
-      # A callable a lowering runs (an inline_mgpu body) may read anything of
-      # an array it holds, its ownership and its memory among it, which no key
-      # holds: only an array the program holds as a value is encoded.
-      raise Uncacheable("an array a callable holds has no encoding")
     if isinstance(x, np.ndarray):
       if x.dtype.kind == "O":
         raise Uncacheable("an object array has no encoding")

@@ -21,6 +21,7 @@ dataclasses, avals) are only encodable where the installation is sealed.
 
 import dataclasses
 import enum
+import collections
 import functools
 import struct
 
@@ -152,10 +153,21 @@ def cases():
        functools.partial(lax.add, np.arange(2.)), "uncacheable"),
       ("a callable holding a scalar", functools.partial(lax.add, 2.0),
        functools.partial(lax.add, 2.0), "equal"),
-      # A dict a callable holds, in another order: the callable may iterate it.
-      ("a callable's dict in another order",
-       functools.partial(lax.add, y={"a": 1, "b": 2}),
-       functools.partial(lax.add, y={"b": 2, "a": 1}), "different"),
+      # A partial's keywords in another order: the callable may iterate them.
+      ("a callable's keywords in another order",
+       functools.partial(lax.add, a=1, b=2),
+       functools.partial(lax.add, b=2, a=1), "different"),
+      # A program's callable may tell what it holds from an equal one (`a is
+      # b`, its state): it holds values alone, or is not cached.
+      ("a callable holding a dict", functools.partial(lax.add, {"a": 1}),
+       functools.partial(lax.add, {"a": 1}), "uncacheable"),
+      ("a callable holding a list", functools.partial(lax.add, [1]),
+       functools.partial(lax.add, [1]), "uncacheable"),
+      ("a callable holding an ordered dict",
+       functools.partial(lax.add, collections.OrderedDict(a=1)),
+       functools.partial(lax.add, collections.OrderedDict(a=1)), "uncacheable"),
+      ("a callable holding a tuple of values", functools.partial(lax.add, (1, "a")),
+       functools.partial(lax.add, (1, "a")), "equal"),
       ("a dict in another order", {"a": 1, "b": 2}, {"b": 2, "a": 1}, "equal"),
       ("weak and strong type", jax_core.ShapedArray((), f32, weak_type=True),
        jax_core.ShapedArray((), f32, weak_type=False), "different"),
