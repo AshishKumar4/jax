@@ -11061,6 +11061,46 @@ class PipelineTest(PallasTest):
         jnp.full(block_size, num_steps, dtype=dtype)
     )
 
+  @parameterized.product(num_steps=[0, 1, 5], max_concurrent_steps=[2, 3])
+  @run_on_sm80
+  def test_emit_pipeline_prefetch_over_a_dynamic_grid(
+      self, num_steps, max_concurrent_steps
+  ):
+    # A vector read prefetched across each step's boundary, the last step's
+    # included, lowers natively (its strided fragments carried from step to
+    # step) and gives each step its own block's first row.
+    self.skip_if_wg_semantics()
+    dtype = jnp.float32
+    rows, width = 8, 128
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((width,), dtype),
+        scratch_types=[plgpu.SMEM((width,), dtype)],
+    )
+    def kernel(num_steps_gmem, x_gmem, o_gmem, acc_ref):
+      acc_ref[...] = jnp.zeros_like(acc_ref)
+
+      def body(_, x_smem, prefetched, boundary):
+        del x_smem
+        acc_ref[...] += prefetched
+        return boundary()
+
+      plgpu.emit_pipeline(
+          body,
+          in_specs=[pl.BlockSpec((rows, width), lambda i: (i, 0))],
+          grid=(num_steps_gmem[...],),
+          max_concurrent_steps=max_concurrent_steps,
+          prefetch=lambda _, x_smem: x_smem[0],
+      )(x_gmem)
+      o_gmem[...] = acc_ref[...]
+
+    blocks = jnp.arange(1, max(num_steps, 1) + 1, dtype=dtype)
+    x = jnp.repeat(blocks, rows)[:, None] * jnp.ones((1, width), dtype)
+    np.testing.assert_array_equal(
+        kernel(jnp.int32(num_steps), x),
+        jnp.full(width, num_steps * (num_steps + 1) / 2, dtype=dtype),
+    )
+
   @parameterized.product(num_steps=[0, 5], max_concurrent_steps=[2, 3])
   @run_on_sm80
   def test_emit_pipeline_dynamic_grid_over_operands_on_a_mesh(
