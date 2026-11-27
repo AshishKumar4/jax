@@ -1,5 +1,5 @@
 diff --git a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
-index 4791f13..1fee96d 100644
+index 4791f13..c0c7402 100644
 --- a/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
 +++ b/xla/backends/gpu/transforms/dynamic_slice_fusion_rewriter_v2.cc
 @@ -599,6 +599,89 @@ void AddDynamicSliceOffsetExpressionInstructions(
@@ -92,6 +92,15 @@ index 4791f13..1fee96d 100644
  //===----------------------------------------------------------------------===//
  // Build fusion plan
  //===----------------------------------------------------------------------===//
+@@ -784,7 +867,7 @@ std::optional<DynamicSliceFusionPlan> BuildFusionPlan(
+ // Create fusion
+ //===----------------------------------------------------------------------===//
+ 
+-std::unique_ptr<HloComputation> CreateFusionBody(
++absl::StatusOr<std::unique_ptr<HloComputation>> CreateFusionBody(
+     const DynamicSliceFusionPlan& plan,
+     absl::Span<const SlicedResult> sliced_results, HloInstruction* hero) {
+   HloComputation::Builder builder("dynamic-slice-fusion");
 @@ -801,19 +884,23 @@ std::unique_ptr<HloComputation> CreateFusionBody(
              index, operand->shape(), absl::StrCat("p", index)));
    }
@@ -124,6 +133,17 @@ index 4791f13..1fee96d 100644
    }
  
    // Build root tuple when there are multiple results (DUS and/or passthrough).
+@@ -996,8 +1083,8 @@ absl::StatusOr<bool> RewriteHero(
+     return false;
+   }
+ 
+-  std::unique_ptr<HloComputation> body =
+-      CreateFusionBody(*plan, sliced_results, hero);
++  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<HloComputation> body,
++                        CreateFusionBody(*plan, sliced_results, hero));
+   ABSL_ASSIGN_OR_RETURN(auto memory_spaces,
+                         FusionMemorySpaces(hero, body.get()));
+   if (!memory_spaces.has_value()) {
 @@ -1102,6 +1189,8 @@ absl::StatusOr<bool> DynamicSliceFusionRewriterV2::RunImpl(
        auto sliced_results =
            ResolveSlicedResults(hero, options_.capture_update_slice);
