@@ -23,6 +23,8 @@ import dataclasses
 import enum
 import functools
 import importlib
+import os
+import pathlib
 import struct
 
 import jax
@@ -312,3 +314,77 @@ def declared(package=None):
         "a jitted declared function": jax.jit(module.body),
     }
   return {name: cache_encoding._declared(form) for name, form in forms.items()}
+
+
+def sources(package, workdir):
+  """What the seal answers (`Seal.source`) of declared and other files, and of
+  which it resolved the path (``os.path.realpath``) or read a component
+  (``os.lstat``): `package`'s ``part.py`` by its own path, through a linked
+  directory and through a link to it, a file of no declared package, a file
+  named as the declared one in another directory, a missing file, the link to
+  it through more directory links than the system follows in one path, the
+  linked path as a string of a class of its own, ``part.py`` replaced by a copy of
+  its bytes and asked through another link, and a file asked of a seal
+  declaring no package. Each path is spelled apart (the seal answers a path
+  once)."""
+  from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing  # pylint: disable=g-import-not-at-top
+
+  class _Path(str):
+    pass
+
+  work = pathlib.Path(workdir)
+  real = os.path.realpath(os.path.join(
+      os.path.dirname(importlib.import_module(package).__file__), "part.py"))
+  for name in ("linked", "linked_later"):
+    (work / name).symlink_to(os.path.dirname(real), target_is_directory=True)
+  (work / "alias.py").symlink_to(real)
+  (work / "loop").symlink_to(".", target_is_directory=True)
+  (work / "plain.py").write_text("")
+  (work / "sub").mkdir()
+  (work / "sub" / "part.py").write_text("")
+  seal = sealing.seal()
+  bare = sealing.Seal(None, "declares no package", {}, 0.0, 0, 0)
+  resolve, look = os.path.realpath, os.lstat
+  calls = {"resolved": [], "read": []}
+
+  def realpath(path, *args, **kwargs):
+    calls["resolved"].append(path)
+    return resolve(path, *args, **kwargs)
+
+  def lstat(path, *args, **kwargs):
+    calls["read"].append(path)
+    return look(path, *args, **kwargs)
+
+  paths, answers = {}, {}
+
+  def ask(name, path, of=seal):
+    paths[name] = path
+    answer = of.source(path)
+    answers[name] = None if answer is None else list(answer)
+
+  os.path.realpath, os.lstat = realpath, lstat
+  try:
+    ask("declared", real)
+    ask("declared through a linked directory", str(work / "linked" / "part.py"))
+    ask("declared through a link to it", str(work / "alias.py"))
+    ask("no declared package's", str(work / "plain.py"))
+    ask("named as a declared file elsewhere", str(work / "sub" / "part.py"))
+    ask("missing", str(work / "missing.py"))
+    # More links than the system follows in one path, each resolving reads.
+    ask("through more links than the system follows",
+        str(work.joinpath(*["loop"] * 41, "alias.py")))
+    ask("a string of a class of its own", _Path(f"{work}/linked/./part.py"))
+    copy = pathlib.Path(real).with_name("part.py.copy")
+    copy.write_bytes(pathlib.Path(real).read_bytes())
+    os.replace(copy, real)
+    ask("replaced, through another link", str(work / "linked_later" / "part.py"))
+    ask("of a seal declaring no package", str(work / "bare.py"), of=bare)
+  finally:
+    os.path.realpath, os.lstat = resolve, look
+  return {
+      "answers": answers,
+      "resolved": sorted(name for name, path in paths.items()
+                         if any(seen is path for seen in calls["resolved"])),
+      "read": sorted(name for name, path in paths.items()
+                     if any(seen == path for seen in calls["read"])),
+  }
