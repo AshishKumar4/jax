@@ -17,6 +17,7 @@ limitations under the License.
 #define JAXLIB_PY_COMPILE_ONLY_CLIENT_H_
 
 #include <memory>
+#include <optional>
 
 // placeholder for index annotation headers
 #include "absl/status/statusor.h"
@@ -54,6 +55,13 @@ class CompileOnlyPyClient : public PyClient {
   absl::StatusOr<nb_class_ptr<PyExecutable>> CompileUnloaded(
       PyModule& mlir_module, xla::ifrt::DeviceListRef executable_devices,
       xla::CompileOptions options);
+
+  // Deserializes an executable `serialized` as `Executable.serialize()` gives
+  // it, for this client's topology, without loading it (as `CompileUnloaded`
+  // returns one).
+  absl::StatusOr<nb_class_ptr<PyExecutable>> DeserializeUnloaded(
+      nanobind::bytes serialized, xla::ifrt::DeviceListRef executable_devices,
+      std::optional<xla::CompileOptions> options);
 
   static void Register(nanobind::module_& m);
 
