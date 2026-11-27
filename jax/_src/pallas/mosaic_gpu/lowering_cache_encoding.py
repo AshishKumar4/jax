@@ -199,6 +199,10 @@ class Encoder:
     # objects, which keep each id from being another's.
     self._anonymous: dict[int, int] = {}
     self._anonymous_objects: list[object] = []
+    # The lists and dicts a callable holds, numbered as they were first met, by
+    # id, and the objects, which keep each id from being another's.
+    self._containers: dict[int, int] = {}
+    self._container_objects: list[object] = []
     self._class_identities: dict[type, bytes] = {}
     # The encodings of the interned avals and the dtypes met, by id, and the
     # objects, which keep each id from being another's: a jaxpr's equations
@@ -245,6 +249,14 @@ class Encoder:
       return frame(b"Y", x)
     if t is tuple:
       return seq(b"T", [self._e(i, depth + 1) for i in x])
+    if t in (list, dict) and self._callables:
+      # A callable a lowering runs may tell one container held twice from two
+      # alike (`a is b`): each is numbered when first met, and met again it is
+      # its number, so the two encode apart.
+      if (number := self._containers.get(id(x))) is not None:
+        return frame(b"R", str(number).encode())
+      self._containers[id(x)] = len(self._container_objects)
+      self._container_objects.append(x)
     if t is list:
       return seq(b"L", [self._e(i, depth + 1) for i in x])
     if t is dict:
@@ -401,8 +413,9 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    # In order of its keys, but where a callable holds it: one a lowering runs
-    # may iterate it, so its order is part of what it reads.
+    # In order of its keys, but where a callable holds it (a partial's keywords,
+    # an immutable mapping): one a lowering runs may iterate it, so its order is
+    # part of what it reads.
     if not self._callables:
       encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
