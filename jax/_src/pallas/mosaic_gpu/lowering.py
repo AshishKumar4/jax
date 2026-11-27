@@ -39,6 +39,7 @@ from jax._src import debugging
 from jax._src import deprecations
 from jax._src import dtypes
 from jax._src import flattree as ft
+from jax._src import hijax
 from jax._src import layout as jax_layout
 from jax._src import literals as jax_literals
 from jax._src import mesh as mesh_lib
@@ -338,6 +339,31 @@ def _eval_jaxpr_resource_estimator(
   return _estimate_resources(ctx, call_jaxpr)
 
 
+def _trace_hi_primitive(
+    _prim, avals_in: Sequence[Any]
+) -> jax_core.Jaxpr:
+  def _expand(*args):
+    return tuple(hijax._call_hi_primitive_to_lojax(*args, _prim=_prim))
+
+  debug_info = api_util.debug_info(
+      "pallas mgpu call_hi_primitive", _expand, avals_in, {}
+  )
+  jaxpr, _ = pe.trace_to_jaxpr(
+      _expand,
+      ft.flatten_args(*avals_in),
+      debug_info=debug_info,
+      requires_low=True,
+  )
+  return jaxpr
+
+
+@_register_resource_estimator(hijax.call_hi_primitive_p)
+def _call_hi_primitive_resource_estimator(
+    ctx: ResourceEstimatorContext, *args, _prim, **params
+) -> Resources:
+  del params  # Unused.
+  return _estimate_resources(ctx, _trace_hi_primitive(_prim, args))
+
 @_register_resource_estimator(mpmd.mpmd_map_p)
 def _mpmd_map_resource_estimator(
     ctx: ResourceEstimatorContext, *args, jaxprs: tuple[jax_core.Jaxpr, ...],
@@ -445,6 +471,21 @@ def _reduce_resource_estimator(
   # We don't need SMEM for some reductions, but it depends on the layout, so we
   # conservatively request the maximum scratch space we might need.
   return Resources(smem_scratch_bytes=ctx.reduction_scratch_bytes)
+
+
+@_register_resource_estimator(lax.reduce_or_p)
+def _reduce_or_resource_estimator(
+    ctx: ResourceEstimatorContext, x_aval: jax_core.ShapedArray, *, axes,
+    **kwargs
+) -> Resources:
+  del kwargs  # Unused.
+  if (
+      ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup
+      and axes
+      and set(axes) != set(range(x_aval.ndim))
+  ):
+    return Resources(smem_scratch_bytes=ctx.reduction_scratch_bytes)
+  return Resources()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -702,9 +743,9 @@ class LoweringRuleContext:
   avals_in: Sequence[ShapedAbstractValue]
   avals_out: Sequence[ShapedAbstractValue]
   out_layout_hint: mgpu.FragmentedLayout | None
+  outvars_live: tuple[bool, ...] | None = None
 
   replace = dataclasses.replace
-
   @property
   def estimator_ctx(self) -> ResourceEstimatorContext:
     return ResourceEstimatorContext(
@@ -1091,11 +1132,22 @@ def lower_jaxpr_to_mosaic_gpu(
     consts=(),
 ) -> Sequence[ir.Value]:
   env = {}
+  used_vars: set[jax_core.Var] = {
+      v for v in jaxpr.outvars if isinstance(v, jax_core.Var)
+  }
+  for eqn in jaxpr.eqns:
+    for v in eqn.invars:
+      if isinstance(v, jax_core.Var):
+        used_vars.add(v)
 
   def read_env(atom: jax_core.Atom):
     return atom.val if isinstance(atom, jax_core.Literal) else env[atom]
 
   def write_env(var: jax_core.Var, val, require_value: bool = True):
+    if isinstance(var, jax_core.DropVar) or (
+        val is None and var not in used_vars
+    ):
+      return
     env[var] = val
     # TODO(apaszke): Handle other avals (refs, etc.).
     if isinstance(aval := var.aval, jax_core.ShapedArray):
@@ -1192,6 +1244,10 @@ def lower_jaxpr_to_mosaic_gpu(
           avals_out=[cast(ShapedAbstractValue, v.aval) for v in eqn.outvars],
           prim=eqn.primitive,
           out_layout_hint=out_layout_hint,
+          outvars_live=tuple(
+              not isinstance(v, jax_core.DropVar) and v in used_vars
+              for v in eqn.outvars
+          ),
       )
       # An equation under `xla_no_contract` metadata (an error-free transform's
       # product and the sums reading it) emits arithmetic that rounds on its own.
@@ -2300,6 +2356,72 @@ def _eval_jaxpr_lowering_rule(
   )
 
 
+@register_lowering_rule(lax.stop_gradient_p, mgpu.LoweringSemantics.Warpgroup)
+def _stop_gradient_lowering_rule_wg(ctx: LoweringRuleContext, x):
+  return _ensure_ir_value(x, ctx.avals_in[0].dtype)
+
+
+@register_lowering_rule(
+    hijax.call_hi_primitive_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _call_hi_primitive_lowering_rule_wg(
+    ctx: LoweringRuleContext, *in_nodes, _prim, **params
+):
+  del params  # Unused.
+  jaxpr = _trace_hi_primitive(_prim, ctx.avals_in)
+  ir_in = tuple(
+      _ensure_ir_value(v, a.dtype)
+      if isinstance(a, jax_core.ShapedArray)
+      else v
+      for v, a in zip(in_nodes, ctx.avals_in)
+  )
+  ir_consts: list[Any] = []
+  for const, var in zip(jaxpr.consts, jaxpr.constvars):
+    aval = var.aval
+    if isinstance(aval, jax_core.ShapedArray) and aval.shape:
+      arr = np.asarray(const)
+      if arr.size == 0:
+        raise NotImplementedError(
+            "Mosaic GPU call_hi_primitive does not support empty shaped"
+            f" constant of shape {aval.shape} and dtype {aval.dtype}"
+        )
+      raw_bytes = np.ascontiguousarray(arr).view(np.uint8).reshape(arr.size, -1)
+      if not bool(np.all(raw_bytes == raw_bytes[0])):
+        raise NotImplementedError(
+            "Mosaic GPU call_hi_primitive does not support non-splat shaped"
+            f" constant of shape {aval.shape} and dtype {aval.dtype}"
+        )
+      elem_ty = mgpu_utils.dtype_to_ir_type(aval.dtype)
+      scalar_val = (
+          bool(arr.flat[0]) if aval.dtype == jnp.bool_ else arr.flat[0]
+      )
+      ir_consts.append(
+          vector_dialect.broadcast(
+              ir.VectorType.get(aval.shape, elem_ty),
+              _ir_constant(scalar_val, elem_ty),
+          )
+      )
+    else:
+      ir_consts.append(const)
+  outs = lower_jaxpr_to_mosaic_gpu(
+      ctx.module_ctx, ctx.launch_ctx, jaxpr, ir_in, ir_consts
+  )
+  live_flags = (
+      ctx.outvars_live
+      if ctx.outvars_live is not None
+      else (True,) * len(ctx.avals_out)
+  )
+  return [
+      None
+      if not live
+      else (
+          _ensure_ir_value(v, a.dtype)
+          if isinstance(a, jax_core.ShapedArray)
+          else v
+      )
+      for v, a, live in zip(outs, ctx.avals_out, live_flags)
+  ]
+
 def _unit_axis_slice_axis(source_shape, shape, start_indices) -> int | None:
   """The singleton axis of a supported whole-row/column slice, if any."""
   if (
@@ -2325,6 +2447,33 @@ def _unit_axis_slice_resource_estimator(
   ):
     return Resources(smem_scratch_bytes=ctx.reduction_scratch_bytes)
   return Resources()
+
+
+def _split_ranges(sizes: Sequence[int]) -> Iterator[tuple[int, int, int]]:
+  offset = 0
+  for idx, size in enumerate(sizes):
+    yield idx, offset, size
+    offset += size
+
+
+def _split_in_dim(value, sizes: Sequence[int], axis: int):
+  return tuple(
+      lax.slice_in_dim(value, start, start + size, axis=axis)
+      for _, start, size in _split_ranges(sizes)
+      if size > 0
+  )
+
+
+@_register_resource_estimator(lax.split_p)
+def _split_resource_estimator(
+    ctx: ResourceEstimatorContext, x_aval, *, sizes, axis
+) -> Resources:
+  if not any(size > 0 for size in sizes):
+    return Resources()
+  closed = jax.make_jaxpr(
+      functools.partial(_split_in_dim, sizes=sizes, axis=axis)
+  )(x_aval)
+  return _estimate_resources(ctx, closed.jaxpr)
 
 
 def _unit_axis_slice_lowering_rule_wg(ctx, x, shape, start_indices, axis):
@@ -2412,9 +2561,11 @@ def _slice_lowering_rule_wg(
     ctx: LoweringRuleContext, x, limit_indices, start_indices, strides
 ):
   assert isinstance(x.type, ir.VectorType)
-  if strides is not None:
+  if strides is not None and any(s != 1 for s in strides):
     raise NotImplementedError("Strides are not supported.")
   shape = tuple(ctx.avals_out[0].shape)
+  if 0 in shape:
+    raise NotImplementedError("Zero-sized slices are not supported.")
   axis = _unit_axis_slice_axis(x.type.shape, shape, start_indices)
   if axis is not None:
     return _unit_axis_slice_lowering_rule_wg(
@@ -2429,6 +2580,39 @@ def _slice_lowering_rule_wg(
       out_ty, x, start_indices, sizes, strides
   )
 
+
+@register_lowering_rule(lax.split_p, mgpu.LoweringSemantics.Warpgroup)
+def _split_lowering_rule_wg(ctx: LoweringRuleContext, x, *, sizes, axis):
+  live_flags = (
+      ctx.outvars_live
+      if ctx.outvars_live is not None
+      else (True,) * len(sizes)
+  )
+  active: list[tuple[int, int, int]] = []
+  for (idx, start, size), live in zip(_split_ranges(sizes), live_flags):
+    if size == 0:
+      if live:
+        raise NotImplementedError("Zero-sized splits are not supported.")
+    elif live:
+      active.append((idx, start, size))
+  results: list[Any] = [None] * len(sizes)
+  if not active:
+    return results
+
+  def _slice_active(value):
+    return tuple(
+        lax.slice_in_dim(value, start, start + size, axis=axis)
+        for _, start, size in active
+    )
+
+  ir_x = _ensure_ir_value(x, ctx.avals_in[0].dtype)
+  closed = jax.make_jaxpr(_slice_active)(*ctx.avals_in)
+  lowered = lower_jaxpr_to_mosaic_gpu(
+      ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, (ir_x,), closed.consts
+  )
+  for (idx, _, _), val in zip(active, lowered):
+    results[idx] = val
+  return results
 
 @register_lowering_rule(lax.concatenate_p, mgpu.LoweringSemantics.Lane)
 def _concatenate_lowering_rule(ctx: LoweringRuleContext, *args, dimension):
@@ -3400,6 +3584,45 @@ def _atan2_lowering_rule_wg(ctx: LoweringRuleContext, y, x):
   return math_dialect.atan2(y, x)
 
 
+def _nextafter_f32(x, y):
+  """IEEE-754 float32 nextafter(x, y) from integer bit arithmetic."""
+  x, y = jnp.broadcast_arrays(x, y)
+  xb = lax.bitcast_convert_type(x, jnp.uint32)
+  nan = jnp.isnan(x) | jnp.isnan(y)
+  same = x == y
+  zero = x == jnp.float32(0.0)
+  from_zero = jnp.where(
+      y > jnp.float32(0.0), jnp.uint32(1), jnp.uint32(0x80000001)
+  )
+  away = ((x > jnp.float32(0.0)) & (y > x)) | (
+      (x < jnp.float32(0.0)) & (y < x)
+  )
+  stepped = jnp.where(
+      zero, from_zero, jnp.where(away, xb + jnp.uint32(1), xb - jnp.uint32(1))
+  )
+  out = lax.bitcast_convert_type(stepped, jnp.float32)
+  return jnp.where(nan, x + y, jnp.where(same, y, out))
+
+
+@register_lowering_rule(lax.nextafter_p, mgpu.LoweringSemantics.Warpgroup)
+def _nextafter_lowering_rule_wg(ctx: LoweringRuleContext, x, y):
+  if (
+      ctx.avals_in[0].dtype != jnp.float32
+      or ctx.avals_in[1].dtype != jnp.float32
+  ):
+    raise NotImplementedError(
+        "Mosaic GPU nextafter supports float32, got"
+        f" ({ctx.avals_in[0].dtype}, {ctx.avals_in[1].dtype})"
+    )
+  ir_args = tuple(
+      _ensure_ir_value(v, a.dtype) for v, a in zip((x, y), ctx.avals_in)
+  )
+  closed = jax.make_jaxpr(_nextafter_f32)(*ctx.avals_in)
+  (out,) = lower_jaxpr_to_mosaic_gpu(
+      ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts
+  )
+  return out
+
 @register_lowering_rule(lax.reshape_p, mgpu.LoweringSemantics.Lane)
 def _reshape_lowering_rule(
     ctx: LoweringRuleContext, x, new_sizes, dimensions, sharding
@@ -3696,13 +3919,28 @@ def _reduce_prod_lowering_rule_wg(
 @register_lowering_rule(lax.reduce_or_p, mgpu.LoweringSemantics.Warpgroup)
 def _reduce_or_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
   [x_aval] = ctx.avals_in
-  _check_reduce_pred("or", x_aval, axes)
+  if x_aval.dtype != jnp.bool_:
+    raise NotImplementedError(
+        f"reduce_or lowers for booleans alone, not {x_aval.dtype}"
+    )
   if not axes:  # A scalar's: itself.
-    return x
-  return _reduce_lowering_rule_wg(
-      ctx, vector_dialect.CombiningKind.OR, 0, x, axes
-  )
+    return _ensure_ir_value(x, x_aval.dtype)
+  if set(axes) == set(range(x_aval.ndim)):
+    return _reduce_lowering_rule_wg(
+        ctx, vector_dialect.CombiningKind.OR, 0, x, axes
+    )
+  def _reduce_axes(v):
+    acc = v.astype(jnp.int32)
+    for axis in sorted(axes, reverse=True):
+      acc = lax.reduce_max(acc, (axis,))
+    return acc != 0
 
+  ir_x = _ensure_ir_value(x, x_aval.dtype)
+  closed = jax.make_jaxpr(_reduce_axes)(x_aval)
+  (out,) = lower_jaxpr_to_mosaic_gpu(
+      ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, (ir_x,), closed.consts
+  )
+  return out
 
 @register_lowering_rule(lax.reduce_and_p, mgpu.LoweringSemantics.Warpgroup)
 def _reduce_and_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
@@ -4553,10 +4791,12 @@ def _bitcast_convert_type_lowering_rule(
 
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Warpgroup:
     x = _ensure_ir_value(x, x_aval.dtype)
-    return arith_dialect.bitcast(
-        ir.VectorType.get(x_aval.shape, dst_elem_type), x
+    dst_type = (
+        ir.VectorType.get(x_aval.shape, dst_elem_type)
+        if x_aval.shape
+        else dst_elem_type
     )
-
+    return arith_dialect.bitcast(dst_type, x)
   x = _ensure_fa(x, x_aval.dtype)
   output_is_signed = mgpu_utils.is_signed(new_dtype)
   return mgpu.FragmentedArray.bitcast(
