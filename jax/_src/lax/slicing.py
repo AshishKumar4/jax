@@ -3342,6 +3342,8 @@ def _scatter_batching_rule(scatter_op, axis_data, batched_args, batch_dims, *,
       out_sharding=out_sharding), 0
 
 
+
+
 scatter_add_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-add',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
@@ -3369,6 +3371,7 @@ scatter_mul_p = standard_primitive(
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'scatter_mul'),
     memory_space_rule=_scatter_memory_space_rule)
+
 
 def _scatter_mul_jvp_rhs(g, x, i, y, *, dimension_numbers,
                          indices_are_sorted, unique_indices, mode,

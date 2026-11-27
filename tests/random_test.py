@@ -428,6 +428,23 @@ class PrngTest(jtu.JaxTestCase):
       else:
         self.assertIn("cu_threefry2x32", hlo_text)
 
+  def test_threefry_rolled_lowering(self):
+    f = lambda key: jax.random.bits(key, (4, 1000), 'uint32')
+    key = jax.random.key(17)
+    with jax._src.config.threefry_rolled_lowering(True):
+      hlo_text = jax.jit(f).trace(key).lower(
+          lowering_platforms=('cuda',)).as_text()
+    self.assertIn("stablehlo.while", hlo_text)
+
+  @jtu.run_on_devices("gpu")
+  def test_threefry_rolled_lowering_draws_the_same_bits(self):
+    f = lambda key: jax.random.bits(key, (4, 1000), 'uint32')
+    key = jax.random.key(17)
+    unrolled = jax.jit(f)(key)
+    with jax._src.config.threefry_rolled_lowering(True):
+      rolled = jax.jit(f)(key)
+    np.testing.assert_array_equal(rolled, unrolled)
+
   @parameterized.parameters([{'make_key': ctor} for ctor in KEY_CTORS])
   def test_random_seed_offset(self, make_key):
     k1 = make_key(17)

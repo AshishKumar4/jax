@@ -34,6 +34,7 @@ from jax._src import api_util
 from jax._src import array
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
@@ -2837,15 +2838,30 @@ def dot(lhs: ArrayLike, rhs: ArrayLike, *,
         " un-batched matrix-matrix, matrix-vector, or vector-vector products;"
         f" got {lhs_shape=} {rhs_shape=}")
 
+  preferred_element_type = (
+      None if preferred_element_type is None else
+      dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
+  return _dot_general_bound(lhs, rhs, dimension_numbers, precision=precision,
+                            preferred_element_type=preferred_element_type,
+                            out_sharding=out_sharding,
+                            reduction_order=reduction_order)
+
+
+def _dot_general_bound(lhs, rhs, dimension_numbers: DotDimensionNumbers, *,
+                       precision: PrecisionLike = None,
+                       preferred_element_type: DTypeLike | None = None,
+                       out_sharding=None, reduction_order: Any = None) -> Array:
+  """`dot_general_p` bound with `preferred_element_type` as given: `dot`'s, a
+  user's request canonicalized; and a transformation rule's (batching,
+  transposition), its jaxpr's param bound as recorded, as canonicalizing it
+  again outside the `jax.enable_x64` scope that traced it would narrow a float64
+  product to float32."""
   out_sharding = canonicalize_sharding(out_sharding, 'dot_general')
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   cdims = (api_util._ensure_index_tuple(lhs_contract),
            api_util._ensure_index_tuple(rhs_contract))
   bdims = (api_util._ensure_index_tuple(lhs_batch),
            api_util._ensure_index_tuple(rhs_batch))
-  preferred_element_type = (
-      None if preferred_element_type is None else
-      dtypes.check_and_canonicalize_user_dtype(preferred_element_type, 'dot'))
   lhs, rhs = core.auto_insert_reshard(lhs, rhs)
   return dot_general_p.bind(lhs, rhs,
                             dimension_numbers=(cdims, bdims),
@@ -2992,11 +3008,26 @@ def ragged_dot_general(
     extra leading dimension of size `g` in the case where the lhs ragged
     dimension is a contracting dimension.
   """
+  preferred_element_type = (
+      None if preferred_element_type is None else
+      dtypes.check_and_canonicalize_user_dtype(
+          preferred_element_type, 'ragged_dot_general'))
+  return _ragged_dot_general_bound(
+      lhs, rhs, group_sizes, ragged_dot_dimension_numbers, precision=precision,
+      preferred_element_type=preferred_element_type, group_offset=group_offset,
+      out_sharding=out_sharding, reduction_order=reduction_order)
+
+
+def _ragged_dot_general_bound(
+    lhs, rhs, group_sizes, ragged_dot_dimension_numbers, *, precision=None,
+    preferred_element_type=None, group_offset=None, out_sharding=None,
+    reduction_order=None):
+  """`ragged_dot_general_p` bound with `preferred_element_type` as given:
+  `ragged_dot_general`'s, a user's request canonicalized; and a transformation
+  rule's (differentiation, transposition, batching), its jaxpr's param bound as
+  recorded, as `_dot_general_bound` binds `dot_general_p`'s."""
   lhs, rhs, group_sizes = core.auto_insert_reshard(lhs, rhs, group_sizes)
   out_sharding = canonicalize_sharding(out_sharding, 'ragged_dot_general')
-  if preferred_element_type is not None:
-    preferred_element_type = dtypes.check_and_canonicalize_user_dtype(
-        preferred_element_type, 'ragged_dot_general')
   return ragged_dot_general_p.bind(
       lhs,
       rhs,
@@ -5412,11 +5443,13 @@ ad.defjvp(atanh_p, lambda g, x: div(g, one_minus_square(x)))
 mlir.register_lowering(atanh_p, partial(_nary_lower_hlo, chlo.atanh))
 
 real_p = unop(_complex_basetype, _complex, 'real')
-ad.deflinear2(real_p, lambda t, _: [complex(t, np.zeros((), _dtype(t)))])
+# The zero imaginary part in the cotangent's own dtype, a recorded wide one too: a NumPy zero of it would be
+# canonicalized narrow outside the x64 scope that traced it.
+ad.deflinear2(real_p, lambda t, _: [complex(t, _zeros(t))])
 mlir.register_lowering(real_p, partial(_nary_lower_hlo, hlo.real))
 
 imag_p = unop(_complex_basetype, _complex, 'imag')
-ad.deflinear2(imag_p, lambda t, _: [complex(np.zeros((), _dtype(t)), neg(t))])
+ad.deflinear2(imag_p, lambda t, _: [complex(_zeros(t), neg(t))])
 mlir.register_lowering(imag_p, partial(_nary_lower_hlo, hlo.imag))
 
 
@@ -5748,8 +5781,10 @@ def _pow_jvp_lhs(g, ans, x, y):
   result_dtype = dtypes.result_type(x, y)
   if result_dtype == bool:
     result_dtype = 'int32'
-  x = convert_element_type(x, result_dtype)
-  y = convert_element_type(y, result_dtype)
+  # The operands' own result type, a recorded wide one too: never canonicalized
+  # narrow outside the x64 scope that traced it.
+  x = _convert_element_type(x, np.dtype(result_dtype))
+  y = _convert_element_type(y, np.dtype(result_dtype))
   if dtypes.issubdtype(y_dtype, np.integer):
     if x.shape != y.shape:
       shape = broadcast_shapes(x.shape, y.shape)
@@ -5765,7 +5800,7 @@ def _pow_jvp_lhs(g, ans, x, y):
 def _pow_jvp_rhs(g, ans, x, y):
   y_dtype = dtypes.dtype(y)
   assert dtypes.issubdtype(y_dtype, np.inexact)
-  return convert_element_type(mul(g, mul(log(_replace_zero(x)), ans)), y_dtype)
+  return _convert_element_type(mul(g, mul(log(_replace_zero(x)), ans)), y_dtype)
 ad.defjvp2(pow_p, _pow_jvp_lhs, _pow_jvp_rhs)
 
 def _pow_lower(ctx, x, y):
@@ -7054,6 +7089,15 @@ def _dot_general_dtype_rule(lhs, rhs, *, dimension_numbers, precision,
       raise TypeError(f'{name} argument type error: {lhs.dtype}, {rhs.dtype}')
     result_dtype = lhs.dtype
   has_algorithm = isinstance(precision, (DotAlgorithm, DotAlgorithmPreset))
+  if (has_algorithm and preferred_element_type is not None
+      and dtypes.issubdtype(result_dtype, np.complexfloating)
+      and not dtypes.issubdtype(preferred_element_type, np.complexfloating)):
+    # A complex dot under an algorithm is its real products at it
+    # (`_complex_dot_by_parts`): complex, as without one, where the bit width
+    # check refuses a real preferred type.
+    raise TypeError(
+        f"{name} of complex operands takes a complex preferred_element_type, "
+        f"got {preferred_element_type} for result type {result_dtype}")
   return _maybe_upcast(result_dtype, preferred_element_type,
                        check_bit_width=not has_algorithm)
 
@@ -7096,9 +7140,9 @@ def _dot_general_transpose_lhs(g, x, y, *, dimension_numbers, precision,
   ds = xs.update(spec=xs.spec.update(partitions=inverse_spec))
   if ds.mesh.empty:
     ds = core.get_cur_mesh_sharding(P(*[None] * x.aval.ndim))
-  dot_general_out = dot_general(g, y, dims, precision=precision,
-                                preferred_element_type=preferred_element_type,
-                                out_sharding=ds)
+  dot_general_out = _dot_general_bound(
+      g, y, dims, precision=precision,
+      preferred_element_type=preferred_element_type, out_sharding=ds)
   x_bar = transpose(dot_general_out, tuple(out_axes))
   if x_bar.dtype != x.aval.dtype:
     x_bar = _convert_element_type(x_bar, x.aval.dtype, x.aval.weak_type,
@@ -7433,7 +7477,7 @@ ad.defjvp(
 )
 _dot_general_batch_rule = functools.partial(
     _dot_batch_rule, _dot_general_batch_unpack_args,
-    _dot_general_batch_unpack_dims, dot_general)
+    _dot_general_batch_unpack_dims, _dot_general_bound)
 batching.fancy_primitive_batchers[dot_general_p] = _dot_general_batch_rule
 core.pp_eqn_rules[dot_general_p] = _dot_general_pp_rule
 
@@ -7543,6 +7587,12 @@ def _handle_dot_precision(ctx, lhs, rhs, precision, platform):
     def maybe_convert_dtype(operand, operand_aval, target_dtype):
       if target_dtype is None or operand_aval.dtype == target_dtype:
         return operand
+      if (dtypes.issubdtype(operand_aval.dtype, np.complexfloating) and
+          not dtypes.issubdtype(target_dtype, np.complexfloating)):
+        # A cast to the algorithm's real type would drop the imaginary part.
+        raise ValueError(
+            f"The dot algorithm '{precision}' takes {np.dtype(target_dtype)} "
+            f"operands, not {operand_aval.dtype}.")
       aval = core.ShapedArray(operand_aval.shape, target_dtype)
       return mlir.convert_hlo(ctx, operand, operand_aval, aval)
 
@@ -7675,6 +7725,39 @@ def _linear_dot(out_dtype, lhs, rhs, *, dimension_numbers):
   prod = lambda i: optimization_barrier(mul(la_at(i), ra_at(i)))
   return control_flow.fori_loop(1, k, lambda i, acc: add(acc, prod(i)), prod(0))
 
+def _algorithm_over_complex(precision, avals_in) -> bool:
+  """Whether a dot names an algorithm, whose operand types are real, over a
+  complex operand."""
+  return (isinstance(precision, (DotAlgorithm, DotAlgorithmPreset)) and
+          precision != DotAlgorithmPreset.DEFAULT and
+          any(dtypes.issubdtype(aval.dtype, np.complexfloating)
+              for aval in avals_in))
+
+
+def _complex_dot_by_parts(lhs, rhs, *, dimension_numbers, precision,
+                          out_dtype, out_sharding):
+  """A dot of complex operands under an algorithm, whose operand types are real,
+  as its real products each at the algorithm:
+  (a + bi)(c + di) = (ac - bd) + (ad + bc)i."""
+  def parts(x):
+    if dtypes.issubdtype(x.dtype, np.complexfloating):
+      return real(x), imag(x)
+    return x, None
+
+  # Bound at the recorded result's real type: canonicalized again (`dot_general`)
+  # outside the x64 scope that traced it, a complex128 dot's parts would narrow.
+  def dot(x, y):
+    return _dot_general_bound(x, y, dimension_numbers, precision=precision,
+                              preferred_element_type=np.finfo(out_dtype).dtype,
+                              out_sharding=out_sharding)
+
+  (a, b), (c, d) = parts(lhs), parts(rhs)
+  re = dot(a, c) if b is None or d is None else sub(dot(a, c), dot(b, d))
+  ims = [dot(x, y) for x, y in ((a, d), (b, c))
+         if x is not None and y is not None]
+  return complex(re, ims[0] if len(ims) == 1 else add(*ims))
+
+
 def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
                        precision, preferred_element_type: np.dtype | None,
                        out_sharding, reduction_order=None, platform: str = "default"):
@@ -7686,6 +7769,14 @@ def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers,
         dict(dimension_numbers=dimension_numbers, preferred_element_type=dt),
         lhs, rhs)
   del preferred_element_type  # Implied by the output aval
+  if _algorithm_over_complex(precision, ctx.avals_in):
+    # An algorithm's operand types are real: a complex operand cast to them
+    # would lose its imaginary part, so its real products are taken at it.
+    return mlir.lower_fun(
+        partial(_complex_dot_by_parts, dimension_numbers=dimension_numbers,
+                precision=precision, out_dtype=ctx.avals_out[0].dtype,
+                out_sharding=out_sharding),
+        multiple_results=False)(ctx, lhs, rhs)
   lhs, rhs, accumulation_aval, algorithm_kwarg = _handle_dot_precision(
       ctx, lhs, rhs, precision, platform
   )
@@ -7969,33 +8060,36 @@ def _ragged_dot_general_transpose_rule(
       x_ndim, ragged_dot_dimension_numbers
   )
 
-  unimplemented = lambda fn_name, ragged_dot_mode: NotImplementedError(
-      f'Unimplemented {fn_name} for ragged dot general in mode '
-      f'{ragged_dot_mode.name}.'
-  )
-
   def grad_x_dims():
     match mode:
-      case RaggedDotMode.RAGGED_NONCONTRACTING:
+      case RaggedDotMode.RAGGED_NONCONTRACTING | RaggedDotMode.RAGGED_BATCH:
         ans_batch, _, ans_y = ranges_like(x_batch, x_kept, y_kept)
+        ragged_dim = (len(x_batch) + x_kept.index(lhs_ragged_dim)
+                      if mode == RaggedDotMode.RAGGED_NONCONTRACTING
+                      else x_batch.index(lhs_ragged_dim))
         dims = RaggedDotDimensionNumbers(
             dot_dimension_numbers=((ans_y, y_kept), (ans_batch, y_batch)),
-            lhs_ragged_dimensions=[
-                len(x_batch) + x_kept.index(lhs_ragged_dim)
-            ],
+            lhs_ragged_dimensions=[ragged_dim],
             rhs_group_dimensions=y_group,
         )
         x_contract_sorted_by_y = list(
             np.take(x_contract, np.argsort(y_contract))
         )
         unsorted_axes = list(x_batch) + x_kept + x_contract_sorted_by_y
-      case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH | _:
-        raise unimplemented('grad_x_dims', mode)
+      case RaggedDotMode.RAGGED_CONTRACTING:
+        lhs_batch, _, lhs_kept = ranges_like(y_batch, y_contract, y_kept)
+        _, ans_batch, _, ans_y = ranges_like((0,), x_batch, x_kept, y_kept)
+        dims = RaggedDotDimensionNumbers(
+            dot_dimension_numbers=((lhs_kept, ans_y), (lhs_batch, ans_batch)),
+            lhs_ragged_dimensions=[len(y_batch) + x_contract.index(lhs_ragged_dim)],
+            rhs_group_dimensions=[0],
+        )
+        unsorted_axes = list(x_batch) + list(x_contract) + x_kept
     return dims, unsorted_axes
 
   def grad_y_dims():
     match mode:
-      case RaggedDotMode.RAGGED_NONCONTRACTING:
+      case RaggedDotMode.RAGGED_NONCONTRACTING | RaggedDotMode.RAGGED_BATCH:
         ans_batch, ans_x, _ = ranges_like(x_batch, x_kept, y_kept)
         dims = RaggedDotDimensionNumbers(
             dot_dimension_numbers=((x_kept, ans_x), (x_batch, ans_batch)),
@@ -8008,30 +8102,50 @@ def _ragged_dot_general_transpose_rule(
         unsorted_axes = (
             list(y_group) + list(y_batch) + y_contract_sorted_by_x + y_kept
         )
-      case RaggedDotMode.RAGGED_CONTRACTING | RaggedDotMode.RAGGED_BATCH | _:
-        raise unimplemented('grad_y_dims', mode)
+      case RaggedDotMode.RAGGED_CONTRACTING:
+        lhs_batch, _, lhs_kept = ranges_like(x_batch, x_contract, x_kept)
+        _, ans_batch, ans_x, _ = ranges_like((0,), x_batch, x_kept, y_kept)
+        dims = RaggedDotDimensionNumbers(
+            dot_dimension_numbers=((lhs_kept, ans_x), (lhs_batch, ans_batch)),
+            lhs_ragged_dimensions=[len(x_batch) + x_contract.index(lhs_ragged_dim)],
+            rhs_group_dimensions=[0],
+        )
+        unsorted_axes = list(y_batch) + list(y_contract) + y_kept
     return dims, unsorted_axes
 
-  def _ragged_dot_grad(lhs, rhs, dims_fn, aval):
+  def _ragged_dot_grad(lhs, rhs, dims_fn, aval, lhs_permutation=None):
     dims, unsorted_axes = dims_fn()
-    ragged_dot_general_out = ragged_dot_general(
+    if lhs_permutation is not None:
+      # Contracting-mode adjoints route the primal's ragged dimension against
+      # the cotangent's leading group axis. Keep the original contracting-pair
+      # order so group_sizes retains its batch/contract-prefix interpretation.
+      lhs = transpose(lhs, tuple(lhs_permutation))
+    sharding = _transpose_sharding_rule(aval, permutation=tuple(unsorted_axes))
+    if sharding.mesh.empty:
+      sharding = core.get_cur_mesh_sharding(P(*[None] * aval.ndim))
+    ragged_dot_general_out = _ragged_dot_general_bound(
           lhs, rhs, group_sizes, dims, precision=precision,
           preferred_element_type=preferred_element_type,
-          group_offset=group_offset, out_sharding=aval.sharding)
+          group_offset=group_offset, out_sharding=sharding)
     result = transpose(ragged_dot_general_out, tuple(np.argsort(unsorted_axes)))
     if result.dtype != aval.dtype:
       result = _convert_element_type(result, aval.dtype, aval.weak_type)
     return result
 
+  contracting = mode == RaggedDotMode.RAGGED_CONTRACTING
   x_bar = (
       None
       if ad.is_undefined_primal(y)
-      else _ragged_dot_grad(ct, y, grad_x_dims, x.aval)
+      else _ragged_dot_grad(
+          y if contracting else ct, ct if contracting else y, grad_x_dims, x.aval,
+          list(y_batch) + list(y_contract) + y_kept if contracting else None)
   )
   y_bar = (
       None
       if ad.is_undefined_primal(x)
-      else _ragged_dot_grad(x, ct, grad_y_dims, y.aval)
+      else _ragged_dot_grad(
+          x, ct, grad_y_dims, y.aval,
+          list(x_batch) + list(x_contract) + x_kept if contracting else None)
   )
   return x_bar, y_bar, None
 
@@ -8048,10 +8162,13 @@ def _ragged_dot_general_batch_rule(
     out_sharding,
     reduction_order=None,
 ):
-  if not all(dim == 0 for dim in batch_dims):
-    raise NotImplementedError('ragged_dot vmap over any dim but 0 - NYI')
-  lhs, rhs, gs = batched_args
-  invoke = lambda l, r, d, **kw: ragged_dot_general(l, r, gs, d, **kw)
+  # Each operand's mapped dimension moved to its front, an unmapped one (a
+  # shared right operand, group sizes closed over) broadcast there, so the rule
+  # for operands batched along their leading dimension applies.
+  lhs, rhs, gs = (
+      batching.bdim_at_front(x, d, axis_data.size, axis_data.explicit_mesh_axis)
+      for x, d in zip(batched_args, batch_dims))
+  invoke = lambda l, r, d, **kw: _ragged_dot_general_bound(l, r, gs, d, **kw)
   batched_out, result_batch_dim = _dot_batch_rule(
       lambda xs: xs, lambda ds: ds, invoke, axis_data, (lhs, rhs), (0, 0),
       dimension_numbers=ragged_dot_dimension_numbers,
@@ -8122,6 +8239,67 @@ ad.primitive_transposes[ragged_dot_general_p] = _ragged_dot_general_transpose_ru
 batching.fancy_primitive_batchers[ragged_dot_general_p] = _ragged_dot_general_batch_rule
 
 
+def _each_row_by_its_group(lhs, rhs, group_sizes, rhs_group_dim,
+                           dimension_numbers, dot, out_sharding):
+  """A non-contracting ragged dot: each output row its own group's product,
+  folded in a group at a time (`fori_loop`), each group's rows taking its
+  product by a select.
+
+  A row reads its own group's matrix alone, never another's (a contraction
+  over the groups with the lhs zeroed outside a group's rows multiplied those
+  zeros by every other group's matrix, so one group's non-finite weight was
+  NaN in every row: 0 * inf), and takes its value bit for bit, with no sum
+  (signed zeros kept; predicates and narrow floats need no reduction). A row
+  in no group is zero. The products need two of the output's size, not one
+  for each group. `group_sizes` ([prefix..., groups]) states its rows over
+  the output's leading dimensions, the row the dimension after them
+  (`_ragged_dot_prefix_dims`: the dot's batch, then the lhs's free dimensions
+  before its ragged one)."""
+  from jax._src.lax import control_flow  # avoid circular imports
+  (l_contract, r_contract), (l_batch, r_batch) = dimension_numbers
+  # The rhs without its group dimension, as each group's product reads it.
+  less = lambda dims: [d - (d > rhs_group_dim) for d in dims]
+  dims = ((l_contract, less(r_contract)), (l_batch, less(r_batch)))
+  rhs_sharding = core.typeof(rhs).sharding
+  spec = [*rhs_sharding.spec, *(None,) * (rhs.ndim - len(rhs_sharding.spec))]
+  if spec[rhs_group_dim] is not None and rhs_sharding.mesh._any_axis_explicit:
+    # A group a step: its matrix whole on every device (an explicit mesh
+    # indexes no sharded dimension).
+    from jax._src.pjit import reshard  # avoid circular imports
+    spec[rhs_group_dim] = None
+    rhs = reshard(rhs, rhs_sharding.update(spec=P(*spec)))
+  groups = rhs.shape[rhs_group_dim]
+
+  def product(g):
+    return dot(lhs, slicing.dynamic_index_in_dim(
+        rhs, g, rhs_group_dim, keepdims=False),
+               dimension_numbers=dims, out_sharding=out_sharding)
+
+  if groups == 0:
+    padded = pad(rhs, _zero(rhs), [(0, int(d == rhs_group_dim), 0)
+                                   for d in range(rhs.ndim)])
+    return _zeros(dot(lhs, slicing.index_in_dim(
+        padded, 0, rhs_group_dim, keepdims=False),
+                      dimension_numbers=dims, out_sharding=out_sharding))
+  prefix = group_sizes.ndim - 1
+  ends = control_flow.cumsum(group_sizes, axis=prefix)
+  starts = ends - group_sizes
+  first = product(0)
+  sharding = core.typeof(first).sharding
+  rows = broadcasted_iota(group_sizes.dtype, first.shape, prefix,
+                          out_sharding=sharding)
+
+  def own(g):
+    at = lambda bound: broadcast_in_dim(
+        slicing.dynamic_index_in_dim(bound, g, prefix, keepdims=False),
+        first.shape, tuple(range(prefix)), out_sharding=sharding)
+    return bitwise_and(at(starts) <= rows, rows < at(ends))
+
+  return control_flow.fori_loop(
+      1, groups, lambda g, out: select(own(g), product(g), out),
+      select(own(0), first, _zeros(first)))
+
+
 def _ragged_dot_general_impl(
     lhs: Array,
     rhs: Array,
@@ -8140,7 +8318,8 @@ def _ragged_dot_general_impl(
     assert gs.ndim == 1
     shape = gs.shape + x.shape
     x = broadcast_in_dim(x, shape, list(range(1, len(shape))))
-    iota = broadcasted_iota(gs.dtype, shape, dim+1)
+    iota = broadcasted_iota(gs.dtype, shape, dim+1,
+                            out_sharding=core.typeof(x).sharding)
     group_ends = control_flow.cumsum(gs)
     group_starts = group_ends - gs
     group_ends = broadcast_in_dim(group_ends, shape, (0,))
@@ -8181,28 +8360,26 @@ def _ragged_dot_general_impl(
       mode, lhs.ndim, lhs_ragged_dim, l_batch, l_contract
   )
 
+  # The primitive's recorded preferred type, bound as recorded (`_dot_general_bound`).
   _dot_general = partial(
-      dot_general,
+      _dot_general_bound,
       precision=precision,
       preferred_element_type=preferred_element_type,
   )
   # TODO(pravnar): Permit other broadcastable shapes.
   if group_sizes.ndim == 1:
-    group_sizes = broadcast(group_sizes, [lhs.shape[i] for i in l_prefix])
+    prefix_spec = tuple(core.typeof(lhs).sharding.spec.partitions[i] for i in l_prefix)
+    group_sizes = broadcast(
+        group_sizes, [lhs.shape[i] for i in l_prefix],
+        out_sharding=core.typeof(lhs).sharding.update(spec=P(*prefix_spec, None)))
 
   match mode:
     case RaggedDotMode.RAGGED_NONCONTRACTING:
-      rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
-      assert len(rhs_group_dims) == 1
-      return _dot_general(
-          expand(lhs, lhs_ragged_dim, group_sizes, *l_prefix),
-          rhs,
-          dimension_numbers=(
-              (incr(l_contract) + [0], list(r_contract) + [rhs_group_dims[0]]),
-              (incr(l_batch), r_batch),
-          ),
-          out_sharding=out_sharding,
-      )
+      (rhs_group_dim,) = ragged_dot_dimension_numbers.rhs_group_dimensions
+      return _each_row_by_its_group(
+          lhs, rhs, group_sizes, rhs_group_dim,
+          ragged_dot_dimension_numbers.dot_dimension_numbers, _dot_general,
+          out_sharding)
     case RaggedDotMode.RAGGED_CONTRACTING:
       rhs_ragged_dim = r_contract[l_contract.index(lhs_ragged_dim)]
       r_prefix = _ragged_dot_prefix_dims(
@@ -8246,7 +8423,13 @@ def _ragged_dot_general_lower(
     raise NotImplementedError(
         f'ragged_dot has no XLA lowering for {reduction_order=}.')
 
-  if (platform == 'default' or
+  # CHLO's ragged_dot carries operand precisions alone: a named dot algorithm
+  # (TF32_TF32_F32_X3, BF16_BF16_F32, ...) lowers through the decomposition,
+  # whose dot_general carries it.
+  named = isinstance(precision, DotAlgorithm) or (
+      isinstance(precision, DotAlgorithmPreset)
+      and precision != DotAlgorithmPreset.DEFAULT)
+  if (platform == 'default' or named or
       not config.jax_ragged_dot_use_ragged_dot_instruction.value):
     return mlir.lower_fun(_ragged_dot_general_impl, multiple_results=False)(
         ctx, lhs, rhs, group_sizes,
@@ -8258,34 +8441,134 @@ def _ragged_dot_general_lower(
     )
 
   del preferred_element_type  # Implied by the output aval
-  lhs, rhs, accumulation_aval, _ = _handle_dot_precision(
-      ctx, lhs, rhs, precision, platform
-  )
+  lhs_aval, rhs_aval, sizes_aval = ctx.avals_in
+  (aval_out,) = ctx.avals_out
   (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = (
       ragged_dot_dimension_numbers.dot_dimension_numbers
   )
   rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
+  lhs_ragged_dims = ragged_dot_dimension_numbers.lhs_ragged_dimensions
+  mode, ragged_dim = _ragged_dot_mode_and_dim(
+      lhs_aval.ndim, ragged_dot_dimension_numbers)
+
+  def fenced(operand):
+    # The layouts this lowering changes (a prefix moved first, a prefix
+    # flattened into a batch) keep their producers out of the GPU input fusion
+    # that takes them: XLA:GPU's bitcast hoisting through copies can lose the
+    # permutation (a ragged adjoint's nonlinear cotangent read transposed).
+    # Deleted when XLA:GPU's ragged dot input fusion keeps it.
+    if platform != 'gpu':
+      return operand
+    return hlo.OptimizationBarrierOp([operand]).result
+
+  def prefix_first(operand, aval, prefix, dimensions):
+    permutation = tuple(prefix) + tuple(remaining(range(aval.ndim), prefix))
+    if permutation != tuple(range(aval.ndim)):
+      operand = hlo.transpose(fenced(operand), mlir.dense_int_array(permutation))
+    aval = core.ShapedArray(tuple(aval.shape[dim] for dim in permutation), aval.dtype)
+    return operand, aval, tuple(tuple(permutation.index(dim) for dim in dims) for dims in dimensions)
+
+  def reshaped(operand, aval, shape):
+    shaped = core.ShapedArray(shape, aval.dtype)
+    return mlir.reshape(ctx, fenced(operand), shaped), shaped
+
+  if sizes_aval.ndim == 1 and mode == RaggedDotMode.RAGGED_NONCONTRACTING:
+    prefix = _ragged_dot_prefix_dims(
+        mode, lhs_aval.ndim, ragged_dim, lhs_batch, lhs_contracting)
+    if prefix:
+      # The native noncontracting rewrite leaves batch axes in place when
+      # inserting the group axis, so materialize its declared prefix first.
+      sizes_aval = core.ShapedArray(
+          (*[lhs_aval.shape[dim] for dim in prefix], *sizes_aval.shape), sizes_aval.dtype)
+      group_sizes = mlir.broadcast_in_dim(
+          ctx, group_sizes, sizes_aval, broadcast_dimensions=(len(prefix),))
+
+  if sizes_aval.ndim > 1:
+    # CHLO and XLA's ragged mask expansion broadcast group_sizes' prefix on
+    # physically leading axes. Preserve its declared prefix order there;
+    # the relative order of kept dimensions, and hence the output, is unchanged.
+    if mode == RaggedDotMode.RAGGED_CONTRACTING:
+      rhs_ragged_dim = rhs_contracting[lhs_contracting.index(ragged_dim)]
+      rhs_prefix = _ragged_dot_prefix_dims(
+          mode, rhs_aval.ndim, rhs_ragged_dim, rhs_batch, rhs_contracting)
+      rhs, rhs_aval, (rhs_batch, rhs_contracting) = prefix_first(
+          rhs, rhs_aval, rhs_prefix, (rhs_batch, rhs_contracting))
+    if mode != RaggedDotMode.RAGGED_BATCH:
+      lhs_prefix = _ragged_dot_prefix_dims(
+          mode, lhs_aval.ndim, ragged_dim, lhs_batch, lhs_contracting)
+      lhs, lhs_aval, (lhs_batch, lhs_contracting, lhs_ragged_dims) = prefix_first(
+          lhs, lhs_aval, lhs_prefix, (lhs_batch, lhs_contracting, lhs_ragged_dims))
+
+  result_shape = aval_out.shape
+  expanded_shape = None
+  summed_axes = ()
+  if platform == 'gpu' and mode == RaggedDotMode.RAGGED_CONTRACTING:
+    if sizes_aval.ndim == 1:
+      # The GPU rewriter finds the RHS ragged dimension correctly only when
+      # its contracting pair is first. Global group sizes permit reordering.
+      ragged_at = lhs_contracting.index(lhs_ragged_dims[0])
+      order = (ragged_at, *remaining(range(len(lhs_contracting)), (ragged_at,)))
+      lhs_contracting = tuple(lhs_contracting[i] for i in order)
+      rhs_contracting = tuple(rhs_contracting[i] for i in order)
+    else:
+      # Prefix-dependent groups cannot reorder their contracting prefix. Make
+      # it batch instead, then sum those partial products. One flattened batch
+      # also avoids the rewriter swapping, rather than rotating, the group axis.
+      prefix = sizes_aval.shape[:-1]
+      count, batches = len(prefix), len(lhs_batch)
+      flat = math.prod(prefix)
+      suffix = aval_out.shape[1 + batches:]
+      result_shape = (sizes_aval.shape[-1], flat, *suffix)
+      expanded_shape = (sizes_aval.shape[-1], *prefix, *suffix)
+      summed_axes = tuple(range(1 + batches, 1 + count))
+      lhs, lhs_aval = reshaped(lhs, lhs_aval, (flat, *lhs_aval.shape[count:]))
+      rhs, rhs_aval = reshaped(rhs, rhs_aval, (flat, *rhs_aval.shape[count:]))
+      group_sizes, sizes_aval = reshaped(group_sizes, sizes_aval, (flat, sizes_aval.shape[-1]))
+      lhs_contracting = tuple(dim - count + 1 for dim in lhs_contracting if dim >= count)
+      rhs_contracting = tuple(dim - count + 1 for dim in rhs_contracting if dim >= count)
+      lhs_ragged_dims = (lhs_ragged_dims[0] - count + 1,)
+      lhs_batch = rhs_batch = (0,)
+
+  lhs, rhs, accumulation_aval, _ = _handle_dot_precision(
+      ctx.replace(avals_in=(lhs_aval, rhs_aval, sizes_aval)), lhs, rhs, precision, platform)
+  partial_dtype = accumulation_aval.dtype
+  if (summed_axes and dtypes.issubdtype(partial_dtype, np.floating)
+      and _bit_width(partial_dtype) < 32):
+    # Tensor-core products accumulate in fp32. Keep the partials and their sum
+    # there too, so a 16-bit result rounds once, not once per prefix slice.
+    partial_dtype = np.dtype(np.float32)
+  accumulation_aval = aval_out.update(dtype=partial_dtype)
+
   ragged_dot_dnums = chlo.RaggedDotDimensionNumbers.get(
       lhs_batching_dimensions=list(lhs_batch),
       rhs_batching_dimensions=list(rhs_batch),
       lhs_contracting_dimensions=list(lhs_contracting),
       rhs_contracting_dimensions=list(rhs_contracting),
-      lhs_ragged_dimensions=list(
-          ragged_dot_dimension_numbers.lhs_ragged_dimensions
-      ),
+      lhs_ragged_dimensions=list(lhs_ragged_dims),
       rhs_group_dimensions=list(rhs_group_dims),
   )
-  acc_type = mlir.aval_to_ir_type(ctx.module_context, accumulation_aval)
+  acc_type = mlir.aval_to_ir_type(
+      ctx.module_context, core.ShapedArray(result_shape, accumulation_aval.dtype))
   result = chlo.ragged_dot(
       acc_type,
       lhs,
       rhs,
       group_sizes,
       ragged_dot_dnums,
-      precision_config=chlo_precision_attr(precision),
+      # The DEFAULT preset names no algorithm: the operands' default precision.
+      precision_config=chlo_precision_attr(
+          Precision.DEFAULT if precision == DotAlgorithmPreset.DEFAULT
+          else precision),
   )
-  (aval_out,) = ctx.avals_out
-  result = mlir.lower_with_sharding_in_types(ctx, result, aval_out)
+  if expanded_shape is not None:
+    expanded_aval = core.ShapedArray(expanded_shape, accumulation_aval.dtype)
+    result = mlir.reshape(ctx, result, expanded_aval)
+    if summed_axes:
+      result, = _unary_reduce_lower(
+          hlo.AddOp, _get_sum_identity,
+          ctx.replace(avals_in=(expanded_aval,), avals_out=(accumulation_aval,)),
+          result, axes=summed_axes)
+  result = mlir.lower_with_sharding_in_types(ctx, result, accumulation_aval)
   if accumulation_aval.dtype != aval_out.dtype:
     result = mlir.convert_hlo(ctx, result, accumulation_aval, aval_out)
   return [result]
@@ -10302,7 +10585,9 @@ def _reduce_jvp(reducer, init_values, primals, tangents, axes):
   permutation = axes + tuple(non_axes)
   new_shape = (n,) + tuple(input_shape[non_axes])
   primals = tuple(reshape(x, new_shape, permutation) for x in primals)
-  tangents = tuple(reshape(t, new_shape, permutation) for t in tangents)
+  # An operand with a symbolic zero tangent (a constant operand, such as a count of ones or a mask
+  # reduced beside the input) still rides the tree below, which reads every operand's tangent.
+  tangents = tuple(reshape(ad.instantiate_zeros(t), new_shape, permutation) for t in tangents)
 
   for d in range(len(non_axes) + 1):
     reducer = api.vmap(reducer)
@@ -10576,7 +10861,10 @@ def _reduce_chooser_jvp_rule(g, ans, operand, *, axes, out_sharding, reduction_o
   # locations in a single pass (rather than comparing equality) and use a
   # gather, and/or even push along the chosen elements of g (b/112040122)
   shape = [1 if i in axes else d for i, d in enumerate(operand.shape)]
-  location_indicators = convert_element_type(
+  # In the tangent's dtype as it is, a wide one too (a float64 reduction traced
+  # under jax.enable_x64, differentiated outside it), which a request through
+  # `convert_element_type` would canonicalize narrow.
+  location_indicators = _convert_element_type(
       _eq_meet(operand, reshape(ans, shape)), g.dtype)
   counts = reduce_sum(location_indicators, axes)
   return div(reduce_sum(mul(g, location_indicators), axes), counts)
@@ -12034,13 +12322,15 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
 
 
 def _balanced_cmp(x, y):
-  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN
+  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN, in x's dtype as it is: a
+  # wide one (a float64 max traced under jax.enable_x64, differentiated outside
+  # it) from constants made in the canonical dtype, where all three are exact.
   gt_mask = gt(x, y)
   eq_mask = eq(x, y)
-  ones = full_like(gt_mask, 1, dtype=x.dtype)
-  zeros = full_like(gt_mask, 0, dtype=x.dtype)
-  half = full_like(gt_mask, 0.5, dtype=x.dtype)
-  return select(gt_mask, ones, select(eq_mask, half, zeros))
+  def filled(value):
+    constant = full_like(gt_mask, value, dtype=dtypes.canonicalize_dtype(x.dtype))
+    return _convert_element_type(constant, x.dtype)
+  return select(gt_mask, filled(1), select(eq_mask, filled(0.5), filled(0)))
 
 
 def _eq_meet(a, b):
@@ -12101,7 +12391,7 @@ def _empty_custom_call_lower(ctx, *, shape, dtype, out_sharding):
       [mlir.ir.RankedTensorType.get(
           list(phys_aval.shape), mlir.dtype_to_ir_type(phys_aval.dtype))],
       [],
-      call_target_name=mlir.ir.StringAttr.get("AllocateBuffer"),
+      call_target_name=mlir.ir.StringAttr.get(custom_call_targets.ALLOCATE_BUFFER),
       has_side_effect=mlir.ir.BoolAttr.get(False),
   )
   assert len(custom_call_op.results) == 1
@@ -12221,6 +12511,7 @@ def optimization_barrier(operand, /):
 
 optimization_barrier_p = core.Primitive('optimization_barrier')
 optimization_barrier_p.multiple_results = True
+# Each output is its operand's entries as they are: a rearrangement that moves none.
 optimization_barrier_p.def_impl(
     partial(dispatch.apply_primitive, optimization_barrier_p))
 

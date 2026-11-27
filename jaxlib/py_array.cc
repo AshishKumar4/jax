@@ -1731,6 +1731,7 @@ absl::Status PyArray::ReplaceWithAlias(PyArray o)
 
     old_npy_value = std::move(storage.npy_value);
     storage.npy_value = o_storage.npy_value;
+    storage.host_read = o_storage.host_read;
     old_ifrt_array = std::move(storage.ifrt_array);
     storage.ifrt_array = o_storage.ifrt_array;
     old_fully_replicated_array = std::move(storage.fully_replicated_array);
@@ -1841,6 +1842,10 @@ int PyArray_bf_getbuffer(PyObject* exporter, Py_buffer* view, int flags) {
           "Buffers of type %s are not supported by the Python buffer protocol.",
           PrimitiveType_Name(buffer.element_type()));
     }
+    if ((flags & PyBUF_WRITEABLE) == PyBUF_WRITEABLE) {
+      return xla::InvalidArgument("XLA buffers are read-only.");
+    }
+    ABSL_RETURN_IF_ERROR(py_array.GuardInPlaceHostRead(ifrt_array));
 
     std::unique_ptr<xla::PjRtBuffer::ExternalReference> external_reference_hold;
     {
@@ -1850,9 +1855,6 @@ int PyArray_bf_getbuffer(PyObject* exporter, Py_buffer* view, int flags) {
       if (buffer.IsTuple()) {
         return xla::InvalidArgument(
             "Python buffer protocol is only defined for array buffers.");
-      }
-      if ((flags & PyBUF_WRITEABLE) == PyBUF_WRITEABLE) {
-        return xla::InvalidArgument("XLA buffers are read-only.");
       }
       ABSL_ASSIGN_OR_RETURN(external_reference_hold,
                             buffer.AcquireExternalReference());
@@ -1916,6 +1918,7 @@ int PyArray_bf_getbuffer(PyObject* exporter, Py_buffer* view, int flags) {
       }
     }
     view->internal = extra.release();
+    py_array.MarkInPlaceHostRead(ifrt_array);
     return absl::OkStatus();
   }();
   if (!status.ok()) {
@@ -2218,6 +2221,41 @@ xla::PjRtBuffer* GetZeroCopyablePjRtBuffer(xla::ifrt::Array& arr) {
   return nullptr;
 }
 
+absl::Status PyArray::GuardInPlaceHostRead(
+    const xla::ifrt::ArrayRef& read) {
+  Storage& storage = GetStorage();
+  {
+    ft_lock_guard lock(storage.mu);
+    // The array's reads stand for `read` alone: one its buffer was replaced
+    // since says nothing of it.
+    if (storage.ifrt_array == read &&
+        (storage.host_read || storage.host_value.IsValid())) {
+      return absl::OkStatus();
+    }
+  }
+  std::optional<absl::string_view> kind =
+      read->sharding().memory_kind().memory_kind();
+  if (kind == "pinned_host" || kind == "unpinned_host") {
+    return absl::OkStatus();
+  }
+  return ApplyTransferGuardToInPlaceHostRead([&read] {
+    return absl::StrCat(
+        "shape=(", absl::StrJoin(read->shape().dims(), ","),
+        "), dtype=", read->dtype(), ", device=",
+        read->sharding().devices()->devices().front()->DebugString());
+  });
+}
+
+void PyArray::MarkInPlaceHostRead(const xla::ifrt::ArrayRef& read) {
+  Storage& storage = GetStorage();
+  ft_lock_guard lock(storage.mu);
+  // Where the array still holds the buffer read: a replacement taken meanwhile
+  // was not read.
+  if (storage.ifrt_array == read) {
+    storage.host_read = true;
+  }
+}
+
 absl::StatusOr<tsl::Future<>> PyArray::CopyToHostAsync() {
   PyUserContextScope user_context_scope;
   xla::ifrt::ArrayRef ifrt_array = ifrt_array_ref();
@@ -2225,6 +2263,8 @@ absl::StatusOr<tsl::Future<>> PyArray::CopyToHostAsync() {
     return xla::InvalidArgument("Array has been deleted.");
   }
   if (GetZeroCopyablePjRtBuffer(*ifrt_array) != nullptr) {
+    ABSL_RETURN_IF_ERROR(GuardInPlaceHostRead(ifrt_array));
+    MarkInPlaceHostRead(ifrt_array);
     return ifrt_array->GetReadyFuture();
   }
   xla::ifrt::Client* client = py_client()->ifrt_client();
@@ -2267,6 +2307,7 @@ absl::StatusOr<std::pair<nb::object, bool>> PyArray::ToNumpyArrayDidCopy() {
   }
   if (xla::PjRtBuffer* pjrt_buffer = GetZeroCopyablePjRtBuffer(*ifrt_array);
       pjrt_buffer != nullptr) {
+    ABSL_RETURN_IF_ERROR(GuardInPlaceHostRead(ifrt_array));
     ABSL_ASSIGN_OR_RETURN(std::vector<int64_t> dynamic_shape, dynamic_shape());
     ABSL_ASSIGN_OR_RETURN(xla::Shape host_shape,
                           GetHostShape(ifrt_array.get(), dynamic_shape));
@@ -2289,7 +2330,7 @@ absl::StatusOr<std::pair<nb::object, bool>> PyArray::ToNumpyArrayDidCopy() {
       }
     }
     ABSL_RETURN_IF_ERROR(BlockUntilResultStatusIsReady());
-    hold->buffer = std::move(ifrt_array);
+    hold->buffer = ifrt_array;
     void* data =
         hold->external_reference_hold->OpaqueDeviceMemoryDataPointer();
     nb::capsule hold_capsule(
@@ -2301,6 +2342,7 @@ absl::StatusOr<std::pair<nb::object, bool>> PyArray::ToNumpyArrayDidCopy() {
                                 ByteStridesForShape(host_shape), data,
                                 hold_capsule);
     array.attr("flags").attr("writeable") = nb::bool_(false);
+    MarkInPlaceHostRead(ifrt_array);
     return std::make_pair(std::move(array), false);
   }
 
@@ -2701,12 +2743,25 @@ absl::Status PyArray::BatchedCopyToHostAsync(nanobind::sequence py_arrays) {
   };
   absl::flat_hash_map<GroupKey, std::vector<CopyToHostState>, GroupKey::Hash>
       groups;
+  // An array read in place (a CPU buffer) is copied by none of the groups:
+  // each is held to the guard first, so that one refused leaves no copy of
+  // another prepared and never issued.
+  std::vector<std::pair<PyArray, xla::ifrt::ArrayRef>> in_place;
   for (nanobind::handle item : py_arrays) {
     if (!PyArray::IsPyArray(item)) {
       return xla::InvalidArgument(
           "PyArray::BatchedCopyToHostAsync can take PyArray only, got %s",
           nb::cast<std::string_view>(nb::repr(item.type())));
     }
+    PyArray py_array = nb::cast<PyArray>(item);
+    xla::ifrt::ArrayRef ifrt_array = py_array.ifrt_array_ref();
+    if (ifrt_array != nullptr && !ifrt_array->IsDeleted() &&
+        GetZeroCopyablePjRtBuffer(*ifrt_array) != nullptr) {
+      ABSL_RETURN_IF_ERROR(py_array.GuardInPlaceHostRead(ifrt_array));
+      in_place.push_back({std::move(py_array), std::move(ifrt_array)});
+    }
+  }
+  for (nanobind::handle item : py_arrays) {
     PyArray py_array = nb::cast<PyArray>(item);
     xla::ifrt::Client* client = py_array.py_client()->ifrt_client();
     ABSL_ASSIGN_OR_RETURN(std::optional<CopyToHostState> state,
@@ -2727,6 +2782,13 @@ absl::Status PyArray::BatchedCopyToHostAsync(nanobind::sequence py_arrays) {
   for (auto& [key, grouped_arrays] : groups) {
     status.Update(
         BatchedCopyToHostAsyncHelper(key.client, std::move(grouped_arrays)));
+  }
+  // The arrays read in place have reached the host only where the whole batch
+  // was taken: a refused one (deleted, a token) leaves the others unread.
+  if (status.ok()) {
+    for (auto& [py_array, read] : in_place) {
+      py_array.MarkInPlaceHostRead(read);
+    }
   }
   return status;
 }
