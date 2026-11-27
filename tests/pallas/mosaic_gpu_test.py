@@ -1225,6 +1225,8 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
           lax.round,
           lax.clz,
           lambda x: lax.round(x, lax.RoundingMethod.TO_NEAREST_EVEN),
+          lambda x: lax.erf(x / 64),
+          lambda x: lax.atan2(x, x + 1),
       ],
       approx_math=[True, False],
   )
