@@ -30,7 +30,7 @@ executable protocols described above.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 import dataclasses
 from dataclasses import dataclass
 import enum
@@ -39,9 +39,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 from jax._src import config
 from jax._src import core
-from jax._src import hlo_reader
 from jax._src import literals
-from jax._src import peak_live
 from jax._src import sharding as sharding_lib
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -859,51 +857,28 @@ class Compiled(Stage):
     except NotImplementedError:
       return None
 
-  def live_intervals(self) -> tuple[peak_live.LiveInterval, ...] | None:
-    """Each buffer of the compile's allocations over the part of a heap
-    simulation's schedule it lives in, the memory it lies in beside;
-    positions compare within one trace alone. In a complete allocation's one
-    trace, the charged ones covering its peak are ``peak_live``'s; an
-    allocation no simulation names has none.
-
-    Read from the same buffer assignment as ``peak_live``; ``None`` where the
-    backend states none.
-    """
+  def buffer_assignment(self) -> bytes | None:
+    """XLA's buffer assignment of the compile, a serialized
+    ``BufferAssignmentProto``, as the compile states it in its memory analysis
+    (whether it ran whole or stopped after buffer assignment); ``None`` where
+    the backend states none."""
     analysis = self.memory_analysis()
-    if analysis is None or not analysis.serialized_buffer_assignment_proto:
+    if analysis is None:
       return None
-    module, = self._executable.xla_extension_executable().hlo_modules()
-    return peak_live.intervals(analysis.serialized_buffer_assignment_proto,
-                               module.as_serialized_hlo_module_proto(),
-                               self._parameter_arguments())
+    return analysis.serialized_buffer_assignment_proto or None
 
-  def peak_live(self) -> tuple[peak_live.LiveBuffer, ...] | None:
-    """The buffers live at the peak of each of the compile's allocations.
+  def entry_arguments(self) -> tuple[int | None, ...] | None:
+    """For each entry parameter of the compiled module, by its number, the
+    flat index among the call's arguments (``args_info``'s leaves) it holds;
+    None for one that holds no argument (a closed-over constant, an effect's
+    token, a mutable array's state). Pruned arguments hold none, so a reader
+    of the module needs this map. ``None`` for an executable that states no
+    such map (not a ``MeshExecutable`` holding its unloaded executable).
 
-    Read from XLA's own buffer assignment, which the compile states in its
-    memory analysis, whether it ran whole or stopped after buffer assignment
-    (``xla_gpu_experimental_early_exit``'s
-    ``EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT``); ``None`` where the backend
-    states no assignment (a plugin serving no executable metadata).
+    Its entry parameters are its ordered effects' tokens, then the arguments
+    it keeps (its const args first), then its mutable arrays'; refused
+    (ValueError) where they do not count the module's.
     """
-    analysis = self.memory_analysis()
-    if analysis is None or not analysis.serialized_buffer_assignment_proto:
-      return None
-    # The executable whose memory analysis that is.
-    module, = self._executable.xla_extension_executable().hlo_modules()
-    return peak_live.live(analysis.serialized_buffer_assignment_proto,
-                          module.as_serialized_hlo_module_proto(),
-                          self._parameter_arguments())
-
-  def _parameter_arguments(self) -> Callable[[int], int | None] | None:
-    """The flat index among the call's arguments (``args_info``'s leaves) of
-    the compiled module's entry parameter numbered as given, None for one that
-    is no argument (a closed-over constant, an effect's token, a mutable
-    array's state); None for an executable that states no such map (not a
-    ``MeshExecutable`` holding its unloaded executable). Its entry parameters
-    are its ordered effects' tokens, then the arguments it keeps (its const
-    args first), then its mutable arrays'; refused (ValueError) where they do
-    not count the module's."""
     from jax._src.interpreters import pxla  # pxla imports this module.
 
     executable = self._executable
@@ -916,21 +891,16 @@ class Compiled(Stage):
     mutable = 0 if unloaded.mut is None else len(unloaded.mut.in_mut)
     consts = len(self._params.const_args)
     module, = executable.xla_extension_executable().hlo_modules()
-    proto = hlo_reader.message_class("xla.HloModuleProto").FromString(
-        module.as_serialized_hlo_module_proto())
-    entry, = (computation for computation in proto.computations
-              if computation.id == proto.entry_computation_id)
-    count = sum(instruction.opcode == "parameter"
-                for instruction in entry.instructions)
+    count = len(xc.XlaComputation(module.as_serialized_hlo_module_proto())
+                .program_shape().parameter_shapes())
     if tokens + len(kept) + mutable != count:
       raise ValueError(
           f"the module's entry takes {count} parameters, its executable "
           f"{tokens} tokens, {len(kept)} kept arguments and {mutable} mutable "
           "arrays")
-    arguments = [*(None,) * tokens,
-                 *(None if index < consts else index - consts for index in kept),
-                 *(None,) * mutable]
-    return arguments.__getitem__
+    return (*(None,) * tokens,
+            *(None if index < consts else index - consts for index in kept),
+            *(None,) * mutable)
 
   @property
   def in_avals(self):

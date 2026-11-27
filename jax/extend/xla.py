@@ -17,11 +17,6 @@
 # Note: import <name> as <name> is required for names to be exported.
 # See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
-from jax._src.hlo_reader import (
-    Instruction as Instruction,
-    instructions as instructions,
-    module_from_text as module_from_text,
-)
 from jax._src.xla_transform import (
     PipelineStage as PipelineStage,
     clear_hlo_module_transformation as clear_hlo_module_transformation,

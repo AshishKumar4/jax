@@ -943,7 +943,8 @@ def _name_lowering(ctx, x, *, name):
   # The value's defining op carries its names (frontend attribute
   # `checkpoint_name`, comma-separated), which XLA keeps on the instruction
   # defining its buffer: a compile's live buffers name the residuals a policy
-  # saves (`Compiled.peak_live`). A parameter has no defining op to carry them.
+  # saves (`Compiled.buffer_assignment`). A parameter has no defining op to
+  # carry them.
   # A reshape holds its operand's elements in their order, and XLA makes most
   # reshapes bitcasts of their operand's buffer, folding reshapes of reshapes
   # into one, so the instruction defining the buffer is the operand's producer

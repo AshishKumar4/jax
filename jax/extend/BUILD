@@ -140,7 +140,6 @@ pytype_strict_library(
     name = "xla",
     srcs = ["xla.py"],
     deps = [
-        "//jax/_src:hlo_reader",
         "//jax/_src:xla_transform",
     ],
 )

@@ -467,26 +467,6 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
-    name = "hlo_reader",
-    srcs = ["hlo_reader.py"],
-    visibility = ["//jax:internal"],
-    deps = [":xla_protos"],
-)
-
-pytype_strict_library(
-    name = "xla_protos",
-    srcs = ["xla_protos.py"],
-    visibility = ["//jax:internal"],
-)
-
-pytype_strict_library(
-    name = "peak_live",
-    srcs = ["peak_live.py"],
-    visibility = ["//jax:internal"],
-    deps = [":hlo_reader"],
-)
-
-pytype_strict_library(
     name = "mosaic_gpu_records",
     srcs = ["mosaic_gpu_records.py"],
     visibility = ["//jax:internal"],
@@ -1324,7 +1304,6 @@ pytype_strict_library(
         ":mesh",
         ":mlir",
         ":partial_eval",
-        ":peak_live",
         ":sharding",
         ":sharding_impls",
         ":source_info_util",

@@ -81,8 +81,8 @@ setup(
         'ml_dtypes>=0.7.0',
         'numpy>=2.2',
         'opt_einsum',
-        # jax.extend.xla's reader of a compiled module's instructions parses XLA's HloModuleProto
-        # (jax._src.hlo_reader, its descriptors jax._src.xla_protos), message classes from a pool of its own.
+        # jax.extend.mosaic_gpu's reader of a compiled kernel's record parses Mosaic GPU's kernel record
+        # (jax._src.mosaic_gpu_records, its descriptors jax._src.mosaic_gpu_protos).
         'protobuf>=5.26',
         'scipy>=1.15',
     ],
