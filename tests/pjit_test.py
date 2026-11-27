@@ -4925,6 +4925,28 @@ class ArrayPjitTest(jtu.JaxTestCase):
 
 class ShardingInTypesTest(jtu.JaxTestCase):
 
+  @jtu.with_explicit_mesh((2,), ('x',))
+  def test_ragged_dot_decomposed_keeps_the_rhs_columns_or_groups_sharding(
+      self, mesh):
+    # The decomposition (the ragged dot instruction off) takes each group's
+    # product with the group an rhs free dimension: an rhs sharded on its
+    # columns or on its groups lowers, and each row reads its own group's
+    # matrix (Dew row 13562).
+    lhs = jnp.arange(32, dtype=np.float32).reshape(8, 4) / 8
+    rhs = np.arange(48, dtype=np.float32).reshape(2, 4, 6) / 16
+    sizes = jnp.array([3, 5], np.int32)
+    want = np.concatenate([np.asarray(lhs[:3]) @ rhs[0],
+                           np.asarray(lhs[3:]) @ rhs[1]])
+    for rhs_spec, out_spec in ((P(None, None, 'x'), P(None, 'x')),
+                               (P('x', None, None), P(None, None))):
+      with (self.subTest(rhs=rhs_spec),
+            config.jax_ragged_dot_use_ragged_dot_instruction(False)):
+        product = jax.jit(lambda l, r, g, s=out_spec: lax.ragged_dot(
+            l, r, g, out_sharding=s))
+        out = product(lhs, jax.device_put(rhs, rhs_spec), sizes)
+        self.assertEqual(out.sharding, NamedSharding(mesh, out_spec))
+        self.assertAllClose(out, want, rtol=1e-6)
+
   def check_wsc_in_lowered(self, text):
     if config.use_shardy_partitioner.value:
       self.assertIn('sdy.sharding_constraint', text)

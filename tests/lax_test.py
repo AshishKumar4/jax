@@ -5669,6 +5669,27 @@ class RaggedTest(jtu.JaxTestCase):
   def test_ragged_dot(self, m, k, n, num_groups, dtype):
     return self._test_ragged_dot(m, k, n, num_groups, dtype)
 
+  @parameterized.parameters(np.bool_, np.float16, dtypes.bfloat16)
+  def test_ragged_dot_decomposed_takes_predicates_and_narrow_floats(
+      self, dtype):
+    # Its groups collapse by OR for a predicate and in float32 for a float
+    # narrower than 32 bits, so neither is refused (the dot it replaced took
+    # both), whatever jax_allow_f16_reductions says.
+    rng = np.random.RandomState(0)
+    draw = ((lambda *s: rng.randint(0, 2, s)) if dtype == np.bool_
+            else (lambda *s: rng.randn(*s)))
+    lhs, rhs = draw(6, 4).astype(dtype), draw(3, 4, 5).astype(dtype)
+    sizes = np.array([2, 1, 3], np.int32)
+    with (config.jax_ragged_dot_use_ragged_dot_instruction(False),
+          config.allow_f16_reductions(False)):
+      out = lax.ragged_dot(lhs, rhs, sizes)
+    starts = np.cumsum(sizes) - sizes
+    want = np.concatenate([
+        np.asarray(lax.dot(lhs[a:a + s], rhs[g]))
+        for g, (a, s) in enumerate(zip(starts, sizes))])
+    self.assertEqual(out.dtype, want.dtype)
+    self.assertAllClose(out, want, atol=0, rtol=0)
+
   def test_ragged_dot_reads_each_rows_own_groups_matrix_alone(self):
     # A row's product is its own group's: another group's non-finite weight
     # leaves it finite, where a sum over every group's product would give

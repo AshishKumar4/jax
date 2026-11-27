@@ -7394,6 +7394,55 @@ ad.primitive_transposes[ragged_dot_general_p] = _ragged_dot_general_transpose_ru
 batching.fancy_primitive_batchers[ragged_dot_general_p] = _ragged_dot_general_batch_rule
 
 
+def _with_group(out_sharding, rank: int, group: int, rhs, rhs_group_dim: int):
+  """A non-contracting ragged dot's `out_sharding` (of `rank` dimensions) with
+  its per-group product's group dimension inserted at `group`, sharded as the
+  rhs's group dimension is; None where none is given."""
+  if out_sharding is None:
+    return None
+  spec = list(out_sharding.spec if isinstance(out_sharding, NamedSharding)
+              else out_sharding)
+  spec += [None] * (rank - len(spec))
+  spec.insert(group, core.typeof(rhs).sharding.spec[rhs_group_dim])
+  return (out_sharding.update(spec=P(*spec))
+          if isinstance(out_sharding, NamedSharding) else P(*spec))
+
+
+def _own_group(group_sizes, products, group: int, row: int,
+               prefix: Sequence[int]):
+  """Whether each element of a non-contracting ragged dot's per-group
+  `products` is its row's own group's: the row (its dimension `row`) lies in
+  the group's (dimension `group`) rows, by `group_sizes` ([prefix..., G], its
+  leading dimensions the products' `prefix` ones), sharded as the products
+  are."""
+  from jax._src.lax import control_flow  # avoid circular imports
+  sharding = core.typeof(products).sharding
+  dims = (*prefix, group)
+  ends = control_flow.cumsum(group_sizes, axis=group_sizes.ndim - 1)
+  ends_at = broadcast_in_dim(ends, products.shape, dims, out_sharding=sharding)
+  starts_at = broadcast_in_dim(ends - group_sizes, products.shape, dims,
+                               out_sharding=sharding)
+  rows = broadcasted_iota(group_sizes.dtype, products.shape, row,
+                          out_sharding=sharding)
+  return bitwise_and(starts_at <= rows, rows < ends_at)
+
+
+def _sum_own_group(kept, group: int, out_sharding):
+  """The per-group products `kept` (each row's own group's, zeros elsewhere)
+  summed over their dimension `group`: one term a row at most, so exact in a
+  type that holds it. A predicate's by OR, and a float narrower than 32 bits
+  in float32 and back, which no setting of jax_allow_f16_reductions
+  refuses."""
+  if kept.dtype == np.bool_:
+    return reduce_or(kept, (group,))
+  if (dtypes.issubdtype(kept.dtype, np.floating)
+      and dtypes.finfo(kept.dtype).bits < 32):
+    total = reduce_sum(convert_element_type(kept, np.float32), (group,),
+                       out_sharding=out_sharding)
+    return convert_element_type(total, kept.dtype)
+  return reduce_sum(kept, (group,), out_sharding=out_sharding)
+
+
 def _ragged_dot_general_impl(
     lhs: Array,
     rhs: Array,
@@ -7471,32 +7520,31 @@ def _ragged_dot_general_impl(
     case RaggedDotMode.RAGGED_NONCONTRACTING:
       rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
       assert len(rhs_group_dims) == 1
-      # Each group's product apart (the group a batch dimension), then each
-      # row's own group's taken by a select: a sum over the groups would
-      # multiply a row's zeros by every other group's matrix, so one group's
-      # non-finite weight would be NaN in every row (0 * inf).
+      (rhs_group_dim,) = rhs_group_dims
+      # Each group's product apart, the group an rhs free dimension of one
+      # dot (no lhs expanded per group), then each row's own group's taken by
+      # a select: contracting the group with the lhs zeroed outside a group's
+      # rows multiplied those zeros by every other group's matrix, so one
+      # group's non-finite weight was NaN in every row (0 * inf).
+      l_free = [d for d in range(lhs.ndim)
+                if d not in l_contract and d not in l_batch]
+      r_free = [d for d in range(rhs.ndim)
+                if d not in r_contract and d not in r_batch]
+      # The product's dimensions: the batch, the lhs's free ones, the rhs's
+      # free ones (the group among them), each in order.
+      group = len(l_batch) + len(l_free) + r_free.index(rhs_group_dim)
+      placed = lambda d: (l_batch.index(d) if d in l_batch
+                          else len(l_batch) + l_free.index(d))
       products = _dot_general(
-          expand(lhs, lhs_ragged_dim, group_sizes, *l_prefix),
-          rhs,
-          dimension_numbers=(
-              (incr(l_contract), list(r_contract)),
-              ([0] + incr(l_batch), [rhs_group_dims[0]] + list(r_batch)),
-          ),
-      )
-      # Which group each of the product's lhs positions is in: the lhs's own
-      # membership, its contracting dimensions reduced, as the product orders
-      # its dimensions (the group, the batch, the lhs's free ones).
-      member = expand(full_like(lhs, True, dtype=np.bool_), lhs_ragged_dim,
-                      group_sizes, *l_prefix)
-      member = reduce_or(member, tuple(incr(l_contract)))
-      kept = [d for d in range(lhs.ndim) if d not in l_contract]
-      free = [d for d in kept if d not in l_batch]
-      member = transpose(member, [0] + [1 + kept.index(d) for d in l_batch]
-                         + [1 + kept.index(d) for d in free])
-      member = broadcast_in_dim(member, products.shape,
-                                tuple(range(member.ndim)))
-      return reduce_sum(select(member, products, _zeros(products)), (0,),
-                        out_sharding=out_sharding)
+          lhs, rhs,
+          dimension_numbers=((l_contract, r_contract), (l_batch, r_batch)),
+          out_sharding=_with_group(
+              out_sharding, len(l_batch) + len(l_free) + len(r_free) - 1,
+              group, rhs, rhs_group_dim))
+      own = _own_group(group_sizes, products, group, placed(lhs_ragged_dim),
+                       [placed(d) for d in l_prefix])
+      return _sum_own_group(select(own, products, _zeros(products)), group,
+                            out_sharding)
     case RaggedDotMode.RAGGED_CONTRACTING:
       rhs_ragged_dim = r_contract[l_contract.index(lhs_ragged_dim)]
       r_prefix = _ragged_dot_prefix_dims(
