@@ -1,0 +1,504 @@
+diff --git a/xla/backends/gpu/collectives/BUILD b/xla/backends/gpu/collectives/BUILD
+index 80b5501..9a86c9a 100644
+--- a/xla/backends/gpu/collectives/BUILD
++++ b/xla/backends/gpu/collectives/BUILD
+@@ -158,13 +158,16 @@ cc_library(
+     hdrs = ["gpu_clique_rendezvous.h"],
+     deps = [
+         ":gpu_clique_key",
++        "//xla:debug_options_flags",
+         "//xla:util",
+         "//xla/core/collectives:rank_id",
+         "//xla/service:rendezvous",
+         "//xla/tsl/util:unique_any",
+         "@com_google_absl//absl/container:btree",
+         "@com_google_absl//absl/log",
++        "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/time",
+         "@com_google_absl//absl/strings",
+         "@com_google_absl//absl/strings:str_format",
+         "@com_google_absl//absl/types:span",
+@@ -182,6 +185,8 @@ xla_cc_test(
+         "//xla/tsl/platform:env",
+         "//xla/tsl/platform:test",
+         "//xla/tsl/platform:test_main",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
+     ],
+ )
+ 
+diff --git a/xla/backends/gpu/collectives/gpu_clique_rendezvous.cc b/xla/backends/gpu/collectives/gpu_clique_rendezvous.cc
+index 5ab2d8a..757fc19 100644
+--- a/xla/backends/gpu/collectives/gpu_clique_rendezvous.cc
++++ b/xla/backends/gpu/collectives/gpu_clique_rendezvous.cc
+@@ -26,9 +26,12 @@ limitations under the License.
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/str_format.h"
+ #include "absl/strings/str_join.h"
++#include "absl/status/status.h"
++#include "absl/time/time.h"
+ #include "absl/types/span.h"
+ #include "xla/backends/gpu/collectives/gpu_clique_key.h"
+ #include "xla/core/collectives/rank_id.h"
++#include "xla/debug_options_flags.h"
+ #include "xla/service/rendezvous.h"
+ #include "xla/tsl/util/unique_any.h"
+ #include "xla/util.h"
+@@ -36,6 +39,21 @@ limitations under the License.
+ namespace xla::gpu {
+ namespace {
+ 
++// A rendezvous of a local clique warns past WarnStuckTimeout and ends at the
++// GPU collectives' termination timeout past that, as acquiring a clique does
++// (gpu_cliques.cc), so a rank that never joins holds its peers no longer:
++// xla_gpu_nccl_termination_timeout_seconds -1 (the default) waits on after the
++// warning as before; N >= 0 ends the process N seconds after it, its stacks
++// dumped (xla/service/rendezvous.cc).
++absl::Duration WarnStuckTimeout() { return absl::Seconds(10); }
++
++absl::Duration TerminateTimeout() {
++  static const int64_t terminate_timeout =
++      GetDebugOptionsFromFlags().xla_gpu_nccl_termination_timeout_seconds();
++  return terminate_timeout >= 0 ? absl::Seconds(terminate_timeout)
++                                : absl::InfiniteDuration();
++}
++
+ // Wrap GpuCliqueKey into a unique struct to guarantee we do not accidentally
+ // try to run multiple unrelated rendezvous for a same key.
+ struct GpuCliqueRendezvousKey {
+@@ -100,9 +118,42 @@ absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> GpuCliqueRendezvous::Join(
+   // We expect that all local participants will collectively allocate the
+   // multicast memory.
+   int64_t num_participants = clique_key.num_local_participants();
+-  return Rendezvous<GpuCliqueRendezvous>(rendezvous_name, rendezvous_key,
+-                                         rendezvous_value, num_participants,
+-                                         callback);
++  return Rendezvous<GpuCliqueRendezvous>(
++      rendezvous_name, rendezvous_key, rendezvous_value, num_participants,
++      callback, WarnStuckTimeout(), TerminateTimeout());
++}
++
++absl::Status GpuCliqueRendezvous::JoinFailed(const GpuCliqueKey& clique_key,
++                                             RankId rank,
++                                             absl::Status failure) {
++  // A failure that is no error still names one: a peer reads it as failed.
++  absl::Status carried =
++      failure.ok() ? Internal("rank %d failed with no status", rank.value())
++                   : failure;
++  absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> joined =
++      Join(clique_key, rank, RankFailure{carried});
++  if (!joined.ok()) {
++    return absl::Status(carried.code(),
++                        absl::StrCat(carried.message(), "; and its peers were "
++                                                        "not told: ",
++                                     joined.status().message()));
++  }
++  return carried;
++}
++
++absl::Status GpuCliqueRendezvous::PeersReady() const {
++  for (const auto& [rank, value] : values_) {
++    if (const auto* failed = tsl::any_cast<RankFailure>(&value)) {
++      return Failed(rank, *failed);
++    }
++  }
++  return absl::OkStatus();
++}
++
++absl::Status GpuCliqueRendezvous::Failed(RankId rank,
++                                         const RankFailure& failure) {
++  return FailedPrecondition("Rank %d of the clique failed before it: %s",
++                            rank.value(), failure.status.ToString());
+ }
+ 
+ }  // namespace xla::gpu
+diff --git a/xla/backends/gpu/collectives/gpu_clique_rendezvous.h b/xla/backends/gpu/collectives/gpu_clique_rendezvous.h
+index 4d963ac..f77b207 100644
+--- a/xla/backends/gpu/collectives/gpu_clique_rendezvous.h
++++ b/xla/backends/gpu/collectives/gpu_clique_rendezvous.h
+@@ -23,14 +23,25 @@ limitations under the License.
+ #include "absl/status/statusor.h"
+ #include "xla/backends/gpu/collectives/gpu_clique_key.h"
+ #include "xla/core/collectives/rank_id.h"
++#include "absl/status/status.h"
+ #include "xla/tsl/util/unique_any.h"
+ #include "xla/util.h"
+ 
+ namespace xla::gpu {
+ 
++// A rank's failure before the rendezvous its peers wait in (`JoinFailed`): the
++// value it joins with in place of its data, which every peer's read of it
++// (`at`, `PeersReady`) returns as an error.
++struct RankFailure {
++  absl::Status status;
++};
++
+ // A result of a rendezvous for a given clique key, where each participant is
+ // expected to join the rendezvous together with a local data that it wants to
+-// share with other participants. Supported only for local cliques.
++// share with other participants. Supported only for local cliques. A join waits
++// at most the GPU collectives' termination timeout
++// (DebugOptions::xla_gpu_nccl_termination_timeout_seconds), as acquiring a
++// clique does.
+ class GpuCliqueRendezvous {
+  public:
+   // Joins a rendezvous for the given clique key and return the associated data.
+@@ -42,6 +53,16 @@ class GpuCliqueRendezvous {
+   static absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> Join(
+       const GpuCliqueKey& clique_key, RankId rank, tsl::UniqueAny data);
+ 
++  // Joins the rendezvous for `clique_key` in place of a rank that failed before
++  // it with `failure`, so its peers return the failure rather than wait for a
++  // rank that never joins, and returns `failure`.
++  static absl::Status JoinFailed(const GpuCliqueKey& clique_key, RankId rank,
++                                 absl::Status failure);
++
++  // OK where no rank of the rendezvous joined it failed (`JoinFailed`), else
++  // the first failed rank's failure.
++  absl::Status PeersReady() const;
++
+   // Returns the clique key associated with this rendezvous object.
+   const GpuCliqueKey& clique_key() const { return clique_key_; }
+ 
+@@ -54,6 +75,9 @@ class GpuCliqueRendezvous {
+       return NotFound("Data not found for rank %d", rank.value());
+     }
+ 
++    if (const auto* failed = tsl::any_cast<RankFailure>(&it->second)) {
++      return Failed(rank, *failed);
++    }
+     const T* ptr = tsl::any_cast<T>(&it->second);
+     if (ptr == nullptr) {
+       return InvalidArgument("Data type mismatch for rank %d", rank.value());
+@@ -70,6 +94,9 @@ class GpuCliqueRendezvous {
+       return NotFound("Data not found for rank %d", rank.value());
+     }
+ 
++    if (const auto* failed = tsl::any_cast<RankFailure>(&it->second)) {
++      return Failed(rank, *failed);
++    }
+     T* ptr = tsl::any_cast<T>(&it->second);
+     if (ptr == nullptr) {
+       return InvalidArgument("Data type mismatch for rank %d", rank.value());
+@@ -79,6 +106,9 @@ class GpuCliqueRendezvous {
+   }
+ 
+  private:
++  // A failed rank's failure as its peers return it.
++  static absl::Status Failed(RankId rank, const RankFailure& failure);
++
+   GpuCliqueRendezvous(GpuCliqueKey clique_key,
+                       absl::btree_map<RankId, tsl::UniqueAny> values);
+ 
+diff --git a/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc b/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
+index e12d81a..a345cca 100644
+--- a/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
++++ b/xla/backends/gpu/collectives/gpu_clique_rendezvous_test.cc
+@@ -16,10 +16,14 @@ limitations under the License.
+ #include "xla/backends/gpu/collectives/gpu_clique_rendezvous.h"
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
+ #include "xla/backends/gpu/collectives/gpu_clique_key.h"
+ #include "xla/core/collectives/rank_id.h"
+ #include "xla/runtime/device_id.h"
+@@ -42,7 +46,7 @@ TEST(GpuCliqueRendezvousTest, TwoParticipants) {
+   auto task = [&](int32_t id) {
+     return [&, id] {
+       auto rendezvous = GpuCliqueRendezvous::Join(key, RankId(id), int32_t{id});
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(data.clique_key(), key);
+@@ -68,7 +72,7 @@ TEST(GpuCliqueRendezvousTest, MoveOnlyType) {
+     return [&, id] {
+       auto rendezvous = GpuCliqueRendezvous::Join(
+           key, RankId(id), std::make_unique<int32_t>(id * 10));
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(*data.at<MoveOnly>(RankId(0))->get(), 0);
+@@ -92,7 +96,7 @@ TEST(GpuCliqueRendezvousTest, ThreeParticipants) {
+     return [&, id] {
+       auto rendezvous =
+           GpuCliqueRendezvous::Join(key, RankId(id), std::string(1, 'a' + id));
+-      ASSERT_OK(rendezvous);
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
+ 
+       GpuCliqueRendezvous& data = **rendezvous;
+       ASSERT_EQ(data.at<std::string>(RankId(0))->get(), "a");
+@@ -107,6 +111,88 @@ TEST(GpuCliqueRendezvousTest, ThreeParticipants) {
+   thread_pool.Schedule(task(2));
+ }
+ 
++TEST(GpuCliqueRendezvousTest, AFailedRanksPeersReturnItsFailure) {
++  // Rank 1 fails before the rendezvous (its scratch past the device's memory)
++  // and joins in place of its data: rank 0's read of it, and its check of its
++  // peers, return the failure rather than wait for a rank that never joins.
++  GlobalDeviceId id0 = GlobalDeviceId(0);
++  GlobalDeviceId id1 = GlobalDeviceId(1);
++  GpuCliqueKey key({id0, id1}, /*num_local_participants=*/2);
++
++  absl::Status read, ready, failed;
++  {
++    auto thread_pool = CreateThreadPool(2);
++    thread_pool.Schedule([&] {
++      absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> rendezvous =
++          GpuCliqueRendezvous::Join(key, RankId(0), int32_t{0});
++      ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
++      read = (*rendezvous)->at<int32_t>(RankId(1)).status();
++      ready = (*rendezvous)->PeersReady();
++    });
++    thread_pool.Schedule([&] {
++      failed = GpuCliqueRendezvous::JoinFailed(
++          key, RankId(1),
++          absl::ResourceExhaustedError("Failed to allocate Scratch 1"));
++    });
++  }
++  EXPECT_EQ(failed.code(), absl::StatusCode::kResourceExhausted);
++  for (const absl::Status& status : {read, ready}) {
++    EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
++    EXPECT_THAT(status.message(), ::testing::HasSubstr("Rank 1"));
++    EXPECT_THAT(status.message(),
++                ::testing::HasSubstr("Failed to allocate Scratch 1"));
++  }
++}
++
++TEST(GpuCliqueRendezvousTest, ReadyPeersAreReady) {
++  GlobalDeviceId id0 = GlobalDeviceId(0);
++  GlobalDeviceId id1 = GlobalDeviceId(1);
++  GpuCliqueKey key({id0, id1}, /*num_local_participants=*/2);
++
++  absl::Status ready[2];
++  {
++    auto thread_pool = CreateThreadPool(2);
++    for (int32_t id : {0, 1}) {
++      thread_pool.Schedule([&, id] {
++        absl::StatusOr<std::shared_ptr<GpuCliqueRendezvous>> rendezvous =
++            GpuCliqueRendezvous::Join(key, RankId(id), int32_t{id});
++        ASSERT_TRUE(rendezvous.ok()) << rendezvous.status();
++        ready[id] = (*rendezvous)->PeersReady();
++      });
++    }
++  }
++  EXPECT_TRUE(ready[0].ok()) << ready[0];
++  EXPECT_TRUE(ready[1].ok()) << ready[1];
++}
++
++TEST(GpuCliqueRendezvousDeathTest, AMissingRankEndsAtTheTerminationTimeout) {
++  // A rank that never joins (its failure told no one) holds its peer at most
++  // the GPU collectives' termination timeout: the process ends, rather than
++  // the peer waiting forever. Run in a process of its own, which reads the
++  // flag afresh.
++  GTEST_FLAG_SET(death_test_style, "threadsafe");
++  const char* held = std::getenv("XLA_FLAGS");
++  const std::optional<std::string> before =
++      held == nullptr ? std::nullopt : std::make_optional<std::string>(held);
++  setenv("XLA_FLAGS", "--xla_gpu_nccl_termination_timeout_seconds=1", 1);
++  GlobalDeviceId id0 = GlobalDeviceId(0);
++  GlobalDeviceId id1 = GlobalDeviceId(1);
++  GpuCliqueKey key({id0, id1}, /*num_local_participants=*/2);
++  EXPECT_DEATH(
++      {
++        auto rendezvous =
++            GpuCliqueRendezvous::Join(key, RankId(0), int32_t{0});
++        (void)rendezvous;
++      },
++      "Termination timeout");
++  // The parent's flags as they were: the next test reads them.
++  if (before.has_value()) {
++    setenv("XLA_FLAGS", before->c_str(), 1);
++  } else {
++    unsetenv("XLA_FLAGS");
++  }
++}
++
+ TEST(GpuCliqueRendezvousTest, NonLocalCliqueReturnsError) {
+   GlobalDeviceId id0 = GlobalDeviceId(0);
+   GlobalDeviceId id1 = GlobalDeviceId(1);
+diff --git a/xla/backends/gpu/runtime/collective_kernel_thunk.cc b/xla/backends/gpu/runtime/collective_kernel_thunk.cc
+index 3b05949..d84f300 100644
+--- a/xla/backends/gpu/runtime/collective_kernel_thunk.cc
++++ b/xla/backends/gpu/runtime/collective_kernel_thunk.cc
+@@ -673,73 +673,111 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
+   const CollectiveMetadataLayout metadata_layout(num_devices, num_parameters,
+                                                  layout.AnyMultimem());
+ 
+-  ABSL_RETURN_IF_ERROR(per_device_state_.GetOrCreateAndInitialize(
++  // A rank whose state fails before a rendezvous of its local clique (its
++  // scratch past the device's memory, its kernel, its pointers' copy) joins it
++  // all the same, carrying its failure (`GpuCliqueRendezvous::JoinFailed`): its
++  // peers return the failure rather than wait for it (Dew row 12131: a 2xH100
++  // step hung on GPU 1 after GPU 0 failed to allocate its scratch). Those
++  // rendezvous are the parameters' (`CollectParamToPeersWithRendezvous`) where
++  // the layout exchanges any, and the one after every fallible step where it
++  // registers symmetric memory with NCCL below, a collective call a failed rank
++  // would never join; a clique spanning processes has none to tell.
++  const bool exchanges = layout.Any(SymmetricMemoryType::kXlaRendezvous);
++  const bool registers = layout.Any(SymmetricMemoryType::kLoadStoreAccessible);
++  // The device's state, built once: later calls find it built, or its failure
++  // kept (a peer's among it, where the ranks met).
++  absl::Status built = per_device_state_.GetOrCreateAndInitialize(
+       params.executor->device_ordinal(),
+       [&](StreamState* state) -> absl::Status {
+-        se::DeviceAddressHandle scratch_allocation;
+-        std::vector<se::DeviceAddressBase> scratch_slices;
+-        scratch_slices.reserve(kernel_spec_.scratch_buffers.size());
+-        if (layout.total_scratch_bytes > 0) {
+-          ABSL_ASSIGN_OR_RETURN(
+-              scratch_allocation,
+-              AllocateMemory(params.executor, layout.total_scratch_bytes,
+-                             "Scratch"));
+-          for (size_t i = 0; i < kernel_spec_.scratch_buffers.size(); ++i) {
+-            scratch_slices.push_back(scratch_allocation.address().GetByteSlice(
+-                layout.scratch_offsets[i], layout.scratch_sizes[i]));
++        absl::Status prepared = [&]() -> absl::Status {
++          se::DeviceAddressHandle scratch_allocation;
++          std::vector<se::DeviceAddressBase> scratch_slices;
++          scratch_slices.reserve(kernel_spec_.scratch_buffers.size());
++          if (layout.total_scratch_bytes > 0) {
++            ABSL_ASSIGN_OR_RETURN(
++                scratch_allocation,
++                AllocateMemory(params.executor, layout.total_scratch_bytes,
++                               "Scratch"));
++            for (size_t i = 0; i < kernel_spec_.scratch_buffers.size(); ++i) {
++              scratch_slices.push_back(
++                  scratch_allocation.address().GetByteSlice(
++                      layout.scratch_offsets[i], layout.scratch_sizes[i]));
++            }
+           }
+-        }
+-        // Step1: Zero out scratch buffers if needed.
+-        for (size_t i = 0; i < scratch_slices.size(); ++i) {
+-          if (kernel_spec_.scratch_buffers[i].should_memzero) {
+-            ABSL_RETURN_IF_ERROR(params.stream->MemZero(
+-                &scratch_slices[i], scratch_slices[i].size()));
++          // Step1: Zero out scratch buffers if needed.
++          for (size_t i = 0; i < scratch_slices.size(); ++i) {
++            if (kernel_spec_.scratch_buffers[i].should_memzero) {
++              ABSL_RETURN_IF_ERROR(params.stream->MemZero(
++                  &scratch_slices[i], scratch_slices[i].size()));
++            }
+           }
+-        }
+-        ABSL_RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
+-        TF_RET_CHECK(!kernel_name_.empty())
+-            << "Kernel name must be set for collective kernel thunk.";
+-        // Create kernel for execution.
+-        std::unique_ptr<se::Kernel> kernel = nullptr;
+-        const int32_t num_args =
+-            kernel_spec_.codegen_config.argument_descriptors.size();
+-        if (cubin_.has_value()) {
+-          ABSL_ASSIGN_OR_RETURN(kernel,
+-                                CreateKernel(kernel_name_, num_args, *cubin_,
+-                                             params.executor, shmem_bytes_));
+-        } else if (!params.src.binary.empty()) {
+-          ABSL_ASSIGN_OR_RETURN(
+-              kernel, CreateKernel(kernel_name_, num_args, params.src.binary,
+-                                   params.executor, shmem_bytes_));
+-        } else {  // Use PTX.
++          ABSL_RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
++          TF_RET_CHECK(!kernel_name_.empty())
++              << "Kernel name must be set for collective kernel thunk.";
++          // Create kernel for execution.
++          std::unique_ptr<se::Kernel> kernel = nullptr;
++          const int32_t num_args =
++              kernel_spec_.codegen_config.argument_descriptors.size();
++          if (cubin_.has_value()) {
++            ABSL_ASSIGN_OR_RETURN(kernel,
++                                  CreateKernel(kernel_name_, num_args, *cubin_,
++                                               params.executor, shmem_bytes_));
++          } else if (!params.src.binary.empty()) {
++            ABSL_ASSIGN_OR_RETURN(
++                kernel, CreateKernel(kernel_name_, num_args, params.src.binary,
++                                     params.executor, shmem_bytes_));
++          } else {  // Use PTX.
++            ABSL_ASSIGN_OR_RETURN(
++                kernel, CreateKernel(kernel_name_, num_args, params.src.text,
++                                     params.executor, shmem_bytes_));
++          }
++          kernel->set_use_pdl(use_pdl_);
++          // Step2: Populate the stream state.
++          *state = StreamState(params.executor->device_ordinal(), rank.value(),
++                               std::move(kernel), std::move(scratch_allocation),
++                               std::move(scratch_slices));
++
+           ABSL_ASSIGN_OR_RETURN(
+-              kernel, CreateKernel(kernel_name_, num_args, params.src.text,
+-                                   params.executor, shmem_bytes_));
++              state->metadata,
++              AllocateCollectiveMetadata(params.executor, params.stream,
++                                         rank.value(), metadata_layout));
++          return absl::OkStatus();
++        }();
++        absl::Status copied = [&]() -> absl::Status {
++          if (!prepared.ok()) {
++            return clique_key.is_local() && exchanges
++                       ? GpuCliqueRendezvous::JoinFailed(clique_key, *rank,
++                                                         prepared)
++                       : prepared;
++          }
++          ABSL_ASSIGN_OR_RETURN(state->param_to_peers_ptrs,
++                                CollectParamToPeersWithRendezvous(
++                                    layout, clique_key, state->rank,
++                                    GetSymmetricParameterAddresses(
++                                        layout, *params.buffer_allocations,
++                                        state->scratch_slices)));
++          return CopyParamToPeersPtrsToDevice(params.stream, metadata_layout,
++                                              state->metadata,
++                                              state->param_to_peers_ptrs);
++        }();
++        if (!registers || !clique_key.is_local()) {
++          return copied;
++        }
++        // Every local rank's fallible work is done before any registers its
++        // symmetric memory: the ranks meet here as they build their state,
++        // one that failed anywhere above joining as failed, so no peer waits
++        // for it in NCCL. The meeting's outcome is the state's, kept for every
++        // later execution: a rank whose peer failed never registers alone.
++        if (!copied.ok()) {
++          return GpuCliqueRendezvous::JoinFailed(clique_key, *rank, copied);
+         }
+-        kernel->set_use_pdl(use_pdl_);
+-        // Step2: Populate the stream state.
+-        *state = StreamState(params.executor->device_ordinal(), rank.value(),
+-                             std::move(kernel), std::move(scratch_allocation),
+-                             std::move(scratch_slices));
+-
+         ABSL_ASSIGN_OR_RETURN(
+-            state->metadata,
+-            AllocateCollectiveMetadata(params.executor, params.stream,
+-                                       rank.value(), metadata_layout));
+-
+-        ABSL_ASSIGN_OR_RETURN(state->param_to_peers_ptrs,
+-                              CollectParamToPeersWithRendezvous(
+-                                  layout, clique_key, state->rank,
+-                                  GetSymmetricParameterAddresses(
+-                                      layout, *params.buffer_allocations,
+-                                      state->scratch_slices)));
+-
+-        return CopyParamToPeersPtrsToDevice(params.stream, metadata_layout,
+-                                            state->metadata,
+-                                            state->param_to_peers_ptrs);
+-      }));
+-
+-  if (!layout.Any(SymmetricMemoryType::kLoadStoreAccessible)) {
++            std::shared_ptr<GpuCliqueRendezvous> ready,
++            GpuCliqueRendezvous::Join(clique_key, *rank, int32_t{0}));
++        return ready->PeersReady();
++      });
++  ABSL_RETURN_IF_ERROR(built);
++  if (!registers) {
+     return absl::OkStatus();
+   }
+ 
