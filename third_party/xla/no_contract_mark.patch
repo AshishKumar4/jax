@@ -1,6 +1,6 @@
 diff --git a/third_party/llvm/arithmetic_fence_vectorizable.patch b/third_party/llvm/arithmetic_fence_vectorizable.patch
 new file mode 100644
-index 0000000000..8f748e9ed1
+index 0000000..8f748e9
 --- /dev/null
 +++ b/third_party/llvm/arithmetic_fence_vectorizable.patch
 @@ -0,0 +1,12 @@
@@ -17,7 +17,7 @@ index 0000000000..8f748e9ed1
 +   default:
 +     return false;
 diff --git a/third_party/llvm/workspace.bzl b/third_party/llvm/workspace.bzl
-index 75c021c525..1a78e778e3 100644
+index 75c021c..1a78e77 100644
 --- a/third_party/llvm/workspace.bzl
 +++ b/third_party/llvm/workspace.bzl
 @@ -36,6 +36,7 @@ def repo(name):
@@ -29,7 +29,7 @@ index 75c021c525..1a78e778e3 100644
          link_files = {"//third_party/llvm:run_lit.sh": "mlir/run_lit.sh"},
      )
 diff --git a/xla/backends/cpu/codegen/BUILD b/xla/backends/cpu/codegen/BUILD
-index 103a4c161f..621a6f67a3 100644
+index 103a4c1..621a6f6 100644
 --- a/xla/backends/cpu/codegen/BUILD
 +++ b/xla/backends/cpu/codegen/BUILD
 @@ -258,6 +258,7 @@ cc_library(
@@ -41,7 +41,7 @@ index 103a4c161f..621a6f67a3 100644
          "//xla/codegen/emitters/ir:xla_attrs_inc_gen",
          "//xla/codegen/emitters/transforms:lower_to_llvm_cpu_pass",
 diff --git a/xla/backends/cpu/codegen/fusion_compiler.cc b/xla/backends/cpu/codegen/fusion_compiler.cc
-index da2dec6ec7..45d9738f57 100644
+index da2dec6..45d9738 100644
 --- a/xla/backends/cpu/codegen/fusion_compiler.cc
 +++ b/xla/backends/cpu/codegen/fusion_compiler.cc
 @@ -70,9 +70,13 @@ limitations under the License.
@@ -127,7 +127,7 @@ index da2dec6ec7..45d9738f57 100644
    if (should_dump_mlir_passes) {
      DumpMlirModule(mlir_module, "post-lowering", *hlo_module_);
 diff --git a/xla/codegen/emitters/BUILD b/xla/codegen/emitters/BUILD
-index e7ed27160d..179dd5adea 100644
+index e7ed271..179dd5a 100644
 --- a/xla/codegen/emitters/BUILD
 +++ b/xla/codegen/emitters/BUILD
 @@ -107,6 +107,7 @@ cc_library(
@@ -139,7 +139,7 @@ index e7ed27160d..179dd5adea 100644
          "//xla:xla_data_proto_cc",
          "//xla:xla_proto_cc",
 diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.cc b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
-index 2caa926c89..4e03097b85 100644
+index 2caa926..4e03097 100644
 --- a/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 +++ b/xla/codegen/emitters/elemental_hlo_to_mlir.cc
 @@ -90,6 +90,7 @@ limitations under the License.
@@ -203,7 +203,7 @@ index 2caa926c89..4e03097b85 100644
        return MapElementwiseOp<mhlo::TanOp>(arg_types, operands, builder);
      case HloOpcode::kTanh:
 diff --git a/xla/codegen/emitters/elemental_hlo_to_mlir.h b/xla/codegen/emitters/elemental_hlo_to_mlir.h
-index e4d2a874dc..2edd57b906 100644
+index e4d2a87..2edd57b 100644
 --- a/xla/codegen/emitters/elemental_hlo_to_mlir.h
 +++ b/xla/codegen/emitters/elemental_hlo_to_mlir.h
 @@ -44,6 +44,18 @@ limitations under the License.
@@ -226,7 +226,7 @@ index e4d2a874dc..2edd57b906 100644
      std::function<absl::StatusOr<llvm::SmallVector<mlir::Value, 1>>(
          const HloInstruction* instr, int index, mlir::ValueRange indices)>;
 diff --git a/xla/codegen/xtile/codegen/emitter_helpers.cc b/xla/codegen/xtile/codegen/emitter_helpers.cc
-index 4ddca9f8b0..792bc74682 100644
+index 4ddca9f..792bc74 100644
 --- a/xla/codegen/xtile/codegen/emitter_helpers.cc
 +++ b/xla/codegen/xtile/codegen/emitter_helpers.cc
 @@ -807,11 +807,13 @@ absl::StatusOr<Value> EmitElementwise(mlir::ImplicitLocOpBuilder& b,
@@ -247,7 +247,7 @@ index 4ddca9f8b0..792bc74682 100644
        return Maximum(b, inputs);
      case HloOpcode::kMinimum:
 diff --git a/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc b/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
-index 1406b25ea4..95fbe9d3aa 100644
+index 1406b25..95fbe9d 100644
 --- a/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
 +++ b/xla/codegen/xtile/ir/transforms/lower_stablehlo_to_arith.cc
 @@ -109,6 +109,9 @@ class LowerStableHloOpToArith : public mlir::OpRewritePattern<StableHloOp> {
@@ -260,85 +260,26 @@ index 1406b25ea4..95fbe9d3aa 100644
          rewriter.replaceOp(op, new_op);
        }
      } else {
-diff --git a/xla/hlo/transforms/simplifiers/hlo_cse.cc b/xla/hlo/transforms/simplifiers/hlo_cse.cc
-index d1235185f5..efe6451103 100644
---- a/xla/hlo/transforms/simplifiers/hlo_cse.cc
-+++ b/xla/hlo/transforms/simplifiers/hlo_cse.cc
-@@ -20,6 +20,7 @@ limitations under the License.
- #include <optional>
- #include <string>
- #include <utility>
-+#include <vector>
- 
- #include "absl/container/flat_hash_map.h"
- #include "absl/container/flat_hash_set.h"
-@@ -277,6 +278,41 @@ struct CseKey {
-   HloInstruction* hlo;
- };
- 
-+// Whether `lhs` and `rhs`, computations equal but for their instructions'
-+// labels, label alike: each pair of their instructions, matched from their
-+// roots through their operands as computation equality matches them, both
-+// labeled to round on their own (`kXlaNoContractAttr`) or neither, and the
-+// computations each pair calls alike too. Merged, a fusion of a labeled
-+// multiply and its unlabeled twin's would leave the label on the one or reach
-+// the other.
-+bool NoContractAlike(const HloComputation& lhs, const HloComputation& rhs) {
-+  absl::flat_hash_set<std::pair<const HloInstruction*, const HloInstruction*>>
-+      visited;
-+  std::vector<std::pair<const HloInstruction*, const HloInstruction*>>
-+      worklist = {{lhs.root_instruction(), rhs.root_instruction()}};
-+  while (!worklist.empty()) {
-+    auto [left, right] = worklist.back();
-+    worklist.pop_back();
-+    if (!visited.insert({left, right}).second) {
-+      continue;
-+    }
-+    if (left->get_frontend_attribute(kXlaNoContractAttr) !=
-+        right->get_frontend_attribute(kXlaNoContractAttr)) {
-+      return false;
-+    }
-+    for (int64_t i = 0; i < left->called_computations().size(); ++i) {
-+      if (!NoContractAlike(*left->called_computations()[i],
-+                           *right->called_computations()[i])) {
-+        return false;
-+      }
-+    }
-+    for (int64_t i = 0; i < left->operand_count(); ++i) {
-+      worklist.push_back({left->operand(i), right->operand(i)});
-+    }
+diff --git a/xla/hlo/ir/hlo_instruction.cc b/xla/hlo/ir/hlo_instruction.cc
+index 393ec21..8d59186 100644
+--- a/xla/hlo/ir/hlo_instruction.cc
++++ b/xla/hlo/ir/hlo_instruction.cc
+@@ -3387,6 +3387,13 @@ bool HloInstruction::IdenticalInternal(
+   if (!equal_result_accuracy(&other)) {
+     return false;
+   }
++  // An operation labeled to round on its own (`kXlaNoContractAttr`) is not its
++  // unlabeled twin, as one of another result accuracy is not: merged, the
++  // label would leave the one or reach the other.
++  if (get_frontend_attribute(kXlaNoContractAttr) !=
++      other.get_frontend_attribute(kXlaNoContractAttr)) {
++    return false;
 +  }
-+  return true;
-+}
-+
- }  // namespace
  
- /*static*/
-@@ -343,13 +379,18 @@ absl::StatusOr<bool> HloCSE::RunOnComputation(HloComputation* computation) {
-   };
-   const auto eq_computations = [](const HloComputation* lhs,
-                                   const HloComputation* rhs) {
--    return *lhs == *rhs;
-+    return *lhs == *rhs && NoContractAlike(*lhs, *rhs);
-   };
- 
-   auto cse_equal = [&](const CseKey& lhs, const CseKey& rhs) {
--    return lhs.hlo->IdenticalIgnoringCommutativeOperandOrder(
--        *rhs.hlo, eq_instructions, eq_computations, is_layout_sensitive_,
--        /*sharding_sensitive=*/true);
-+    // An operation labeled to round on its own is not its unlabeled twin
-+    // (`kXlaNoContractAttr`): merged, the label would leave the one or reach
-+    // the other, contracting the first or rounding the second.
-+    return lhs.hlo->get_frontend_attribute(kXlaNoContractAttr) ==
-+               rhs.hlo->get_frontend_attribute(kXlaNoContractAttr) &&
-+           lhs.hlo->IdenticalIgnoringCommutativeOperandOrder(
-+               *rhs.hlo, eq_instructions, eq_computations, is_layout_sensitive_,
-+               /*sharding_sensitive=*/true);
-   };
- 
-   // HLO instructions are grouped into equivalency classes by using the
+   // Check that operands are equal.
+   //
 diff --git a/xla/side_effect_util.cc b/xla/side_effect_util.cc
-index 49d0f6a0bc..ae9c15b267 100644
+index 49d0f6a..ae9c15b 100644
 --- a/xla/side_effect_util.cc
 +++ b/xla/side_effect_util.cc
 @@ -97,6 +97,8 @@ const char kMustFuseAttr[] = "MUST_FUSE";
@@ -351,7 +292,7 @@ index 49d0f6a0bc..ae9c15b267 100644
  
  const char kBufferingLevelAttr[] = "buffering_level";
 diff --git a/xla/side_effect_util.h b/xla/side_effect_util.h
-index d6e71c46f1..e94ecbcaaa 100644
+index d6e71c4..e94ecbc 100644
 --- a/xla/side_effect_util.h
 +++ b/xla/side_effect_util.h
 @@ -196,6 +196,12 @@ extern const char kXlaLoopUnrollAttr[];
@@ -368,10 +309,10 @@ index d6e71c46f1..e94ecbcaaa 100644
  
  #endif  // XLA_SIDE_EFFECT_UTIL_H_
 diff --git a/xla/tests/hlo_cse_test.cc b/xla/tests/hlo_cse_test.cc
-index a6e26c109c..4aa3969c73 100644
+index a6e26c1..3f1bb1c 100644
 --- a/xla/tests/hlo_cse_test.cc
 +++ b/xla/tests/hlo_cse_test.cc
-@@ -282,6 +282,45 @@ TEST_F(HloCseTest, RemovedUnusedIotaOperandIsNotReused) {
+@@ -282,6 +282,68 @@ TEST_F(HloCseTest, RemovedUnusedIotaOperandIsNotReused) {
    EXPECT_EQ(entry->root_instruction()->operand(1)->parent(), entry);
  }
  
@@ -412,6 +353,29 @@ index a6e26c109c..4aa3969c73 100644
 +  EXPECT_FALSE(changed);
 +  HloInstruction* root = m->entry_computation()->root_instruction();
 +  EXPECT_NE(root->operand(0), root->operand(1));
++}
++
++// A multiply labeled to round on its own (xla_no_contract) is not its unlabeled
++// twin, nor is the add of each; two labeled alike are one.
++TEST_F(HloCseTest, OperationsLabeledApartToRoundOnTheirOwnAreNotCombined) {
++  const char* const hlo_string = R"(
++    HloModule m
++
++    ENTRY entry {
++      %x = f32[8] parameter(0)
++      %y = f32[8] parameter(1)
++      %labeled = f32[8] multiply(%x, %y), frontend_attributes={xla_no_contract="true"}
++      %twin = f32[8] multiply(%x, %y), frontend_attributes={xla_no_contract="true"}
++      %unlabeled = f32[8] multiply(%x, %y)
++      ROOT %root = (f32[8], f32[8], f32[8]) tuple(%labeled, %twin, %unlabeled)
++    })";
++  ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(hlo_string));
++  HloCSE cse(/*is_layout_sensitive=*/false);
++  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&cse, m.get()));
++  EXPECT_TRUE(changed);
++  HloInstruction* root = m->entry_computation()->root_instruction();
++  EXPECT_EQ(root->operand(0), root->operand(1));
++  EXPECT_NE(root->operand(0), root->operand(2));
 +}
 +
  // Test two identical while loops with same inputs
