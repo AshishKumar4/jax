@@ -130,6 +130,39 @@ class _PrimitiveHolders:
 _HOLDERS = _PrimitiveHolders()
 
 
+def _declared(fn: Any) -> bool:
+  """Whether `fn` is a callable form whose call runs a function of a package
+  the process declares (`lowering_cache_seal`'s sources), and runs nothing
+  else: such a function, an exact `functools.partial` of such a form, or a
+  bound method of one. A subclass, a callable object or a wrapper may run code
+  other than the function it names, which no key holds: none is admitted."""
+  if type(fn) is functools.partial:
+    return _declared(fn.func)
+  if type(fn) is types.MethodType:
+    return _declared(fn.__func__)
+  return type(fn) is types.FunctionType and (
+      sealing.seal().source(fn.__code__.co_filename) is not None)
+
+
+def _admit(eqn: jax_core.JaxprEqn) -> None:
+  """Refuses (Uncacheable) an inline_mgpu equation whose body no declared
+  package defines.
+
+  Its body is run by the lowering, and may emit from anything it observes
+  (identity, iteration order, the hash seed): only a declared package's is,
+  its declaration the promise that its emission follows from its inputs'
+  values (`lowering_cache_seal.SOURCES_VARIABLE`). What runs is checked, not
+  its wrapper (`_declared`).
+  """
+  from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives  # pylint: disable=g-import-not-at-top
+
+  if eqn.primitive is gpu_primitives.inline_mgpu_p and not _declared(
+      eqn.params["mgpu_fn"]):
+    raise Uncacheable(
+        "a kernel holding an inline_mgpu body of no declared source package"
+        " is not cached")
+
+
 class Uncacheable(Exception):
   """This lowering cannot be keyed exactly: it is lowered afresh."""
 
@@ -179,7 +212,17 @@ class Encoder:
   """
 
   def __init__(self, placed: bool = True,
-               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None):
+               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None,
+               program: bool = True):
+    # Whether it encodes a program (a kernel's jaxpr and its params): a Python
+    # callable one holds (an inline_mgpu body) is run by its lowering, and may
+    # emit from anything it can observe (what it holds, by identity or by
+    # iteration order, the process's hash seed), which no key holds. Such a
+    # kernel is cached only where a declared source package defines the
+    # callable, which promises its emission follows from what the key holds.
+    # A registry's rules are encoded as they are (`lowering_cache_registries`):
+    # sealed code's own, as the key's identity.
+    self.program = program
     # Whether an aval's placement (its sharding and its manual axes) is
     # encoded: not for a kernel that reads no mesh (`lowering_cache`'s
     # `_reads_jax_mesh`), whose avals are a shard's or the whole's alike.
@@ -284,9 +327,9 @@ class Encoder:
       return seq(b"tr", [self._aval(x.aval, depth + 1)])
     if isinstance(x, jax.Array):
       if self._callables:
-        # Refused before it is read to the host: a callable a lowering runs may
-        # read anything of it (`_numpy_value`), and reading it is a transfer.
-        raise Uncacheable("an array a callable holds has no encoding")
+        # Refused before it is read: a callable may read its shape alone, and
+        # reading it to the host is a transfer the guard may refuse.
+        raise Uncacheable("an array a callable holds is not read to key it")
       value = np.asarray(x)
       return seq(b"jx", [
           self._numpy_value(value), self._e(bool(jax_core.typeof(x).weak_type), depth + 1)
@@ -401,8 +444,9 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    # In order of its keys, but where a callable holds it: one a lowering runs
-    # may iterate it, so its order is part of what it reads.
+    # In order of its keys, but where a callable holds it (a partial's keywords,
+    # an immutable mapping): one a lowering runs may iterate it, so its order is
+    # part of what it reads.
     if not self._callables:
       encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
@@ -426,11 +470,6 @@ class Encoder:
     ])
 
   def _numpy_value(self, x) -> bytes:
-    if isinstance(x, np.ndarray) and self._callables:
-      # A callable a lowering runs (an inline_mgpu body) may read anything of
-      # an array it holds, its ownership and its memory among it, which no key
-      # holds: only an array the program holds as a value is encoded.
-      raise Uncacheable("an array a callable holds has no encoding")
     if isinstance(x, np.ndarray):
       if x.dtype.kind == "O":
         raise Uncacheable("an object array has no encoding")
@@ -545,6 +584,13 @@ class Encoder:
 
   def _callable(self, fn: Any, depth: int) -> bytes:
     """A callable the sealed installation defines, with what it closes over."""
+    if self.program and type(fn) not in (
+        types.FunctionType, functools.partial, types.MethodType):
+      # A subclass or a builtin a program's lowering may run is no form whose
+      # call is the function it names (`_declared`).
+      raise Uncacheable(
+          f"a kernel holding a {type(fn).__qualname__} its lowering runs is not"
+          " cached")
     if any(fn is c for c in self._callables):
       return b"Fcycle"
     self._callables.append(fn)
@@ -572,7 +618,14 @@ class Encoder:
         identity = sealing.seal().function_identity(fn)
       except sealing.NotSealed as e:
         raise Uncacheable(str(e)) from e
-      if sealing.seal().source(fn.__code__.co_filename) is not None:
+      declared = sealing.seal().source(fn.__code__.co_filename) is not None
+      if self.program and not declared:
+        # A program's function is run by its lowering, as an inline_mgpu body
+        # is (`_admit`): only a declared package's.
+        raise Uncacheable(
+            "a kernel holding a Python function of no declared source package"
+            " is not cached")
+      if declared:
         self.extended = True
       cells = []
       for cell in fn.__closure__ or ():
@@ -670,6 +723,8 @@ class Encoder:
     eqns = []
     for eqn in jaxpr.eqns:
       prim = self._primitive(eqn.primitive, depth)
+      if self.program:
+        _admit(eqn)
       invars = seq(b"ei", [atom(a) for a in eqn.invars])
       try:
         params = self._mapping(b"pa", self._params(eqn), depth)

@@ -192,7 +192,7 @@ class State:
         continue
       found = self._own.get(primitive)
       if found is None:
-        enc = encoding.Encoder()
+        enc = encoding.Encoder(program=False)
         held = []
         for table, live in self.primitive_tables:
           if primitive in live and (entry := _encode_entry(
@@ -255,7 +255,7 @@ def current() -> State:
     if _last is not None and _last.token == token:
       return _last
     lowered = _lowered(snapshot)
-    enc = encoding.Encoder()
+    enc = encoding.Encoder(program=False)
     encoded = []
     for table, _, held in snapshot:
       reached = (entry for entry in held

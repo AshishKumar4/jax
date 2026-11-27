@@ -65,5 +65,41 @@ class RulesTest(harness.LoweringCacheTestCase):
     self.assertEqual(result["no rule"], "refused")
 
 
+class DeclaredTest(harness.LoweringCacheTestCase):
+
+  def test_what_an_inline_body_runs_is_checked_not_its_wrapper(self):
+    # A function, and what a partial, a jitted function or a callable object
+    # runs: none of a declared package here, so none is admitted.
+    found = self.run_child(mode="declared")["declared"]
+    self.assertEqual(found, dict.fromkeys(found, False))
+    self.assertLen(found, 5)
+
+  def test_only_a_declared_function_or_an_exact_partial_of_one_is_admitted(self):
+    # A package the process declares: its function and an exact partial of it
+    # run that function alone; a partial subclass overriding `__call__`, a
+    # callable object and a jitted function may run code no key holds.
+    package = self.tmp / "declaredpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "import functools\n"
+        "def body(ctx, ref):\n  del ctx, ref\n"
+        "class Calling(functools.partial):\n"
+        "  def __call__(self, *args):\n    return None\n"
+        "class Body:\n  def __call__(self, ctx, ref):\n    del ctx, ref\n")
+    path = os.pathsep.join(
+        [str(self._site), str(harness.TESTS_PALLAS), str(self.tmp)])
+    found = self.run_child(
+        mode="declared", package="declaredpkg",
+        env={"PYTHONPATH": path,
+             "JAX_PALLAS_LOWERING_CACHE_SOURCES": "declaredpkg"})["declared"]
+    self.assertEqual(found, {
+        "a declared function": True,
+        "a partial of a declared function": True,
+        "a partial subclass of a declared function": False,
+        "a declared callable object": False,
+        "a jitted declared function": False,
+    })
+
+
 if __name__ == "__main__":
   absltest.main()
