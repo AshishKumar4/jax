@@ -152,10 +152,16 @@ def cases():
        functools.partial(lax.add, np.arange(2.)), "uncacheable"),
       ("a callable holding a scalar", functools.partial(lax.add, 2.0),
        functools.partial(lax.add, 2.0), "equal"),
-      # A dict a callable holds, in another order: the callable may iterate it.
-      ("a callable's dict in another order",
-       functools.partial(lax.add, y={"a": 1, "b": 2}),
-       functools.partial(lax.add, y={"b": 2, "a": 1}), "different"),
+      # A partial's keywords in another order: the callable may iterate them.
+      ("a callable's keywords in another order",
+       functools.partial(lax.add, a=1, b=2),
+       functools.partial(lax.add, b=2, a=1), "different"),
+      # A mutable container a callable holds: one held twice and two alike
+      # differ to it (`a is b`), which no value holds.
+      ("a callable holding a dict", functools.partial(lax.add, {"a": 1}),
+       functools.partial(lax.add, {"a": 1}), "uncacheable"),
+      ("a callable holding a list", functools.partial(lax.add, [1]),
+       functools.partial(lax.add, [1]), "uncacheable"),
       ("a dict in another order", {"a": 1, "b": 2}, {"b": 2, "a": 1}, "equal"),
       ("weak and strong type", jax_core.ShapedArray((), f32, weak_type=True),
        jax_core.ShapedArray((), f32, weak_type=False), "different"),

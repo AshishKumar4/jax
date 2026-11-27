@@ -245,6 +245,10 @@ class Encoder:
       return frame(b"Y", x)
     if t is tuple:
       return seq(b"T", [self._e(i, depth + 1) for i in x])
+    if t in (list, dict) and self._callables:
+      # A callable a lowering runs may tell one held twice from two alike
+      # (`a is b`), or mutate it: by value, no key holds either.
+      raise Uncacheable("a mutable container a callable holds has no encoding")
     if t is list:
       return seq(b"L", [self._e(i, depth + 1) for i in x])
     if t is dict:
@@ -401,8 +405,9 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    # In order of its keys, but where a callable holds it: one a lowering runs
-    # may iterate it, so its order is part of what it reads.
+    # In order of its keys, but where a callable holds it (a partial's keywords,
+    # an immutable mapping): one a lowering runs may iterate it, so its order is
+    # part of what it reads.
     if not self._callables:
       encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
