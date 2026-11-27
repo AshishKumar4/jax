@@ -279,9 +279,9 @@ class _Read:
         self.aliases.get(buffer.id, ()), self.instructions, self.computations)
     if written is not None:
       named = written.frontend_attributes.map.get("checkpoint_name")
-    made = _fused_root(instruction, buffer.defined_at.shape_index,
-                       self.instructions, self.computations)
-    if not named and made is not None:
+    made, within = _fused_root(instruction, buffer.defined_at.shape_index,
+                               self.instructions, self.computations)
+    if not named and made is not None and _names_output(made, within):
       named = made.frontend_attributes.map.get("checkpoint_name")
     return dict(
         bytes=buffer.size, shape=tuple(shape.dimensions),
@@ -298,19 +298,32 @@ class _Read:
 
 
 def _fused_root(instruction: Any, index: Any, instructions: dict[int, Any],
-                computations: dict[int, Any]) -> Any | None:
-  """What makes fusion ``instruction``'s output at shape ``index`` inside it:
-  its fused computation's root, or the root tuple's element there (XLA:GPU's
-  own fusions carry no op_name of their own, the instruction they fuse does:
-  a gemm's address-computation fusion, its cuBLAS call and the workspace it
-  holds, Dew's decoder in its backward); None for any other instruction."""
+                computations: dict[int, Any]) -> tuple[Any, tuple[int, ...]]:
+  """What makes fusion ``instruction``'s output at shape ``index`` inside it,
+  and where in that maker's own output it is: its fused computation's root, or
+  the root tuple's element there (XLA:GPU's own fusions carry no op_name of
+  their own, the instruction they fuse does: a gemm's address-computation
+  fusion, its cuBLAS call and the workspace it holds, Dew's decoder in its
+  backward); (None, ()) for any other instruction."""
   if instruction.opcode != "fusion":
-    return None
+    return None, ()
   root = instructions[
       computations[instruction.called_computation_ids[0]].root_id]
+  index = tuple(index)
   if root.opcode == "tuple" and index:
-    root = instructions[root.operand_ids[index[0]]]
-  return root
+    root, index = instructions[root.operand_ids[index[0]]], index[1:]
+  return root, index
+
+
+def _names_output(maker: Any, index: tuple[int, ...]) -> bool:
+  """Whether ``maker``'s checkpoint name names its output at ``index``: its
+  whole output, or a cuBLAS call's result, its tuple's first element (XLA's
+  gemm rewriter puts an auxiliary output and the workspace after it). Any other
+  element of a tuple an instruction makes is named by none of it: a cuBLAS
+  call's 32 MiB workspace is no checkpointed value."""
+  return not index or (
+      index == (0,) and maker.opcode == "custom-call"
+      and maker.custom_call_target.startswith("__cublas$"))
 
 
 def _aliased_named(locations: Any, instructions: dict[int, Any],
