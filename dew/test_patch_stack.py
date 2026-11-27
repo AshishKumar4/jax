@@ -326,11 +326,12 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     clone.mkdir()
     run("init", "-q", "-b", "main")
     run("remote", "add", "origin", str(origin))
-    # A compiled source the checkout holds as a link to one of two implementations.
+    # A compiled source the checkout holds as a link to a link to one of two implementations.
     (clone / "jaxlib").mkdir()
     for impl in ("a", "b"):
         (clone / "jaxlib" / f"impl_{impl}.cc").write_text(f"int {impl};\n")
-    (clone / "jaxlib" / "target.cc").symlink_to("impl_a.cc")
+    (clone / "jaxlib" / "picked.cc").symlink_to("impl_a.cc")
+    (clone / "jaxlib" / "target.cc").symlink_to("picked.cc")
     commit({"jaxlib/kernel.cc": "int k;\n", "jax/core.py": "post81", ".bazelrc": "build --copt=-O2\n",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post81"\n', "MODULE.bazel": module,
             "third_party/xla/fix.patch": fix("int f() { return 2; }")}, "the commit post81's plugins were built at")
@@ -394,13 +395,15 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
         commit(change, "a change a build could read")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
-    # A link retargeted to the other implementation, neither file changed: what the build reads changed.
-    (clone / "jaxlib" / "target.cc").unlink()
-    (clone / "jaxlib" / "target.cc").symlink_to("impl_b.cc")
-    run("add", "-A")
-    run("commit", "-qm", "the link retargeted")
-    assert patch_stack.plugins("0.12.0.1.post82") == ""
-    run("reset", "-q", "--hard", "HEAD~1")
+    # A link on the way retargeted to the other implementation, neither file changed, the first link itself or the
+    # one it names: what the build reads changed.
+    for link in ("target.cc", "picked.cc"):
+        (clone / "jaxlib" / link).unlink()
+        (clone / "jaxlib" / link).symlink_to("impl_b.cc")
+        run("add", "-A")
+        run("commit", "-qm", f"{link} retargeted")
+        assert patch_stack.plugins("0.12.0.1.post82") == ""
+        run("reset", "-q", "--hard", "HEAD~1")
     # Records beside other wheels than theirs (an attach's record of a rebuild, its first build's wheels kept)
     # pair nothing.
     uploaded["jaxlib-0.12.0.1.post81-cp312.whl"] = hashlib.sha256(b"another build's jaxlib").hexdigest()
@@ -448,6 +451,27 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     run("reset", "-q", "--hard", "HEAD~1")
     uploaded.clear()
     assert patch_stack.plugins("0.12.0.1.post143") == ""
+    # A release from before the records (LEGACY_THROUGH) ships the wheels its listing holds as uploaded.
+    monkeypatch.setattr(patch_stack, "released", lambda tag: ({"x.whl": "1" * 64, "x.tar.gz": "2" * 64}, []))
+    verified = {}
+    assert patch_stack.plugins("0.12.0.1.post81", verified=verified) == "plugin-0.12.0.1.post81"
+    assert verified == {"x.whl": "1" * 64}
+
+
+def test_a_lookups_links_are_each_keyed_where_git_holds_them(tmp_path):
+    """`hops`: each symlink a lookup passes, a link to a link and a link reached through a directory link, keyed by
+    its real path in the checkout (the path Git holds it at, not the alias it was reached by) and its target's
+    text; none outside the checkout."""
+    (tmp_path / "w" / "real").mkdir(parents=True)
+    workspace = (tmp_path / "w").resolve()  # As `recorded` takes it: a link above the checkout is none of its.
+    (workspace / "real" / "g.cc").write_text("int g;\n")
+    (workspace / "real" / "f.cc").symlink_to("g.cc")
+    (workspace / "alias").symlink_to("real")
+    (workspace / "chain.cc").symlink_to("alias/f.cc")
+    assert patch_stack.hops(workspace / "chain.cc", workspace) == {
+        "chain.cc": patch_stack.digest(b"alias/f.cc"), "alias": patch_stack.digest(b"real"),
+        "real/f.cc": patch_stack.digest(b"g.cc")}
+    assert patch_stack.hops(workspace / "real" / "g.cc", workspace) == {}
 
 
 def test_a_release_lacks_each_wheel_a_publish_ships_that_it_holds_none_of():

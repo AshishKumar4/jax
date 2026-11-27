@@ -192,6 +192,26 @@ def starlark(path: str) -> bool:
     return path.endswith(".bzl") or Path(path).name in STARLARK
 
 
+def hops(path: Path, workspace: Path) -> dict[str, str]:
+    """Each symlink inside `workspace` that looking up `path` passes through, hop by hop as the kernel follows
+    them (a link to a link, a link through a directory link), by its real path in the checkout, which is the
+    path Git holds it at: the `digest` of the text it names, as `git show` gives a link's blob."""
+    found, current, parts = {}, Path(path.anchor), list(path.parts[1:])
+    for _ in range(256):
+        if not parts:
+            return found
+        step = current / parts.pop(0)
+        if not step.is_symlink():
+            current = step
+            continue
+        target = os.readlink(step)
+        if step.is_relative_to(workspace):
+            found[str(step.relative_to(workspace))] = digest(target.encode())
+        current = Path(step.anchor) if Path(target).is_absolute() else current
+        parts = list(Path(target).parts[1:] if Path(target).is_absolute() else Path(target).parts) + parts
+    raise ValueError(f"{path}: too many links to follow")
+
+
 def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
     """What one plugin build cell read (a Python and a CUDA, as dew/build_plugin.sh builds them), each file's
     `digest`, taken right after the cell's build, its repositories as it fetched them: every file `read` names, by
@@ -210,14 +230,9 @@ def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
     def take(path: Path) -> None:
         if not path.is_file():
             return
-        # A checkout's symlink on the way to it by its own path and what it names (as Git holds a link: its target's
-        # text), beside the bytes it reaches: retargeting one to another file both of which stay unchanged is a
-        # change to what the build reads.
-        if path.is_relative_to(workspace):
-            for depth in range(1, len(path.relative_to(workspace).parts) + 1):
-                link = workspace.joinpath(*path.relative_to(workspace).parts[:depth])
-                if link.is_symlink():
-                    main[str(link.relative_to(workspace))] = digest(os.readlink(link).encode())
+        # Each of the checkout's symlinks its lookup passes, by its own path and what it names (`hops`), beside the
+        # bytes it reaches: retargeting one to another file, both unchanged, changes what the build reads.
+        main.update(hops(path, workspace))
         real = path.resolve()
         # Keyed where its bytes lie: a repository that vendors another (TSL within XLA's tree, linked as its own
         # repository) records the file as the vendoring repository's, whose patches change it (`differences`).
@@ -553,14 +568,20 @@ def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[s
                     verified.update({wheel: digest for record in records for wheel, digest in record["wheels"].items()})
                 return name
             continue
-        if found == int(post):
+        legacy = found == int(post)
+        if not legacy:
+            git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
+            stack = f"refs/remotes/origin/release/{release}.post{found}"
+            git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}",
+                check=False)
+            held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
+            legacy = any(not native(base) for base in held)
+        if legacy:
+            # A legacy match ships the wheels its listing holds as uploaded (`released`), named as the records'
+            # are: a failed upload's placeholder is none of them.
+            if verified is not None:
+                verified.update({wheel: sha for wheel, sha in uploaded.items() if wheel.endswith(".whl")})
             return name
-        git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
-        stack = f"refs/remotes/origin/release/{release}.post{found}"
-        git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
-        held = [tag, *([stack] if git("rev-parse", "-q", "--verify", stack, check=False).strip() else [])]
-        if any(not native(base) for base in held):
-            return tag.removeprefix("refs/tags/")
     return ""
 
 

@@ -80,6 +80,12 @@ env:
   # 0.12.0.1.post77's publish).
   TEST_DEPENDENCIES: absl-py cloudpickle hypothesis portpicker pytest pytest-xdist mpmath pillow scipy protobuf
     grpcio-tools
+  # The native projects a stack with native patches ships beside jax, each built for every supported Python (the
+  # plugins; the PJRT plugins name none) and CUDA on each machine (dew/build_plugin.sh): the one matrix the publish
+  # ships, a plugin release is chosen whole for (`patch_stack.py plugins --pythons --cudas`, `lacking`), and the
+  # index lists.
+  PYTHONS: "cp312 cp313 cp314"
+  CUDAS: "12 13"
 
 defaults:
   run:
@@ -269,14 +275,10 @@ jobs:
       verified: ${{ steps.native.outputs.verified }}
     env:
       RELEASE: ${{ needs.carry.outputs.release }}
-      # The native projects a stack with native patches ships beside jax, each built for every supported Python
-      # (the plugins; the PJRT plugins name none) on each machine (dew/build_plugin.sh).
-      PYTHONS: "cp312 cp313 cp314"
       # Every machine's, unless `machines` names those built so far (Main, 2026-11-08: post67's x86_64 set staged ahead
       # of its aarch64 one, which Lambda had no GH200 to build); the index keeps what it lists, so publishing the
       # same release again with every machine adds the rest.
       MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
-      CUDAS: "12 13"
       # The branch built from: a composed release dew/release.sh names (`from`), else the stack branch.
       FROM: ${{ inputs.from }}
     steps:
@@ -334,8 +336,9 @@ jobs:
           echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
           echo "verified=$(cat verified.json)" >> "$GITHUB_OUTPUT"
           version=${plugins#plugin-}
-          # The wheels its records bound, by name, each checked against its digest: an asset uploaded since the
-          # pairing read the release is none of them. A release whose builds recorded nothing, all its wheels.
+          # The wheels its records bound, or a release from before the records its uploaded wheels (`plugins`), by
+          # name, each checked against its digest where GitHub states one: an asset uploaded since the pairing read
+          # the release, or a failed upload's placeholder, is none of them.
           if [ "$(python3 -c 'import json; print(len(json.load(open("verified.json"))))')" = 0 ]; then
             gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "*.whl"
           else
@@ -346,7 +349,7 @@ jobs:
           import hashlib, json, pathlib, sys
           for name, want in json.load(open("verified.json")).items():
               got = hashlib.sha256(pathlib.Path("native", name).read_bytes()).hexdigest()
-              if got != want:
+              if want and got != want:
                   sys.exit(f"::error::{name}: sha256 {got}, its record binds {want}")
           CHECK
           fi
@@ -451,9 +454,6 @@ jobs:
       PLUGINS: ${{ inputs.staging == '' && needs.assemble.outputs.plugins || '' }}
       VERIFIED: ${{ inputs.staging == '' && needs.assemble.outputs.verified || '' }}
       MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
-      # The wheels a whole plugin release holds, as `assemble` asks them (`lacking`).
-      PYTHONS: "cp312 cp313 cp314"
-      CUDAS: "12 13"
       BUCKET: ${{ secrets.R2_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -486,6 +486,17 @@ jobs:
             # shellcheck disable=SC2086 # Each machine its own word.
             plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION" --machines $MACHINES \
               --pythons $PYTHONS --cudas $CUDAS --wheels ../verified.json)
+            # A stack with native patches stages its plugins or nothing: none whole for its machines is an error,
+            # as `assemble`'s is; a stack of Python alone stages its jax.
+            if [ -z "$plugins" ]; then
+              release=${VERSION%.post*}
+              git -C jax fetch -q --no-tags https://github.com/jax-ml/jax.git \
+                "refs/tags/jax-v$release:refs/tags/jax-v$release"
+              if [ -n "$(cd jax && python3 ../dew/dew/patch_stack.py native "$release")" ]; then
+                echo "::error::no whole plugin release holds $VERSION's native code for $MACHINES"
+                exit 1
+              fi
+            fi
           fi
           shipping=()
           if [ -n "$plugins" ]; then
@@ -536,7 +547,6 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: auto
       R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-      CUDAS: "12 13"
     steps:
       - uses: actions/checkout@v4
         with:
