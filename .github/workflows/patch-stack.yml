@@ -116,7 +116,8 @@ jobs:
           # assignment); else its release's stock one.
           jaxlib="jaxlib==$release"
           version=$(echo "$CANDIDATE" | sed -n 's|^release/\(.*\)-candidate$|\1|p')
-          plugins=$([ -z "$version" ] || python3 ../dew/dew/patch_stack.py plugins "$version")
+          # x86_64's alone: the test runs here, and a candidate's aarch64 plugins may not be built yet.
+          plugins=$([ -z "$version" ] || python3 ../dew/dew/patch_stack.py plugins "$version" --machines x86_64)
           if [ -n "$plugins" ] && gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir ../native \
               --pattern "jaxlib-*-cp312-cp312-manylinux_*_x86_64.whl" 2> /dev/null; then
             jaxlib=$(ls ../native/jaxlib-*.whl)
@@ -262,8 +263,10 @@ jobs:
     permissions:
       contents: read
     outputs:
-      # The plugin release whose native wheels it shipped (`patch_stack.py plugins`), which `staging` indexes as it is.
+      # The plugin release whose native wheels it shipped (`patch_stack.py plugins`), and the wheels its records bound
+      # (name: sha256, JSON; {} for a release whose builds recorded nothing), which `staging` indexes as they are.
       plugins: ${{ steps.native.outputs.plugins }}
+      verified: ${{ steps.native.outputs.verified }}
     env:
       RELEASE: ${{ needs.carry.outputs.release }}
       # The native projects a stack with native patches ships beside jax, each built for every supported Python
@@ -327,6 +330,7 @@ jobs:
           fi
           echo "$version's native code is $plugins's"
           echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
+          echo "verified=$(cat verified.json)" >> "$GITHUB_OUTPUT"
           version=${plugins#plugin-}
           # The wheels its records bound, by name, each checked against its digest: an asset uploaded since the
           # pairing read the release is none of them. A release whose builds recorded nothing, all its wheels.
@@ -464,8 +468,11 @@ jobs:
       contents: read
     env:
       VERSION: ${{ inputs.staging || needs.stage.outputs.version }}
-      # The plugin release this run's `assemble` shipped; none for a staging run alone (`staging`).
-      PLUGINS: ${{ needs.assemble.outputs.plugins }}
+      # The plugin release this run's `assemble` shipped and the wheels it verified, where this run stages the version
+      # `assemble` built; none for a staging run of a version of its own (`staging`), which chooses as `assemble` did.
+      PLUGINS: ${{ inputs.staging == '' && needs.assemble.outputs.plugins || '' }}
+      VERIFIED: ${{ inputs.staging == '' && needs.assemble.outputs.verified || '' }}
+      MACHINES: ${{ inputs.machines || 'x86_64 aarch64' }}
       BUCKET: ${{ secrets.R2_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -489,13 +496,22 @@ jobs:
           # which may be staged and not yet indexed (review).
           # The one `assemble` chose and shipped, not chosen again (a release uploaded since would be another); a
           # staging run alone chooses it as `assemble` did.
+          [[ "$MACHINES" =~ ^(x86_64|aarch64)( (x86_64|aarch64))*$ ]] || { echo "::error::machines"; exit 1; }
           plugins=$PLUGINS
-          if [ -z "$plugins" ]; then
-            git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
-            plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION")
-          fi
           if [ -n "$plugins" ]; then
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$plugins" > "assets/plugin.json"
+            printf '%s' "$VERIFIED" > verified.json
+          else
+            git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
+            # shellcheck disable=SC2086 # Each machine its own word.
+            plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION" --machines $MACHINES \
+              --wheels ../verified.json)
+          fi
+          shipping=()
+          if [ -n "$plugins" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$plugins" > plugin.json
+            # Its wheels for the machines shipped, and where its records bound them, those alone at their digests.
+            # shellcheck disable=SC2206 # Each machine its own word.
+            shipping=(--plugin plugin.json --verified verified.json --machines $MACHINES)
           fi
           # The index's projects as its root lists them; none where it has no root yet (review).
           if aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/simple/index.html" root.html > /dev/null 2> root.txt; then
@@ -508,7 +524,8 @@ jobs:
           for project in $projects; do
             aws s3 cp --endpoint-url "$R2" "s3://$BUCKET/packages/$project/manifest.json" "manifests/$project.json" > /dev/null
           done
-          pages=$(python3 dew/dew/patch_stack.py staged site "$VERSION" "$INDEX" manifests assets/*.json)
+          pages=$(python3 dew/dew/patch_stack.py staged site "$VERSION" "$INDEX" manifests assets/jax.json \
+            "${shipping[@]}")
           # Each page once: R2 refuses a second put of a key (If-None-Match: *); one there already must hold these
           # bytes, else the staging index another lock may name would change under it.
           for page in $pages; do

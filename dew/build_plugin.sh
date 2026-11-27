@@ -27,6 +27,12 @@
 # seconds (builds.tsv) and the commit built (commit.txt).
 set -euo pipefail
 ref=$1 version=$2 out=$3 pythons=${4:-"3.12 3.13 3.14"} cudas=${5:-"12 13"}
+# A batch's Pythons in one order, whatever order they were asked in: its files are named by them (`batch`), and a
+# batch asked as "3.14 3.12" is the one asked as "3.12 3.14".
+pythons=$(printf '%s\n' $pythons | sort -V | xargs)
+# What names this batch's files beside its wheels (its sums, its debug archive, its record): a machine's builds for
+# other Pythons, attached to one release, each keep their own.
+batch=$(uname -m)-py$(echo "$pythons" | tr ' ' '-')
 here=$(cd "$(dirname "$0")" && pwd)
 token_file=${DEW_BAZEL_TOKEN_FILE:-$here/bazel.token}
 cache=${DEW_BAZEL_CACHE:-https://dew-bazel.ashishkmr472.workers.dev/bazel}
@@ -50,7 +56,7 @@ if [ -z "${DEW_BAZEL_TOKEN_FILE:-}" ] && [ -n "${DEW_BAZEL_TOKEN:-}" ]; then
 fi
 # This invocation's wheels and records alone: an OUT an earlier run of the job left (a retry on its node) keeps none
 # that the merged record (sources-<machine>.json) would describe as this build's.
-rm -rf "$out/dist" "$out/read" "$out"/sources-*.json
+rm -rf "$out/dist" "$out/read" "$out"/sources-*.json "$out"/debug-*.tar.gz "$out"/wheels-*.sha256
 mkdir -p "$out/dist"
 # Fetched by name or sha alike (git clone --branch takes no sha), then checked out detached.
 git init -q "$tree/jax"
@@ -158,10 +164,11 @@ printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
     started=$(date +%s) code=0
-    # The PJRT plugin names no Python: built once a CUDA, with the first Python's plugin. jaxlib names no CUDA: built
-    # once a Python, with its first CUDA's plugin.
+    # The PJRT plugin names no Python: built once a CUDA, with the first Python's plugin, by one batch of a release
+    # (DEW_PLUGIN_PJRT=0 in a later batch for other Pythons, whose PJRT wheels would be the first's names over other
+    # bytes). jaxlib names no CUDA: built once a Python, with its first CUDA's plugin.
     wheels=jax-cuda-plugin
-    [ "$python" != "${pythons%% *}" ] || wheels=$wheels,jax-cuda-pjrt
+    [ "$python" != "${pythons%% *}" ] || [ "${DEW_PLUGIN_PJRT:-1}" = 0 ] || wheels=$wheels,jax-cuda-pjrt
     [ "$cuda" != "${cudas%% *}" ] || wheels=jaxlib,$wheels
     config=ci_linux_$(uname -m)_cuda$cuda
     # DEW_PLUGIN_WHEELS=jaxlib: jaxlib alone, a CPU change's wheel built without the CUDA plugins (an XLA CPU
@@ -197,14 +204,15 @@ done
 # the release carries beside the wheels, so a stack captured on a host running them reads their frames (row 6013).
 # DEW_DEBUG_SPLIT names the splitter where this script is staged apart from it (a fleet job's extra/).
 python3 "${DEW_DEBUG_SPLIT:-$here/debug_split.py}" "$out/dist" "$out/debug" | tee "$out/debug.txt"
-tar -C "$out/debug" -czf "$out/debug-$(uname -m).tar.gz" .build-id
+tar -C "$out/debug" -czf "$out/debug-$batch.tar.gz" .build-id
 # What the build read, each cell's (row 5670), merged with the wheels as they are published (after the split
 # rewrote them): a later release ships beside these plugins only where it holds every file of every cell's as read
 # (`patch_stack.py plugins`). DEW_PATCH_STACK names patch_stack.py where this script is staged apart from it (a
 # fleet job's extra/).
 python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" merged "$(cat "$out/commit.txt")" "$out/dist" "$out"/read/*.json \
-  > "$out/sources-$(uname -m)-py$(echo "$pythons" | tr ' ' '-').json"
+  > "$out/sources-$batch.json"
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
+cp "$out/wheels.sha256" "$out/wheels-$batch.sha256"
 column -t -s $'\t' "$out/builds.tsv"
 # A red test leaves the wheels built and fails the job.
 [ "$red" = 0 ] || { echo "build_plugin: the wheels are built; a test target was red ($red): OUT/$report" >&2

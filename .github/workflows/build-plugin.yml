@@ -30,6 +30,10 @@ on:
       cudas:
         required: true
         default: "12 13"
+      pjrt:
+        description: "true: it builds the PJRT plugins; false for a later batch of other Pythons, the release holding the first batch's"
+        required: true
+        default: "true"
       cache:
         description: "on: Bazel reads and writes Dew's remote cache; off, the default while row 6204 holds its token as leaked: the build is cold and reads no result of it"
         required: true
@@ -54,6 +58,7 @@ jobs:
       PYTHONS: ${{ inputs.pythons }}
       CUDAS: ${{ inputs.cudas }}
       CACHE: ${{ inputs.cache }}
+      DEW_PLUGIN_PJRT: ${{ inputs.pjrt == 'true' && '1' || '0' }}
     steps:
       - name: The inputs are of their forms
         run: |
@@ -91,9 +96,8 @@ jobs:
       - name: What it made
         run: |
           cd "$RUNNER_TEMP/out"
-          # One checksum file a machine and set of Pythons: a later build for other Pythons (cp313 after cp312 and
-          # cp314) adds its own beside the first's, never over it.
-          cp wheels.sha256 "wheels-$(uname -m)-py$(echo "$PYTHONS" | tr ' ' '-').sha256"
+          # Its sums, debug archive and record each named for its machine and Pythons (dew/build_plugin.sh's batch): a
+          # later build for other Pythons (cp313 after cp312 and cp314) adds its own beside the first's, never over it.
           mkdir -p "$RUNNER_TEMP/made" && cp dist/*.whl wheels-*.sha256 debug-*.tar.gz sources-*.json "$RUNNER_TEMP/made/"
       - uses: actions/upload-artifact@v4
         with:

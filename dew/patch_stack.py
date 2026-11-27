@@ -121,8 +121,8 @@ def native(base: str) -> list[str]:
 SOURCES = re.compile(r"sources-(x86_64|aarch64)(-py[0-9.-]+)?\.json")
 """A plugin release's record of what its build read on one machine (`recorded`, dew/build_plugin.sh)."""
 MACHINES = ("x86_64", "aarch64")
-CONFIGURED = (".bazelrc", ".bazelversion", "MODULE.bazel", "platform_mappings", "bazel_downloader.cfg",
-              "build/build.py")
+CONFIGURED = (".bazelrc", ".bazelversion", ".bazeliskrc", "MODULE.bazel", "platform_mappings",
+              "bazel_downloader.cfg", "build/build.py")
 """What configures a build beside the files it reads (`recorded`): Bazel's flags and its version, the modules and
 their overrides, and the driver that names its targets and options: a flag or a macro changed over the same sources
 builds other code. MODULE.bazel.lock is none: Bazel writes it from MODULE.bazel at a build, and no tree holds it
@@ -171,11 +171,16 @@ def labelled(label: str) -> str:
     return f"{package}/{name}" if package else name
 
 
+LAUNCHING = (".bazeliskrc", ".bazelversion", "tools/bazel", "build/build.py", "build/tools")
+"""What finds and starts a build beside the files it reads: Bazelisk's configuration, the Bazel it picks and a
+wrapper it runs in its place, and the driver and its tools (`differences`). A file added among them changes the
+build as a changed one does (a build/tools/utils/__init__.py shadowing the module a tool imports), and no record
+names a file that was not there to read, so these paths are compared whole, by presence as well as bytes."""
 STARLARK = ("BUILD", "BUILD.bazel", "MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel")
 """Files Bazel evaluates by name (beside every .bzl file): a change to one can change what a build does though no
 record names it (a module extension's implementation, whose transitive loads Bazel digests apart), so a release
 whose tree changes one a build could have read is paired with no earlier plugins (`differences`)."""
-LEGACY_THROUGH = {"0.12.0.1": 142, "0.12.2": 1}
+LEGACY_THROUGH = {"0.12.0.1": 142, "0.12.1": 1, "0.12.2": 1}
 """Each release series' last post release whose plugin builds recorded nothing (`recorded`): a later one's plugins
 pair a release only through a record of every machine's build (`built_from`); a series it names none of records
 from its first."""
@@ -352,12 +357,26 @@ def materialized(override: dict, commit: str, into: Path) -> Path:
     return root
 
 
+def patched(name: str, override: dict, commit: str, made: dict[tuple[str, str], dict[str, str] | str]
+            ) -> dict[str, str] | str:
+    """The files (`tree`) of module `name`'s archive_override made at `commit` (`materialized`), or why it could
+    not be made; each made once a module and commit (`made`)."""
+    if (name, commit) not in made:
+        with tempfile.TemporaryDirectory() as into:
+            try:
+                made[name, commit] = tree(materialized(override, commit, Path(into)))
+            except (OSError, ValueError, subprocess.CalledProcessError, urllib.error.URLError) as failure:
+                made[name, commit] = str(failure)
+    return made[name, commit]
+
+
 def tree(root: Path) -> dict[str, str]:
     """Each file under `root` by its path in it: its `digest`."""
     return {str(path.relative_to(root)): digest(path.read_bytes()) for path in root.rglob("*") if path.is_file()}
 
 
-def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
+def differences(record: dict, built: str, commit: str = "HEAD",
+                made: dict[tuple[str, str], dict[str, str] | str] | None = None) -> list[str]:
     """What `commit` holds that could build otherwise than the plugin build at commit `built` did (a machine's
     record, `merged`), each named; none where its native code is the build's. Every cell's main files are compared
     by digest, and a .bzl file `commit` changes over `built` refuses (an extension's code, read by no record). An
@@ -366,8 +385,12 @@ def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
     (`materialized`) and refused for any file that differs between them that a cell read, that `commit` adds (a
     glob may take it) or that Bazel evaluates (`starlark`): only a file read by none, unadded and no Starlark, a
     patch's own test changed, pairs; a patch's message changes no file. A repository a module extension generated
-    (a canonical name holding "++") is made from inputs the record holds."""
-    differing = []
+    (a canonical name holding "++") is made from inputs the record holds. What launches the build (`LAUNCHING`)
+    differs where any path of it is added, removed or changed. `made` keeps each patched repository made, by
+    module and commit, across the records of one release (two machines' builds of one commit make each once)."""
+    made = {} if made is None else made
+    differing = [f"{path}: launches the build" for path in
+                 git("diff", "--name-only", built, commit, "--", *LAUNCHING).split()]
     for name, cell in sorted(record["cells"].items()):
         for path, wanted in sorted(cell["main"].items()):
             held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
@@ -393,12 +416,9 @@ def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
             continue
         read = {path for cell in record["cells"].values() for repository, files in cell["external"].items()
                 if repository in (f"{name}+", f"{name}~") for path in files}
-        with tempfile.TemporaryDirectory() as then, tempfile.TemporaryDirectory() as now:
-            try:
-                before = tree(materialized(override, built, Path(then)))
-                after = tree(materialized(override, commit, Path(now)))
-            except (OSError, ValueError, subprocess.CalledProcessError, urllib.error.URLError) as failure:
-                return [f"{name}'s patched archive: {failure}"]
+        before, after = (patched(name, override, at, made) for at in (built, commit))
+        if isinstance(before, str) or isinstance(after, str):
+            return [f"{name}'s patched archive: {before if isinstance(before, str) else after}"]
         for path in sorted(set(before) | set(after)):
             if before.get(path) == after.get(path):
                 continue
@@ -409,37 +429,39 @@ def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
     return differing
 
 
-def assets(tag: str) -> dict[str, str]:
-    """Plugin release `tag`'s uploaded files by name: each one's sha256 as GitHub's release API states it ("" where
-    it states none, which binds nothing, `bound`)."""
+class Unread(Exception):
+    """A plugin release that could not be read whole: its listing or a record it lists (`released`)."""
+
+
+def released(tag: str) -> tuple[dict[str, str], list[tuple[str, dict]]]:
+    """Plugin release `tag` as one read of it: its uploaded files by name, each one's sha256 as GitHub's release API
+    states it ("" where it states none, which binds nothing, `bound`), and the records of what its builds read, each
+    with its machine (every asset `SOURCES` names, sources-<machine>-py<Pythons>.json, one a build), each fetched at
+    the address that listing gives it; none for a release built before the builds recorded (`LEGACY_THROUGH`).
+    Unread where the listing or a record it names cannot be read (an asset deleted since, a 404): that release
+    pairs nothing, and the next is tried."""
     address = f"https://api.github.com/repos/AshishKumar4/jax/releases/tags/{tag}"
-    with urllib.request.urlopen(address, timeout=120) as response:
-        found = json.loads(response.read())
-    return {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in found["assets"]}
+    try:
+        with urllib.request.urlopen(address, timeout=120) as response:
+            listed = json.loads(response.read())["assets"]
+        uploaded = {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in listed}
+        records = []
+        for asset in sorted(listed, key=lambda found: found["name"]):
+            if (matched := SOURCES.fullmatch(asset["name"])) is not None:
+                with urllib.request.urlopen(asset["browser_download_url"], timeout=120) as response:
+                    records.append((matched[1], json.loads(response.read())))
+    except (OSError, ValueError, KeyError) as failure:
+        raise Unread(f"{tag}: {failure}") from failure
+    return uploaded, records
 
 
 def bound(record: dict, uploaded: dict[str, str]) -> bool:
-    """Whether a machine's record (`merged`) describes the wheels release assets `uploaded` (`assets`) hold: each
+    """Whether a machine's record (`merged`) describes the wheels release assets `uploaded` (`released`) hold: each
     wheel it made is there under its name at its digest. An attach uploads each file apart: a record of one build
     beside another build's wheels of the same version (the first attach's record failed, a rebuild's took its
     place, its wheels kept by the no-replace upload) pairs nothing."""
     return bool(record.get("wheels")) and all(uploaded.get(name) == wanted for name, wanted in
                                               record["wheels"].items())
-
-
-def built_from(tag: str) -> list[tuple[str, dict]]:
-    """The records of what plugin release `tag`'s builds read, each with its machine: every asset `SOURCES` names
-    (sources-<machine>-py<Pythons>.json, one a build, as its checksum file is named), so two builds of one machine
-    for different Pythons each have theirs; none for a release built before the builds recorded
-    (`LEGACY_THROUGH`)."""
-    found = []
-    for name in sorted(assets(tag)):
-        if (matched := SOURCES.fullmatch(name)) is None:
-            continue
-        address = f"{FORK.removesuffix('.git')}/releases/download/{tag}/{name}"
-        with urllib.request.urlopen(address, timeout=120) as response:
-            found.append((matched[1], json.loads(response.read())))
-    return found
 
 
 def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[str, str] | None = None) -> str:
@@ -468,10 +490,13 @@ def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[s
         # each bound to the wheels the release holds (`bound`), HEAD holding all of each as it was read at the
         # commit the record names (its tag names the version alone); an earlier one, by the path rule below. Its
         # own version's release too: a record of another build than its wheels' is no evidence of them.
-        built = built_from(name)
+        try:
+            uploaded, built = released(name)
+        except Unread as unread:
+            print(f"plugins: {unread}; its plugins pair nothing", file=sys.stderr)
+            continue
         records = [record for _, record in built]
         if records or found > LEGACY_THROUGH.get(release, 0):
-            uploaded = assets(name) if records else {}
             # Every machine shipped has a record, each bound to its wheels, and the records together cover every
             # wheel the release holds: an upload no record describes pairs nothing.
             wheels = {asset for asset in uploaded if asset.endswith(".whl")}
@@ -481,8 +506,10 @@ def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[s
                 continue
             for commit in sorted({record["commit"] for record in records}):
                 git("fetch", "-q", "--no-tags", "origin", commit)
-            # Its own version's too: its native code is compared with what its builds read.
-            if not any(differences(record, record["commit"]) for record in records):
+            # Its own version's too: its native code is compared with what its builds read, each patched archive
+            # made once for every record of one commit.
+            made: dict[tuple[str, str], dict[str, str] | str] = {}
+            if not any(differences(record, record["commit"], made=made) for record in records):
                 if verified is not None:
                     verified.update({wheel: digest for record in records for wheel, digest in record["wheels"].items()})
                 return name
@@ -786,7 +813,9 @@ def indexable(pins: dict[str, set[str]], wheels: list[Path], version: str) -> li
     return chosen
 
 
-def staged(site: Path, version: str, base: str, manifests: dict[str, dict], assets: list[dict]) -> list[str]:
+def staged(site: Path, version: str, base: str, manifests: dict[str, dict], assets: list[dict],
+           plugin: list[dict] = (), verified: dict[str, str] | None = None,
+           machines: tuple[str, ...] = MACHINES) -> list[str]:
     """A staging simple index of release `version`, under site/staging/<version>/<digest>/simple/: the fork's own
     projects (STAGED) alone, each with the files Dew's index lists of it (`manifests`, as index() keeps them: linked
     absolutely at `base`, their yanks kept) and the release's staged wheels of it (`assets`: GitHub's {name, digest,
@@ -795,7 +824,20 @@ def staged(site: Path, version: str, base: str, manifests: dict[str, dict], asse
     find-links page gives uv the one wheel it picks: uv #10308), and every other package from /simple, which stays its
     authority (a later release or yank there is seen: Main, 2026-11-16); installs read /simple, which gets nothing
     until that head has landed (`indexable`). `<digest>` names the pages' content, so a page is never rewritten under
-    a path a lock names. The pages written, relative to `site`."""
+    a path a lock names. `plugin`, the plugin release's assets the stack ships beside its jax (`plugins`): its wheels
+    for `machines` alone, and where its builds' records bound them (`verified`, by name and sha256, as the publish
+    downloaded them), exactly those, each at that digest, so an asset uploaded since is never staged. The pages
+    written, relative to `site`."""
+    if verified:
+        listed = {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in plugin}
+        if differing := sorted(name for name, wanted in verified.items() if listed.get(name) != wanted):
+            raise SystemExit(f"the plugin release no longer holds what its records bound: {', '.join(differing)}")
+    shipped = [asset for asset in plugin
+               if asset["name"].endswith(".whl.metadata")
+               or asset["name"].endswith(".whl") and asset["name"].removesuffix(".whl").endswith(
+                   tuple(f"_{machine}" for machine in machines))
+               and (not verified or asset["name"] in verified)]
+    assets = [*assets, *shipped]
     pages: dict[str, list[str]] = {}
     for project, listed in manifests.items():
         if project not in STAGED:
@@ -904,6 +946,10 @@ def main() -> int:
     staging.add_argument("base", help="the index's address, e.g. https://pypi.dewml.dev")
     staging.add_argument("manifests", type=Path, help="a directory of <project>.json, each project's manifest")
     staging.add_argument("assets", type=Path, nargs="+", help="each release's `gh api releases/tags/<tag>` JSON")
+    staging.add_argument("--plugin", type=Path, help="the shipped plugin release's `gh api releases/tags/<tag>` JSON")
+    staging.add_argument("--verified", type=Path, help="the wheels its records bound (`plugins --wheels`)")
+    staging.add_argument("--machines", nargs="+", choices=MACHINES, default=list(MACHINES),
+                         help="the machines whose plugins the publish ships")
     rooting = commands.add_parser("root")
     rooting.add_argument("site", type=Path)
     rooting.add_argument("--projects", nargs="*", default=[], help="every package the root lists")
@@ -953,7 +999,10 @@ def main() -> int:
     if args.command == "staged":
         manifests = {path.stem: json.loads(path.read_text()) for path in sorted(args.manifests.glob("*.json"))}
         assets = [asset for path in args.assets for asset in json.loads(path.read_text())["assets"]]
-        print("\n".join(staged(args.site, args.version, args.base, manifests, assets)))
+        plugin = [] if args.plugin is None else json.loads(args.plugin.read_text())["assets"]
+        verified = None if args.verified is None else json.loads(args.verified.read_text())
+        print("\n".join(staged(args.site, args.version, args.base, manifests, assets, plugin, verified,
+                               tuple(args.machines))))
         return 0
     if args.command == "root":
         root(args.site, args.projects)

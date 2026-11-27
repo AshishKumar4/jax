@@ -19,7 +19,7 @@ import patch_stack
 @pytest.fixture(autouse=True)
 def unrecorded(monkeypatch):
     """No test reads a plugin release's record from the network: each releases none but its own test's."""
-    monkeypatch.setattr(patch_stack, "built_from", lambda tag: [])
+    monkeypatch.setattr(patch_stack, "released", lambda tag: ({}, []))
 
 
 def listing(*refs: str) -> str:
@@ -354,8 +354,8 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     record = patch_stack.merged({"cp312-cuda12": cell}, built, sorted((tmp_path / "dist").glob("*.whl")))
     built = [("x86_64", record), ("aarch64", record)]
     uploaded = dict(record["wheels"])
-    monkeypatch.setattr(patch_stack, "built_from", lambda tag: built if tag == "plugin-0.12.0.1.post81" else [])
-    monkeypatch.setattr(patch_stack, "assets", lambda tag: uploaded)
+    monkeypatch.setattr(patch_stack, "released",
+                        lambda tag: (uploaded, built) if tag == "plugin-0.12.0.1.post81" else ({}, []))
 
     commit({"jax/core.py": "post82", "tests/core_test.py": "post82",
             "jax/version.py": '_release_version: str | None = "0.12.0.1.post82"\n'}, "post82, Python only")
@@ -364,7 +364,12 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     assert verified == record["wheels"]
     commit({"third_party/xla/fix.patch": fix("int f() { return 2; }", test="TEST(F, Two) {}",
                                              message="its message, reworded\n")}, "the patch's own test")
+    # Each patched archive made once a commit, however many machines' records name it.
+    making, made = patch_stack.materialized, []
+    monkeypatch.setattr(patch_stack, "materialized", lambda *args: made.append(args[1]) or making(*args))
     assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
+    assert sorted(made) == sorted([built[0][1]["commit"], "HEAD"])
+    monkeypatch.setattr(patch_stack, "materialized", making)
     # A test package's BUILD, which no cell read a file of, pairs.
     commit({"tests/BUILD": "py_test(name = 'core_test')\n"}, "a test target")
     assert patch_stack.plugins("0.12.0.1.post82") == "plugin-0.12.0.1.post81"
@@ -375,7 +380,8 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
                    {"third_party/xla/fix.patch": fix("int f() { return 2; }", extra=starlark)},
                    {"jaxlib/kernel.cc": "int k2;\n"}, {".bazelrc": "build --copt=-O3\n"},
                    {"jaxlib/rules.bzl": "Y = 1\n"}, {"jaxlib/BUILD.bazel": "cc_library(name = 'kernel')\n"},
-                   {"BUILD.bazel": "package()\n"}):
+                   {"BUILD.bazel": "package()\n"}, {"build/tools/utils/__init__.py": "shadowing = True\n"},
+                   {".bazeliskrc": "USE_BAZEL_VERSION=8.4.2\n"}):
         commit(change, "a change a build could read")
         assert patch_stack.plugins("0.12.0.1.post82") == ""
         run("reset", "-q", "--hard", "HEAD~1")
@@ -405,8 +411,14 @@ def test_a_release_ships_the_plugins_whose_builds_read_nothing_it_changed(tmp_pa
     assert patch_stack.plugins("0.12.0.1.post144") == ""
     # A series LEGACY_THROUGH names no post of records from its first: its release with none pairs nothing.
     assert patch_stack.plugins("0.12.9.post1") == ""
-    monkeypatch.setattr(patch_stack, "built_from", lambda tag: [("x86_64", record), ("aarch64", record)])
+    monkeypatch.setattr(patch_stack, "released", lambda tag: (uploaded, [("x86_64", record), ("aarch64", record)]))
     assert patch_stack.plugins("0.12.0.1.post144") == "plugin-0.12.0.1.post143"
+    # A release that cannot be read whole (its listing, or a record it lists, gone) pairs nothing; the search goes on.
+    def unread(tag):
+        raise patch_stack.Unread(f"{tag}: 404")
+    monkeypatch.setattr(patch_stack, "released", unread)
+    assert patch_stack.plugins("0.12.0.1.post144") == ""
+    monkeypatch.setattr(patch_stack, "released", lambda tag: (uploaded, [("x86_64", record), ("aarch64", record)]))
     # Its own version's release ships beside its records only where they describe its wheels and HEAD holds what
     # they read: a compiled change since its build is no build of it.
     assert patch_stack.plugins("0.12.0.1.post143") == "plugin-0.12.0.1.post143"
@@ -748,6 +760,37 @@ def test_a_staging_index_states_each_wheels_core_metadata_where_it_lies_beside_i
     assert 'data-core-metadata="sha256=' + "4" * 64 + '"' in links[held]
     assert "data-core-metadata" not in links[bare] and "data-dist-info-metadata" not in links[bare]
     assert f"{held}.metadata" not in links
+
+
+def test_a_staging_index_stages_the_plugin_wheels_its_records_bound_for_the_machines_shipped(tmp_path):
+    """A staging index's plugin wheels (`staged`'s `plugin`) are the shipped release's wheels for the machines the
+    publish ships, and where its builds' records bound them (`verified`, as the publish downloaded them), exactly
+    those: an asset uploaded since the pairing read the release is never staged, and one the release no longer
+    holds at its bound digest refuses; a release whose builds recorded nothing stages every wheel of a machine."""
+    url = "https://github.com/AshishKumar4/jax/releases/download/plugin-0.12.1.post3"
+
+    def wheel(name, digit):
+        return {"name": name, "digest": "sha256:" + digit * 64, "browser_download_url": f"{url}/{name}"}
+    x86, arm, late = (
+        "jaxlib-0.12.1.post3-cp312-cp312-manylinux_2_27_x86_64.whl",
+        "jaxlib-0.12.1.post3-cp312-cp312-manylinux_2_27_aarch64.whl",
+        "jax_cuda12_plugin-0.12.1.post3-cp312-cp312-manylinux_2_27_x86_64.whl")
+    plugin = [wheel(x86, "3"), wheel(arm, "4"), wheel(late, "9"), wheel("debug-x86_64-py3.12.tar.gz", "5")]
+    verified = {x86: "3" * 64, arm: "4" * 64}
+
+    def staged(into, verified, machines):
+        prefix = patch_stack.staged(tmp_path / into, "0.12.1.post3", "https://pypi.dewml.dev", {}, [], plugin,
+                                    verified, machines)[-1]
+        return {name: (tmp_path / into / prefix / name / "index.html").read_text()
+                for name in ("jaxlib", "jax-cuda12-plugin") if (tmp_path / into / prefix / name).is_dir()}
+    both = staged("both", verified, ("x86_64", "aarch64"))
+    assert x86 in both["jaxlib"] and arm in both["jaxlib"] and "jax-cuda12-plugin" not in both
+    alone = staged("alone", verified, ("x86_64",))
+    assert x86 in alone["jaxlib"] and arm not in alone["jaxlib"]
+    legacy = staged("legacy", {}, ("x86_64",))
+    assert x86 in legacy["jaxlib"] and late in legacy["jax-cuda12-plugin"] and arm not in legacy["jaxlib"]
+    with pytest.raises(SystemExit, match="no longer holds"):
+        staged("moved", {**verified, x86: "8" * 64}, ("x86_64", "aarch64"))
 
 
 def test_a_staging_index_lists_the_forks_projects_alone_every_file_hashed(tmp_path):
