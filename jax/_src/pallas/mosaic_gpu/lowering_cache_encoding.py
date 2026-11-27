@@ -283,6 +283,10 @@ class Encoder:
       # operand: the aval is all it can read of it.
       return seq(b"tr", [self._aval(x.aval, depth + 1)])
     if isinstance(x, jax.Array):
+      if self._callables:
+        # Refused before it is read to the host: a callable a lowering runs may
+        # read anything of it (`_numpy_value`), and reading it is a transfer.
+        raise Uncacheable("an array a callable holds has no encoding")
       value = np.asarray(x)
       return seq(b"jx", [
           self._numpy_value(value), self._e(bool(jax_core.typeof(x).weak_type), depth + 1)
@@ -397,7 +401,10 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    encoded.sort(key=lambda kv: kv[0])
+    # In order of its keys, but where a callable holds it: one a lowering runs
+    # may iterate it, so its order is part of what it reads.
+    if not self._callables:
+      encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
 
   def _enum(self, x: enum.Enum, depth: int) -> bytes:

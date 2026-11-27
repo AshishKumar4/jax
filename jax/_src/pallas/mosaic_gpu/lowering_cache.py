@@ -41,7 +41,12 @@ The contract is the one of JAX's persistent compilation cache:
   that is not sealed code, and a registry that changes after the key was made.
 * *What the cache assumes:* a module-level constant of the lowering's packages
   holds the value its sealed source assigns. A process that assigns one another
-  value (``gpu_core.SMEM_ALIGNMENT = ...``) must not enable the cache.
+  value (``gpu_core.SMEM_ALIGNMENT = ...``) must not enable the cache. Nor may
+  one replace a lowering or discharge rule while another thread lowers through
+  the cache: a rule replaced and put back while a miss lowered (which the
+  registries' identities, the same before and after, do not show) would store
+  the replacement's kernel under the rules' key. Rules registered at import, as
+  decorators register them, are what the cache keys.
 * *A value the encoder cannot encode exactly bypasses the cache, counted as
   ``uncacheable``:* a class, enum, pytree node or aval no sealed module owns (a
   user's layout class), a primitive no sealed module holds, a mutable container.
