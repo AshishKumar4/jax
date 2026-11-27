@@ -44,9 +44,10 @@ archive_override(
         # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
         "//third_party:xla/triton_pipeliner_multiuse_load.patch",
         # A cuDNN convolution compiled with no algorithm (the autotuner's default, -1, which a compile with
-        # no device keeps) runs the first engine cuDNN's heuristics give it that needs no workspace, as none
-        # is allocated it, where engine -1 failed its first run with CUDNN_STATUS_BAD_PARAM (Dew's
-        # FS-DEVICELESS-AUTO-gh200).
+        # no device keeps) runs the first deterministic engine (no Winograd, no down-converted input) cuDNN's
+        # heuristics give it that needs no workspace, as none is allocated it, and is refused where none
+        # exists, never relaxing that policy to find one; engine -1 failed its first run with
+        # CUDNN_STATUS_BAD_PARAM (Dew's FS-DEVICELESS-AUTO-gh200).
         "//third_party:xla/cudnn_conv_default_engine.patch",
         # A deviceless compile's cuDNN device description states the global memory bus width, which cuDNN
         # 9.27 requires of one ("!json_object.HasMember(key)" without it: every cuDNN graph compiled with no
@@ -130,10 +131,13 @@ archive_override(
         # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
         # converts a mixed dot's operands (no other pass makes one at this pin).
         "//third_party:xla/mixed_index_dot.patch",
-        # A rank whose collective kernel fails before its local clique's
-        # rendezvous (its scratch past the device's memory) joins it carrying
-        # the failure, which its peers return rather than wait for it; and a
-        # local clique's rendezvous ends at the termination timeout.
+        # A rank whose collective kernel fails before a rendezvous of its local
+        # clique (its scratch past the device's memory, its kernel, its
+        # pointers' copy) joins it carrying the failure, which its peers return
+        # rather than wait for it: the parameters' exchange, and one after every
+        # fallible step where it registers symmetric memory, only as the state
+        # is built; and a local clique's rendezvous ends at the termination
+        # timeout.
         "//third_party:xla/collective_peer_failure.patch",
         # A CUDA executor loads the kernels its graphs' conditionals and
         # barriers launch as it makes its first command buffer and holds
@@ -155,9 +159,10 @@ archive_override(
         # than decoding replica_groups itself (row 5856). Delete when upstream's HloInstruction binding states them.
         "//third_party:xla/instruction_device_groups.patch",
         # A ragged dot's row reads its own group's matrix alone where XLA expands it (RaggedDotRewriter, the
-        # non-contracting mode no cuDNN, cuBLASLt or Triton backend claims): each group's product apart, each
-        # row's own selected, where the zero-masked contraction over groups made 0 * inf NaN in every other
-        # group's rows (Dew row 13562). Delete when upstream's rewriter selects each row's own group.
+        # non-contracting mode no cuDNN, cuBLASLt or Triton backend claims): a loop over the groups, each step
+        # one group's product selected into its rows (no product for each group held), where the zero-masked
+        # contraction over groups made 0 * inf NaN in every other group's rows (Dew row 13562). Delete when
+        # upstream's rewriter selects each row's own group.
         "//third_party:xla/ragged_dot_own_group.patch",
         # A finished GPU compile serializes no memory limit, and its memory stats
         # and compiled module say whether it stopped at one (the executable's own
