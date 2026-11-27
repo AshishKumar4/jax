@@ -39,7 +39,10 @@ digest of the package's whole tree in their identity. An entry that holds such
 code is then read by a process of the same tree alone; one that holds none is
 unaffected. The declaration is the process's statement that the package's code
 a lowering runs (an ``inline_mgpu`` body) reads nothing but its arguments, its
-closure and the package's code.
+closure and the package's code, and emits from their values alone: not from an
+object's identity, an unordered collection's iteration order or the process's
+hash seed. A kernel holding any other Python callable its lowering runs (JAX's
+own included) is not cached.
 """
 
 from __future__ import annotations

@@ -130,6 +130,40 @@ class _PrimitiveHolders:
 _HOLDERS = _PrimitiveHolders()
 
 
+def _declared(fn: Any) -> bool:
+  """Whether `fn`, a callable, runs code of a package the process declares
+  (`lowering_cache_seal`'s sources): the function a partial, a bound method or
+  a jitted function wraps, or a callable object's `__call__`, defined in one."""
+  while True:
+    if isinstance(fn, functools.partial):
+      fn = fn.func
+    elif isinstance(fn, types.MethodType):
+      fn = fn.__func__
+    elif isinstance(getattr(fn, "__wrapped__", None), types.FunctionType):
+      fn = fn.__wrapped__
+    elif isinstance(fn, types.FunctionType):
+      return sealing.seal().source(fn.__code__.co_filename) is not None
+    elif isinstance(getattr(type(fn), "__call__", None), types.FunctionType):
+      fn = type(fn).__call__
+    else:
+      return False
+
+
+def _admit(x: Any) -> None:
+  """Refuses (Uncacheable) a program's callable no declared package defines.
+
+  A program's callable is run by its lowering (an inline_mgpu body), and may
+  emit from anything it observes (identity, iteration order, the hash seed):
+  only a declared package's is, its declaration the promise that its emission
+  follows from its inputs' values (`lowering_cache_seal.SOURCES_VARIABLE`).
+  """
+  if callable(x) and not isinstance(x, (type, types.ModuleType)) and (
+      not _declared(x)):
+    raise Uncacheable(
+        f"a kernel holding the callable {type(x).__qualname__} of no declared"
+        " source package is not cached")
+
+
 class Uncacheable(Exception):
   """This lowering cannot be keyed exactly: it is lowered afresh."""
 
@@ -179,7 +213,17 @@ class Encoder:
   """
 
   def __init__(self, placed: bool = True,
-               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None):
+               ignored: Mapping[jax_core.Primitive, tuple[str, ...]] | None = None,
+               program: bool = True):
+    # Whether it encodes a program (a kernel's jaxpr and its params): a Python
+    # callable one holds (an inline_mgpu body) is run by its lowering, and may
+    # emit from anything it can observe (what it holds, by identity or by
+    # iteration order, the process's hash seed), which no key holds. Such a
+    # kernel is cached only where a declared source package defines the
+    # callable, which promises its emission follows from what the key holds.
+    # A registry's rules are encoded as they are (`lowering_cache_registries`):
+    # sealed code's own, as the key's identity.
+    self.program = program
     # Whether an aval's placement (its sharding and its manual axes) is
     # encoded: not for a kernel that reads no mesh (`lowering_cache`'s
     # `_reads_jax_mesh`), whose avals are a shard's or the whole's alike.
@@ -228,6 +272,8 @@ class Encoder:
   def _e(self, x: Any, depth: int) -> bytes:
     if depth > _MAX_DEPTH:
       raise Uncacheable("a value nests too deeply to encode")
+    if self.program:
+      _admit(x)
     t = type(x)
     if x is None:
       return b"N"
@@ -284,9 +330,9 @@ class Encoder:
       return seq(b"tr", [self._aval(x.aval, depth + 1)])
     if isinstance(x, jax.Array):
       if self._callables:
-        # Refused before it is read to the host: a callable a lowering runs may
-        # read anything of it (`_numpy_value`), and reading it is a transfer.
-        raise Uncacheable("an array a callable holds has no encoding")
+        # Refused before it is read: a callable may read its shape alone, and
+        # reading it to the host is a transfer the guard may refuse.
+        raise Uncacheable("an array a callable holds is not read to key it")
       value = np.asarray(x)
       return seq(b"jx", [
           self._numpy_value(value), self._e(bool(jax_core.typeof(x).weak_type), depth + 1)
@@ -401,8 +447,9 @@ class Encoder:
 
   def _mapping(self, tag: bytes, items, depth: int) -> bytes:
     encoded = [(self._e(k, depth + 1), self._e(v, depth + 1)) for k, v in items]
-    # In order of its keys, but where a callable holds it: one a lowering runs
-    # may iterate it, so its order is part of what it reads.
+    # In order of its keys, but where a callable holds it (a partial's keywords,
+    # an immutable mapping): one a lowering runs may iterate it, so its order is
+    # part of what it reads.
     if not self._callables:
       encoded.sort(key=lambda kv: kv[0])
     return seq(tag, [k + v for k, v in encoded])
@@ -426,11 +473,6 @@ class Encoder:
     ])
 
   def _numpy_value(self, x) -> bytes:
-    if isinstance(x, np.ndarray) and self._callables:
-      # A callable a lowering runs (an inline_mgpu body) may read anything of
-      # an array it holds, its ownership and its memory among it, which no key
-      # holds: only an array the program holds as a value is encoded.
-      raise Uncacheable("an array a callable holds has no encoding")
     if isinstance(x, np.ndarray):
       if x.dtype.kind == "O":
         raise Uncacheable("an object array has no encoding")
