@@ -164,6 +164,53 @@ ENTRY e {
     self.assertEqual([_counted(other, at) for at in range(10)],
                      [0, 16, 16, 16, 16, 0, 0, 16, 0, 0])
 
+  def test_a_fusions_output_is_named_by_what_makes_it_where_it_has_no_name(
+      self):
+    # XLA's own fusions carry no op_name; each output of one is named by the
+    # instruction inside that makes it (a gemm's fusion, its cuBLAS call and
+    # its workspace); a fusion named itself keeps its own.
+    hlo = """
+HloModule m, entry_computation_layout={(f32[2]{0})->(f32[2]{0}, f32[2]{0})}
+
+pair {
+  p = f32[2]{0} parameter(0)
+  n = f32[2]{0} negate(p), metadata={op_name="jit(f)/neg"}
+  x = f32[2]{0} exponential(p), metadata={op_name="jit(f)/exp"}, frontend_attributes={checkpoint_name="grown"}
+  ROOT t = (f32[2]{0}, f32[2]{0}) tuple(n, x)
+}
+
+one {
+  p = f32[2]{0} parameter(0)
+  ROOT s = f32[2]{0} sine(p), metadata={op_name="jit(f)/sin"}
+}
+
+ENTRY e {
+  a = f32[2]{0} parameter(0)
+  f = (f32[2]{0}, f32[2]{0}) fusion(a), kind=kLoop, calls=pair
+  g = f32[2]{0} fusion(a), kind=kLoop, calls=one, metadata={op_name="jit(f)/own"}
+  ROOT r = (f32[2]{0}, f32[2]{0}) tuple(g, g)
+}
+"""
+    module = hlo_reader.module_from_text(hlo).as_serialized_hlo_module_proto()
+    [entry] = [computation for computation in hlo_reader.message_class(
+        "xla.HloModuleProto").FromString(module).computations
+               if computation.name == "e"]
+    defined = {instruction.name: instruction.id
+               for instruction in entry.instructions}
+    assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+    assignment.buffer_allocations.add(index=0, size=24)
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, (name, index) in enumerate(
+        (("f", [0]), ("f", [1]), ("g", []))):
+      buffer = assignment.logical_buffers.add(id=buffer_id, size=8)
+      buffer.defined_at.instruction_id = defined[name]
+      buffer.defined_at.shape_index.extend(index)
+      peak.logical_buffer_ids.append(buffer_id)
+    live = peak_live.live(assignment.SerializeToString(), module)
+    self.assertEqual([(each.op_name, each.names) for each in live],
+                     [("jit(f)/neg", ()), ("jit(f)/exp", ("grown",)),
+                      ("jit(f)/own", ())])
+
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
     # sin(tanh(x @ w))'s gradient in w under a policy saving the residual
@@ -231,7 +278,8 @@ ENTRY e {
 
   def test_a_loops_state_is_named_only_by_a_scans_whole_stack(self):
     # A scan's stack, which the loop's steps fill a row each, forwards or
-    # backwards, is named by the row it writes; a populated matrix whose one
+    # backwards, fused or through an async fusion, is named by the row it
+    # writes; a populated matrix whose one
     # row each step overwrites is not, nor a filled one written at one row,
     # nor a square turned by a bitcast to another layout and a copy back
     # before each write, nor one written at the counter passed through any op
@@ -240,10 +288,11 @@ ENTRY e {
     self.assertEqual(_loop_names(4), {"zeros": ("hidden",),
                                       "ones": ("late",), "populated": (),
                                       "filled": (), "spread": (),
-                                      "blank": ()})
+                                      "blank": (), "tardy": ("deep",)})
     self.assertEqual(_loop_names(2), {"zeros": (), "ones": (),
                                       "populated": (), "filled": (),
-                                      "spread": (), "blank": ()})
+                                      "spread": (), "blank": (),
+                                      "tardy": ()})
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast(self):
@@ -366,15 +415,23 @@ backwards {
   ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, row, at, zero)
 }
 
+wrapped {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[2]{0} parameter(1)
+  at = s32[] parameter(2)
+  ROOT put = f32[4,2]{1,0} fusion(stack, row, at), kind=kLoop, calls=forwards
+}
+
 body {
-  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
   stack = f32[4,2]{1,0} get-tuple-element(state), index=0
   back = f32[4,2]{1,0} get-tuple-element(state), index=1
   matrix = f32[4,2]{1,0} get-tuple-element(state), index=2
   fixed = f32[4,2]{1,0} get-tuple-element(state), index=3
   square = f32[4,4]{1,0} get-tuple-element(state), index=4
   cast = f32[4,2]{1,0} get-tuple-element(state), index=5
-  i = s32[] get-tuple-element(state), index=6
+  deferred = f32[4,2]{1,0} get-tuple-element(state), index=6
+  i = s32[] get-tuple-element(state), index=7
   hidden = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}
   written = f32[4,2]{1,0} fusion(stack, hidden, i), kind=kLoop, calls=forwards
   late = f32[1,2]{1,0} constant({{3, 4}}), frontend_attributes={checkpoint_name="late"}
@@ -387,14 +444,17 @@ body {
   turned = f32[4,4]{1,0} fusion(square, line, i), kind=kLoop, calls=moved
   counted = s32[] bitcast(i)
   through = f32[4,2]{1,0} dynamic-update-slice(cast, row, counted, zero)
+  deep = f32[2]{0} constant({7, 8}), frontend_attributes={checkpoint_name="deep"}
+  begun = ((f32[4,2]{1,0}, f32[2]{0}, s32[]), f32[4,2]{1,0}, u32[]) async-start(deferred, deep, i), calls=wrapped
+  ended = f32[4,2]{1,0} async-done(begun)
   one = s32[] constant(1)
   next = s32[] add(i, one)
-  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, reversed, over, pinned, turned, through, next)
+  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, reversed, over, pinned, turned, through, ended, next)
 }
 
 condition {
-  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
-  i = s32[] get-tuple-element(state), index=6
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  i = s32[] get-tuple-element(state), index=7
   bound = s32[] constant(STEPS)
   ROOT less = pred[] compare(i, bound), direction=LT
 }
@@ -408,9 +468,10 @@ ENTRY e {
   filled = f32[4,2]{1,0} broadcast(a), dimensions={}
   spread = f32[4,4]{1,0} broadcast(a), dimensions={}
   blank = f32[4,2]{1,0} broadcast(a), dimensions={}
+  tardy = f32[4,2]{1,0} broadcast(a), dimensions={}
   start = s32[] constant(0)
-  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, ones, populated, filled, spread, blank, start)
-  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"6"}}
+  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, ones, populated, filled, spread, blank, tardy, start)
+  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"7"}}
   ROOT x = f32[4,2]{1,0} get-tuple-element(loop), index=0
 }
 """
@@ -431,7 +492,7 @@ def _loop_names(steps: int) -> dict[str, tuple[str, ...]]:
   assignment.buffer_allocations.add(index=0, size=128)
   peak = assignment.peak_buffers.add(index=0)
   for element, name in enumerate(
-      ("zeros", "ones", "populated", "filled", "spread", "blank")):
+      ("zeros", "ones", "populated", "filled", "spread", "blank", "tardy")):
     buffer = assignment.logical_buffers.add(id=element, size=32)
     buffer.defined_at.instruction_id = defined[name].id
     alias = assignment.buffer_aliases.add(source_buffer_id=element)
