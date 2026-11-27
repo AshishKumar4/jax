@@ -172,6 +172,11 @@ archive_override(
         # mesh's axes) and a collective permute's pairs, so a reader of a compiled module takes XLA's groups rather
         # than decoding replica_groups itself (row 5856). Delete when upstream's HloInstruction binding states them.
         "//third_party:xla/instruction_device_groups.patch",
+        # A ragged dot's row reads its own group's matrix alone where XLA expands it (RaggedDotRewriter, the
+        # non-contracting mode no cuDNN, cuBLASLt or Triton backend claims): each group's product apart, each
+        # row's own selected, where the zero-masked contraction over groups made 0 * inf NaN in every other
+        # group's rows (Dew row 13562). Delete when upstream's rewriter selects each row's own group.
+        "//third_party:xla/ragged_dot_own_group.patch",
     ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],

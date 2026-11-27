@@ -1,0 +1,471 @@
+diff --git a/xla/hlo/transforms/expanders/BUILD b/xla/hlo/transforms/expanders/BUILD
+index a4199d9..7acc368 100644
+--- a/xla/hlo/transforms/expanders/BUILD
++++ b/xla/hlo/transforms/expanders/BUILD
+@@ -502,7 +502,12 @@ xla_cc_test(
+     srcs = ["ragged_dot_rewriter_test.cc"],
+     deps = [
+         ":ragged_dot_rewriter",
++        "//xla:literal",
++        "//xla:literal_util",
++        "//xla:shape_util",
++        "//xla/hlo/evaluator:hlo_evaluator",
+         "//xla/hlo/ir:hlo",
++        "//xla/hlo/parser:hlo_parser",
+         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+         "//xla/service:decision",
+         "//xla/service/gpu:ir_emission_utils",
+@@ -511,7 +516,11 @@ xla_cc_test(
+         "//xla/stream_executor:semantic_version",
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/stream_executor/rocm:rocm_compute_capability",
++        "@com_google_absl//absl/algorithm:container",
++        "@com_google_absl//absl/functional:function_ref",
++        "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/strings:string_view",
++        "@com_google_absl//absl/types:span",
+         "@com_google_googletest//:gtest",
+         "@com_google_googletest//:gtest_main",  # fixdeps: keep
+     ],
+diff --git a/xla/hlo/transforms/expanders/ragged_dot_rewriter.cc b/xla/hlo/transforms/expanders/ragged_dot_rewriter.cc
+index 8ebb6a0..30bb8fa 100644
+--- a/xla/hlo/transforms/expanders/ragged_dot_rewriter.cc
++++ b/xla/hlo/transforms/expanders/ragged_dot_rewriter.cc
+@@ -118,16 +118,15 @@ int ShiftedDim(int dim, int new_dim_index) {
+   return dim >= new_dim_index ? dim + 1 : dim;
+ }
+ 
+-// Expands ragged_op by one dimension with each row in the new dimension
+-// representing each group. It then zeros out the elements that don't belong to
+-// that group.
+-// `prefix_dims` holds the operand dimensions that the leading dimensions of
+-// group_sizes range over, see GroupSizesPrefix.
+-HloInstruction* RaggedToDense(HloInstruction* ragged_operand,
+-                              HloInstruction* group_sizes,
+-                              absl::Span<const int64_t> prefix_dims,
+-                              int new_dim_index, int ragged_dim) {
+-  auto computation = ragged_operand->parent();
++// A predicate of `old_shape`'s dimensions with a group dimension inserted at
++// `new_dim_index`: true where the element's row along `ragged_dim` lies in
++// that group's rows.
++// `prefix_dims` holds the dimensions of `old_shape` that the leading
++// dimensions of group_sizes range over, see GroupSizesPrefix.
++HloInstruction* GroupMask(HloComputation* computation,
++                          HloInstruction* group_sizes, const Shape& old_shape,
++                          absl::Span<const int64_t> prefix_dims,
++                          int new_dim_index, int ragged_dim) {
+   HloInstruction* cumulative_sum =
+       computation->AddInstruction(CreateCumulativeSum(group_sizes));
+   // Group dimension is always the last dimension.
+@@ -159,7 +158,6 @@ HloInstruction* RaggedToDense(HloInstruction* ragged_operand,
+       group_sizes->shape(), {zero_arr, slice}, group_dim));
+ 
+   // Broadcast cumulative sum array to operand shape + group dimension.
+-  auto old_shape = ragged_operand->shape();
+   llvm::SmallVector<int64_t> new_shape_dims;
+   new_shape_dims.reserve(old_shape.dimensions().size() + 1);
+   new_shape_dims.append(old_shape.dimensions().begin(),
+@@ -198,8 +196,27 @@ HloInstruction* RaggedToDense(HloInstruction* ragged_operand,
+           new_shape_pred, broadcast_iota, broadcast_groups,
+           ComparisonDirection::kLt));
+   // Combine top+bottom half masks.
+-  auto mask = computation->AddInstruction(HloInstruction::CreateBinary(
++  return computation->AddInstruction(HloInstruction::CreateBinary(
+       new_shape_pred, HloOpcode::kAnd, compare_top, compare_bottom));
++}
++
++// Expands ragged_op by one dimension with each row in the new dimension
++// representing each group. It then zeros out the elements that don't belong to
++// that group.
++// `prefix_dims` holds the operand dimensions that the leading dimensions of
++// group_sizes range over, see GroupSizesPrefix.
++HloInstruction* RaggedToDense(HloInstruction* ragged_operand,
++                              HloInstruction* group_sizes,
++                              absl::Span<const int64_t> prefix_dims,
++                              int new_dim_index, int ragged_dim) {
++  auto computation = ragged_operand->parent();
++  const Shape& old_shape = ragged_operand->shape();
++  HloInstruction* mask = GroupMask(computation, group_sizes, old_shape,
++                                   prefix_dims, new_dim_index, ragged_dim);
++  llvm::SmallVector<int64_t> new_shape_dims(old_shape.dimensions().begin(),
++                                            old_shape.dimensions().end());
++  new_shape_dims.insert(new_shape_dims.begin() + new_dim_index,
++                        mask->shape().dimensions(new_dim_index));
+ 
+   // Load LHS & broadcast it for each group.
+   llvm::SmallVector<int64_t> old_dims_new_shape(old_shape.dimensions().size());
+@@ -321,26 +338,6 @@ int FindRhsRaggedDim(const DotDimensionNumbers& dot_dims, int lhs_ragged_dim) {
+   return dot_dims.rhs_contracting_dimensions(ragged_contracting_index);
+ }
+ 
+-DotDimensionNumbers CreateRaggedNonContractingDotDims(
+-    const DotDimensionNumbers& old_dims, int new_dim_index, int rhs_group_dim) {
+-  DotDimensionNumbers new_dims;
+-  new_dims.add_lhs_contracting_dimensions(new_dim_index);
+-  for (auto dim : old_dims.lhs_contracting_dimensions()) {
+-    new_dims.add_lhs_contracting_dimensions(ShiftedDim(dim, new_dim_index));
+-  }
+-  for (auto dim : old_dims.lhs_batch_dimensions()) {
+-    new_dims.add_lhs_batch_dimensions(ShiftedDim(dim, new_dim_index));
+-  }
+-  new_dims.add_rhs_contracting_dimensions(rhs_group_dim);
+-  for (auto dim : old_dims.rhs_contracting_dimensions()) {
+-    new_dims.add_rhs_contracting_dimensions(dim);
+-  }
+-  for (auto dim : old_dims.rhs_batch_dimensions()) {
+-    new_dims.add_rhs_batch_dimensions(dim);
+-  }
+-  return new_dims;
+-}
+-
+ DotDimensionNumbers CreateRaggedContractingDotDims(
+     const DotDimensionNumbers& old_dims) {
+   DotDimensionNumbers new_dims;
+@@ -362,7 +359,100 @@ DotDimensionNumbers CreateRaggedContractingDotDims(
+   return new_dims;
+ }
+ 
+-absl::StatusOr<std::unique_ptr<HloInstruction>> RaggedToGeneral(
++// The non-contracting mode's product: each group's apart, the group a batch
++// dimension of the dot, each row's own by a select, summed over the groups.
++// Contracting the group dimension with the lhs zeroed outside a group's rows
++// multiplied those zeros by every other group's matrix, so one group's
++// non-finite weight was NaN in every other group's rows (0 * inf; Dew row
++// 13562: an MoE bank with one expert's non-finite weight poisoned every token
++// on that route). A row in no group sums nothing: zero.
++HloInstruction* RaggedNonContractingDot(HloRaggedDotInstruction* ragged_dot,
++                                        absl::Span<const int64_t> lhs_prefix,
++                                        int lhs_ragged_dim, int rhs_group_dim) {
++  HloComputation* computation = ragged_dot->parent();
++  const DotDimensionNumbers& dot_dims =
++      ragged_dot->ragged_dot_dimension_numbers().dot_dimension_numbers();
++  HloInstruction* lhs = ragged_dot->mutable_operand(0);
++  HloInstruction* rhs = ragged_dot->mutable_operand(1);
++  HloInstruction* group_sizes = ragged_dot->mutable_operand(2);
++  const int64_t num_groups = rhs->shape().dimensions(rhs_group_dim);
++  const int64_t lhs_rank = lhs->shape().dimensions().size();
++
++  // The lhs once for each group, the group leading.
++  llvm::SmallVector<int64_t> grouped_lhs_dims = {num_groups};
++  grouped_lhs_dims.append(lhs->shape().dimensions().begin(),
++                          lhs->shape().dimensions().end());
++  llvm::SmallVector<int64_t> lhs_in_grouped(lhs_rank);
++  for (int64_t i = 0; i < lhs_rank; ++i) {
++    lhs_in_grouped[i] = i + 1;
++  }
++  HloInstruction* grouped_lhs =
++      computation->AddInstruction(HloInstruction::CreateBroadcast(
++          ShapeUtil::MakeShape(lhs->shape().element_type(), grouped_lhs_dims),
++          lhs, lhs_in_grouped));
++
++  DotDimensionNumbers grouped_dims;
++  grouped_dims.add_lhs_batch_dimensions(0);
++  grouped_dims.add_rhs_batch_dimensions(rhs_group_dim);
++  for (int i = 0; i < dot_dims.lhs_batch_dimensions_size(); ++i) {
++    grouped_dims.add_lhs_batch_dimensions(dot_dims.lhs_batch_dimensions(i) + 1);
++    grouped_dims.add_rhs_batch_dimensions(dot_dims.rhs_batch_dimensions(i));
++  }
++  for (int i = 0; i < dot_dims.lhs_contracting_dimensions_size(); ++i) {
++    grouped_dims.add_lhs_contracting_dimensions(
++        dot_dims.lhs_contracting_dimensions(i) + 1);
++    grouped_dims.add_rhs_contracting_dimensions(
++        dot_dims.rhs_contracting_dimensions(i));
++  }
++  // Each group's product: [group, batch..., lhs free..., rhs free...], the
++  // ragged dot's result's dimensions after the group's.
++  const Shape& shape = ragged_dot->shape();
++  llvm::SmallVector<int64_t> grouped_out_dims = {num_groups};
++  grouped_out_dims.append(shape.dimensions().begin(), shape.dimensions().end());
++  const Shape grouped_shape =
++      ShapeUtil::MakeShape(shape.element_type(), grouped_out_dims);
++  HloInstruction* products =
++      computation->AddInstruction(HloInstruction::CreateDot(
++          grouped_shape, grouped_lhs, rhs, grouped_dims,
++          ragged_dot->precision_config()));
++  products->set_metadata(ragged_dot->metadata());
++
++  // Where an lhs dimension is in the result: a batch dimension at its place
++  // among them, any other after them in its order.
++  auto in_result = [&](int64_t lhs_dim) -> int64_t {
++    const auto& batch = dot_dims.lhs_batch_dimensions();
++    if (auto it = absl::c_find(batch, lhs_dim); it != batch.end()) {
++      return std::distance(batch.begin(), it);
++    }
++    int64_t position = batch.size();
++    for (int64_t dim = 0; dim < lhs_dim; ++dim) {
++      position += !absl::c_linear_search(batch, dim) &&
++                  !absl::c_linear_search(dot_dims.lhs_contracting_dimensions(),
++                                         dim);
++    }
++    return position;
++  };
++  llvm::SmallVector<int64_t> result_prefix;
++  for (int64_t dim : lhs_prefix) {
++    result_prefix.push_back(in_result(dim));
++  }
++  HloInstruction* own =
++      GroupMask(computation, group_sizes, shape, result_prefix,
++                /*new_dim_index=*/0, in_result(lhs_ragged_dim));
++  HloInstruction* zero =
++      computation->AddInstruction(Zero(shape.element_type()));
++  HloInstruction* zeros = computation->AddInstruction(
++      HloInstruction::CreateBroadcast(grouped_shape, zero, {}));
++  HloInstruction* own_products =
++      computation->AddInstruction(HloInstruction::CreateTernary(
++          grouped_shape, HloOpcode::kSelect, own, products, zeros));
++  HloComputation* add = ragged_dot->GetModule()->AddEmbeddedComputation(
++      CreateScalarAddComputation(shape.element_type()));
++  return computation->AddInstruction(
++      HloInstruction::CreateReduce(shape, own_products, zero, {0}, add));
++}
++
++absl::StatusOr<HloInstruction*> RaggedToGeneral(
+     HloRaggedDotInstruction* ragged_dot) {
+   const auto& ragged_dims = ragged_dot->ragged_dot_dimension_numbers();
+   const auto& dot_dims = ragged_dims.dot_dimension_numbers();
+@@ -394,12 +484,8 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> RaggedToGeneral(
+             "rhs_group_dimensions must have size equal to 1 when lhs ragged "
+             "dimension is a non-contracting dimension");
+       }
+-      int rhs_group_dim = ragged_dims.rhs_group_dimensions(0);
+-      lhs = RaggedToDense(lhs, group_sizes, prefix.lhs, new_dim_index,
+-                          lhs_ragged_dim);
+-      new_dot_dims = CreateRaggedNonContractingDotDims(dot_dims, new_dim_index,
+-                                                       rhs_group_dim);
+-      break;
++      return RaggedNonContractingDot(ragged_dot, prefix.lhs, lhs_ragged_dim,
++                                     ragged_dims.rhs_group_dimensions(0));
+     }
+     case RaggedDotMode::kRaggedContracting: {
+       lhs = RaggedToDense(lhs, group_sizes, prefix.lhs, new_dim_index,
+@@ -418,8 +504,9 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> RaggedToGeneral(
+     }
+   }
+ 
+-  return HloInstruction::CreateDot(ragged_dot->shape(), lhs, rhs, new_dot_dims,
+-                                   ragged_dot->precision_config());
++  return ragged_dot->parent()->AddInstruction(
++      HloInstruction::CreateDot(ragged_dot->shape(), lhs, rhs, new_dot_dims,
++                                ragged_dot->precision_config()));
+ }
+ 
+ }  // namespace
+@@ -463,10 +550,11 @@ absl::StatusOr<bool> RaggedDotRewriter::RunImpl(
+   bool changed = !ragged_dots.empty();
+ 
+   for (auto* ragged_dot : ragged_dots) {
+-    ABSL_ASSIGN_OR_RETURN(auto general_dot, RaggedToGeneral(ragged_dot));
++    ABSL_ASSIGN_OR_RETURN(HloInstruction * general_dot,
++                          RaggedToGeneral(ragged_dot));
+     general_dot->set_metadata(ragged_dot->metadata());
+-    ABSL_RETURN_IF_ERROR(ragged_dot->parent()->ReplaceWithNewInstruction(
+-        ragged_dot, std::move(general_dot)));
++    ABSL_RETURN_IF_ERROR(
++        ragged_dot->parent()->ReplaceInstruction(ragged_dot, general_dot));
+   }
+ 
+   return changed;
+diff --git a/xla/hlo/transforms/expanders/ragged_dot_rewriter_test.cc b/xla/hlo/transforms/expanders/ragged_dot_rewriter_test.cc
+index be22192..038a700 100644
+--- a/xla/hlo/transforms/expanders/ragged_dot_rewriter_test.cc
++++ b/xla/hlo/transforms/expanders/ragged_dot_rewriter_test.cc
+@@ -18,13 +18,24 @@ limitations under the License.
+ #include <gmock/gmock.h>
+ #include <gtest/gtest.h>
+ 
++#include <cstdint>
++#include <limits>
+ #include <memory>
+ #include <optional>
+ 
++#include "absl/algorithm/container.h"
++#include "absl/functional/function_ref.h"
++#include "absl/log/check.h"
+ #include "absl/strings/string_view.h"
++#include "absl/types/span.h"
++#include "xla/hlo/evaluator/hlo_evaluator.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/parser/hlo_parser.h"
+ #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
++#include "xla/literal.h"
++#include "xla/literal_util.h"
++#include "xla/shape.h"
+ #include "xla/service/decision.h"
+ #include "xla/service/gpu/ir_emission_utils.h"
+ #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+@@ -436,8 +447,10 @@ TEST_F(RaggedDotRewriterTest, RaggedNonContracting) {
+                       lhs_ragged_dims={0}, rhs_group_dims={0}
+   })",
+                         R"(
+-  // CHECK: ROOT [[dot:%[^ ]+]] = bf16[64,8]{1,0}
+-  // CHECK-SAME: lhs_contracting_dims={0,2}, rhs_contracting_dims={0,1}
++  // CHECK: [[products:%[^ ]+]] = bf16[2,64,8]{2,1,0} dot(
++  // CHECK-SAME: lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
++  // CHECK: [[own:%[^ ]+]] = bf16[2,64,8]{2,1,0} select({{.*}}, [[products]], {{.*}})
++  // CHECK: ROOT {{.*}} = bf16[64,8]{1,0} reduce([[own]], {{.*}}), dimensions={0}
+   )");
+ }
+ 
+@@ -455,9 +468,10 @@ TEST_F(RaggedDotRewriterTest, RaggedNonContractingWithBatchDimensions) {
+                       lhs_ragged_dims={1}, rhs_group_dims={1}
+   })",
+                         R"(
+-  // CHECK: ROOT [[dot:%[^ ]+]] = bf16[3,64,8]{2,1,0}
+-  // CHECK-SAME: lhs_batch_dims={0}, lhs_contracting_dims={1,3},
+-  // CHECK-SAME: rhs_batch_dims={0}, rhs_contracting_dims={1,2}
++  // CHECK: [[products:%[^ ]+]] = bf16[2,3,64,8]{3,2,1,0} dot(
++  // CHECK-SAME: lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={1,0}, rhs_contracting_dims={2}
++  // CHECK: [[own:%[^ ]+]] = bf16[2,3,64,8]{3,2,1,0} select({{.*}}, [[products]], {{.*}})
++  // CHECK: ROOT {{.*}} = bf16[3,64,8]{2,1,0} reduce([[own]], {{.*}}), dimensions={0}
+   )");
+ }
+ 
+@@ -477,11 +491,12 @@ TEST_F(RaggedDotRewriterTest, RaggedNonContractingWithNonLeadingBatchDim) {
+                       lhs_ragged_dims={0}, rhs_group_dims={0}
+   })",
+                         R"(
+-  // CHECK: s32[64,3,2,16]{3,2,1,0} broadcast({{.*}}), dimensions={2,1}
+-  // CHECK: f32[64,3,2,16]{3,2,1,0} broadcast({{.*}}), dimensions={0,2,3}
+-  // CHECK: ROOT [[dot:%[^ ]+]] = f32[2,64,8]{2,1,0}
+-  // CHECK-SAME: lhs_batch_dims={2}, lhs_contracting_dims={1,3},
+-  // CHECK-SAME: rhs_batch_dims={1}, rhs_contracting_dims={0,2}
++  // The group sizes' batch dimension is the result's first, after the group.
++  // CHECK: s32[3,2,64,8]{3,2,1,0} broadcast({{.*}}), dimensions={1,0}
++  // CHECK: [[products:%[^ ]+]] = f32[3,2,64,8]{3,2,1,0} dot(
++  // CHECK-SAME: lhs_batch_dims={0,2}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  // CHECK: [[own:%[^ ]+]] = f32[3,2,64,8]{3,2,1,0} select({{.*}}, [[products]], {{.*}})
++  // CHECK: ROOT {{.*}} = f32[2,64,8]{2,1,0} reduce([[own]], {{.*}}), dimensions={0}
+   )");
+ }
+ 
+@@ -501,9 +516,10 @@ TEST_F(RaggedDotRewriterTest, RaggedNonContractingWithFlatGroupSizes) {
+                       lhs_ragged_dims={1}, rhs_group_dims={1}
+   })",
+                         R"(
+-  // CHECK: ROOT [[dot:%[^ ]+]] = f32[3,64,8]{2,1,0}
+-  // CHECK-SAME: lhs_batch_dims={0}, lhs_contracting_dims={1,3},
+-  // CHECK-SAME: rhs_batch_dims={0}, rhs_contracting_dims={1,2}
++  // CHECK: [[products:%[^ ]+]] = f32[2,3,64,8]{3,2,1,0} dot(
++  // CHECK-SAME: lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={1,0}, rhs_contracting_dims={2}
++  // CHECK: [[own:%[^ ]+]] = f32[2,3,64,8]{3,2,1,0} select({{.*}}, [[products]], {{.*}})
++  // CHECK: ROOT {{.*}} = f32[3,64,8]{2,1,0} reduce([[own]], {{.*}}), dimensions={0}
+   )");
+ }
+ 
+@@ -522,11 +538,113 @@ TEST_F(RaggedDotRewriterTest, RaggedNonContractingWithExtraLhsDim) {
+                       lhs_ragged_dims={1}, rhs_group_dims={0}
+   })",
+                         R"(
+-  // CHECK: ROOT [[dot:%[^ ]+]] = f32[2,6,5]{2,1,0}
+-  // CHECK-SAME: lhs_contracting_dims={1,3}, rhs_contracting_dims={0,1}
++  // CHECK: [[products:%[^ ]+]] = f32[3,2,6,5]{3,2,1,0} dot(
++  // CHECK-SAME: lhs_batch_dims={0}, lhs_contracting_dims={3}, rhs_batch_dims={0}, rhs_contracting_dims={1}
++  // CHECK: [[own:%[^ ]+]] = f32[3,2,6,5]{3,2,1,0} select({{.*}}, [[products]], {{.*}})
++  // CHECK: ROOT {{.*}} = f32[2,6,5]{2,1,0} reduce([[own]], {{.*}}), dimensions={0}
+   )");
+ }
+ 
++// `shape` filled with `value` of each element's index.
++Literal Filled(const Shape& shape,
++               absl::FunctionRef<float(absl::Span<const int64_t>)> value) {
++  Literal literal(shape);
++  CHECK_OK(literal.Populate<float>(value));
++  return literal;
++}
++
++// Each row's product reads its own group's matrix alone, as the evaluator's
++// ragged dot computes it: one group's infinity weight (group 1's, along
++// `rhs_group_dim`) leaves every other group's rows finite and as they were,
++// where 0 * inf made them NaN (Dew row 13562); a row in no group is zero.
++void ExpectRowsReadTheirOwnGroup(absl::string_view hlo, int rhs_group_dim,
++                                 const Literal& group_sizes,
++                                 RaggedDotRewriter rewriter) {
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> ragged,
++                       ParseAndReturnUnverifiedModule(hlo));
++  std::unique_ptr<HloModule> rewritten = ragged->Clone();
++  ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(rewritten.get()));
++  ASSERT_TRUE(changed);
++  const HloInstruction* root = ragged->entry_computation()->root_instruction();
++  Literal lhs = Filled(root->operand(0)->shape(),
++                       [](absl::Span<const int64_t> index) {
++                         return 1.0f + absl::c_accumulate(index, 0) % 3;
++                       });
++  Literal rhs = Filled(root->operand(1)->shape(),
++                       [&](absl::Span<const int64_t> index) {
++                         return index[rhs_group_dim] == 1
++                                    ? std::numeric_limits<float>::infinity()
++                                    : 0.5f + index.back();
++                       });
++  ASSERT_OK_AND_ASSIGN(Literal want, HloEvaluator().Evaluate(
++                                         *ragged, {&lhs, &rhs, &group_sizes}));
++  ASSERT_OK_AND_ASSIGN(Literal got,
++                       HloEvaluator().Evaluate(*rewritten,
++                                               {&lhs, &rhs, &group_sizes}));
++  // Literals compare their floats by value: a NaN in either is a difference.
++  EXPECT_EQ(got, want);
++}
++
++TEST_F(RaggedDotRewriterTest, RaggedNonContractingRowsReadTheirOwnGroupAlone) {
++  // Row 3 in no group (sizes 1 and 2 of 4 rows).
++  ExpectRowsReadTheirOwnGroup(R"(
++  HloModule module
++
++  ENTRY main {
++    p0 = f32[4,2]{1,0} parameter(0)
++    p1 = f32[2,2,3]{2,1,0} parameter(1)
++    p2 = s32[2]{0} parameter(2)
++    ROOT ragged-dot = f32[4,3]{1,0} ragged-dot(p0, p1, p2),
++                      lhs_contracting_dims={1}, rhs_contracting_dims={1},
++                      lhs_ragged_dims={0}, rhs_group_dims={0}
++  })",
++                              /*rhs_group_dim=*/0,
++                              LiteralUtil::CreateR1<int32_t>({1, 2}),
++                              RaggedDotRewriter(GetCudaComputeCapability()));
++}
++
++TEST_F(RaggedDotRewriterTest,
++       RaggedNonContractingRowsReadTheirOwnGroupAloneInEachBatch) {
++  // A batch dimension the lhs holds second, group sizes of their own each.
++  ExpectRowsReadTheirOwnGroup(R"(
++  HloModule module
++
++  ENTRY main {
++    p0 = f32[6,2,2]{2,1,0} parameter(0)
++    p1 = f32[3,2,2,3]{3,2,1,0} parameter(1)
++    p2 = s32[2,3]{1,0} parameter(2)
++    ROOT ragged-dot = f32[2,6,3]{2,1,0} ragged-dot(p0, p1, p2),
++                      lhs_contracting_dims={2}, rhs_contracting_dims={2},
++                      lhs_batch_dims={1}, rhs_batch_dims={1},
++                      lhs_ragged_dims={0}, rhs_group_dims={0}
++  })",
++                              /*rhs_group_dim=*/0,
++                              LiteralUtil::CreateR2<int32_t>({{2, 0, 3},
++                                                              {1, 4, 1}}),
++                              RaggedDotRewriter(GetCudaComputeCapability()));
++}
++
++TEST_F(RaggedDotRewriterTest,
++       RaggedNonContractingRowsReadTheirOwnGroupAloneUnderAnOuterDim) {
++  // Group sizes over the lhs non-contracting dimension outer to the ragged
++  // one, the group dimension the rhs's last but one.
++  ExpectRowsReadTheirOwnGroup(R"(
++  HloModule module
++
++  ENTRY main {
++    p0 = f32[2,6,4]{2,1,0} parameter(0)
++    p1 = f32[4,3,5]{2,1,0} parameter(1)
++    p2 = s64[2,3]{1,0} parameter(2)
++    ROOT ragged-dot = f32[2,6,5]{2,1,0} ragged-dot(p0, p1, p2),
++                      lhs_contracting_dims={2}, rhs_contracting_dims={0},
++                      lhs_ragged_dims={1}, rhs_group_dims={1}
++  })",
++                              /*rhs_group_dim=*/1,
++                              LiteralUtil::CreateR2<int64_t>({{3, 2, 1},
++                                                              {0, 6, 0}}),
++                              RaggedDotRewriter(GetCudaComputeCapability()));
++}
++
+ TEST_F(RaggedDotRewriterTest, RaggedContractingWithExtraContractingDim) {
+   // group_sizes ranges over the contracting dimension outer to the ragged
+   // one, which the group dimension the expansion inserts shifts.
