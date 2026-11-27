@@ -23,6 +23,7 @@ from typing import Any, cast
 from jax._src import api
 from jax._src import config
 from jax._src import core
+from jax._src import custom_call_targets
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
@@ -70,6 +71,22 @@ class _FlatCallback:
   def __call__(self, *flat_args: Array) -> Sequence[Array]:
     args, kwargs = tree_util.tree_unflatten(self.in_tree, flat_args)
     return tree_util.tree_leaves(self.callback_func(*args, **kwargs))
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _NumpyInputs:
+  """A callback of JAX's own that takes its inputs as the host's NumPy arrays.
+
+  `io_callback_impl` places a callback's inputs on the CPU device before it
+  calls it, as the public callbacks promise `jax.Array` inputs; that is one
+  `device_put` a call, which dominates a callback that does little, such as each
+  step of the Mosaic GPU interpreter. Wrapped in this, a callback is handed the
+  arrays as XLA gave them (`io_callback_numpy_inputs`).
+  """
+  func: Callable[..., Any]
+
+  def __call__(self, *args, **kwargs):
+    return self.func(*args, **kwargs)
 
 
 def pure_callback_impl(
@@ -427,7 +444,10 @@ def io_callback_impl(
         " inputs on. Make sure \"cpu\" is listed in --jax_platforms or the"
         " JAX_PLATFORMS environment variable."
     ) from e
-  args = api.device_put(args, cpu_device)
+  if isinstance(callback.callback_func, _NumpyInputs):
+    args = tree_util.tree_map(np.asarray, args)
+  else:
+    args = api.device_put(args, cpu_device)
   # The callback may run on the dispatching thread; ignore that thread's mesh.
   with (
       config.default_device(cpu_device),
@@ -585,6 +605,19 @@ def io_callback(
       ordered=ordered,
   )
   return tree_util.tree_unflatten(out_tree, out_flat)
+
+
+def io_callback_numpy_inputs(
+    callback: Callable[..., Any], result_shape_dtypes: Any, *args: Any,
+    **kwargs: Any,
+):
+  """`io_callback`, its callback handed NumPy arrays rather than `jax.Array`s.
+
+  For JAX's own callbacks only (`_NumpyInputs`): the public callbacks' inputs
+  stay `jax.Array`s.
+  """
+  return io_callback(_NumpyInputs(callback), result_shape_dtypes, *args,
+                     **kwargs)
 
 
 def is_empty_shape(s: core.Shape) -> bool:
@@ -811,14 +844,17 @@ def emit_python_callback(
 
   # First we apply checks to ensure output shapes and dtypes match the expected
   # ones.
+  callback_x64 = config.enable_x64.value
+
   def _wrapped_callback(*args):
-    out_vals = callback(*args)
-    if len(out_vals) != len(result_avals):
-      raise RuntimeError(
-          "Mismatched number of outputs from callback. "
-          "Expected: {}, Actual: {}".format(len(result_avals), len(out_vals)))
-    # Handle Python literals, and custom arrays, e.g., tf.Tensor.
-    out_vals = tuple(dtypes.canonicalize_value(np.asarray(a)) for a in out_vals)
+    with config.enable_x64(callback_x64):
+      out_vals = callback(*args)
+      if len(out_vals) != len(result_avals):
+        raise RuntimeError(
+            "Mismatched number of outputs from callback. "
+            "Expected: {}, Actual: {}".format(len(result_avals), len(out_vals)))
+      # Handle Python literals, and custom arrays, e.g., tf.Tensor.
+      out_vals = tuple(dtypes.canonicalize_value(np.asarray(a)) for a in out_vals)
     for i, (out_val, out_aval) in enumerate(zip(out_vals, result_avals)):
       if out_val.shape != out_aval.shape:
         raise RuntimeError(
@@ -860,8 +896,7 @@ def emit_python_callback(
     return outputs, token, None
 
   device = "gpu" if platform in {"cuda", "rocm", "oneapi"} else "cpu"
-  partition = "_partitioned" if partitioned else ""
-  call_target_name = f"xla_ffi{partition}_python_{device}_callback"
+  call_target_name = custom_call_targets.PYTHON_CALLBACK[(device, bool(partitioned))]
   if token:
     callback_without_token = _wrapped_callback
     def _wrapped_callback(token, *args):

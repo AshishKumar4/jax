@@ -20,6 +20,7 @@ from functools import partial, wraps
 import json
 import math
 import textwrap
+import types
 import unittest
 
 from absl.testing import absltest
@@ -2597,6 +2598,18 @@ class ArrayPjitTest(jtu.JaxTestCase):
         f(inp)
     self.assertEqual(tracing_count(), 2)  # twice for f
 
+  def test_abstract_device_states_a_gpus_compute_capability(self):
+    # A compile-only GPU states the capability its lowering targets; its
+    # mesh's abstract device carries it, where a host has no such GPU.
+    gpu = types.SimpleNamespace(platform='gpu', device_kind='NVIDIA A100-SXM4-40GB',
+                                core_count=108, compute_capability='8.0')
+    abstract = mesh_lib.abstract_device_from(gpu)
+    self.assertEqual(abstract.compute_capability, '8.0')
+    self.assertEqual((abstract.device_kind, abstract.num_cores, abstract.platform),
+                     ('NVIDIA A100-SXM4-40GB', 108, 'gpu'))
+    cpu = types.SimpleNamespace(platform='cpu', device_kind='cpu')
+    self.assertIsNone(mesh_lib.abstract_device_from(cpu).compute_capability)
+
   def test_pjit_relayout_multi_slice(self):
     mesh = jtu.create_mesh((2, 2), ('x', 'y'))
 
@@ -4921,6 +4934,35 @@ class ArrayPjitTest(jtu.JaxTestCase):
 
 
 class ShardingInTypesTest(jtu.JaxTestCase):
+
+  @jtu.with_explicit_mesh((2,), ('x',))
+  def test_ragged_dot_decomposed_over_an_explicit_mesh(self, mesh):
+    # The decomposition (the ragged dot instruction off) folds in a group at a
+    # time: an rhs sharded on its columns, or on its groups with the result's
+    # rows on the same axis, lowers with the sharding asked, each row its own
+    # group's product, forward and back (Dew row 13562).
+    lhs = np.arange(32, dtype=np.float32).reshape(8, 4) / 8
+    rhs = np.arange(48, dtype=np.float32).reshape(2, 4, 6) / 16
+    sizes = jnp.array([3, 5], np.int32)
+    want = np.concatenate([lhs[:3] @ rhs[0], lhs[3:] @ rhs[1]])
+    cases = ((P(None, None), P(None, None, 'x'), P(None, 'x')),
+             (P(None, None), P('x', None, None), P('x', None)),
+             (P('x', None), P(None, None, None), P(None, None)))
+    for lhs_spec, rhs_spec, out_spec in cases:
+      with (self.subTest(lhs=lhs_spec, rhs=rhs_spec, out=out_spec),
+            config.jax_ragged_dot_use_ragged_dot_instruction(False)):
+        product = jax.jit(lambda l, r, g, s=out_spec: lax.ragged_dot(
+            l, r, g, out_sharding=s))
+        x = jax.device_put(lhs, lhs_spec)
+        y = jax.device_put(rhs, rhs_spec)
+        out = product(x, y, sizes)
+        self.assertEqual(out.sharding, NamedSharding(mesh, out_spec))
+        self.assertAllClose(out, want, rtol=1e-6)
+        d_lhs = jax.jit(jax.grad(
+            lambda l, r: product(l, r, sizes).sum()))(x, y)
+        self.assertAllClose(d_lhs, np.concatenate(
+            [np.ones((3, 6)) @ rhs[0].T, np.ones((5, 6)) @ rhs[1].T]),
+            rtol=1e-6)
 
   def check_wsc_in_lowered(self, text):
     self.assertIn('sdy.sharding_constraint', text)

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import collections
+import concurrent.futures
 import contextlib
 import functools
 import logging
@@ -25,6 +26,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 from jax import lax
+from jax._src import callback as callback_lib
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
@@ -1288,6 +1290,27 @@ class IOCallbackTest(jtu.JaxTestCase):
     super().tearDown()
     dispatch.runtime_tokens.clear()
 
+  def test_io_callback_keeps_its_lowerings_x64_on_another_thread(self):
+    # A float64 callback compiled under enable_x64 and run where the executing
+    # thread has x64 off returns float64, not a float32 its own dtype check
+    # refuses (Dew ledger 4750).
+    def cb(value):
+      return np.int32(0), np.asarray(value, dtype=np.float64)
+
+    def f(value):
+      return io_callback(
+          cb, (jax.ShapeDtypeStruct((), np.int32),
+               jax.ShapeDtypeStruct((), np.float64)),
+          value, ordered=True)[1]
+
+    with jax.enable_x64(True):
+      operand = jnp.asarray(1.25, dtype=jnp.float64)
+      compiled = jax.jit(f).lower(operand).compile()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+      result = pool.submit(compiled, operand).result()
+    self.assertEqual(np.asarray(result).dtype, np.float64)
+    self.assertEqual(float(result), 1.25)
+
   def test_io_callback_can_mutate_state(self):
     x = 0
     def cb():
@@ -1303,6 +1326,25 @@ class IOCallbackTest(jtu.JaxTestCase):
     f()
     jax.effects_barrier()
     self.assertEqual(x, 2)
+
+  @parameterized.parameters(True, False)
+  def test_only_jaxs_own_callbacks_take_numpy_inputs(self, jitted):
+    # The public io_callback hands its callback jax.Arrays; JAX's own callbacks
+    # routed through io_callback_numpy_inputs (the Mosaic GPU interpreter's)
+    # take the host's NumPy arrays, with no device_put a call.
+    seen = []
+    def cb(x):
+      seen.append(type(x))
+      return x
+
+    shape = jax.ShapeDtypeStruct((2,), jnp.float32)
+    for route in (io_callback, callback_lib.io_callback_numpy_inputs):
+      f = lambda x: route(cb, shape, x)
+      out = (jax.jit(f) if jitted else f)(jnp.arange(2.))
+      self.assertAllClose(out, jnp.arange(2.))
+    jax.effects_barrier()
+    self.assertTrue(issubclass(seen[0], jax.Array))
+    self.assertIs(seen[1], np.ndarray)
 
   def test_io_callback_can_be_batched_if_unordered(self):
     _mut = 0
