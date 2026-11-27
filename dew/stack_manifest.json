@@ -73,7 +73,7 @@
    "fix": "cpu-host-cache-key",
    "topic": "core-artifacts",
    "status": "reworked",
-   "why": "C10: the CPU target from jaxlib's cpu_target_machine",
+   "why": "C10: the topology's fingerprint keys XLA:CPU's target; the host's CPU where a backend serves no topology",
    "subject": "Key a CPU program's persistent cache entry by the host's CPU, which XLA:CPU compiles for (0.12.0.1.post13).",
    "deleted_when": "none known",
    "commits": [
@@ -1658,8 +1658,8 @@
   {
    "fix": "xla-dot-algorithm-multiply",
    "topic": "xla-numerics",
-   "status": "retired",
-   "why": "XLA #11: pinned XLA declines an algorithm it cannot expand; its F8 multiply type is gpu_dot_strength_wide's (#15)",
+   "status": "carried",
+   "why": "XLA #11: kept, the fork's one-element FP8, F16_F16_F16 and BF16_BF16_BF16 dots need it; its F8 operand type is #15's accumulator rule",
    "subject": "a small dot strength-reduces as its precision algorithm states (delete with the XLA patch dot_algorithm_multiply: when an A100 build without it computes these cases as stated, row 8554)",
    "deleted_when": "none stated",
    "commits": [
