@@ -209,7 +209,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     for platform_name in ("gpu", "tpu"):
       with_cpu, without = hashlib.sha256(), hashlib.sha256()
       cache_key._hash_host_cpu(
-          with_cpu, types.SimpleNamespace(platform=platform_name))
+          with_cpu, types.SimpleNamespace(platform=platform_name), None)
       self.assertEqual(with_cpu.digest(), without.digest())
 
   def test_hash_string(self):
