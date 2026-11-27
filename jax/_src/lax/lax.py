@@ -8309,15 +8309,32 @@ def _ragged_dot_general_impl(
     case RaggedDotMode.RAGGED_NONCONTRACTING:
       rhs_group_dims = ragged_dot_dimension_numbers.rhs_group_dimensions
       assert len(rhs_group_dims) == 1
-      return _dot_general(
+      # Each group's product apart (the group a batch dimension), then each
+      # row's own group's taken by a select: a sum over the groups would
+      # multiply a row's zeros by every other group's matrix, so one group's
+      # non-finite weight would be NaN in every row (0 * inf).
+      products = _dot_general(
           expand(lhs, lhs_ragged_dim, group_sizes, *l_prefix),
           rhs,
           dimension_numbers=(
-              (incr(l_contract) + [0], list(r_contract) + [rhs_group_dims[0]]),
-              (incr(l_batch), r_batch),
+              (incr(l_contract), list(r_contract)),
+              ([0] + incr(l_batch), [rhs_group_dims[0]] + list(r_batch)),
           ),
-          out_sharding=out_sharding,
       )
+      # Which group each of the product's lhs positions is in: the lhs's own
+      # membership, its contracting dimensions reduced, as the product orders
+      # its dimensions (the group, the batch, the lhs's free ones).
+      member = expand(full_like(lhs, True, dtype=np.bool_), lhs_ragged_dim,
+                      group_sizes, *l_prefix)
+      member = reduce_or(member, tuple(incr(l_contract)))
+      kept = [d for d in range(lhs.ndim) if d not in l_contract]
+      free = [d for d in kept if d not in l_batch]
+      member = transpose(member, [0] + [1 + kept.index(d) for d in l_batch]
+                         + [1 + kept.index(d) for d in free])
+      member = broadcast_in_dim(member, products.shape,
+                                tuple(range(member.ndim)))
+      return reduce_sum(select(member, products, _zeros(products)), (0,),
+                        out_sharding=out_sharding)
     case RaggedDotMode.RAGGED_CONTRACTING:
       rhs_ragged_dim = r_contract[l_contract.index(lhs_ragged_dim)]
       r_prefix = _ragged_dot_prefix_dims(
