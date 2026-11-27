@@ -469,13 +469,10 @@ def pallas_call_tpu_lowering_rule(
   mlir_ctx = ctx.module_context.context
   tpu.register_dialect(mlir_ctx)
 
-  # The kernel's lowering stages what it defers (a PRNG's seeding, lower_fun)
-  # as a kernel's body.
   with (
       mlir_ctx,
       ir.Location.unknown(mlir_ctx),
       xla_metadata.clear_xla_metadata(),
-      pallas_core.kernel_trace(),
   ):
     mosaic_module = lowering.lower_jaxpr_to_pipelined_module(
         ctx,
@@ -737,18 +734,17 @@ def mpmd_map_tpu_lowering_rule(
             jaxpr, mesh, (*meshes, *external_meshes)
         )
 
-      with pallas_core.kernel_trace():
-        lowering.lower_jaxpr_into_unpipelined_module(
-            ctx,
-            mosaic_module,
-            jaxpr,
-            jax_mesh=jax_mesh,
-            pallas_mesh=mesh,
-            name=mlir.sanitize_name(jaxpr.debug_info.func_name),
-            dynamic_shape_replacement_enabled=pallas_core.dynamic_shapes_export_enabled(),
-            num_scratch=num_scratch,
-            needs_layout_passes=mosaic_params.needs_layout_passes,
-        )
+      lowering.lower_jaxpr_into_unpipelined_module(
+          ctx,
+          mosaic_module,
+          jaxpr,
+          jax_mesh=jax_mesh,
+          pallas_mesh=mesh,
+          name=mlir.sanitize_name(jaxpr.debug_info.func_name),
+          dynamic_shape_replacement_enabled=pallas_core.dynamic_shapes_export_enabled(),
+          num_scratch=num_scratch,
+          needs_layout_passes=mosaic_params.needs_layout_passes,
+      )
 
   if debug:
     pm = passmanager.PassManager.parse("builtin.module(canonicalize)", mlir_ctx)

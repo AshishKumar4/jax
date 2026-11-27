@@ -92,7 +92,6 @@ jax_multiplatform_test(
         "//jax/experimental:pallas_mosaic_gpu",
         "//jax/experimental:pallas_tpu",
         "//jax/experimental:pallas_tpu_ops",
-        "//jax/extend",
     ] + py_deps([
         "absl/testing",
         "numpy",

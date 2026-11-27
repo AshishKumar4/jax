@@ -18,5 +18,4 @@
 from jax._src.pallas.core import (
     GridMapping as GridMapping,
     register_lowering_rule as register_lowering_rule,
-    tracing_kernel as tracing_kernel,
 )
