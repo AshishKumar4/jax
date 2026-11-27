@@ -93,12 +93,6 @@ archive_override(
         # error-free transforms' products contracted into fused multiply-adds, their compensations lost). Delete
         # when upstream XLA honours a no-contract mark on an op (an upstream issue, not yet filed).
         "//third_party:xla/no_contract_mark.patch",
-        # A small dot strength-reduces as its precision algorithm states, each multiplied and summed as it says
-        # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
-        # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554). At this pin
-        # upstream keeps such a dot a dot (StrengthReduceAlgorithmSupports): delete when an A100 build without it
-        # compiles and computes lax_test's testSmallDotComputesAsItsAlgorithmStates and SmallF8 cases as stated.
-        "//third_party:xla/dot_algorithm_multiply.patch",
         # DotStrengthReduction multiplies in the accumulator type when an implicit GEMV is reduced.
         "//third_party:xla/gpu_dot_strength_wide.patch",
         # A sliced parameter whose slice reads a buffer another of the hero's sliced parameters makes (a slice
