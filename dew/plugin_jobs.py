@@ -4,7 +4,8 @@ beside this script; aarch64's are built by the fork's build-plugin workflow on G
 
     python3 dew/plugin_jobs.py VERSION SHA > dew/plugin-jobs.json
     node launch dew-a10-build-<ts> lambda:gpu_1x_a10 --role build
-    node put dew-a10-build-<ts> dew/bazel.token dew/debug_split.py dew/bazel_credentials.py dew/build_plugin.sh
+    node put dew-a10-build-<ts> dew/bazel.token dew/debug_split.py dew/bazel_credentials.py dew/build_plugin.sh \
+        dew/patch_stack.py
     node push dew-a10-build-<ts> dew/plugin-jobs.json
 
 A plugin build needs no GPU: Bazel's CUDA toolchain is hermetic and Dew's remote cache serves its objects. It never
@@ -33,11 +34,12 @@ def jobs(version: str, sha: str) -> dict:
         raise SystemExit(f"plugin_jobs: {version!r} is no release version or {sha!r} no full commit sha")
     tag = version.rsplit(".", 1)[-1].upper()
     build = (f"DEW_BAZEL_TOKEN_FILE=$SESSION/extra/bazel.token DEW_DEBUG_SPLIT=$SESSION/extra/debug_split.py "
+             f"DEW_PATCH_STACK=$SESSION/extra/patch_stack.py "
              f"taskset -c 0-{CORES - 1} bash $SESSION/extra/build_plugin.sh {sha} {version} \"$OUT\"")
     return {"note": f"{version}'s x86_64 plugin build on a build node (dew/plugin_jobs.py)", "inputs": [], "jobs": [
         {"name": f"PLUGIN-{tag}-x86_64", "gpu": "a10", "ref": "main", "keep": [],
          "prepare": f"git ls-remote {FORK} {sha} && {build}", "prepare_minutes": 240, "minutes": 5,
-         "run": "ls -l \"$OUT\"/dist/*.whl \"$OUT\"/debug-*.tar.gz",
+         "run": "ls -l \"$OUT\"/dist/*.whl \"$OUT\"/debug-*.tar.gz \"$OUT\"/sources-*.json",
          "measures": f"{version}'s CUDA and PJRT plugins, every Python and CUDA, for x86_64"}]}
 
 
