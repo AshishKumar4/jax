@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import zipfile
@@ -759,3 +760,21 @@ def test_a_staging_index_lists_the_forks_projects_alone_every_file_hashed(tmp_pa
     with pytest.raises(SystemExit):
         patch_stack.staged(tmp_path, "0.12.0.1.post102", "https://pypi.dewml.dev", manifests,
                            [{**assets[0], "digest": None}])
+
+
+def test_each_cells_record_queries_under_its_wheels_own_build_options():
+    """A cell's record queries under each wheel build's own options as build.py ran it (its log's [EXECUTING]
+    lines), --config=cuda_libraries_from_stubs, which it appends itself, among them: queried under the options it
+    writes alone, the CI config's include_cuda_libs=true failed the wheels' analysis (row 5670)."""
+    log = (
+        "INFO building\n"
+        "[EXECUTING] /usr/bin/bazelisk build --config=ci_linux_x86_64_cuda --repo_env=HERMETIC_CUDA_VERSION=12.9.1 "
+        "--config=cuda_libraries_from_stubs '--action_env=PATH=/a b' //jaxlib/tools:jaxlib_wheel\n"
+        "noise [EXECUTING] /usr/bin/bazelisk build --config=cuda_libraries_from_stubs "
+        "//jaxlib/tools:jax_cuda_plugin_wheel\n"
+        "[EXECUTING] /usr/bin/bazelisk info output_base\n")
+    found = patch_stack.invocations(log)
+    assert [target for _, target in found] == ["//jaxlib/tools:jaxlib_wheel", "//jaxlib/tools:jax_cuda_plugin_wheel"]
+    assert shlex.split(found[0][0]) == ["--config=ci_linux_x86_64_cuda", "--repo_env=HERMETIC_CUDA_VERSION=12.9.1",
+                                        "--config=cuda_libraries_from_stubs", "--action_env=PATH=/a b"]
+    assert all("--config=cuda_libraries_from_stubs" in options for options, _ in found)

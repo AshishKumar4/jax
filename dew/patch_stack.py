@@ -57,6 +57,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -242,6 +243,19 @@ def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
         for path in paths:
             main.pop(path, None)
     return {"main": main, "external": outer, "patches": patches}
+
+
+def invocations(log: str) -> list[tuple[str, str]]:
+    """Each wheel build a cell's log shows build.py running (its "[EXECUTING] <bazel> build <options> <target>"
+    lines), as (its options, shell-quoted, its target): what each cell's record queries under, so the record reads
+    what that build configured, the options build.py appends itself (--config=cuda_libraries_from_stubs) among
+    them."""
+    found = []
+    for line in log.splitlines():
+        if executed := re.search(r"\[EXECUTING\] \S+ build (.+)$", line):
+            words = shlex.split(executed[1])
+            found.append((" ".join(map(shlex.quote, words[:-1])), words[-1]))
+    return found
 
 
 def merged(cells: dict[str, dict], commit: str, wheels: list[Path]) -> dict:
@@ -773,6 +787,9 @@ def main() -> int:
     recording.add_argument("output_base", type=Path)
     recording.add_argument("read", type=Path, help="the cell's queries' output")
     merging = commands.add_parser("merged", help="a machine's cells' records, as sources-<machine>.json")
+    executing = commands.add_parser("invocations", help="each wheel build a cell's log shows, one a line: its "
+                                                       "options, a tab, its target")
+    executing.add_argument("log", type=Path)
     merging.add_argument("commit", help="the commit the build checked out (its commit.txt)")
     merging.add_argument("dist", type=Path, help="the directory of the wheels it made")
     merging.add_argument("cells", type=Path, nargs="+", help="each cell's record, named <cell>.json")
@@ -817,6 +834,10 @@ def main() -> int:
         print(json.dumps(recorded(args.workspace, args.output_base, args.read.read_text().splitlines()),
                          sort_keys=True))
         return 0
+    if args.command == "invocations":
+        for options, target in invocations(args.log.read_text(errors="replace")):
+            print(f"{options}\t{target}")
+        return
     if args.command == "merged":
         print(json.dumps(merged({path.stem: json.loads(path.read_text()) for path in args.cells}, args.commit,
                                 sorted(args.dist.glob("*.whl"))), sort_keys=True))

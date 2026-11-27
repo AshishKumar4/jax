@@ -149,14 +149,7 @@ record_cell() {
   mkdir -p "$out/read"
   : > "$out/read/$cell.txt"
   : > "$out/read/$cell.log"
-  invocations=$(python3 - "$out/plugin-$cell.log" <<'PY'
-import re, shlex, sys
-for line in open(sys.argv[1], errors="replace"):
-    if found := re.search(r"\[EXECUTING\] \S+ build (.*)$", line):
-        words = shlex.split(found[1])
-        print(" ".join(map(shlex.quote, words[:-1])) + "\t" + words[-1])
-PY
-)
+  invocations=$(python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" invocations "$out/plugin-$cell.log")
   [ -n "$invocations" ] || { echo "build_plugin: no wheel build in $out/plugin-$cell.log to record" >&2; return 1; }
   while IFS=$'\t' read -r options target; do
     targets="$targets${targets:+ + }$target"
