@@ -63,7 +63,8 @@ def _device_to_host_funcs():
   """Generates device-to-host transfer functions.
 
   A CPU array in device memory reaches the host without a copy, and is held to
-  the guard as an accelerator array's copy is (`array._guard_host_read`).
+  the guard as an accelerator array's copy is (jaxlib's
+  `PyArray::GuardInPlaceHostRead`).
   """
   with jax.transfer_guard_host_to_device("allow"):
     device_arrays = [jnp.ones(1) for _ in range(6)]
