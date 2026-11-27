@@ -1,0 +1,53 @@
+diff --git a/xla/stream_executor/cuda/cuda_dnn.cc b/xla/stream_executor/cuda/cuda_dnn.cc
+index f2c228d2947..e839bd183ef 100644
+--- a/xla/stream_executor/cuda/cuda_dnn.cc
++++ b/xla/stream_executor/cuda/cuda_dnn.cc
+@@ -3978,9 +3978,47 @@ static absl::StatusOr<cudnn_frontend::ExecutionPlan> GetExecPlanFromHeuristics(
+              << ". absl::Status of final plan: " << CudnnStatusToString(status);
+ }
+ 
++// The execution plan of the first engine cuDNN's heuristics give `op_graph`
++// that runs it without workspace and under the strictest numerical policy (no
++// Winograd, no nondeterminism, no down-converted input), for a convolution
++// compiled with no algorithm (the autotuner's default, algo_id -1, which a
++// deviceless compile keeps): it reaches the runtime with no workspace
++// allocated, and no policy of its compile reaches here to relax, so none is.
++// Refused where no such engine exists.
++static absl::StatusOr<cudnn_frontend::ExecutionPlan> UnallocatedExecutionPlan(
++    const CudnnHandle& cudnn, cudnn_frontend::OperationGraph& op_graph) {
++  auto strict = [](cudnnBackendDescriptor_t engine_config) {
++    return GenericEngineFilter(engine_config, /*disable_winograd=*/true,
++                               /*disable_nondeterminism=*/true,
++                               /*disable_tensor_core=*/false);
++  };
++  cudnn_frontend::EngineConfigList engine_configs;
++  cudnn_frontend::get_heuristics_list<2>(
++      {"heuristics_instant", "heuristics_fallback"}, op_graph, strict,
++      engine_configs, true);
++  for (const auto& engine_config : engine_configs) {
++    cudnn_frontend::ExecutionPlan plan =
++        cudnn_frontend::ExecutionPlanBuilder()
++            .setHandle(cudnn.handle())
++            .setEngineConfig(engine_config, op_graph.getTag())
++            .build();
++    if (plan.get_status() == CUDNN_STATUS_SUCCESS &&
++        plan.getWorkspaceSize() == 0) {
++      return plan;
++    }
++  }
++  return absl::NotFoundError(absl::StrCat(
++      "No deterministic cuDNN engine of the ", engine_configs.size(),
++      " its heuristics give runs ", op_graph.getTag(),
++      " without workspace; autotune the convolution on a device"));
++}
++
+ static absl::StatusOr<cudnn_frontend::ExecutionPlan> RebuildExecutionPlan(
+     const CudnnHandle& cudnn, const dnn::AlgorithmDesc& desc,
+-    const cudnn_frontend::OperationGraph& op_graph) {
++    cudnn_frontend::OperationGraph& op_graph) {
++  if (desc.algo_id() < 0) {
++    return UnallocatedExecutionPlan(cudnn, op_graph);
++  }
+   // Errors encountered when building a cuDNN operation graph are surfaced in an
+   // unprecedented and innovative way: they're written into a field of the
+   // contained engine object, but then clobbered by the object's move
