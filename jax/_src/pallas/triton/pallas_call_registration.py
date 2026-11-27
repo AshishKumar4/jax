@@ -21,17 +21,19 @@ import json
 from typing import Final
 
 from jax._src import core as jax_core
+from jax._src import custom_call_targets
 from jax._src import deprecations
 from jax._src import frozen_dict
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src import gpu_info as gpu_info_lib
+from jax._src.lib.mlir import passmanager as pm
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.triton import core as triton_core
 from jax._src.pallas.triton import lowering
 
 
-CUSTOM_CALL_TARGET_NAME: Final = "__gpu$xla.gpu.triton"
+CUSTOM_CALL_TARGET_NAME: Final = custom_call_targets.TRITON
 
 
 def normalize_grid(grid: pallas_core.StaticGrid) -> tuple[int, int, int]:
@@ -127,6 +129,15 @@ def pallas_call_lowering(
     print(module_op.get_asm(enable_debug_info=True, pretty_debug_info=True))
 
   grid_x, grid_y, grid_z = normalize_grid(lowering_result.grid)
+  if not debug:
+    # The kernel's locations name where its body and helpers were traced, and
+    # a helper traced once a process (a reduction's combiner, a scan's) keeps
+    # its first caller's: one kernel would serialize apart across processes
+    # and call orders, its program with it. XLA strips them before LLVM
+    # anyway, reading them only for its diagnostics; `debug` keeps them.
+    pm.PassManager.parse(
+        "builtin.module(strip-debuginfo)", context=module_op.context
+    ).run(module_op)
   buf = io.BytesIO()
   module_op.write_bytecode(buf)
 
@@ -156,7 +167,7 @@ def pallas_call_lowering(
         serialized_metadata
     )
   return mlir.custom_call(
-      call_target_name="__gpu$xla.gpu.triton",
+      call_target_name=CUSTOM_CALL_TARGET_NAME,
       result_types=out_types,
       operands=in_nodes,
       backend_config=backend_config,

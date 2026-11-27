@@ -3167,9 +3167,11 @@ def push_block_spec(
       out_type = tree_util.tree_unflatten(
           out_tree,
           [
+              # On its mesh: a trace's input made of it reads its sharding.
               jax.ShapeDtypeStruct(
                   v.aval.shape,
                   v.aval.dtype,
+                  sharding=v.aval.sharding,
                   manual_axis_type=(
                       v.aval.mat if config._check_vma.value else None
                   ),
@@ -3629,6 +3631,79 @@ register_eltwise_rule(lax.abs_p)
 register_eltwise_rule(lax.logistic_p)
 register_eltwise_rule(lax.round_p)
 register_eltwise_rule(pallas_primitives.multiple_of_p)
+# Every other unary elementwise primitive: an element of its output reads the
+# element of its operand at the same index alone.
+for _prim in (
+    lax.neg_p, lax.sign_p, lax.floor_p, lax.ceil_p, lax.log1p_p, lax.expm1_p,
+    lax.exp2_p, lax.tan_p, lax.atan_p, lax.asin_p, lax.acos_p, lax.sinh_p,
+    lax.cosh_p, lax.asinh_p, lax.acosh_p, lax.atanh_p, lax.cbrt_p,
+    lax.is_finite_p, lax.not_p, lax.imag_p, lax.real_p, lax.conj_p,
+    lax.reduce_precision_p, lax.copy_p, lax.erf_p, lax.erfc_p, lax.erf_inv_p,
+):
+  register_eltwise_rule(_prim)
+del _prim
+
+
+# A cast of a value's type along manual mesh axes (to vary, as JAX stages one
+# where a consumer under a shard_map checking variance reads an invariant value
+# beside a varying one; from reduced to varying): an element of its output is
+# its operand's at the same index, used as its output is. On values the map
+# types (the check on) it is bound, so what reads it is checked as written; on
+# a kernel's tile or a prefetched scalar an index map replays its program on,
+# which carry no mesh's types (the check off), it is the identity, as upstream's
+# `pvary` eval rule makes it: a shard_map's slice offset staged from an
+# invariant scalar and `axis_index` fuses (upstream's centered-slice prologue).
+def _manual_cast_usage_rule(
+    ctx: UsageRuleContext, used_out: set[Usage], **params
+) -> Sequence[set[Usage]]:
+  del ctx, params
+  return [used_out]
+
+
+def _manual_cast_eval_rule(ctx: KernelEvalContext, x, **params):
+  return ctx.prim.bind(x, **params) if config._check_vma.value else x
+
+
+# pvary's eval, pull and push rules are upstream's (its eval casts only along the
+# axes the value does not already vary over); its usage rule is this one.
+register_usage_rule(core.pvary_p)(_manual_cast_usage_rule)
+register_pull_block_spec_rule(core.reduced_vary_cast_p)(_eltwise_pull_rule)
+register_usage_rule(core.reduced_vary_cast_p)(_manual_cast_usage_rule)
+register_push_block_spec_rule(core.reduced_vary_cast_p)(_eltwise_push_rule)
+register_eval_rule(core.reduced_vary_cast_p)(_manual_cast_eval_rule)
+
+
+# An optimization barrier: each output its operand as it is, a block of one the
+# same block of the other.
+@register_pull_block_spec_rule(lax.optimization_barrier_p)
+def _optimization_barrier_pull_rule(
+    ctx: PullRuleContext,
+    block_transforms: Sequence[BlockIndexTransform | None],
+    **params,
+) -> Sequence[BlockIndexTransform | None]:
+  del ctx, params
+  return list(block_transforms)
+
+
+@register_usage_rule(lax.optimization_barrier_p)
+def _optimization_barrier_usage_rule(
+    ctx: UsageRuleContext, used_out: Sequence[set[Usage]], **params
+) -> Sequence[set[Usage]]:
+  del ctx, params
+  return list(used_out)
+
+
+@register_eval_rule(lax.optimization_barrier_p)
+def _optimization_barrier_eval_rule(ctx: KernelEvalContext, *args, **params):
+  return ctx.prim.bind(*args, **params)
+
+
+@register_push_block_spec_rule(lax.optimization_barrier_p)
+def _optimization_barrier_push_rule(
+    ctx: PushRuleContext, *block_specs: pallas_core.BlockSpec, **params
+) -> Sequence[pallas_core.BlockSpec]:
+  del ctx, params
+  return list(block_specs)
 
 
 @register_push_block_spec_rule(lax.reshape_p)

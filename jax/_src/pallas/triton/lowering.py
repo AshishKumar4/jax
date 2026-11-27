@@ -32,8 +32,10 @@ from jax._src import ad_util
 from jax._src import api_util
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import custom_derivatives
 from jax._src import debugging
+from jax._src import hijax
 from jax._src import literals
 from jax._src import pjit
 from jax._src import source_info_util
@@ -418,13 +420,16 @@ def lower_jaxpr_to_triton_ir(
 
   for eqn in jaxpr.eqns:
     invals = map(read_env, eqn.invars)
-    if eqn.primitive not in triton_lowering_rules:
+    # Any call primitive lowers as `eval_jaxpr_p`, its body inlined.
+    primitive = (pe.eval_jaxpr_p if eqn.primitive in eval_jaxpr_lib.call_primitives
+                 else eqn.primitive)
+    if primitive not in triton_lowering_rules:
       raise NotImplementedError(
           "Unimplemented primitive in Pallas Triton lowering:"
           f" {eqn.primitive.name}. Please file an issue at"
           " https://github.com/jax-ml/jax/issues/new/choose."
       )
-    rule = triton_lowering_rules[eqn.primitive]
+    rule = triton_lowering_rules[primitive]
     avals_in = [v.aval for v in eqn.invars]
     avals_out = [v.aval for v in eqn.outvars]
     eqn_block_infos = map(read_block_info_env, eqn.invars)
@@ -992,6 +997,41 @@ tanh_dispatch_table = _make_dispatch_table(
     ],
 )
 
+_ERF_SYMBOLS = {
+    ("cuda", jnp.dtype(jnp.float32)): "__nv_erff",
+    ("cuda", jnp.dtype(jnp.float64)): "__nv_erf",
+    ("rocm", jnp.dtype(jnp.float32)): "__ocml_erf_f32",
+    ("rocm", jnp.dtype(jnp.float64)): "__ocml_erf_f64",
+}
+
+
+def _erf_lowering_rule(ctx: LoweringRuleContext, x: ir.Value) -> ir.Value:
+  # The device library's erf at the result's exact dtype, a float16 or bfloat16 one through float32's and
+  # rounded back: an extern table matches a weak float64 to float32's symbol, and nothing on a Pallas
+  # call's path lowers math.erf itself.
+  [x_aval] = ctx.avals_in
+  [out_aval] = ctx.avals_out
+  dtype = jnp.dtype(out_aval.dtype)
+  wide = dtype if dtype in (jnp.float32, jnp.float64) else jnp.dtype(jnp.float32)
+  if dtype not in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
+    raise NotImplementedError(f"unsupported types for erf: {dtype}")
+  x = _bcast_to(_ensure_ir_value(x, x_aval), out_aval.shape)
+  if jnp.dtype(x_aval.dtype) != wide:
+    x = _cast(x, x_aval.dtype, wide)
+  result_type = _dtype_to_ir_type(wide)
+  if out_aval.shape:
+    result_type = ir.RankedTensorType.get(out_aval.shape, result_type)
+  result = tt_dialect.extern_elementwise(
+      result_type,
+      [x],
+      libname="",
+      libpath="",
+      symbol=_ERF_SYMBOLS[(ctx.context.platform, wide)],
+      pure=True,
+  )
+  return result if dtype == wide else _cast(result, wide, dtype)
+
+
 asinh_dispatch_table = _make_dispatch_table(
     "asinh",
     cuda=[
@@ -1107,6 +1147,7 @@ triton_lowering_rules.update({
     lax.sinh_p: sinh_dispatch_table,
     lax.cosh_p: cosh_dispatch_table,
     lax.tanh_p: tanh_dispatch_table,
+    lax.erf_p: _erf_lowering_rule,
     lax.asinh_p: asinh_dispatch_table,
     lax.acosh_p: acosh_dispatch_table,
     lax.atanh_p: atanh_dispatch_table,
@@ -1208,6 +1249,15 @@ def _truediv(x: ir.Value, y: ir.Value, *, signed: bool) -> ir.Value:
     y = _int_float_cast(y, x_element_type, signed=signed)
   if isinstance(x_element_type, (ir.F32Type, ir.F64Type)):
     return arith_dialect.divf(x, y)
+  if isinstance(x_element_type, (ir.BF16Type, ir.F16Type)):
+    # A correctly rounded float32 quotient rounds to the correctly rounded
+    # 16-bit one (float32's 24 bits are at least twice the 16-bit precision
+    # plus two), so this divides as XLA does. arith.divf is approximate.
+    f32 = ir.F32Type.get()
+    quotient = tt_dialect.precise_divf(
+        _ir_cast(x, f32, signed=False), _ir_cast(y, f32, signed=False)
+    )
+    return _ir_cast(quotient, x.type, signed=False)
   raise NotImplementedError(f"unsupported types: {x.type} and {y.type}")
 
 
@@ -2659,6 +2709,64 @@ triton_lowering_rules[lax.reduce_min_p] = functools.partial(
 triton_lowering_rules[lax.reduce_sum_p] = functools.partial(
     _reduce_lowering, jnp.add
 )
+triton_lowering_rules[lax.reduce_or_p] = functools.partial(
+    _reduce_lowering, jnp.bitwise_or
+)
+triton_lowering_rules[lax.reduce_and_p] = functools.partial(
+    _reduce_lowering, jnp.bitwise_and
+)
+
+
+def _unit_slice(x, *, start_indices, limit_indices, strides):
+  # A Triton tensor is no memory to index: a slice of one element along one
+  # axis is the masked maximum of that axis, over the value's bits, so a float
+  # (a NaN, a negative zero) and a boolean come back exactly.
+  sliced = [
+      axis
+      for axis, (start, limit) in enumerate(zip(start_indices, limit_indices))
+      if limit - start != x.shape[axis]
+  ]
+  if (
+      len(sliced) != 1
+      or limit_indices[sliced[0]] - start_indices[sliced[0]] != 1
+      or (strides is not None and any(stride != 1 for stride in strides))
+  ):
+    raise NotImplementedError(
+        f"Pallas Triton slices one element along one axis, not"
+        f" {start_indices}:{limit_indices} of {x.shape}"
+    )
+  (axis,) = sliced
+  dtype = jnp.dtype(x.dtype)
+  if dtype == jnp.bool_:
+    bits = x.astype(jnp.int32)
+  elif jnp.issubdtype(dtype, jnp.floating):
+    bits = lax.bitcast_convert_type(x, jnp.dtype(f"int{dtype.itemsize * 8}"))
+  else:
+    bits = x
+  least = jnp.iinfo(bits.dtype).min
+  picked = jnp.where(
+      lax.broadcasted_iota(jnp.int32, x.shape, axis) == start_indices[axis],
+      bits,
+      least,
+  )
+  found = jnp.max(picked, axis=axis, keepdims=True)
+  if dtype == jnp.bool_:
+    return found.astype(jnp.bool_)
+  if jnp.issubdtype(dtype, jnp.floating):
+    return lax.bitcast_convert_type(found, dtype)
+  return found
+
+
+triton_lowering_rules[lax.slice_p] = lower_fun(
+    _unit_slice, multiple_results=False
+)
+# A hijax primitive's call lowers as the lojax its primitive expands to.
+triton_lowering_rules[hijax.call_hi_primitive_p] = lower_fun(
+    lambda *args, _prim: hijax.call_hi_primitive_p.to_lojax(
+        *args, _prim=_prim
+    ),
+    multiple_results=True,
+)
 
 
 def _argreduce_lowering(
@@ -2732,6 +2840,7 @@ def _reshard_lowering_rule(
 
 @register_lowering(pe.eval_jaxpr_p)
 @register_lowering(custom_derivatives.custom_jvp_call_p)
+@register_lowering(custom_derivatives.custom_vjp_call_p)
 def _eval_jaxpr_lowering_rule(
     ctx: LoweringRuleContext, *args, call_jaxpr, **_
 ):
@@ -2747,6 +2856,14 @@ def _remat_lowering_rule(ctx: LoweringRuleContext, *args, jaxpr, **_):
 
 
 triton_lowering_rules[ad_util.stop_gradient_p] = lambda _, x: x
+
+
+@register_lowering(lax.optimization_barrier_p)
+def _optimization_barrier_lowering_rule(ctx: LoweringRuleContext, *args):
+  # The operands as they are: XLA compiles a Triton call with no floating-point
+  # contraction, so each operation stays its own and rounds on its own.
+  del ctx
+  return args
 
 
 @register_lowering(lax.axis_index_p)

@@ -290,10 +290,10 @@ def _run_scoped_physicalize_rule(
     raise NotImplementedError(
         "run_scoped interpret rule does not support collective axes"
     )
-  physical_jaxpr, physical_consts = interpreter(jaxpr, consts)
+  physical_jaxpr, physical_consts = interpreter(jaxpr.with_consts(consts), consts)
   return primitives.run_scoped_p.bind(
-      *physical_consts, jaxpr=physical_jaxpr, collective_axes=collective_axes,
-      **params
+      *physical_consts, jaxpr=physical_jaxpr.with_consts(()),
+      collective_axes=collective_axes, **params
   )
 _eval_jaxpr_hop_rules[primitives.run_scoped_p] = _run_scoped_physicalize_rule
 
