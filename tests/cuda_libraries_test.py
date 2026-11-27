@@ -90,5 +90,40 @@ class CudaLibrariesTest(jtu.JaxTestCase):
     self.assertEqual([again, linked], [resolved, resolved])
 
 
+  @jtu.run_on_devices("cuda")
+  def test_a_compile_only_topology_resolves_the_linker_with_no_device(self):
+    # A process of no GPU backend (JAX_PLATFORMS=cpu), its plugin loaded by a
+    # compile-only CUDA topology of this GPU's target, resolves the same build
+    # as a process of this GPU, before either compiles.
+    from jax._src.lib import _jax
+    import jax
+    target = _jax.get_topology_for_devices(jax.devices()[:1]).target_config
+    script = (
+        "import sys, jax\n"
+        "try:\n"
+        "  from jax_plugins import xla_cuda13 as plugin\n"
+        "except ImportError:\n"
+        "  from jax_plugins import xla_cuda12 as plugin\n"
+        "if sys.argv[1] == 'cpu':\n"
+        "  from jax.experimental import topologies\n"
+        "  topologies.get_topology_desc('resolve', 'cuda',\n"
+        "      target_config=sys.stdin.read(), topology='1x1x1')\n"
+        "else:\n"
+        "  jax.devices()\n"
+        "print(plugin.nvjitlink_build_id(),\n"
+        "      plugin.nvjitlink_build_id(resolve=True))\n")
+    found = {}
+    for platforms in ("cpu", "cuda"):
+      ran = subprocess.run(
+          [sys.executable, "-c", script, platforms], input=target,
+          capture_output=True, text=True, check=True, env={
+              **os.environ, "JAX_PLATFORMS": platforms,
+              "XLA_FLAGS": "--xla_gpu_enable_libnvjitlink=true"})
+      found[platforms] = ran.stdout.split()[-2:]
+    self.assertEqual(found["cpu"][0], "None")
+    self.assertRegex(found["cpu"][1], r"^[0-9a-f]{16,}$")
+    self.assertEqual(found["cpu"][1], found["cuda"][1])
+
+
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
