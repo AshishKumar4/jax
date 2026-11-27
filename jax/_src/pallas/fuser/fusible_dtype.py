@@ -552,7 +552,9 @@ _physicalize_rules[shard_map.shard_map_p] = _shard_map_rule
 def _run_scoped_rule(ctx: Context, *args, jaxpr, **params):
   _assert_no_fusion_types(ctx.avals_out)
   flat_args = tree_util.tree_leaves(args)
-  jaxpr = physicalize_jaxpr(jaxpr).with_consts(flat_args)
+  # Its body holds none of its operands, its leading invars standing for them
+  # (`pallas_primitives.run_scoped`).
+  jaxpr = physicalize_jaxpr(jaxpr)
   return pallas_primitives.run_scoped_p.bind(*flat_args, jaxpr=jaxpr, **params)
 
 

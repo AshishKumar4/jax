@@ -55,6 +55,7 @@ from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import layouts as mgpu_layouts
+from jax.experimental.mosaic.gpu.mma import M_WARPS_ATTRIBUTE as MMA_M_WARPS_ATTRIBUTE
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.mosaic.gpu.launch_context import AsyncCopyImplementation
@@ -1767,7 +1768,14 @@ def _barrier_arrive_lowering(
   else:
     scope = mgpu_utils.ThreadSubset.WARPGROUP
 
-  if isinstance(barrier, mgpu.CollectiveBarrierRef):
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    # A named barrier counts its arriving warpgroups' threads (`bar.arrive`).
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise NotImplementedError(
+          "Arriving on a CTA barrier is not supported in a warp context"
+      )
+    barrier.arrive(predicate=predicate)
+  elif isinstance(barrier, mgpu.CollectiveBarrierRef):
     if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
       raise NotImplementedError(
           "Arriving on a collective barrier is not supported in a warp context"
@@ -1860,6 +1868,21 @@ def _barrier_arrive_and_wait_lowering(
     *flat_transforms,
     transforms_treedef,
 ):
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    # A named barrier counts its arriving warpgroups' threads: a warp's 32 can
+    # never meet it, and a warp waiting at it would hang the CTA.
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise NotImplementedError(
+          "Arriving on a CTA barrier is not supported in a warp context"
+      )
+    # A named barrier arrives and waits in one instruction (`bar.sync`).
+    base_index = _get_barrier_base_index(
+        ctx.avals_in[0], transforms_treedef.unflatten(flat_transforms)
+    )
+    if base_index is not None:
+      barrier = barrier[base_index]
+    barrier.arrive_and_wait()
+    return ()
   _barrier_arrive_lowering(
       ctx, barrier, *flat_transforms, transforms_treedef=transforms_treedef
   )
@@ -1978,12 +2001,16 @@ def _barrier_wait_pp_eqn(
     context: jax_core.JaxprPpContext,
     settings: jax_core.JaxprPpSettings,
 ):
-  del settings
   barrier, *flat_transforms = eqn.invars
+  pp_params = {}
+  if eqn.params.get("has_phase", False):
+    *flat_transforms, phase = flat_transforms
+    pp_params["phase"] = phase.pretty_print(context)
   transforms_treedef = eqn.params["transforms_treedef"]
   transforms = transforms_treedef.unflatten(flat_transforms)
   return pp.concat([
       pp.text("barrier_wait"),
+      jax_core.pp_kv_pairs(pp_params.items(), context, settings),
       pp.text(" "),
       state_primitives.pp_ref_transforms(context, barrier, transforms),
   ])
@@ -2003,9 +2030,27 @@ def _barrier_wait_lowering(
     barrier,
     *flat_transforms,
     transforms_treedef,
+    has_phase: bool = False,
 ):
+  if has_phase:
+    *flat_transforms, phase = flat_transforms
+    phase = lowering._ensure_ir_value(phase, jnp.int32)  # pylint: disable=protected-access
+    i32 = ir.IntegerType.get_signless(32)
+    # The hardware waits at a phase's parity, its low bit.
+    parity = arith_dialect.cmpi(
+        arith_dialect.CmpIPredicate.ne,
+        arith_dialect.andi(phase, mgpu_utils.c(1, i32)),
+        mgpu_utils.c(0, i32),
+    )
+  else:
+    parity = None
   barrier_aval = ctx.avals_in[0]
   assert isinstance(barrier_aval, state_types.AbstractRef)
+  if isinstance(barrier, mgpu.CtaBarrierRef):
+    raise NotImplementedError(
+        "A CTA barrier has no wait apart from its arrival: use"
+        " barrier_arrive_and_wait"
+    )
   transforms = transforms_treedef.unflatten(flat_transforms)
   orders_tensor_core = getattr(
       barrier_aval.inner_aval.dtype, "orders_tensor_core", False  # pyrefly: ignore[missing-attribute]
@@ -2013,18 +2058,40 @@ def _barrier_wait_lowering(
   base_index = _get_barrier_base_index(barrier_aval, transforms)
   if base_index is not None:
     barrier = barrier[base_index]
-  barrier.wait(orders_tensor_core=orders_tensor_core)
+  if parity is None:
+    barrier.wait(orders_tensor_core=orders_tensor_core)
+  else:
+    barrier.wait_parity(parity, orders_tensor_core=orders_tensor_core)
   return ()
 
 
-def barrier_wait(barrier: state.AbstractRef) -> None:
-  """Waits on the given barrier."""
+def barrier_wait(
+    barrier: state.AbstractRef,
+    *,
+    phase: int | jax.Array | None = None,
+) -> None:
+  """Waits on the given barrier.
+
+  Without a ``phase``, the wait takes the barrier's next phase, which the
+  kernel tracks for each barrier of an array. With one, it waits for that
+  phase, counted from 0 (the barrier's first completion), and tracks nothing:
+  a ring whose barriers all complete a phase each turn names the turn's
+  rotation, where tracking spends a bit test and a flip on every wait. The
+  hardware waits at the phase's parity, so a waiter may skip phases (consumers
+  taking alternate tiles of one ring) as long as the phase it names is the
+  barrier's latest completed or the one it is completing; the interpreter
+  checks that. A barrier is awaited one way throughout a kernel.
+  """
   barrier, transforms = state_primitives.get_ref_and_transforms(
       barrier, None, "barrier_wait"
   )
   flat_transforms, transforms_treedef = tree_util.tree_flatten(transforms)
   barrier_wait_p.bind(
-      barrier, *flat_transforms, transforms_treedef=transforms_treedef,
+      barrier,
+      *flat_transforms,
+      *() if phase is None else (phase,),
+      transforms_treedef=transforms_treedef,
+      has_phase=phase is not None,
   )
 
 
@@ -2435,16 +2502,39 @@ def _wgmma_effectful_abstract_eval(acc, lhs_ref, *args, **kwargs):
   }
 
 
-def mma(acc: jax.Array, a: jax.Array, b: jax.Array, /) -> jax.Array:
-  """Computes ``acc + a @ b`` synchronously using Ampere MMA instructions."""
-  return mma_p.bind(acc, a, b)
+def mma(
+    acc: jax.Array,
+    a: jax.Array,
+    b: jax.Array,
+    /,
+    *,
+    m_warps: int | None = None,
+    rows: jax.Array | int | None = None,
+) -> jax.Array:
+  """Computes ``acc + a @ b`` synchronously using Ampere MMA instructions.
+
+  ``m_warps`` (1, 2 or 4) is how many of the warpgroup's four warps split the
+  accumulator's rows, the rest its columns (``MMALayouts``); by default the most
+  whose tile divides the accumulator. The operands' layouts must be that split's.
+
+  ``rows``, an int32 scalar uniform across the warpgroup: a warp issues no
+  instruction for a 16-row block of the accumulator that begins at or past it,
+  and those rows of the result are ``acc``'s (a ragged group's rows past its end,
+  padded to whole tiles). None issues every instruction.
+  """
+  if m_warps not in (None, 1, 2, 4):
+    raise ValueError(f"m_warps must be 1, 2 or 4, got {m_warps}")
+  bound = () if rows is None else (jnp.asarray(rows, jnp.int32),)
+  return mma_p.bind(acc, a, b, *bound, m_warps=m_warps)
 
 
 mma_p = jax_core.Primitive("mma")
 
 
 @mma_p.def_abstract_eval
-def _mma_abstract_eval(acc, a, b):
+def _mma_abstract_eval(acc, a, b, *rows, m_warps):
+  if len(rows) > 1 or any(r.shape or r.dtype != jnp.int32 for r in rows):
+    raise TypeError(f"rows must be one int32 scalar, got {rows}")
   m, n = acc.shape
   m2, k = a.shape
   k2, n2 = b.shape
@@ -2473,7 +2563,8 @@ def _mma_abstract_eval(acc, a, b):
   _check_layout_mode()
   if get_layout_mode() == LayoutMode.PALLAS_GPU:
     out_layout = lax_utils.call_layout_rule(
-        mma_p, in_avals=(acc, a, b), out_avals=acc, layout_rule=None
+        mma_p, in_avals=(acc, a, b), out_avals=acc, layout_rule=None,
+        m_warps=m_warps,
     )
     if out_layout != acc.layout:
       raise ValueError(
@@ -2484,15 +2575,39 @@ def _mma_abstract_eval(acc, a, b):
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Lane)
-def _mma_lowering(ctx: lowering.LoweringRuleContext, acc, a, b):
-  del ctx  # Unused.
-  return mgpu.mma(acc, a, b)
+def _mma_lowering(
+    ctx: lowering.LoweringRuleContext, acc, a, b, *rows, m_warps
+):
+  # The operands' layouts carry their split, which `mgpu.mma` reads; a stated
+  # `m_warps` is held to it (the Warpgroup rule's attribute has layout
+  # inference lay the operands out so).
+  del ctx
+  if m_warps is not None and acc.layout != mgpu.MMALayouts(
+      a.mlir_dtype, m_warps=m_warps).acc:
+    raise ValueError(
+        f"mma's m_warps={m_warps} is not its operands' split: Lane semantics "
+        "reads the split from the accumulator's layout (plgpu.Layout.MMA_ACC)"
+    )
+  bound = None
+  if rows:
+    bound = lowering._ensure_ir_value(rows[0], jnp.int32)
+  return mgpu.mma(acc, a, b, rows=bound)
 
 
 @lowering.register_lowering_rule(mma_p, mgpu.LoweringSemantics.Warpgroup)
-def _mma_warpgroup_lowering(ctx: lowering.LoweringRuleContext, acc, a, b):
-  del ctx  # Unused.
-  return mgpu.dialect.mma(acc, a, b)
+def _mma_warpgroup_lowering(
+    ctx: lowering.LoweringRuleContext, acc, a, b, *rows, m_warps
+):
+  del ctx
+  bound = None
+  if rows:
+    bound = lowering._ensure_ir_value(rows[0], jnp.int32)
+  result = mgpu.dialect.mma(acc, a, b, rows=bound)  # pyrefly: ignore[unexpected-keyword]
+  if m_warps is not None:
+    result.owner.attributes[MMA_M_WARPS_ATTRIBUTE] = ir.IntegerAttr.get(
+        ir.IntegerType.get_signless(32), m_warps
+    )
+  return result
 
 
 wgmma_wait_p = jax_core.Primitive("wgmma_wait")
@@ -3429,6 +3544,43 @@ def _set_max_registers_lowering(
 def set_max_registers(n: int, *, action: Literal["increase", "decrease"]):
   """Sets the maximum number of per-lane registers in the thread."""
   set_max_registers_p.bind(n=n, action=action)
+
+
+fresh_axis_index_p = jax_core.Primitive("fresh_axis_index")
+
+
+@fresh_axis_index_p.def_abstract_eval
+def _fresh_axis_index_abstract_eval(*, axis_name):
+  del axis_name
+  return jax_core.ShapedArray((), jnp.int32)
+
+
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, mgpu.LoweringSemantics.Lane)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, *gpu_core.LANExWARP_SEMANTICS)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, mgpu.LoweringSemantics.Warpgroup)
+@lowering.register_lowering_rule(
+    fresh_axis_index_p, *gpu_core.WGxWARP_SEMANTICS)
+def _fresh_axis_index_lowering(
+    ctx: lowering.LoweringRuleContext, *, axis_name
+):
+  return lowering.axis_index(ctx, axis_name, fresh=True)
+
+
+def fresh_axis_index(axis_name: Hashable) -> jax.Array:
+  """``lax.axis_index(axis_name)``, a grid axis's read from the hardware where it
+  is used.
+
+  The read is side-effecting, so the compiler neither merges it with another
+  read of the coordinate nor moves it: no value derived from an earlier read is
+  held live to this use. A kernel that forms a late address from its program's
+  coordinate (an output row stored after a long loop, a role's after its
+  ``set_max_registers``) reads it here rather than holding the first read's.
+  Interpreted, it is ``lax.axis_index``.
+  """
+  return fresh_axis_index_p.bind(axis_name=axis_name)
 
 
 commit_smem_p = jax_core.Primitive("commit_smem")

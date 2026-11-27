@@ -22,6 +22,7 @@ from jax._src.pallas.mosaic_gpu.core import Barrier as Barrier
 from jax._src.pallas.mosaic_gpu.core import BlockSpec as BlockSpec
 from jax._src.pallas.mosaic_gpu.core import cluster_ref as cluster_ref
 from jax._src.pallas.mosaic_gpu.core import ClusterBarrier as ClusterBarrier
+from jax._src.pallas.mosaic_gpu.core import CtaBarrier as CtaBarrier
 from jax._src.pallas.mosaic_gpu.core import CompilerParams as CompilerParams
 from jax._src.pallas.mosaic_gpu.core import im2col_ref as im2col_ref
 from jax._src.pallas.mosaic_gpu.core import kernel as kernel
@@ -31,6 +32,7 @@ from jax._src.pallas.mosaic_gpu.core import MemorySpace as MemorySpace
 from jax._src.pallas.mosaic_gpu.core import Mesh as Mesh
 from jax._src.pallas.mosaic_gpu.core import multicast_ref as multicast_ref
 from jax._src.pallas.mosaic_gpu.core import PeerMemRef as PeerMemRef
+from jax._src.pallas.mosaic_gpu.core import PlainTransform as PlainTransform
 from jax._src.pallas.mosaic_gpu.core import RefUnion as RefUnion
 from jax._src.pallas.mosaic_gpu.core import remote_ref as remote_ref
 from jax._src.pallas.mosaic_gpu.core import SemaphoreType as SemaphoreType
@@ -77,6 +79,7 @@ from jax._src.pallas.mosaic_gpu.primitives import commit_smem_to_gmem_group as c
 from jax._src.pallas.mosaic_gpu.primitives import commit_tmem as commit_tmem
 from jax._src.pallas.mosaic_gpu.primitives import copy_gmem_to_smem as copy_gmem_to_smem
 from jax._src.pallas.mosaic_gpu.primitives import copy_smem_to_gmem as copy_smem_to_gmem
+from jax._src.pallas.mosaic_gpu.primitives import fresh_axis_index as fresh_axis_index
 from jax._src.pallas.mosaic_gpu.primitives import get_barrier_semaphore as get_barrier_semaphore
 from jax._src.pallas.mosaic_gpu.primitives import griddepcontrol_launch_dependents as griddepcontrol_launch_dependents
 from jax._src.pallas.mosaic_gpu.primitives import griddepcontrol_wait as griddepcontrol_wait

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import math
+import threading
+from unittest import mock
 
 from absl.testing import absltest
 import jax
@@ -187,6 +189,107 @@ class InterpretDistributedTest(jtu.JaxTestCase):
 
     np.testing.assert_array_equal(y, x)
     self.assertFalse(mosaic_interpret.get_races().races_found)
+
+
+  @jtu.parameterized.parameters(2, 4)
+  def test_kernel_with_barrier_under_shard_map(self, num_devices):
+    # Each device copies its shard through a barrier of its own; one device's
+    # kernel ends while another's still holds its barrier.
+    def kernel(x_ref, o_ref, smem, barrier):
+      plgpu.copy_gmem_to_smem(x_ref, smem, barrier)
+      plgpu.barrier_wait(barrier)
+      o_ref[...] = smem[...] + 1.0
+
+    def body(x):
+      return plgpu.kernel(
+          kernel,
+          out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          scratch_types=[
+              plgpu.SMEM(x.shape, x.dtype),
+              plgpu.Barrier(num_arrivals=1),
+          ],
+          interpret=InterpretParams(),
+      )(x)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:num_devices], ['x'])
+    x = jnp.arange(num_devices * 128 * 64, dtype=jnp.float32).reshape(-1, 64)
+    x = jax.device_put(x, jax.sharding.NamedSharding(mesh, P('x')))
+    f = jax.jit(
+        jax.shard_map(body, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+    )
+    for _ in range(2):
+      np.testing.assert_array_equal(f(x), x + 1.0)
+
+  def test_nested_regs_scopes_while_another_device_finishes_a_cluster(self):
+    # Device 0's first cluster finishes while device 1 is inside its first,
+    # holding its outer REGS buffer (forced: the first `cluster_finished`,
+    # device 0's as device 1 waits in its first cluster, waits for that
+    # allocation, and device 1's inner scope for that finish). The inner scope's
+    # buffer is a new one, and both scopes' deallocations find theirs: a reset
+    # of every device's REGS IDs handed the outer's ID out again.
+    from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
+
+    holds, finished = threading.Event(), threading.Event()
+    allocate = shared_memory.GPUSharedMemory.get_next_wgmma_accumulator_id
+    cluster_finished = gpu_callbacks.cluster_finished
+
+    def allocated(memory, thread):
+      regs_id = allocate(memory, thread)
+      if thread.device_id == 1 and not holds.is_set():
+        holds.set()
+        if not finished.wait(60):
+          raise TimeoutError("device 0's first cluster never finished")
+      return regs_id
+
+    # A failure in it (a wait timed out) fails the run, as the interpreter's
+    # own callbacks do, rather than leave the other device at its barrier.
+    @gpu_callbacks.fail_on_exception
+    def finishing(*, token, **device):
+      if finished.is_set():
+        return cluster_finished(token=token, **device)
+      if not holds.wait(60):
+        raise TimeoutError("device 1 never allocated its outer REGS buffer")
+      token = cluster_finished(token=token, **device)
+      finished.set()
+      return token
+
+    def kernel(x_ref, o_ref):
+      # Each grid point its own tile; each accumulator starts zeroed in the
+      # interpreter.
+      tile = pl.ds(lax.axis_index('g') * 64, 64)
+
+      def outer(acc):
+        def inner(again):
+          o_ref[tile] = x_ref[tile] + acc[...] + again[...] + 1.0
+
+        pl.run_scoped(inner, plgpu.ACC((64, 64), jnp.float32))
+
+      pl.run_scoped(outer, plgpu.ACC((64, 64), jnp.float32))
+
+    def body(x):
+      return plgpu.kernel(
+          kernel,
+          out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          grid=(2,),
+          grid_names=('g',),
+          interpret=InterpretParams(),
+      )(x)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:2], ['x'])
+    x = jnp.arange(2 * 2 * 64 * 64, dtype=jnp.float32).reshape(-1, 64)
+    x = jax.device_put(x, jax.sharding.NamedSharding(mesh, P('x')))
+    with (
+        mock.patch.object(
+            shared_memory.GPUSharedMemory, 'get_next_wgmma_accumulator_id',
+            allocated),
+        mock.patch.object(gpu_callbacks, 'cluster_finished', finishing),
+    ):
+      f = jax.jit(
+          jax.shard_map(body, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+      )
+      np.testing.assert_array_equal(f(x), x + 1.0)
+    self.assertTrue(finished.is_set())
 
 
 if __name__ == '__main__':
