@@ -211,6 +211,62 @@ ENTRY e {
                      [("jit(f)/neg", ()), ("jit(f)/exp", ("grown",)),
                       ("jit(f)/own", ())])
 
+  def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(self):
+    # Dew's decoder: a gemm fusion's root is its cuBLAS call, a tuple of its
+    # result and its 32 MiB workspace, named by the checkpoint its dot is in.
+    # The name is the result's alone (the call's first element); the workspace,
+    # and every element of another instruction's tuple, keep the op_name and
+    # take no name.
+    hlo = """
+HloModule m, entry_computation_layout={(f32[8192,128]{1,0}, f32[128,64]{1,0})->(f32[8192,64]{1,0}, s8[33554432]{0}, f32[2]{0}, f32[2]{0})}
+
+gemm {
+  a = f32[8192,128]{1,0} parameter(0)
+  b = f32[128,64]{1,0} parameter(1)
+  ROOT c = (f32[8192,64]{1,0}, s8[33554432]{0}) custom-call(a, b), custom_call_target="__cublas$lt$matmul", metadata={op_name="jit(f)/down_proj/dot_general"}, frontend_attributes={checkpoint_name="down_proj"}
+}
+
+other {
+  p = f32[128,64]{1,0} parameter(0)
+  ROOT c = (f32[2]{0}, f32[2]{0}) custom-call(p), custom_call_target="pair", metadata={op_name="jit(f)/pair"}, frontend_attributes={checkpoint_name="paired"}
+}
+
+ENTRY e {
+  a = f32[8192,128]{1,0} parameter(0)
+  b = f32[128,64]{1,0} parameter(1)
+  f = (f32[8192,64]{1,0}, s8[33554432]{0}) fusion(a, b), kind=kCustom, calls=gemm
+  g = (f32[2]{0}, f32[2]{0}) fusion(b), kind=kCustom, calls=other
+  r = f32[8192,64]{1,0} get-tuple-element(f), index=0
+  w = s8[33554432]{0} get-tuple-element(f), index=1
+  x = f32[2]{0} get-tuple-element(g), index=0
+  y = f32[2]{0} get-tuple-element(g), index=1
+  ROOT t = (f32[8192,64]{1,0}, s8[33554432]{0}, f32[2]{0}, f32[2]{0}) tuple(r, w, x, y)
+}
+"""
+    module = hlo_reader.module_from_text(hlo).as_serialized_hlo_module_proto()
+    [entry] = [computation for computation in hlo_reader.message_class(
+        "xla.HloModuleProto").FromString(module).computations
+               if computation.name == "e"]
+    defined = {instruction.name: instruction.id
+               for instruction in entry.instructions}
+    assignment = hlo_reader.message_class("xla.BufferAssignmentProto")()
+    assignment.buffer_allocations.add(index=0, size=2 * 33554432 + 16)
+    peak = assignment.peak_buffers.add(index=0)
+    for buffer_id, (name, index, size) in enumerate(
+        (("f", [0], 2097152), ("f", [1], 33554432), ("g", [0], 8),
+         ("g", [1], 8))):
+      buffer = assignment.logical_buffers.add(id=buffer_id, size=size)
+      buffer.defined_at.instruction_id = defined[name]
+      buffer.defined_at.shape_index.extend(index)
+      peak.logical_buffer_ids.append(buffer_id)
+    live = peak_live.live(assignment.SerializeToString(), module)
+    self.assertEqual(
+        [(each.shape, each.op_name, each.names) for each in live],
+        [((8192, 64), "jit(f)/down_proj/dot_general", ("down_proj",)),
+         ((33554432,), "jit(f)/down_proj/dot_general", ()),
+         ((2,), "jit(f)/pair", ()),
+         ((2,), "jit(f)/pair", ())])
+
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
     # sin(tanh(x @ w))'s gradient in w under a policy saving the residual
