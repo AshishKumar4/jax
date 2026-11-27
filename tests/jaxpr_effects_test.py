@@ -117,6 +117,43 @@ def callback_effect_lowering(ctx: mlir.LoweringRuleContext, *args, callback, out
 mlir.register_lowering(callback_p, callback_effect_lowering)
 
 
+class EffectTypeSetTest(jtu.JaxTestCase):
+
+  def test_a_type_added_while_the_set_is_read_changes_no_read(self):
+    # A type registered while a read iterates the set (as a module imported
+    # lazily on another thread registers its effects): the read sees the types
+    # as they stood when it began, and a later read sees the new one.
+    types = effects.EffectTypeSet()
+    added = []
+
+    class Registering(type):
+
+      def __instancecheck__(cls, instance):
+        added.append(type(f"Added{len(added)}", (effects.Effect,), {}))
+        types.add_type(added[-1])
+        return False
+
+    class Checked(effects.Effect, metaclass=Registering):
+      pass
+
+    types.add_type(Checked)
+    types.add_type(BasicEffect)
+    self.assertFalse(types.contains(UnlowerableEffect()))
+    self.assertNotEmpty(added)
+    self.assertTrue(types.contains(added[0]()))
+
+  def test_types_added_on_threads_are_all_held(self):
+    types = effects.EffectTypeSet()
+    made = [type(f"Made{i}", (effects.Effect,), {}) for i in range(64)]
+    threads = [threading.Thread(target=types.add_type, args=(made_type,))
+               for made_type in made]
+    for thread in threads:
+      thread.start()
+    for thread in threads:
+      thread.join()
+    self.assertTrue(all(types.contains(made_type()) for made_type in made))
+
+
 class JaxprEffectsTest(jtu.JaxTestCase):
 
   def test_trivial_jaxpr_has_no_effects(self):
