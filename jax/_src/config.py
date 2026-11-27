@@ -1487,6 +1487,16 @@ threefry_gpu_kernel_lowering = bool_state(
     include_in_jit_key=True,
     include_in_trace_context=True)
 
+threefry_rolled_lowering = bool_state(
+    name='jax_threefry_rolled_lowering',
+    default=False,
+    help=('On GPU, lower threefry PRNG operations as rolled loops over their '
+          'rounds, as on CPU, in place of the rounds unrolled: a smaller '
+          'program that compiles faster, its rounds no longer fused into what '
+          'reads them. Partitioned as elementwise ops are.'),
+    include_in_jit_key=True,
+    include_in_trace_context=True)
+
 use_direct_linearize = bool_state(
     name='jax_use_direct_linearize',
     default=True,
@@ -2474,6 +2484,29 @@ jax_pallas_poison_buffers = bool_state(
     help=(
         "If set, scratch buffers allocated by Pallas (e.g., in run_scoped)"
         " are initialized with poison values (NaN for floats) at allocation time."
+    ),
+)
+
+jax_pallas_lowering_cache_dir = optional_string_state(
+    name='jax_pallas_lowering_cache_dir',
+    default=None,
+    help=(
+        'If set, a directory in which Pallas Mosaic GPU kernels\' lowerings are'
+        ' kept, so a kernel lowered before, by this process or another, is'
+        ' read back instead of lowered again. The cache is used only for'
+        ' lowerings it can prove depend on nothing but its key, and its'
+        ' modules carry no source locations. Unset, nothing is cached.'
+    ),
+)
+
+jax_pallas_lowering_cache_verify = bool_state(
+    name='jax_pallas_lowering_cache_verify',
+    default=False,
+    help=(
+        'If set with jax_pallas_lowering_cache_dir, each lowering the cache'
+        ' returns is also lowered afresh, and a difference raises. A process'
+        ' that used the cache with it set and verified no lowering exits with'
+        ' status 3.'
     ),
 )
 

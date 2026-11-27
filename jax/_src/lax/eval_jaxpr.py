@@ -50,7 +50,9 @@ def _eval_jaxpr_jvp(prim, primals, tangents, *, call_jaxpr, **params):
 def _eval_jaxpr_batch(prim, axis_data, args, dims, *, call_jaxpr, **params):
   new_jaxpr, out_dims = batching.batch_jaxpr2(call_jaxpr, axis_data, tuple(dims))
   outs = prim.bind(*args, call_jaxpr=new_jaxpr, **params)
-  return outs, list(out_dims)
+  # The body's output axes as batching gave them, a staged custom_jvp output's
+  # marker with them (`batching._BatchDims`), which a shared read refuses.
+  return outs, out_dims
 
 def _eval_jaxpr_linearize(prim, is_vjp, nzs, *primals_in, call_jaxpr, **params):
   primal_jaxpr, out_tree, nzs_out, in_fwd_res, tangent_jaxpr = \
@@ -127,9 +129,15 @@ def _eval_jaxpr_remat(prim, trace, *args, call_jaxpr, **params):
   return primals_out, res_full, rem
 
 
+call_primitives: set[core.Primitive] = set()
+"""Every primitive with `eval_jaxpr_p`'s rules (`register_call_primitive_rules`): a call of its body's
+jaxpr (`call_jaxpr`), which a backend that lowers `eval_jaxpr_p` lowers alike."""
+
+
 def register_call_primitive_rules(
     prim: core.Primitive, name: str | None = None, transpose_rule=None,
     inline_jax_late: bool = True):
+  call_primitives.add(prim)
   prim.multiple_results = True
   prim.def_impl(eval_jaxpr_p.impl)
   prim.def_effectful_abstract_eval(eval_jaxpr_p.abstract_eval)
@@ -146,6 +154,7 @@ def register_call_primitive_rules(
   remat.rules[prim] = partial(_eval_jaxpr_remat, prim)
   discharge.register_discharge_rule(prim)(partial(discharge._eval_jaxpr_discharge_rule, prim))
   if name is not None:
+    # Lowered to a call of its body, which XLA inlines: an inlined call.
     lowering_rule = partial(
         mlir.core_call_lowering, name=name, inline_jax_late=inline_jax_late)
     mlir.register_lowering(

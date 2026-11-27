@@ -46,6 +46,7 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters.remat import remat_transform
 from jax._src import linear_util as lu
 from jax._src import tree_util
+from jax._src.lib import hlo as _hlo
 from jax._src.lib import jaxlib_extension_version, xla_version
 from jax.custom_derivatives import SymbolicZero
 import jax.numpy as jnp
@@ -407,6 +408,38 @@ class ShardMapTest(jtu.JaxTestCase):
 
     c = fwd(a)
     self.assertAllClose(c[1, :], a[0, :])
+
+  @jtu.run_on_devices('cpu')
+  def test_compiled_collectives_state_their_device_groups(self):
+    # The compiled module's collectives state their groups as XLA reads them
+    # (HloInstruction.replica_groups, source_target_pairs): a psum over one
+    # axis of a 2x4 mesh groups the devices along it, and a ppermute states
+    # its pairs. An instruction that is neither states None.
+    if not hasattr(_hlo.HloInstruction, 'replica_groups'):
+      self.skipTest('needs a jaxlib whose HLO reader states device groups')
+    mesh = jtu.create_mesh((2, 4), ('x', 'y'))
+
+    @jax.jit
+    @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+    def f(a):
+      shifted = lax.ppermute(a, 'y', perm=[(j, (j + 1) % 4) for j in range(4)])
+      return shifted + lax.psum(a, 'y')
+
+    a = jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8)
+    module = f.lower(a).compile().runtime_executable().hlo_modules()[0]
+    instructions = [inst for computation in module.computations()
+                    for inst in computation.instructions()]
+    (reduce,) = [i for i in instructions
+                 if i.opcode == _hlo.HloOpcode.kAllReduce]
+    self.assertEqual(sorted(map(sorted, reduce.replica_groups())),
+                     [[0, 1, 2, 3], [4, 5, 6, 7]])
+    (permute,) = [i for i in instructions
+                  if i.opcode == _hlo.HloOpcode.kCollectivePermute]
+    self.assertEqual(sorted(permute.source_target_pairs()),
+                     sorted((d + 4 * r, (d + 1) % 4 + 4 * r)
+                            for r in range(2) for d in range(4)))
+    self.assertIsNone(permute.replica_groups())
+    self.assertIsNone(reduce.source_target_pairs())
 
   def test_collective_permute_in_loop_and_after_loop(self):
     if xla_version < 79:

@@ -247,12 +247,30 @@ def batched_device_put(aval: core.ShapedArray,
                        sharding: JSharding, xs: Sequence[Any],
                        devices: Sequence[xc.Device] | xc.DeviceList,
                        committed: bool = True,
-                       enable_x64: bool | None = None):
+                       enable_x64: bool | None = None,
+                       copy_semantics=xc.ArrayCopySemantics.REUSE_INPUT):
+  """An array of `sharding` holding `xs`, each on its device. A single-device
+  array already on its device is taken as it is (its buffer the result's),
+  unless `copy_semantics` asks a copy (`ALWAYS_COPY`, a `device_put(...,
+  may_alias=False)`): then it is copied there first, so the result aliases no
+  source."""
   util.test_event("batched_device_put_start")
   try:
-    bufs = [x for x, d in safe_zip(xs, devices)
-            if (isinstance(x, array.ArrayImpl) and x.sharding.num_devices == 1
-                and x.devices() == {d})]
+    on_device = [
+        i for i, (x, d) in enumerate(safe_zip(xs, devices))
+        if (isinstance(x, array.ArrayImpl) and x.sharding.num_devices == 1
+            and x.devices() == {d})]
+    if copy_semantics == xc.ArrayCopySemantics.ALWAYS_COPY and on_device:
+      copies = xc.batched_copy_array_to_devices_with_sharding(
+          [xs[i] for i in on_device],
+          [xs[i].sharding._internal_device_list.addressable_device_list
+           for i in on_device],
+          [xs[i].sharding for i in on_device],
+          [xc.ArrayCopySemantics.ALWAYS_COPY] * len(on_device))
+      xs = list(xs)
+      for i, copy in safe_zip(on_device, copies):
+        xs[i] = copy
+    bufs = [xs[i] for i in on_device]
     if len(bufs) == len(xs) > 0:
       return array.ArrayImpl(
           aval, sharding, bufs, committed=committed, _skip_checks=True)
