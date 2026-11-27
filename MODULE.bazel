@@ -103,6 +103,12 @@ archive_override(
         # upstream keeps such a dot a dot (StrengthReduceAlgorithmSupports): delete when an A100 build without it
         # compiles and computes lax_test's testSmallDotComputesAsItsAlgorithmStates and SmallF8 cases as stated.
         "//third_party:xla/dot_algorithm_multiply.patch",
+        # DotStrengthReduction multiplies in the accumulator type when an implicit GEMV is reduced.
+        "//third_party:xla/gpu_dot_strength_wide.patch",
+        # A sliced parameter whose slice reads a buffer another of the hero's sliced parameters makes (a slice
+        # of a dynamic slice) stays an operand of its dynamic-slice fusion: planned in, its slice was cloned
+        # before that buffer's chain and CreateFusionBody threw std::out_of_range (Dew's 4B step on one GH200).
+        "//third_party:xla/gpu_dynamic_slice_nested_slice.patch",
         # A compile-only GPU device states the client's memory spaces (device, pinned_host), so a program compiled
         # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
         # (row 8372: a host step prepared without a GPU compiled other programs than its run). Delete when
@@ -130,6 +136,14 @@ archive_override(
         # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
         # converts a mixed dot's operands (no other pass makes one at this pin).
         "//third_party:xla/mixed_index_dot.patch",
+        # A finished GPU compile serializes no memory limit and its memory stats
+        # say whether it stopped at one, so its bytes are one under any limit it
+        # fits and jax writes no stopped compile to its cache.
+        "//third_party:xla/memory_limit_canonical.patch",
+        # A compile whose entry's arguments and new outputs alone pass its memory
+        # limit is hollowed right after layout assignment: its autotuning and
+        # scheduling run over nothing, and it stops stating those bytes alone.
+        "//third_party:xla/memory_limit_hollow.patch",
         # A compile-only client deserializes an unloaded executable (the GPU plugin's
         # PJRT_ExecutableDeserialize_Extension, PjRtCApiCompiler and IFRT's Compiler::DeserializeExecutable), so
         # jaxlib's CompileOnlyPyClient reads the persistent cache back (row 5403: two compile-only processes that
