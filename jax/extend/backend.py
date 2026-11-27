@@ -41,3 +41,12 @@ from jax._src.lib import (
 )
 
 del _util
+
+
+def no_contract_attribute() -> str | None:
+  """The frontend attribute (`jax.experimental.xla_metadata.set_xla_metadata`'s
+  name) under which a float add, subtract or multiply rounds on its own, never
+  contracted into a fused multiply-add, where the running jaxlib's compilers
+  honour it; None where they do not, every operation contractible."""
+  from jax._src import lib
+  return lib.no_contract_attribute

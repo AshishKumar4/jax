@@ -855,6 +855,51 @@ class Compiled(Stage):
     except NotImplementedError:
       return None
 
+  def buffer_assignment(self) -> bytes | None:
+    """XLA's buffer assignment of the compile, a serialized
+    ``BufferAssignmentProto``, as the compile states it in its memory analysis
+    (whether it ran whole or stopped after buffer assignment); ``None`` where
+    the backend states none."""
+    analysis = self.memory_analysis()
+    if analysis is None:
+      return None
+    return analysis.serialized_buffer_assignment_proto or None
+
+  def entry_arguments(self) -> tuple[int | None, ...] | None:
+    """For each entry parameter of the compiled module, by its number, the
+    flat index among the call's arguments (``args_info``'s leaves) it holds;
+    None for one that holds no argument (a closed-over constant, an effect's
+    token, a mutable array's state). Pruned arguments hold none, so a reader
+    of the module needs this map. ``None`` for an executable that states no
+    such map (not a ``MeshExecutable`` holding its unloaded executable).
+
+    Its entry parameters are its ordered effects' tokens, then the arguments
+    it keeps (its const args first), then its mutable arrays'; refused
+    (ValueError) where they do not count the module's.
+    """
+    from jax._src.interpreters import pxla  # pxla imports this module.
+
+    executable = self._executable
+    if not (isinstance(executable, pxla.MeshExecutable)
+            and executable._unloaded_executable is not None):
+      return None
+    unloaded = executable._unloaded_executable
+    tokens = len(unloaded.ordered_effects)
+    kept = sorted(unloaded.kept_var_idx)
+    mutable = 0 if unloaded.mut is None else len(unloaded.mut.in_mut)
+    consts = len(self._params.const_args)
+    module, = executable.xla_extension_executable().hlo_modules()
+    count = len(xc.XlaComputation(module.as_serialized_hlo_module_proto())
+                .program_shape().parameter_shapes())
+    if tokens + len(kept) + mutable != count:
+      raise ValueError(
+          f"the module's entry takes {count} parameters, its executable "
+          f"{tokens} tokens, {len(kept)} kept arguments and {mutable} mutable "
+          "arrays")
+    return (*(None,) * tokens,
+            *(None if index < consts else index - consts for index in kept),
+            *(None,) * mutable)
+
   @property
   def in_avals(self):
     # Including dead args, but not const_args
