@@ -516,7 +516,7 @@ def _vector_store_op_lowering_rule(
   fragmented_array = _fragmented_array_from_ir(op.valueToStore, to_store_layout)
 
   if ctx.auto_barriers:
-    utils.warpgroup_barrier()  # Make sure the reads have completed.
+    utils.warpgroup_barrier(collective=True)  # Make sure the reads have completed.
 
   ref = op.destination
   ref_type = ir.MemRefType(ref.type)
@@ -548,7 +548,7 @@ def _vector_store_op_lowering_rule(
     raise ValueError(f"Unsupported memory space: {ref_type.memory_space}")
 
   if ctx.auto_barriers:
-    utils.warpgroup_barrier()  # Make sure the writes have completed.
+    utils.warpgroup_barrier(collective=True)  # Make sure the writes have completed.
 
   return []
 

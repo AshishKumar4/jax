@@ -1174,16 +1174,28 @@ def warpgroup_barrier_idx(sync: bool = True) -> ir.Value[ir.IntegerType]:
   return arith.addi(warpgroup_idx(sync=sync), c(1, i32))
 
 
-def warpgroup_barrier():
+COLLECTIVE_BARRIER = "mosaic_gpu.collective_barrier"
+"""The attribute marking a warpgroup barrier every thread of the warpgroup
+reaches from the same program point (`warpgroup_barrier(collective=True)`: a
+warpgroup collective store's automatic barriers, a kernel's own warpgroup-wide
+sync), until the lowering drops those repeated back to back
+(`core._drop_repeated_barriers`)."""
+
+
+def warpgroup_barrier(*, collective: bool = False):
   """A sync of the warpgroup's threads on its own barrier
   (`warpgroup_barrier_idx`): a typed `nvvm.barrier` of its id and of
   `WARPGROUP_SIZE` threads, `bar.sync id, 128` in PTX, which a reader of a
-  lowered module finds as an operation."""
+  lowered module finds as an operation. `collective`: one every thread of the
+  warpgroup reaches from the same program point (no branch splits its
+  participants), marked so a repeat of it may be dropped."""
   i32 = ir.IntegerType.get_signless(32)
-  nvvm.barrier(
+  op = nvvm.barrier(
       barrier_id=warpgroup_barrier_idx(sync=False),
       number_of_threads=c(WARPGROUP_SIZE, i32),
   )
+  if collective:
+    op.attributes[COLLECTIVE_BARRIER] = ir.UnitAttr.get()
 
 
 def warpgroup_reduce_pred(pred: ir.Value, op: Literal["or", "and"]) -> ir.Value:
