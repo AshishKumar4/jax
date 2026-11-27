@@ -196,9 +196,16 @@ def _serialized(value: Any, module: bytes) -> dict[str, Any] | None:
     if not isinstance(value[name], kind):
       raise InvalidEntry(f"{name}={value[name]!r} is not of the schema")
   try:
-    bytes.fromhex(value["kernel_id"])
+    kernel_id = bytes.fromhex(value["kernel_id"])
   except ValueError as e:
     raise InvalidEntry(f"{value['kernel_id']!r} is not a kernel hash") from e
+  # The hash XLA's call reads, of exactly its 32 bytes (a call holding another
+  # length aborts the process that runs it).
+  if len(kernel_id) != 32:
+    raise InvalidEntry(f"a kernel hash of {len(kernel_id)} bytes")
+  symmetric = value["symmetric_memory_args"]
+  if symmetric is not None and not all(type(v) is bool for v in symmetric):
+    raise InvalidEntry(f"{symmetric!r} is not a list of booleans")
   if not module:
     raise InvalidEntry("a serialized kernel with no bytecode")
   return value
