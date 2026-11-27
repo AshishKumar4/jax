@@ -21,7 +21,31 @@ message MosaicGpuKernelProto {
   bool uses_xla_collective_metadata = 14;
   bool skip_device_barrier = 15;
   optional int64 collective_id = 16;
+  // What the kernel's caller stated of its launch (an identity, a resource
+  // decision), opaque to Mosaic: the custom call's `metadata` attribute, kept
+  // with the compiled call so a reader of a serialized executable finds it.
+  bytes caller_metadata = 17;
+  // What ptxas noted of a loss of performance in the kernel's assembly, in its
+  // order: a warpgroup MMA serialized (C7510 to C7515), a register move it
+  // ignores (C7507). Read once from ptxas's report as it assembled the kernel,
+  // so a reader of a compiled call finds them as data.
+  repeated AssemblerNote assembler_notes = 18;
+  // The bytes ptxas states the kernel's launch spilled as it assembled it, its
+  // functions' spill stores and loads together (a stack frame its own locals
+  // take, libdevice's sinf range reduction's, is none of them). Absent where
+  // they were not measured: a kernel compiled before this field, or one whose
+  // binary's launch scope was not established. A number upstream's schema
+  // leaves unused.
+  optional int64 spilled_bytes = 100;
 
   reserved 6;
   reserved "init_func_name";
+}
+
+// A note ptxas made of a loss of performance in a kernel's assembly.
+message AssemblerNote {
+  // Its code, as ptxas states it: `C7515`.
+  string code = 1;
+  // Its message, as ptxas states it after the code.
+  string message = 2;
 }

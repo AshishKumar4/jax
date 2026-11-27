@@ -34,7 +34,7 @@ from jax._src.lib.mlir.dialects import memref
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax._src.pallas.mosaic import error_handling as error
-from jax.experimental.mosaic.gpu.mma import MMALayouts
+from jax.experimental.mosaic.gpu.mma import layouts_for_op as mma_layouts_for_op
 import numpy as np
 
 from . import constraints as cs
@@ -532,6 +532,55 @@ def conjure_assignment(
         assert_never(never)
 
 
+def _independent_components(
+    unknowns: Sequence[cs.Variable],
+    constraint_system: cs.ConstraintSystem,
+) -> list[tuple[list[cs.Variable], list[cs.Constraint]]]:
+  """Splits `unknowns` into groups that no constraint of the system relates.
+
+  Returns each group's unknowns, in the order of `unknowns`, with the
+  constraints that mention any of them. A constraint that mentions no unknown
+  goes with every group.
+  """
+  parent = {u: u for u in unknowns}
+
+  def root(u: cs.Variable) -> cs.Variable:
+    while parent[u] != u:
+      parent[u] = parent[parent[u]]
+      u = parent[u]
+    return u
+
+  mentioned: list[tuple[cs.Constraint, list[cs.Variable]]] = []
+  for constraint in constraint_system.constraints:
+    variables = [
+        v
+        for v in cs.ConstraintSystem(
+            assignments=constraint_system.assignments, constraints=[constraint]
+        ).unknowns()
+        if v in parent
+    ]
+    mentioned.append((constraint, variables))
+    for v in variables[1:]:
+      parent[root(v)] = root(variables[0])
+
+  groups: dict[cs.Variable, list[cs.Variable]] = {}
+  for u in unknowns:
+    groups.setdefault(root(u), []).append(u)
+  # Each constraint filed under its group once, in the system's order: a
+  # kernel's thousands of groups would otherwise each scan every constraint.
+  constraints_of: dict[cs.Variable, list[cs.Constraint]] = {}
+  free = []
+  for constraint, variables in mentioned:
+    if variables:
+      constraints_of.setdefault(root(variables[0]), []).append(constraint)
+    else:
+      free.append(constraint)
+  return [
+      (members, constraints_of.get(group, []) + free)
+      for group, members in groups.items()
+  ]
+
+
 def find_assignments_for(
     unknowns: Sequence[cs.Variable],
     constraint_system: cs.ConstraintSystem,
@@ -573,6 +622,35 @@ def find_assignments_for(
         " constraints. This is a bug."
     )
     return {u: constraint_system.assignments[u] for u in unknowns}, fuel
+
+  # Unknowns that no constraint relates are solved apart: searching them
+  # together would retry every combination of one group's assignments for each
+  # dead end of another's, so a kernel with two independent buffers costs the
+  # product of their searches rather than the sum.
+  components = _independent_components(remaining_unknowns, constraint_system)
+  if len(components) > 1:
+    # A set: a kernel's thousands of assignments are each looked up among its
+    # thousands of unknowns.
+    unknown_set = frozenset(unknowns)
+    solution = {
+        v: k
+        for v, k in constraint_system.assignments.items()
+        if v in unknown_set
+    }
+    for component_unknowns, component_constraints in components:
+      component_solution, fuel = find_assignments_for(
+          component_unknowns,
+          cs.ConstraintSystem(
+              assignments=constraint_system.assignments,
+              constraints=component_constraints,
+          ),
+          fuel=fuel,
+          arch=arch,
+      )
+      if isinstance(component_solution, cs.Unsatisfiable):
+        return cs.Unsatisfiable(), fuel
+      solution |= component_solution
+    return solution, fuel
 
   # If unknowns remain and we have fully reduced the system, we may still
   # be able to make progress by trying out potential assignments. These
@@ -769,10 +847,14 @@ for _op in [
     mlir_math.RsqrtOp,
     mlir_math.SqrtOp,
     mlir_math.TanhOp,
+    mlir_math.ErfOp,
+    mlir_math.Atan2Op,
     mlir_math.AbsFOp,
     mlir_math.AbsIOp,
     mlir_math.RoundOp,
     mlir_math.RoundEvenOp,
+    mlir_math.CeilOp,
+    mlir_math.FloorOp,
     mlir_math.CopySignOp,
     mlir_math.CountLeadingZerosOp,
     arith.ShLIOp,
@@ -1192,7 +1274,7 @@ def _mma_constraint_system(
   del ctx
   element_type = op.a.type.element_type
   m, n = op.accumulator.type.shape
-  layouts = MMALayouts.for_shape(element_type, m, n)
+  layouts = mma_layouts_for_op(op, element_type, m, n)
 
   assignments: dict[cs.Variable, cs.Constant] = {}
   value_sites_for_variable: ValueSitesForVariable = {}
@@ -1270,9 +1352,13 @@ def _multi_dim_reduction_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   source = ValueSite(op, VariableType.OPERAND, 0)
+  source_variable = cs.Variable(source)
+  if not isinstance(op.result.type, ir.VectorType):
+    # Every dimension reduced, to a scalar: its source in any layout, as
+    # vector.reduction's.
+    return cs.ConstraintSystem(), {source_variable: [source]}
   acc = ValueSite(op, VariableType.OPERAND, 1)
   out = ValueSite(op, VariableType.RESULT, 0)
-  source_variable = cs.Variable(source)
   out_variable = cs.Variable(out)
   constraints = [
       cs.NotOfType(source_variable, fa.WGStridedFragLayout),

@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import math
 import operator
+import re
 from typing import Any, Literal, assert_never, cast
 
 from jax._src.interpreters import mlir as mlir_interpreter
@@ -35,7 +36,7 @@ from jax._src.lib.mlir.dialects import memref
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax.experimental.mosaic.gpu.mma import mma as do_mma
-from jax.experimental.mosaic.gpu.mma import MMALayouts
+from jax.experimental.mosaic.gpu.mma import layouts_for_op as mma_layouts_for_op
 import numpy as np
 
 from . import constraints as cs
@@ -288,7 +289,7 @@ def _initialize_barrier_op_lowering_rule(
   return []
 
 
-@_register_lowering(mgpu.AssumeMultipleOp)
+@_register_lowering(mgpu.AssumeMultipleOp, support_warp_semantics=True)
 def _assume_multiple_op_lowering_rule(
     _: LoweringContext,
     op: mgpu.AssumeMultipleOp,
@@ -515,7 +516,7 @@ def _vector_store_op_lowering_rule(
   fragmented_array = _fragmented_array_from_ir(op.valueToStore, to_store_layout)
 
   if ctx.auto_barriers:
-    utils.warpgroup_barrier()  # Make sure the reads have completed.
+    utils.warpgroup_barrier(collective=True)  # Make sure the reads have completed.
 
   ref = op.destination
   ref_type = ir.MemRefType(ref.type)
@@ -547,7 +548,7 @@ def _vector_store_op_lowering_rule(
     raise ValueError(f"Unsupported memory space: {ref_type.memory_space}")
 
   if ctx.auto_barriers:
-    utils.warpgroup_barrier()  # Make sure the writes have completed.
+    utils.warpgroup_barrier(collective=True)  # Make sure the writes have completed.
 
   return []
 
@@ -803,42 +804,110 @@ def _is_reduction_signed(kind: vector.CombiningKind) -> bool | None:
   return None
 
 
+def _reduction_scratch(
+    op: ir.OpView, element_type: ir.Type, elements: int, smem_size: int
+) -> ir.Value:
+  """The scratch of `elements` a reduction op's warpgroup takes, at the op's
+  `offset`: a block's warpgroups reduce at once and the reduction indexes its
+  scratch by the warp within the warpgroup, so each takes its own share, the
+  region holding `scratch_warpgroups` of them (one where the attribute is
+  absent). `scratch_size` is the byte stride between warpgroup shares, not
+  the amount this particular reduction happens to use."""
+  warpgroups = (
+      ir.IntegerAttr(op.attributes["scratch_warpgroups"]).value
+      if "scratch_warpgroups" in op.attributes
+      else 1
+  )
+  offset = ir.IntegerAttr(op.attributes["offset"]).value
+  # A share of no scratch reaches the reduction's own required-size check.
+  if warpgroups == 1 or elements == 0:
+    return _slice_smem(
+        ir.MemRefType.get([elements], element_type, memory_space=utils.smem()),
+        offset,
+        smem_size,
+    )
+  if "scratch_size" not in op.attributes:
+    raise ValueError("Multi-warpgroup reductions require a scratch_size byte stride.")
+  stride_bytes = ir.IntegerAttr(op.attributes["scratch_size"]).value
+  stride_elements, remainder = divmod(
+      stride_bytes * 8, utils.bitwidth(element_type)
+  )
+  if remainder or stride_elements < elements:
+    raise ValueError("Reduction scratch share is smaller than its required size.")
+  scratch = _slice_smem(
+      ir.MemRefType.get(
+          [warpgroups, stride_elements], element_type, memory_space=utils.smem()
+      ),
+      offset,
+      smem_size,
+  )
+  warpgroup = arith.index_cast(
+      ir.IndexType.get(), utils.warpgroup_idx(sync=True)
+  )
+  return utils.memref_slice(scratch, (warpgroup, slice(0, elements)))
+
+
+def _reduced_whole(
+    ctx: LoweringContext,
+    op: vector.ReductionOp | vector.MultiDimReductionOp,
+    source: ir.Value,
+    layout: ir.Attribute,
+    acc: ir.Value | None = None,
+) -> ir.Value:
+  """`source`, of any rank and layout, reduced over every axis to a scalar by
+  `op`'s kind, then combined with `acc` where given (a multi-reduction's)."""
+  op_kind = _combining_kind(op.kind)
+  if op_kind in (vector.CombiningKind.OR, vector.CombiningKind.AND):
+    # A boolean's, over the warpgroup's threads by a barrier: no scratch.
+    a = _fragmented_array_from_ir(source, layout, None)
+    if op_kind == vector.CombiningKind.OR:
+      result, combined = a.reduce_pred("or"), operator.or_
+    else:
+      result, combined = a.reduce_pred("and"), operator.and_
+  else:
+    element_type = ir.VectorType(source.type).element_type
+    scratch = _reduction_scratch(op, element_type, 4, ctx.smem_requested_bytes)
+    axes = range(ir.VectorType(source.type).rank)
+    is_signed = _is_reduction_signed(op_kind)
+    a = _fragmented_array_from_ir(source, layout, is_signed)
+    acc_ilp_attr = op.attributes.get("acc_ilp")
+    acc_ilp = None if acc_ilp_attr is None else ir.IntegerAttr(acc_ilp_attr).value
+    reduce = functools.partial(a.reduce, axis=axes, scratch=scratch, acc_ilp=acc_ilp)
+    match op_kind:
+      case vector.CombiningKind.ADD:
+        result, combined = reduce("add"), operator.add
+      case vector.CombiningKind.MUL:
+        result, combined = reduce("prod"), operator.mul
+      case vector.CombiningKind.MAXSI | vector.CombiningKind.MAXUI | vector.CombiningKind.MAXIMUMF:
+        result, combined = reduce("max"), fa.FragmentedArray.max
+      case vector.CombiningKind.MINUI | vector.CombiningKind.MINSI | vector.CombiningKind.MINIMUMF:
+        result, combined = reduce("min"), fa.FragmentedArray.min
+      case _:
+        raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
+  if acc is not None:
+    result = combined(
+        result, fa.FragmentedArray.splat(acc, (), is_signed=result.is_signed)
+    )
+  assert isinstance(result.layout, fa.WGSplatFragLayout)
+  return result.registers.item()
+
+
 @_register_lowering(vector.ReductionOp)
 def _vector_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.ReductionOp
 ) -> Sequence[ir.Value]:
   [layout] = inference_utils.in_layouts(op)
-  element_type = op.vector.type.element_type
-  scratch = _slice_smem(
-      ir.MemRefType.get([4], element_type, memory_space=utils.smem()),
-      ir.IntegerAttr(op.attributes["offset"]).value,
-      ctx.smem_requested_bytes,
-  )
-  axes = range(op.vector.type.rank)
-  op_kind = _combining_kind(op.kind)
-  is_signed = _is_reduction_signed(op_kind)
-  a = _fragmented_array_from_ir(op.vector, layout, is_signed)
-  acc_ilp_attr = op.attributes.get("acc_ilp")
-  acc_ilp = None if acc_ilp_attr is None else ir.IntegerAttr(acc_ilp_attr).value
-  match op_kind:
-    case vector.CombiningKind.ADD:
-      result = a.reduce("add", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MUL:
-      result = a.reduce("prod", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MAXSI | vector.CombiningKind.MAXUI | vector.CombiningKind.MAXIMUMF:
-      result = a.reduce("max", axes, scratch, acc_ilp=acc_ilp)
-    case vector.CombiningKind.MINUI | vector.CombiningKind.MINSI | vector.CombiningKind.MINIMUMF:
-      result = a.reduce("min", axes, scratch, acc_ilp=acc_ilp)
-    case _:
-      raise NotImplementedError(f"Unsupported reduction kind: {op.kind}")
-  assert isinstance(result.layout, fa.WGSplatFragLayout)
-  return [result.registers.item()]
+  return [_reduced_whole(ctx, op, op.vector, layout)]
 
 
 @_register_lowering(vector.MultiDimReductionOp)
 def _vector_multi_dim_reduction_op_lowering_rule(
     ctx: LoweringContext, op: vector.MultiDimReductionOp
 ) -> Sequence[ir.Value]:
+  if not isinstance(op.result.type, ir.VectorType):
+    # Every axis reduced, to a scalar: vector.reduction's, of any rank.
+    [in_layout] = inference_utils.in_layouts(op)
+    return [_reduced_whole(ctx, op, op.source, in_layout, op.acc)]
   [in_layout, acc_layout] = inference_utils.in_layouts(op)
   [out_layout] = inference_utils.out_layouts(op)
   if out_layout != acc_layout:
@@ -857,15 +926,17 @@ def _vector_multi_dim_reduction_op_lowering_rule(
 
   if not isinstance(src.layout, fa.TiledLayout):
     raise NotImplementedError(f"Unsupported layout: {src.layout}")
-  reduced_dim = src.layout.tiling.tile_dimension(op.reduction_dims[0])
-  if any(reduced_dim[d] for d in src.layout.partitioned_warp_dims):
+  num_untiled_dims = len(src.shape) - len(src.layout.base_tile_shape)
+  tiling_dim = op.reduction_dims[0] - num_untiled_dims
+  if tiling_dim >= 0 and any(
+      src.layout.tiling.tile_dimension(tiling_dim)[d]
+      for d in src.layout.partitioned_warp_dims
+  ):
     # cross-warp reductions require scratch space.
     dtype = op.source.type.element_type
     allocation_size = ir.IntegerAttr(op.attributes["scratch_size"]).value * 8 // utils.bitwidth(dtype)
-    scratch = _slice_smem(
-        ir.MemRefType.get([allocation_size], dtype, memory_space=utils.smem()),
-        ir.IntegerAttr(op.attributes["offset"]).value,
-        ctx.smem_requested_bytes,
+    scratch = _reduction_scratch(
+        op, dtype, allocation_size, ctx.smem_requested_bytes
     )
   else:
     scratch = None
@@ -1174,7 +1245,11 @@ def _mgpu_async_load_op_lowering_rule(
   # flatten -> async_copy -> unflatted here, as long as flattened size is a
   # multiple of 16.
 
-  if ctx.auto_barriers and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP:
+  if (
+      ctx.auto_barriers
+      and ctx.thread_semantics == utils.ThreadSubset.WARPGROUP
+      and not _warpgroup_synced_before(load_op)
+  ):
     utils.warpgroup_barrier()  # Make sure the writes have completed.
 
   # TODO(dasenov): Add support for the remaining op properties.
@@ -1243,6 +1318,113 @@ if hasattr(mgpu, "AsyncLoadIm2colOp"):
         predicate=predicate,
     )
     return []
+
+
+# Ops that touch no shared memory from a thread: arithmetic, address and view
+# computations, special-register reads (the NVVM ones and the GPU dialect's
+# thread, block and grid indices and dimensions), the dynamic shared memory's
+# base address, and cp.async's own issue and commit (asynchronous copies a
+# warpgroup barrier does not order anyway).
+_NO_THREAD_SMEM_ACCESS = (
+    "arith.", "index.", "math.", "builtin.unrealized_conversion_cast",
+    "gpu.thread_id", "gpu.block_id", "gpu.block_dim", "gpu.grid_dim",
+    "gpu.lane_id", "gpu.cluster_id", "gpu.cluster_dim",
+    "gpu.cluster_block_id", "gpu.dynamic_shared_memory",
+    "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison",
+    "llvm.getelementptr", "llvm.extractvalue", "llvm.insertvalue",
+    "llvm.ptrtoint", "llvm.inttoptr", "llvm.addrspacecast", "llvm.bitcast",
+    "llvm.zext", "llvm.sext", "llvm.trunc", "llvm.add", "llvm.mul",
+    "llvm.and", "llvm.or", "llvm.shl", "llvm.lshr", "llvm.icmp",
+    "nvvm.read.ptx.sreg.", "nvvm.cp.async.shared.global",
+    "nvvm.cp.async.commit.group", "nvvm.cp.async.wait.group",
+    "memref.subview", "memref.reinterpret_cast", "memref.cast",
+    "memref.collapse_shape", "memref.expand_shape", "memref.transpose",
+    "memref.view", "memref.extract_aligned_pointer_as_index",
+    "memref.extract_strided_metadata", "scf.yield",
+)
+_STRUCTURED = ("scf.if", "scf.index_switch", "scf.for")
+_WARPGROUP_BARRIER = re.compile(
+    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;"
+)
+
+
+def _no_thread_smem_access(op: ir.Operation) -> bool:
+  """Whether `op`, and every op its regions hold, touches no shared memory."""
+  name = op.name
+  if name.startswith(_STRUCTURED):
+    return all(
+        _no_thread_smem_access(inner.operation)
+        for region in op.regions
+        for block in region.blocks
+        for inner in block.operations
+    )
+  return name.startswith(_NO_THREAD_SMEM_ACCESS)
+
+
+def _constant_int(value: ir.Value) -> int | None:
+  """`value`'s integer where an `arith.constant` or `llvm.mlir.constant` defines
+  it, else None."""
+  owner = value.owner
+  if not isinstance(owner, (ir.Operation, ir.OpView)):
+    return None
+  operation = owner.operation if isinstance(owner, ir.OpView) else owner
+  if operation.name not in ("arith.constant", "llvm.mlir.constant"):
+    return None
+  attribute = operation.attributes["value"]
+  return attribute.value if isinstance(attribute, ir.IntegerAttr) else None
+
+
+def _is_warpgroup_barrier(op: ir.Operation) -> bool:
+  """Whether `op` is a barrier every thread of a warpgroup takes part in: one of
+  the whole CTA (`nvvm.barrier0`, `gpu.barrier`, an `nvvm.barrier` that names no
+  thread count), or one whose thread count is a constant of at least a
+  warpgroup. An `nvvm.barrier` of fewer threads (`numberOfThreads=32`, one
+  warp's) or of a count not known here orders no warpgroup."""
+  if op.name in ("nvvm.barrier0", "gpu.barrier"):
+    return True
+  if op.name == "nvvm.barrier":
+    # Its operands by segment: barrierId, then numberOfThreads (each optional).
+    segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+    if segments[1] == 0:
+      return True
+    threads = _constant_int(op.operands[segments[0]])
+    return threads is not None and threads >= utils.WARPGROUP_SIZE
+  if op.name != "llvm.inline_asm":
+    return False
+  asm = ir.StringAttr(op.attributes["asm_string"]).value
+  match = _WARPGROUP_BARRIER.match(asm)
+  return match is not None and (
+      match.group(4) is None or int(match.group(4)) >= utils.WARPGROUP_SIZE
+  )
+
+
+def _warpgroup_synced_before(op: ir.OpView) -> bool:
+  """Whether a warpgroup barrier precedes `op` with no thread's access to
+  shared memory between them on every path that reaches it.
+
+  The walk goes back through `op`'s block and out of the conditionals holding
+  it (a branch's start follows the ops before it); a loop's body or the
+  kernel's start ends it, a loop's start following its previous iteration too.
+  Ops already lowered precede `op`, so a preceding copy's issue is seen as the
+  cp.async ops it lowered to.
+  """
+  operation = op.operation
+  while True:
+    block = operation.block
+    before = []
+    for inner in block.operations:
+      if inner.operation == operation:
+        break
+      before.append(inner.operation)
+    for previous in reversed(before):
+      if _is_warpgroup_barrier(previous):
+        return True
+      if not _no_thread_smem_access(previous):
+        return False
+    owner = block.owner
+    if owner is None or owner.operation.name not in ("scf.if", "scf.index_switch"):
+      return False
+    operation = owner.operation
 
 
 @_register_lowering(mgpu.AsyncPrefetchOp, support_warp_semantics=True)
@@ -1477,6 +1659,8 @@ for _op, _unary_impl, _is_signed in [
     (mlir_math.AbsIOp, fa.FragmentedArray.abs, True),
     (mlir_math.RoundOp, fa.FragmentedArray.round, None),
     (mlir_math.RoundEvenOp, fa.FragmentedArray.round_even, None),
+    (mlir_math.CeilOp, fa.FragmentedArray.ceil, None),
+    (mlir_math.FloorOp, fa.FragmentedArray.floor, None),
     (mlir_math.ErfOp, fa.FragmentedArray.erf, None),
     (
         mlir_math.CountLeadingZerosOp,
@@ -1488,6 +1672,11 @@ for _op, _unary_impl, _is_signed in [
   _lowerings[_op.OPERATION_NAME] = functools.partial(
       _unary_op_lowering_rule, impl=_unary_impl, is_signed=_is_signed
   )
+
+
+UNCONTRACTED = "mosaic_gpu.uncontracted"
+"""A float add, subtract or multiply's unit attribute: it rounds on its own,
+never contracted into a fused multiply-add (`fragmented_array.contracting`)."""
 
 
 def _binary_op_lowering_rule(
@@ -1504,7 +1693,9 @@ def _binary_op_lowering_rule(
     raise ValueError("Layout mismatch")
   lhs = _fragmented_array_from_ir(op.lhs, layout, is_signed)
   rhs = _fragmented_array_from_ir(op.rhs, layout, is_signed)
-  return [fragmented_array_to_ir(impl(lhs, rhs), op.result.type)]
+  # An operation marked to round on its own is not contracted (`contracting`).
+  with fa.contracting(UNCONTRACTED not in op.attributes):
+    return [fragmented_array_to_ir(impl(lhs, rhs), op.result.type)]
 
 
 for _op, _binary_impl, _is_signed in [
@@ -1732,7 +1923,7 @@ def _mgpu_mma_op_lowering_rule(
 
   a_element_type = mma_op.a.type.element_type
   m, n = mma_op.accumulator.type.shape
-  mma_layouts = MMALayouts.for_shape(a_element_type, m, n)
+  mma_layouts = mma_layouts_for_op(mma_op, a_element_type, m, n)
   expected_acc_layout = layouts_lib.to_layout_attr(mma_layouts.acc)
   assert acc_layout == expected_acc_layout
   assert out_layout == expected_acc_layout
@@ -1744,7 +1935,7 @@ def _mgpu_mma_op_lowering_rule(
   a = _fragmented_array_from_ir(mma_op.a, a_layout, is_signed=is_signed)
   b = _fragmented_array_from_ir(mma_op.b, b_layout, is_signed=is_signed)
 
-  new_acc = do_mma(acc, a, b)
+  new_acc = do_mma(acc, a, b, rows=mma_op.rows)  # pyrefly: ignore[missing-attribute]
   return [fragmented_array_to_ir(new_acc, mma_op.result.type)]
 
 

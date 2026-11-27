@@ -23,6 +23,7 @@ limitations under the License.
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,10 +31,15 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -44,10 +50,12 @@ limitations under the License.
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/LLVM.h"
 #include "jaxlib/mosaic/gpu/dump.h"
+#include "jaxlib/mosaic/gpu/gpu_module_to_assembly.h"
 #include "xla/mosaic/pass_boilerplate.h"
 #include "xla/stream_executor/cuda/compilation_options.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/kernel_stats.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace mosaic {
@@ -56,6 +64,13 @@ namespace gpu {
 namespace {
 
 namespace se = ::stream_executor;
+
+// What precedes a performance-loss note's message, after its code.
+constexpr absl::string_view kLoss = ") Potential Performance Loss: ";
+
+// The PTX pragma letting ptxas spill registers to shared memory (CUDA 13),
+// spills `--warn-on-spills` does not report.
+constexpr llvm::StringLiteral kSharedMemorySpilling = "\"enable_smem_spilling\"";
 
 absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
     const se::cuda::CompilationProvider& compilation_provider,
@@ -80,16 +95,70 @@ absl::StatusOr<std::string> SetPtxIsaVersionToHighestSupported(
       ptx_str.substr(end_pos).str());
 }
 
+// The bytes ptxas spilled assembling `object`, known where its assembly
+// defines one kernel entry (`kKernelEntriesProperty`), every function of it
+// then that entry or one it calls: its functions' spill stores and loads
+// (`stats`, read from the spill warnings Mosaic GPU's compilation providers ask
+// ptxas for, so a function it holds none of spilled nothing). Unknown where
+// `ptx` lets ptxas spill to shared memory, which no warning reports.
+std::optional<int64_t> EntrySpilledBytes(mlir::gpu::ObjectAttr object,
+                                         llvm::StringRef ptx,
+                                         const ModuleStats& stats) {
+  llvm::SmallVector<llvm::StringRef> lines;
+  ptx.split(lines, '\n');
+  for (llvm::StringRef line : lines) {
+    llvm::StringRef code = line.split("//").first;
+    if (code.contains(".pragma") && code.contains(kSharedMemorySpilling)) {
+      return std::nullopt;
+    }
+  }
+  mlir::IntegerAttr entries;
+  if (mlir::DictionaryAttr properties = object.getProperties()) {
+    entries = properties.getAs<mlir::IntegerAttr>(kKernelEntriesProperty);
+  }
+  if (!entries || entries.getInt() != 1) {
+    return std::nullopt;
+  }
+  int64_t spilled = 0;
+  for (const auto& [function, kernel] : stats) {
+    spilled += kernel.store_bytes_spilled + kernel.load_bytes_spilled;
+  }
+  return spilled;
+}
+
+// The compute capability an object's PTX is compiled for: its NVVM target's
+// chip, which `nvvm-attach-target` set from the compile's own capability
+// ("sm_90a" is 9.0 with accelerated features). Read per object, not fixed when
+// the pass is registered: a process compiles for several GPUs in turn (a host
+// compiling ahead for another's), and a capability fixed at registration
+// assembles every later compile's PTX for the first's.
+absl::StatusOr<se::CudaComputeCapability> ObjectCapability(
+    mlir::gpu::ObjectAttr object) {
+  auto target = mlir::dyn_cast<mlir::NVVM::NVVMTargetAttr>(object.getTarget());
+  if (!target) {
+    return absl::InvalidArgumentError("Expected an NVVM target.");
+  }
+  llvm::StringRef chip = target.getChip();
+  using FeatureExtension = se::CudaComputeCapability::FeatureExtension;
+  FeatureExtension extension = chip.consume_back("a")
+                                   ? FeatureExtension::kAcceleratedFeatures
+                                   : FeatureExtension::kNone;
+  int version = 0;
+  if (!chip.consume_front("sm_") || chip.getAsInteger(10, version)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unexpected NVVM target chip: ", target.getChip().str()));
+  }
+  return se::CudaComputeCapability(version / 10, version % 10, extension);
+}
+
 class AssemblyToBinaryPass
     : public jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp> {
  public:
   using jaxlib::mlir::Pass<AssemblyToBinaryPass, mlir::ModuleOp>::Pass;
 
-  AssemblyToBinaryPass(
-      const se::cuda::CompilationProvider* compilation_provider,
-      se::CudaComputeCapability cc)
-      : compilation_provider_(std::move(compilation_provider)),
-        cc_(std::move(cc)) {}
+  explicit AssemblyToBinaryPass(
+      const se::cuda::CompilationProvider* compilation_provider)
+      : compilation_provider_(compilation_provider) {}
 
   static constexpr llvm::StringLiteral kArgumentName =
       "mosaic-gpu-assembly-to-binary";
@@ -102,8 +171,15 @@ class AssemblyToBinaryPass
     DumpOptions dump_opts = GetOrSetDumpOptionsForModule(module);
 
     se::cuda::CompilationOptions compilation_options;
-    compilation_options.dump_compilation_log = dump_opts.ptxas;
+    // ptxas's report, whose notes of a loss of performance the module keeps.
+    compilation_options.dump_compilation_log = true;
     compilation_options.generate_line_info = true;
+    std::vector<mlir::Attribute> notes;
+    // The bytes the module's binaries spilled, each where it is known
+    // (`EntrySpilledBytes`); the attribute states them for one binary alone.
+    module->removeAttr(kSpilledBytesAttr);
+    int64_t binaries = 0;
+    std::optional<int64_t> spilled;
 
     mlir::WalkResult result = module.walk([&](mlir::gpu::BinaryOp binary) {
       if (binary.getObjects().size() != 1) {
@@ -139,21 +215,34 @@ class AssemblyToBinaryPass
       ptx_str = *ptx_str_or;
       dump_ptx_if_enabled();
 
+      absl::StatusOr<se::CudaComputeCapability> cc = ObjectCapability(object);
+      if (!cc.ok()) {
+        binary.emitOpError(cc.status().message());
+        return mlir::WalkResult::interrupt();
+      }
       absl::StatusOr<se::cuda::Assembly> sass_or =
-          compilation_provider_->Compile(cc_, ptx_str, compilation_options);
+          compilation_provider_->Compile(*cc, ptx_str, compilation_options);
       if (!sass_or.ok()) {
         binary.emitOpError(sass_or.status().message());
         return mlir::WalkResult::interrupt();
       }
 
+      if (!sass_or->compilation_log.has_value()) {
+        binary.emitOpError("Expected a compilation log to be available.");
+        return mlir::WalkResult::interrupt();
+      }
       if (dump_opts.ptxas) {
-        if (!sass_or->compilation_log.has_value()) {
-          binary.emitOpError("Expected a compilation log to be available.");
-          return mlir::WalkResult::interrupt();
-        }
         DumpToFileOrStdout(*sass_or->compilation_log,
                            dump_opts.module_basename + ".ptxas",
                            dump_opts.dump_path);
+      }
+      ++binaries;
+      spilled = EntrySpilledBytes(object, ptx_str, sass_or->module_stats);
+      for (const PtxasNote& note :
+           PtxasNotes(*sass_or->compilation_log)) {
+        notes.push_back(b.getDictionaryAttr(
+            {b.getNamedAttr("code", b.getStringAttr(note.code)),
+             b.getNamedAttr("message", b.getStringAttr(note.message))}));
       }
 
       mlir::StringAttr sass = mlir::StringAttr::get(
@@ -175,24 +264,40 @@ class AssemblyToBinaryPass
 
     if (result.wasInterrupted()) {
       signalPassFailure();
+      return;
+    }
+    module->setAttr(kAssemblerNotesAttr, b.getArrayAttr(notes));
+    if (binaries == 1 && spilled.has_value()) {
+      module->setAttr(kSpilledBytesAttr, b.getI64IntegerAttr(*spilled));
     }
   }
 
  private:
   const se::cuda::CompilationProvider* compilation_provider_;
-  se::CudaComputeCapability cc_;
 };
 
 }  // namespace
 
+std::vector<PtxasNote> PtxasNotes(absl::string_view log) {
+  std::vector<PtxasNote> notes;
+  for (absl::string_view line : absl::StrSplit(log, '\n')) {
+    size_t loss = line.find(kLoss);
+    size_t open = line.rfind("(C", loss);
+    if (loss == absl::string_view::npos || open == absl::string_view::npos) {
+      continue;
+    }
+    notes.push_back({std::string(line.substr(open + 1, loss - open - 1)),
+                     std::string(absl::StripTrailingAsciiWhitespace(
+                         line.substr(loss + kLoss.size())))});
+  }
+  return notes;
+}
+
 void registerAssemblyToBinaryPass(
-    const se::cuda::CompilationProvider* compilation_provider,
-    const se::CudaComputeCapability& cc) {
-  ::mlir::registerPass(
-      [compilation_provider, cc]() -> std::unique_ptr<::mlir::Pass> {
-        return std::make_unique<AssemblyToBinaryPass>(compilation_provider,
-                                                      std::move(cc));
-      });
+    const se::cuda::CompilationProvider* compilation_provider) {
+  ::mlir::registerPass([compilation_provider]() -> std::unique_ptr<::mlir::Pass> {
+    return std::make_unique<AssemblyToBinaryPass>(compilation_provider);
+  });
 }
 
 }  // namespace gpu
