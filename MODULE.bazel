@@ -68,7 +68,8 @@ archive_override(
         # client reads their buffer assignment from it into memory_analysis().
         "//third_party:xla/executable_metadata_gpu.patch",
         # FFI handlers that instantiate concurrently (Mosaic GPU's) are instantiated together on the compile
-        # threads before thunk emission, a program's Mosaic kernels compiled in parallel.
+        # threads before thunk emission, a program's Mosaic kernels compiled in parallel: only the calls the
+        # generic emitter takes, as the emitter's own dispatch decides (SpecializedCustomCall).
         "//third_party:xla/instantiate_concurrently.patch",
         # A compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment: one check there,
         # whose bytes the executable carries (and serializes), states its memory and buffer assignment and
@@ -114,10 +115,11 @@ archive_override(
         # Mosaic GPU's kernel facts (row 9649). Delete when upstream's ExtractModuleStatsFromLog reads a quoted
         # function name of any characters.
         "//third_party:xla/ptxas_spill_function_names.patch",
-        # A reduce over degenerate dimensions alone is its inputs, each result its own: ReductionDegenerateDimRemover
-        # replaced a variadic one with one bitcast of its first input and failed the compile (RET_CHECK
-        # hlo_computation.cc: reduce ((f32[32], f32[32])) vs bitcast (f32[32]), a compensated (hi, lo) sum over a
-        # one-element axis on an A100, row 10742), and bitcast a mixed precision one across element types.
+        # A variadic or mixed precision reduce over degenerate dimensions alone is left for the reduction
+        # emitters, which read its init and reducer: ReductionDegenerateDimRemover replaced a variadic one with
+        # one bitcast of its first input and failed the compile (RET_CHECK hlo_computation.cc: reduce ((f32[32],
+        # f32[32])) vs bitcast (f32[32]), a compensated (hi, lo) sum over a one-element axis on an A100, row
+        # 10742), and bitcast a mixed precision one across element types.
         "//third_party:xla/reduce_degenerate_variadic.patch",
         # A reduce no result of which is used, kept by dead code elimination for its reducer's function call,
         # is left as it is: StableHLO's ReduceOpUnusedResultCanon rebuilt it with no inputs, and type inference
@@ -126,10 +128,8 @@ archive_override(
         # A scatter's indices are flattened in their own type: ScatterDeterminismExpander's S64 strides made S32
         # indices an s32 x s64 dot, which the elemental emitter multiplied as `arith.muli (i32, i64)` and LLVM IR
         # translation refused (RET_CHECK mlir_kernel_emitter.cc:705) under deterministic ops with the algebraic
-        # simplifier off, an accuracy check's reference as written (row 10741); and the emitter multiplies any
-        # mixed precision dot's operands in one type. Delete the scatter half when upstream's FlattenIndices
-        # converts its strides to the indices' type; the EmitDotLoop half when upstream's elemental emitter
-        # converts a mixed dot's operands (no other pass makes one at this pin).
+        # simplifier off, an accuracy check's reference as written (row 10741). Delete when upstream's
+        # FlattenIndices converts its strides to the indices' type.
         "//third_party:xla/mixed_index_dot.patch",
         # A rank whose collective kernel fails before a rendezvous of its local
         # clique (its scratch past the device's memory, its kernel, its

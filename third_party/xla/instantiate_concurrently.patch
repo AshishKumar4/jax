@@ -1,5 +1,5 @@
 diff --git a/xla/backends/gpu/codegen/BUILD b/xla/backends/gpu/codegen/BUILD
-index c726323f0d..9d8a83d44e 100644
+index c726323..9d8a83d 100644
 --- a/xla/backends/gpu/codegen/BUILD
 +++ b/xla/backends/gpu/codegen/BUILD
 @@ -730,6 +730,7 @@ cc_library(
@@ -26,7 +26,7 @@ index c726323f0d..9d8a83d44e 100644
          "@llvm-project//llvm:Core",
          "@llvm-project//llvm:OrcJIT",
 diff --git a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
-index cd278d73fa..d3b7bcc585 100644
+index cd278d7..d3b7bcc 100644
 --- a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
 +++ b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.cc
 @@ -15,6 +15,8 @@ limitations under the License.
@@ -97,7 +97,7 @@ index cd278d73fa..d3b7bcc585 100644
  CubinCustomKernelCompiler::CompileToTargetBinary(
      MlirKernelDefinition kernel_def, absl::string_view fingerprint,
 diff --git a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
-index cbb947a605..c7ff41598a 100644
+index cbb947a..c7ff415 100644
 --- a/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
 +++ b/xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h
 @@ -91,6 +91,9 @@ class CubinCustomKernelCompiler final : public KernelCompiler {
@@ -111,7 +111,7 @@ index cbb947a605..c7ff41598a 100644
        absl::string_view kernel_name, const HloModule& hlo_module,
        const se::DeviceDescription& device_info,
 diff --git a/xla/backends/gpu/codegen/kernel_compiler.h b/xla/backends/gpu/codegen/kernel_compiler.h
-index b6d0b99ca6..7a1bc9c54d 100644
+index b6d0b99..7a1bc9c 100644
 --- a/xla/backends/gpu/codegen/kernel_compiler.h
 +++ b/xla/backends/gpu/codegen/kernel_compiler.h
 @@ -24,6 +24,7 @@ limitations under the License.
@@ -140,7 +140,7 @@ index b6d0b99ca6..7a1bc9c54d 100644
      pre_optimization_hook_ = std::move(hook);
    }
 diff --git a/xla/backends/gpu/runtime/custom_call_thunk.cc b/xla/backends/gpu/runtime/custom_call_thunk.cc
-index bad6523e30..bf697a6ce8 100644
+index bad6523..bf697a6 100644
 --- a/xla/backends/gpu/runtime/custom_call_thunk.cc
 +++ b/xla/backends/gpu/runtime/custom_call_thunk.cc
 @@ -204,6 +204,34 @@ absl::StatusOr<std::unique_ptr<CustomCallThunk>> CustomCallThunk::Create(
@@ -210,7 +210,7 @@ index bad6523e30..bf697a6ce8 100644
  
    ABSL_ASSIGN_OR_RETURN(CallFrame call_frame,
 diff --git a/xla/backends/gpu/runtime/custom_call_thunk.h b/xla/backends/gpu/runtime/custom_call_thunk.h
-index b87d4c64f7..10493b436c 100644
+index b87d4c6..10493b4 100644
 --- a/xla/backends/gpu/runtime/custom_call_thunk.h
 +++ b/xla/backends/gpu/runtime/custom_call_thunk.h
 @@ -108,6 +108,18 @@ class CustomCallThunk : public TracedCommand {
@@ -233,7 +233,7 @@ index b87d4c64f7..10493b436c 100644
    // bundle. Note that `target_name` needs to refer to a registered XLA FFI
    // handler which matches the given bundle.
 diff --git a/xla/ffi/api/api.h b/xla/ffi/api/api.h
-index 80cdfb9612..e6eb75b8b2 100644
+index 80cdfb9..e6eb75b 100644
 --- a/xla/ffi/api/api.h
 +++ b/xla/ffi/api/api.h
 @@ -270,6 +270,12 @@ enum class Traits : uint32_t {
@@ -250,7 +250,7 @@ index 80cdfb9612..e6eb75b8b2 100644
  
  // Forward declare template defined below.
 diff --git a/xla/ffi/api/c_api.h b/xla/ffi/api/c_api.h
-index f9cd1139f5..0ecfc0d7cd 100644
+index f9cd113..0ecfc0d 100644
 --- a/xla/ffi/api/c_api.h
 +++ b/xla/ffi/api/c_api.h
 @@ -530,6 +530,11 @@ enum XLA_FFI_Handler_TraitsBits {
@@ -266,7 +266,7 @@ index f9cd1139f5..0ecfc0d7cd 100644
  
  typedef uint32_t XLA_FFI_Handler_Traits;
 diff --git a/xla/ffi/ffi_registry.h b/xla/ffi/ffi_registry.h
-index 517f6fd9c9..15fd9da67f 100644
+index 517f6fd..15fd9da 100644
 --- a/xla/ffi/ffi_registry.h
 +++ b/xla/ffi/ffi_registry.h
 @@ -89,6 +89,9 @@ inline std::vector<Traits> DecodeTraits(XLA_FFI_Handler_Traits traits) {
@@ -290,7 +290,7 @@ index 517f6fd9c9..15fd9da67f 100644
  }
  
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index 8088ae65c0..8ed5a15fce 100644
+index 65df6ab..ca80bc5 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -544,6 +544,8 @@ cc_library(
@@ -302,7 +302,7 @@ index 8088ae65c0..8ed5a15fce 100644
          "//xla/hlo/ir:hlo",
          "//xla/hlo/ir:hlo_instruction_utils",
          "//xla/mlir/utils:error_util",
-@@ -2314,6 +2316,34 @@ xla_test(
+@@ -2292,6 +2294,37 @@ xla_test(
      ],
  )
  
@@ -314,6 +314,9 @@ index 8088ae65c0..8ed5a15fce 100644
 +    linkstatic = True,
 +    backends = ["gpu"],
 +    deps = [
++        "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_emitter_context",
++        "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_handler_registry",
++        "//xla/backends/gpu/runtime:thunk",
 +        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
 +        "//xla/ffi",
 +        "//xla/ffi:ffi_api",
@@ -339,10 +342,10 @@ index 8088ae65c0..8ed5a15fce 100644
      srcs = ["gpu_compiler_test.cc"],
 diff --git a/xla/service/gpu/instantiate_concurrently_test.cc b/xla/service/gpu/instantiate_concurrently_test.cc
 new file mode 100644
-index 0000000000..bcbda9047d
+index 0000000..e20dbd2
 --- /dev/null
 +++ b/xla/service/gpu/instantiate_concurrently_test.cc
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,176 @@
 +/* Copyright 2026 The OpenXLA Authors.
 +
 +Licensed under the Apache License, Version 2.0 (the "License");
@@ -369,10 +372,14 @@ index 0000000000..bcbda9047d
 +#include "absl/strings/string_view.h"
 +#include "absl/time/clock.h"
 +#include "absl/time/time.h"
++#include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_emitter_context.h"
++#include "xla/backends/gpu/libraries/native_custom_call_thunks/native_custom_call_handler_registry.h"
++#include "xla/backends/gpu/runtime/thunk.h"
 +#include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
 +#include "xla/ffi/api/c_api.h"
 +#include "xla/ffi/ffi.h"
 +#include "xla/ffi/ffi_api.h"
++#include "xla/hlo/ir/hlo_instructions.h"
 +#include "xla/hlo/ir/hlo_module.h"
 +#include "xla/service/compiler.h"
 +#include "xla/service/executable.h"
@@ -411,6 +418,20 @@ index 0000000000..bcbda9047d
 +XLA_FFI_DEFINE_HANDLER(kInstantiateTogetherExecute,
 +                       []() { return absl::OkStatus(); }, ffi::Ffi::Bind());
 +
++// A target whose calls a native handler folds (no CustomCallThunk), which
++// also has an FFI registration opting into concurrent instantiation whose
++// instantiate always fails: dispatch never reaches its FFI handler.
++XLA_GPU_REGISTER_NATIVE_CUSTOM_CALL_HANDLER(
++    "xla.gpu.instantiate_folded",
++    [](const HloCustomCallInstruction&, const NativeCustomCallEmitterContext&)
++        -> absl::StatusOr<ThunkSequence> { return ThunkSequence::Empty(); });
++XLA_FFI_DEFINE_HANDLER(kInstantiateRefused,
++                       []() -> absl::Status {
++                         return absl::InvalidArgumentError(
++                             "instantiated though another emitter claims it");
++                       },
++                       ffi::Ffi::BindInstantiate());
++
 +class InstantiateConcurrentlyTest : public HloPjRtGpuTestBase {
 + protected:
 +  void SetUp() override {
@@ -421,10 +442,19 @@ index 0000000000..bcbda9047d
 +        /*initialize=*/nullptr,
 +        /*execute=*/kInstantiateTogetherExecute,
 +    };
++    XLA_FFI_Handler_Bundle refused = {
++        /*instantiate=*/kInstantiateRefused,
++        /*prepare=*/nullptr,
++        /*initialize=*/nullptr,
++        /*execute=*/kInstantiateTogetherExecute,
++    };
 +    for (absl::string_view platform : {"CUDA", "ROCM"}) {
 +      xla::ffi::Ffi::RegisterStaticHandler(
 +          ffi::GetXlaFfiApi(), "xla.gpu.instantiate_together", platform,
 +          bundle, XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
++      xla::ffi::Ffi::RegisterStaticHandler(
++          ffi::GetXlaFfiApi(), "xla.gpu.instantiate_folded", platform, refused,
++          XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
 +    }
 +    instantiate_together_arrived = 0;
 +  }
@@ -474,10 +504,26 @@ index 0000000000..bcbda9047d
 +                                     HasSubstr("instantiation refused")));
 +}
 +
++
++TEST_F(InstantiateConcurrentlyTest,
++       ACallAnotherEmitterClaimsIsNeverInstantiated) {
++  // The scan follows the emitter's dispatch: a call a native handler folds
++  // consumes no instantiated state, so its registration's failing
++  // instantiate is never asked and the compile succeeds.
++  TF_ASSERT_OK(Compiled(R"(
++    HloModule m
++
++    ENTRY e {
++      p0 = f32[8] parameter(0)
++      ROOT a = f32[8] custom-call(p0), custom_call_target="xla.gpu.instantiate_folded",
++        api_version=API_VERSION_TYPED_FFI
++    })")
++                   .status());
++}
 +}  // namespace
 +}  // namespace xla::gpu
 diff --git a/xla/service/gpu/thunk_emitter.cc b/xla/service/gpu/thunk_emitter.cc
-index ef32b25922..821fe3eede 100644
+index ef32b25..9239f00 100644
 --- a/xla/service/gpu/thunk_emitter.cc
 +++ b/xla/service/gpu/thunk_emitter.cc
 @@ -136,6 +136,8 @@ limitations under the License.
@@ -489,7 +535,142 @@ index ef32b25922..821fe3eede 100644
  #include "xla/future.h"
  #include "xla/hlo/ir/hlo_casting_utils.h"
  #include "xla/hlo/ir/hlo_computation.h"
-@@ -1358,15 +1360,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitNativeCustomCallThunks(
+@@ -457,61 +459,94 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::DispatchRecvDone(
+                                    : EmitRecvDone(instr);
+ }
+ 
+-Future<ThunkSequence> ThunkEmitter::DispatchCustomCall(
+-    const HloInstruction* hlo) {
+-  auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
++// The emitter DispatchCustomCall gives `custom_call` where one other than the
++// generic one claims it (a library call, a native folding, none at all); empty
++// where the generic one emits it, as InstantiateConcurrently asks.
++std::function<Future<ThunkSequence>()> ThunkEmitter::SpecializedCustomCall(
++    const HloCustomCallInstruction* custom_call) {
++  const HloInstruction* hlo = custom_call;
+ 
+   if (IsCublasLtMatmul(*hlo)) {
+-    return EmitCublasLtMatmul(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitCublasLtMatmul(custom_call);
++    };
+   }
+   if (IsCublasLtMatmulF8(*hlo)) {
+-    return EmitCublasLtMatmulF8(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitCublasLtMatmulF8(custom_call);
++    };
+   }
+   if (IsCublasLtGroupedMatmul(*hlo)) {
+-    return EmitCublasLtGroupedMatmul(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitCublasLtGroupedMatmul(custom_call);
++    };
+   }
+   if (IsCublasLtMatmulMx(*hlo)) {
+-    return EmitCublasLtMatmulMx(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitCublasLtMatmulMx(custom_call);
++    };
+   }
+   if (IsCudnnConvolutionReorder(*hlo)) {
+-    return EmitConvolutionReorder(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitConvolutionReorder(custom_call);
++    };
+   }
+   if (IsCustomCallToDnnNorm(*hlo)) {
+-    return EmitNorm(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitNorm(custom_call);
++    };
+   }
+   if (IsCustomCallTofMHA(*hlo) || IsCustomCallTofMHAF8(*hlo) ||
+       IsCustomCallToBlockScaledDot(*hlo)) {
+-    return EmitCuDnn(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitCuDnn(custom_call);
++    };
+   }
+   if (IsCustomCallToPtxKernel(*hlo)) {
+-    return EmitPtxCustomCall(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitPtxCustomCall(custom_call);
++    };
+   }
+   if (IsCustomCallToTopK(*hlo)) {
+-    return EmitTopKCustomCall(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitTopKCustomCall(custom_call);
++    };
+   }
+   if (IsCustomCallToDnnConvolution(*hlo)) {
+-    return EmitConvolution(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitConvolution(custom_call);
++    };
+   }
+   if (IsTriangularSolve(*hlo)) {
+-    return EmitTriangularSolveCustomCall(hlo);
++    return [this, hlo]() -> Future<ThunkSequence> {
++      return EmitTriangularSolveCustomCall(hlo);
++    };
+   }
+   // CUB sort is handled as a generic FFI custom call via CustomCallThunk.
+   // See xla.gpu.ext.cub_sort_keys and xla.gpu.ext.cub_sort_pairs handlers.
+   if (hlo->custom_call_target() == "PadToStatic") {
+-    return EmitPadToStatic(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitPadToStatic(custom_call);
++    };
+   }
+   if (hlo->custom_call_target() == "SliceToDynamic") {
+-    return EmitSliceToDynamic(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitSliceToDynamic(custom_call);
++    };
+   }
+   if (hlo->custom_call_target() == "__gpu$xla.gpu.triton") {
+     // TODO(slebedev): Remove this after June 15th 2025.
+-    return EmitTritonCustomCall(custom_call);
++    return [this, custom_call]() -> Future<ThunkSequence> {
++      return EmitTritonCustomCall(custom_call);
++    };
+   }
+   if (EmitsNoThunks(*hlo)) {
+-    return ThunkSequence::Empty();
++    return []() -> Future<ThunkSequence> { return ThunkSequence::Empty(); };
+   }
+   if (hlo->custom_call_target() == "GetRngSeed") {
+-    return EmitRngSeed(hlo);
++    return [this, hlo]() -> Future<ThunkSequence> {
++      return EmitRngSeed(hlo);
++    };
+   }
+   // Custom calls that have registered a thunk-folding handler are lowered
+   // directly to a native ThunkSequence instead of a CustomCallThunk. This is
+@@ -521,7 +556,19 @@ Future<ThunkSequence> ThunkEmitter::DispatchCustomCall(
+           NativeCustomCallHandlerRegistry::GetGlobal().Lookup(
+               hlo->custom_call_target());
+       handler.has_value()) {
+-    return EmitNativeCustomCallThunks(custom_call, *handler);
++    return [this, custom_call, handler = *handler]() -> Future<ThunkSequence> {
++      return EmitNativeCustomCallThunks(custom_call, handler);
++    };
++  }
++  return nullptr;
++}
++
++Future<ThunkSequence> ThunkEmitter::DispatchCustomCall(
++    const HloInstruction* hlo) {
++  auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
++  if (std::function<Future<ThunkSequence>()> emit =
++          SpecializedCustomCall(custom_call)) {
++    return emit();
+   }
+   return EmitGenericCustomCall(custom_call);
+ }
+@@ -1358,15 +1405,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitNativeCustomCallThunks(
    return handler(*instr, ctx);
  }
  
@@ -508,7 +689,7 @@ index ef32b25922..821fe3eede 100644
    using Slices = std::vector<NullableShapedSlice>;
  
    Slices operands;
-@@ -1400,11 +1396,113 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+@@ -1400,11 +1441,117 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
          results.push_back(ShapedSlice{slice, subshape});
          return absl::OkStatus();
        }));
@@ -561,6 +742,10 @@ index ef32b25922..821fe3eede 100644
 +          instr->api_version() != CustomCallApiVersion::API_VERSION_TYPED_FFI) {
 +        continue;
 +      }
++      // Only a call the generic emitter takes consumes the state.
++      if (SpecializedCustomCall(instr)) {
++        continue;
++      }
 +      absl::StatusOr<ffi::HandlerRegistration> registration =
 +          ffi::FindHandler(instr->custom_call_target(), platform_name());
 +      if (!registration.ok() || registration->bundle.instantiate == nullptr ||
@@ -600,11 +785,7 @@ index ef32b25922..821fe3eede 100644
 +  }
 +  return absl::OkStatus();
 +}
- 
--  // For XLA FFI handlers we decode opaque backend config into
--  // attributes map at IR emission time, so that we do not need to
--  // parse MLIR at run time. For FFI handlers backend config must be
--  // a compatible MLIR dictionary.
++
 +std::unique_ptr<ffi::ExecutionState> ThunkEmitter::TakeInstantiated(
 +    const HloInstruction* instr) {
 +  auto found = instantiated_.extract(instr);
@@ -619,14 +800,18 @@ index ef32b25922..821fe3eede 100644
 +  // with a rich type safe API.
 +  bool is_ffi_custom_call =
 +      instr->api_version() == CustomCallApiVersion::API_VERSION_TYPED_FFI;
-+
+ 
+-  // For XLA FFI handlers we decode opaque backend config into
+-  // attributes map at IR emission time, so that we do not need to
+-  // parse MLIR at run time. For FFI handlers backend config must be
+-  // a compatible MLIR dictionary.
 +  ABSL_ASSIGN_OR_RETURN(auto slices, CustomCallSlices(instr));
 +  std::vector<NullableShapedSlice> operands = std::move(slices.first);
 +  std::vector<NullableShapedSlice> results = std::move(slices.second);
    ffi::AttributesMap attributes;
  
    auto backend_config = instr->backend_config<GpuBackendConfig>();
-@@ -1431,22 +1529,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+@@ -1431,22 +1578,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
                         "(--xla_gpu_hlo_custom_call_allowlist). "));
      }
      auto& called_computations = instr->called_computations();
@@ -650,7 +835,7 @@ index ef32b25922..821fe3eede 100644
      const bool enable_pdl =
          IsPdlEnabled(ir_emitter_context_->debug_options(),
                       ir_emitter_context_->gpu_compute_capability());
-@@ -1459,7 +1542,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
+@@ -1459,7 +1591,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGenericCustomCall(
          called_computations.empty() ? nullptr : called_computations[0],
          ir_emitter_context_->platform_name(),
          ir_emitter_context_->gpu_compute_capability(),
@@ -659,7 +844,7 @@ index ef32b25922..821fe3eede 100644
          ir_emitter_context_->cpu_target_machine_options(), enable_pdl);
    };
  
-@@ -3011,6 +3094,12 @@ Future<ThunkSequence> ThunkEmitter::EmitHloInstruction(
+@@ -3011,6 +3143,12 @@ Future<ThunkSequence> ThunkEmitter::EmitHloInstruction(
  
  Future<ThunkSequence> ThunkEmitter::EmitHloEntryComputation(
      const HloModule* module) {
@@ -673,10 +858,18 @@ index ef32b25922..821fe3eede 100644
  }
  
 diff --git a/xla/service/gpu/thunk_emitter.h b/xla/service/gpu/thunk_emitter.h
-index 46df8a0b2d..b7f33071c9 100644
+index 46df8a0..22107f0 100644
 --- a/xla/service/gpu/thunk_emitter.h
 +++ b/xla/service/gpu/thunk_emitter.h
-@@ -35,6 +35,8 @@ limitations under the License.
+@@ -16,6 +16,7 @@ limitations under the License.
+ #ifndef XLA_SERVICE_GPU_THUNK_EMITTER_H_
+ #define XLA_SERVICE_GPU_THUNK_EMITTER_H_
+ 
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -35,6 +36,8 @@ limitations under the License.
  #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
  #include "xla/backends/gpu/runtime/thunk.h"
  #include "xla/codegen/llvm_kernel_source.h"
@@ -685,7 +878,18 @@ index 46df8a0b2d..b7f33071c9 100644
  #include "xla/future.h"
  #include "xla/hlo/ir/hlo_computation.h"
  #include "xla/hlo/ir/hlo_instruction.h"
-@@ -250,6 +252,27 @@ class ThunkEmitter {
+@@ -138,6 +141,10 @@ class ThunkEmitter {
+   // Dispatches a custom call to specialized thunk emission when supported and
+   // falls back to generic custom-call emission.
+   Future<ThunkSequence> DispatchCustomCall(const HloInstruction* hlo);
++  // The emitter DispatchCustomCall gives a custom call another than the generic
++  // one claims; empty where the generic one emits it.
++  std::function<Future<ThunkSequence>()> SpecializedCustomCall(
++      const HloCustomCallInstruction* custom_call);
+ 
+   // Dispatches a legacy collective-start to synchronous collective emission or
+   // generic async execution.
+@@ -250,6 +257,27 @@ class ThunkEmitter {
    absl::StatusOr<ThunkSequence> EmitCublasLtMatmulMx(
        const HloCustomCallInstruction* instr);
  
@@ -713,7 +917,7 @@ index 46df8a0b2d..b7f33071c9 100644
    absl::StatusOr<ThunkSequence> EmitGenericCustomCall(
        const HloCustomCallInstruction* instr);
  
-@@ -392,6 +415,12 @@ class ThunkEmitter {
+@@ -392,6 +420,12 @@ class ThunkEmitter {
    }
    AllocationOverrides allocation_overrides_;
  

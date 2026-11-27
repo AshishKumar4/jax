@@ -1,77 +1,40 @@
-From 81562ab513b7b364f7818b1e058b9336364ebf7b Mon Sep 17 00:00:00 2001
-From: Ashish Kumar Singh <ashishkmr472@gmail.com>
-Date: Sat, 21 Nov 2026 06:13:15 -0600
-Subject: [PATCH] [XLA:GPU] A reduce over degenerate dimensions alone is its
- inputs, each result its own
-
-ReductionDegenerateDimRemover replaced a reduce whose every reduced dimension is
-degenerate with one bitcast of its first input in its first result's shape: a
-variadic reduce, whose shape is a tuple, failed the replacement's shape check
-(RET_CHECK hlo_computation.cc ShapeUtil::Compatible: reduce ((f32[32], f32[32]))
-vs bitcast (f32[32])), and a mixed precision reduce's bitcast changed its
-element type. Each result is now its input bitcast to its shape, converted
-where its element type is another, a variadic reduce's results a tuple.
----
 diff --git a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
-index c03e6c8000..a8b10662b4 100644
+index c03e6c8..432597d 100644
 --- a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
 +++ b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover.cc
-@@ -38,6 +38,33 @@ limitations under the License.
- namespace xla {
- namespace gpu {
- 
-+// The results of `reduce`, every one of whose reduced dimensions is degenerate:
-+// each its input in its result's shape (the init values are the identities of
-+// the reducer), converted where the result's element type is another (a mixed
-+// precision reduce), a variadic reduce's in a tuple.
-+std::unique_ptr<HloInstruction> Unreduced(HloReduceInstruction* reduce) {
-+  absl::InlinedVector<HloInstruction*, 2> results;
-+  for (int64_t i = 0; i < reduce->input_count(); ++i) {
-+    HloInstruction* input = reduce->inputs()[i];
-+    const Shape& result_shape = reduce->shape().IsTuple()
-+                                    ? reduce->shape().tuple_shapes(i)
-+                                    : reduce->shape();
-+    std::unique_ptr<HloInstruction> result = HloInstruction::CreateBitcast(
-+        ShapeUtil::ChangeElementType(result_shape,
-+                                     input->shape().element_type()),
-+        input);
-+    if (!ShapeUtil::SameElementType(result_shape, input->shape())) {
-+      result = HloInstruction::CreateConvert(
-+          result_shape, reduce->parent()->AddInstruction(std::move(result)));
-+    }
-+    if (!reduce->shape().IsTuple()) {
-+      return result;
-+    }
-+    results.push_back(reduce->parent()->AddInstruction(std::move(result)));
-+  }
-+  return HloInstruction::CreateTuple(results);
-+}
-+
- class ReductionDegenerateDimRemoverVisitor : public DfsHloRewriteVisitor {
-  public:
-   absl::Status HandleReduce(HloInstruction* hlo) override {
-@@ -78,9 +105,7 @@ class ReductionDegenerateDimRemoverVisitor : public DfsHloRewriteVisitor {
+@@ -78,9 +78,17 @@ class ReductionDegenerateDimRemoverVisitor : public DfsHloRewriteVisitor {
        }
  
        if (updated_reduced_dimensions.empty()) {
 -        std::unique_ptr<HloInstruction> reshape =
 -            HloInstruction::CreateBitcast(reduce_shape, reduced_op);
 -        return ReplaceWithNewInstruction(instr, std::move(reshape));
-+        return ReplaceWithNewInstruction(instr, Unreduced(instr));
++        // Every reduced dimension is degenerate: its result is its input where
++        // its init is its reducer's identity, as this pass assumes of a reduce
++        // of one input in its own type. A variadic or mixed precision reduce,
++        // whose results that bitcast would not make, is left as it is for the
++        // reduction emitters, which read its init and reducer.
++        if (instr->shape().IsTuple() ||
++            !ShapeUtil::SameElementType(reduce_shape, input_shape)) {
++          return absl::OkStatus();
++        }
++        return ReplaceWithNewInstruction(
++            instr, HloInstruction::CreateBitcast(reduce_shape, reduced_op));
        }
  
        input_reshapes.push_back(instr->parent()->AddInstruction(
 diff --git a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
-index fa51e54b32..d4c555f568 100644
+index fa51e54..5386ec0 100644
 --- a/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
 +++ b/xla/backends/gpu/transforms/reduction_degenerate_dim_remover_test.cc
-@@ -131,5 +131,60 @@ ENTRY main {
+@@ -131,5 +131,54 @@ ENTRY main {
        )");
  }
  
 +TEST_F(ReductionDegenerateDimRemoverTest,
-+       DegenerateVariadicReductionIsATupleOfItsInputs) {
-+  // A compensated (hi, lo) sum over a one-element axis.
++       DegenerateVariadicReductionIsLeftForTheEmitters) {
++  // A compensated (hi, lo) sum over a one-element axis: a bitcast of its first
++  // input, as one input's reduce is rewritten, is no result of it.
 +  const char* hlo = R"(
 +HloModule ReduceVariadicOverDegenerateDimension
 +
@@ -93,15 +56,11 @@ index fa51e54b32..d4c555f568 100644
 +}
 +)";
 +
-+  CheckDegenerateDimRemover(hlo, R"(
-+// CHECK-DAG: [[hi:%[^ ]+]] = f32[32]{0} bitcast({{.*}}hi
-+// CHECK-DAG: [[lo:%[^ ]+]] = f32[32]{0} bitcast({{.*}}lo
-+// CHECK: ROOT {{.*}} = (f32[32]{0}, f32[32]{0}) tuple([[hi]], [[lo]])
-+)");
++  CheckDegenerateDimRemover(hlo, std::nullopt);
 +}
 +
 +TEST_F(ReductionDegenerateDimRemoverTest,
-+       DegenerateMixedPrecisionReductionConvertsItsInput) {
++       DegenerateMixedPrecisionReductionIsLeftForTheEmitters) {
 +  const char* hlo = R"(
 +HloModule ReduceMixedPrecisionOverDegenerateDimension
 +
@@ -118,10 +77,7 @@ index fa51e54b32..d4c555f568 100644
 +}
 +)";
 +
-+  CheckDegenerateDimRemover(hlo, R"(
-+// CHECK: [[bitcast:%[^ ]+]] = bf16[32]{0} bitcast({{.*}}input
-+// CHECK: ROOT {{.*}} = f32[32]{0} convert([[bitcast]])
-+)");
++  CheckDegenerateDimRemover(hlo, std::nullopt);
 +}
 +
  }  // namespace

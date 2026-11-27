@@ -70,7 +70,7 @@ index 231e703..9a8ad75 100644
      }
    }
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
-index d52564e..d542b8d 100644
+index ca80bc5..6c8bcd0 100644
 --- a/xla/service/gpu/BUILD
 +++ b/xla/service/gpu/BUILD
 @@ -863,6 +863,7 @@ cc_library(
@@ -81,7 +81,7 @@ index d52564e..d542b8d 100644
          "//xla/pjrt/proto:compile_options_proto_cc",
          "//xla/runtime:device_id",
          "//xla/runtime:hang_watchdog",
-@@ -2422,6 +2423,32 @@ xla_test(
+@@ -2425,6 +2426,32 @@ xla_test(
      ],
  )
  
