@@ -230,11 +230,10 @@ auto AppendDiagnosticTo(std::string* diagnostic) {
 absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     mlir::MLIRContext* ctx,
     const se::cuda::CompilationProvider* compilation_provider,
-    const se::CudaComputeCapability& cc, const std::string& sm,
-    const std::string& ptx_isa, const std::string& nvshmem_path,
-    bool verify_target) {
+    const std::string& sm, const std::string& ptx_isa,
+    const std::string& nvshmem_path, bool verify_target) {
   static absl::once_flag register_passes_flag;
-  absl::call_once(register_passes_flag, [&compilation_provider, &cc]() {
+  absl::call_once(register_passes_flag, [&compilation_provider]() {
     mosaic::gpu::EnsureLLVMNVPTXTargetIsRegistered();
     EnsureLLVMisInitialized();
     mlir::registerCanonicalizerPass();
@@ -258,7 +257,7 @@ absl::StatusOr<mlir::OpPassManager> GetPassPipeline(
     mlir::registerGPUNVVMPasses();
     mlir::registerGpuLaunchSinkIndexComputationsPass();
     mosaic::gpu::registerGpuModuleToAssemblyPass();
-    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider, cc);
+    mosaic::gpu::registerAssemblyToBinaryPass(compilation_provider);
     mosaic::gpu::registerGpuLaunchLoweringPass();
     mosaic::gpu::registerConvertGpuToLLVMPass();
     mosaic::gpu::registerByvalInsertionPass();
@@ -517,6 +516,10 @@ struct CompiledKernel {
   std::string kernel_name;
   int32_t smem_bytes = 0;
   int32_t cluster_size = 1;
+  // What ptxas noted of a loss of performance as it assembled the kernel.
+  std::vector<mosaic::gpu::PtxasNote> assembler_notes;
+  // The bytes ptxas states its launch spilled, where they were measured.
+  std::optional<int64_t> spilled_bytes;
   // The following fields are used for de/serialization of CompiledKernel.
   std::string object_file;
   std::string host_func_name;
@@ -616,7 +619,7 @@ absl::Status RunMlirPasses(mlir::ModuleOp module, se::CudaComputeCapability cc,
   bool verify_target = !((cc.major == 10 && cc.minor > 0) || cc.major == 11);
   ASSIGN_OR_RETURN(
       auto passes,
-      GetPassPipeline(module.getContext(), compilation_provider, cc, sm,
+      GetPassPipeline(module.getContext(), compilation_provider, sm,
                       llvm_ptx_isa, nvshmem_path, verify_target));
   return RunPasses(std::move(passes), module, dump_opts);
 }
@@ -917,6 +920,15 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
   std::string kernel_name = kernel_name_attr.getValue().str();
   int32_t smem_bytes = smem_bytes_attr.getInt();
   int32_t cluster_size = cluster_size_attr.getInt();
+  std::vector<mosaic::gpu::PtxasNote> assembler_notes;
+  if (auto notes = (*module)->getAttrOfType<mlir::ArrayAttr>(
+          mosaic::gpu::kAssemblerNotesAttr)) {
+    for (auto note : notes.getAsRange<mlir::DictionaryAttr>()) {
+      assembler_notes.push_back(
+          {note.getAs<mlir::StringAttr>("code").getValue().str(),
+           note.getAs<mlir::StringAttr>("message").getValue().str()});
+    }
+  }
 
   ASSIGN_OR_RETURN(
       auto object_file,
@@ -931,15 +943,26 @@ absl::StatusOr<std::unique_ptr<CompiledKernel>> Compile(
 
   ASSIGN_OR_RETURN(auto host_func_name, GetHostFuncName(*module));
 
-  return CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
-                          use_nvshmem, multimem_used, std::move(gpu_binary),
-                          std::move(kernel_name), smem_bytes, cluster_size);
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<CompiledKernel> kernel,
+      CreateAndInitJIT(std::move(object_file), std::move(host_func_name),
+                       use_nvshmem, multimem_used, std::move(gpu_binary),
+                       std::move(kernel_name), smem_bytes, cluster_size));
+  kernel->assembler_notes = std::move(assembler_notes);
+  if (auto spilled = (*module)->getAttrOfType<mlir::IntegerAttr>(
+          mosaic::gpu::kSpilledBytesAttr)) {
+    kernel->spilled_bytes = spilled.getInt();
+  }
+  return kernel;
 }
 
 struct KernelCache {
   absl::Mutex mutex;
   absl::flat_hash_map<KernelHash, std::unique_ptr<CompiledKernel>> kernels
       ABSL_GUARDED_BY(mutex);
+  // The kernels a thread is compiling: another thread asking one waits for
+  // it rather than compiling it again.
+  absl::flat_hash_set<KernelHash> compiling ABSL_GUARDED_BY(mutex);
 };
 
 static KernelCache& GetKernelCache() {
@@ -954,17 +977,30 @@ absl::StatusOr<CompiledKernel*> GetOrCreateKernel(
   auto& cache = GetKernelCache();
   {
     absl::MutexLock lock(cache.mutex);
+    // A kernel another thread is compiling is waited for, compiled once: XLA
+    // instantiates a program's calls together, and a program calls one kernel
+    // from many places (each layer of a model).
+    std::pair<KernelCache*, const KernelHash*> asked(&cache, &kernel_hash);
+    cache.mutex.Await(absl::Condition(
+        +[](std::pair<KernelCache*, const KernelHash*>* asked)
+            ABSL_EXCLUSIVE_LOCKS_REQUIRED(asked->first->mutex) {
+              return !asked->first->compiling.contains(*asked->second);
+            },
+        &asked));
     auto it = cache.kernels.find(kernel_hash);
     if (it != cache.kernels.end()) {
       return it->second.get();
     }
+    cache.compiling.insert(kernel_hash);
   }
-  // Release the lock while compiling the kernel. It is possible that multiple
-  // threads compile the same kernel concurrently. In that case, we will discard
-  // all but the first result.
-  ASSIGN_OR_RETURN(auto kernel, factory());
+  // The lock released while compiling, so other kernels compile beside it.
+  absl::StatusOr<std::unique_ptr<CompiledKernel>> kernel = factory();
   absl::MutexLock lock(cache.mutex);
-  auto [iter, _] = cache.kernels.try_emplace(kernel_hash, std::move(kernel));
+  cache.compiling.erase(kernel_hash);
+  if (!kernel.ok()) {
+    return kernel.status();
+  }
+  auto [iter, _] = cache.kernels.try_emplace(kernel_hash, *std::move(kernel));
   return iter->second.get();
 }
 
@@ -1134,6 +1170,9 @@ struct CustomCallResources {
   bool uses_xla_collective_metadata = false;
   bool skip_device_barrier = false;
   std::optional<int64_t> collective_id;
+  // The custom call's `metadata` attribute: its caller's statement of the
+  // launch, one per call (calls of one kernel share `kernel`, not this).
+  std::string metadata;
 
   static absl::StatusOr<std::string> Serialize(
       const CustomCallResources& resources);
@@ -1170,6 +1209,15 @@ absl::StatusOr<std::string> CustomCallResources::Serialize(
   if (resources.collective_id.has_value()) {
     kernel_proto.set_collective_id(*resources.collective_id);
   }
+  kernel_proto.set_caller_metadata(resources.metadata);
+  for (const PtxasNote& note : kernel->assembler_notes) {
+    mosaic::gpu::AssemblerNote* stated = kernel_proto.add_assembler_notes();
+    stated->set_code(note.code);
+    stated->set_message(note.message);
+  }
+  if (kernel->spilled_bytes.has_value()) {
+    kernel_proto.set_spilled_bytes(*kernel->spilled_bytes);
+  }
   return kernel_proto.SerializeAsString();
 }
 
@@ -1188,6 +1236,7 @@ CustomCallResources::Deserialize(absl::string_view data) {
   }
   std::memcpy(resources->hash.data(), kernel_proto.kernel_hash().data(),
               sizeof(KernelHash));
+  resources->metadata = kernel_proto.caller_metadata();
 
   if (kernel_proto.version() != 5) {
     return absl::InternalError(absl::StrCat(
@@ -1217,12 +1266,21 @@ CustomCallResources::Deserialize(absl::string_view data) {
       GetOrCreateKernel(
           resources->hash,
           [&]() -> absl::StatusOr<std::unique_ptr<CompiledKernel>> {
-            return CreateAndInitJIT(
-                llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
-                                                 "kernel"),
-                std::move(host_func_name), kernel_proto.is_nvshmem_used(),
-                kernel_proto.is_multimem_used(), std::move(gpu_binary),
-                std::move(kernel_name), smem_bytes, cluster_size);
+            ASSIGN_OR_RETURN(
+                std::unique_ptr<CompiledKernel> kernel,
+                CreateAndInitJIT(
+                    llvm::MemoryBuffer::getMemBuffer(kernel_proto.object_file(),
+                                                     "kernel"),
+                    std::move(host_func_name), kernel_proto.is_nvshmem_used(),
+                    kernel_proto.is_multimem_used(), std::move(gpu_binary),
+                    std::move(kernel_name), smem_bytes, cluster_size));
+            for (const auto& note : kernel_proto.assembler_notes()) {
+              kernel->assembler_notes.push_back({note.code(), note.message()});
+            }
+            if (kernel_proto.has_spilled_bytes()) {
+              kernel->spilled_bytes = kernel_proto.spilled_bytes();
+            }
+            return kernel;
           }));
   return resources;
 }
@@ -1311,6 +1369,8 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
                    attrs.get<std::string_view>("kernel_hash"));
   ASSIGN_OR_RETURN(std::string_view module,
                    attrs.get<std::string_view>("module"));
+  const std::string_view metadata =
+      attrs.get<std::string_view>("metadata").value_or("");
   if (kernel_hash.size() != sizeof(KernelHash)) {
     return absl::InvalidArgumentError(
         absl::StrFormat("Kernel hash size is %d bytes, expected %d bytes",
@@ -1354,6 +1414,7 @@ absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
       // barrier semaphores.
       .collective_id = collective_id.ok() ? std::make_optional(*collective_id)
                                           : std::nullopt,
+      .metadata = std::string(metadata),
   });
 }
 
@@ -2030,6 +2091,8 @@ XLA_FFI_DEFINE_HANDLER(kMosaicGpuPrepare, MosaicGpuPrepare,
 // - module: the serialized MLIR module.
 // - skip_device_barrier (optional)
 // - uses_xla_collective_metadata (optional)
+// - metadata (optional): the caller's statement of the launch, kept in the
+//   serialized call (MosaicGpuKernelProto.caller_metadata).
 // - xla_replica_ids (required if uses_xla_collective_metadata is true)
 // - symmetric_memory_parameters (optional)
 // - collective_id (optional, enables barrier semaphores)
@@ -2075,6 +2138,9 @@ XLA_FFI_DEFINE_HANDLER(
         .Ctx<xla::ffi::State<mosaic::gpu::CustomCallResources>>(),
     {ffi::Traits::kCmdBufferCompatible});
 
+// Its instantiate stage compiles the kernel into a cache that compiles
+// concurrently (`GetOrCreateKernel`), each compile in an MLIR context of its
+// own, so XLA instantiates a program's calls together.
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                          {
                              /*instantiate=*/kMosaicGPUInstantiate,
@@ -2082,7 +2148,8 @@ XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                              /*initialize=*/kMosaicGpuInitialize,
                              /*execute=*/kMosaicGpuExecute,
                              /*record=*/kMosaicGpuRecord,
-                         });
+                         },
+                         XLA_FFI_HANDLER_TRAITS_INSTANTIATE_CONCURRENTLY);
 
 }  // namespace
 

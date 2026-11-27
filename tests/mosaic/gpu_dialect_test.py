@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 
+from unittest import mock
 from absl.testing import parameterized
 import jax
 from jax import numpy as jnp
@@ -2610,6 +2611,130 @@ class DialectLoweringTest(MosaicGpuTest):
         list(filter(is_mosaic_gpu_op, if_op.then_block.operations))
     )
 
+  def _marked_after(self, before, *, branch=None):
+    """A marker op after `before` (a callable emitting ops), inside `branch`
+    ("if" or "for") when given; returns the marker."""
+    i32 = ir.IntegerType.get_signless(32)
+    with self.kernel():
+      before()
+      if branch is None:
+        return llvm.UndefOp(i32)
+      if branch == "if":
+        index = arith.constant(ir.IndexType.get(), 1)
+        op = scf.IndexSwitchOp([], index, [1])
+        with ir.InsertionPoint(op.case_block(0)):
+          marker = llvm.UndefOp(i32)
+          scf.yield_([])
+        with ir.InsertionPoint(op.default_block):
+          scf.yield_([])
+        return marker
+      lb = arith.constant(ir.IndexType.get(), 0)
+      for_op = scf.ForOp(lb, lb, lb)
+      with ir.InsertionPoint(for_op.body):
+        marker = llvm.UndefOp(i32)
+        scf.yield_([])
+      return marker
+
+  @staticmethod
+  def _barrier(threads=mgpu_utils.WARPGROUP_SIZE):
+    def emit():
+      mgpu_utils.inline_ptx(
+          f"bar.sync $0, {threads};",
+          arith.constant(ir.IntegerType.get_signless(32), 1),
+          has_side_effects=True,
+      )
+    return emit
+
+  def test_a_barrier_then_address_arithmetic_syncs_the_warpgroup(self):
+    def before():
+      self._barrier()()
+      arith.constant(ir.IntegerType.get_signless(32), 7)
+    self.assertTrue(lowering._warpgroup_synced_before(self._marked_after(before)))
+
+  def test_a_barrier_then_index_reads_and_the_shared_base_syncs_the_warpgroup(self):
+    # A pipeline's copy addresses its slot from the dynamic shared memory's
+    # base and the block's dimensions: reads of no thread's shared memory, so
+    # the barrier before them orders the copy (Dew 3181: an A100 GEMM's fetch
+    # kept a barrier a copy behind `gpu.dynamic_shared_memory` and
+    # `gpu.block_dim`).
+    def before():
+      self._barrier()()
+      mgpu_utils.thread_idx()
+      i8 = ir.IntegerType.get_signless(8)
+      gpu.dynamic_shared_memory(
+          ir.MemRefType.get((mgpu_utils.DYNAMIC,), i8, memory_space=mgpu_utils.smem())
+      )
+    self.assertTrue(lowering._warpgroup_synced_before(self._marked_after(before)))
+
+  def test_a_shared_access_after_the_barrier_does_not_sync(self):
+    def before():
+      self._barrier()()
+      llvm.load(ir.IntegerType.get_signless(32), llvm.UndefOp(workgroup_ptr_ty()))
+    self.assertFalse(
+        lowering._warpgroup_synced_before(self._marked_after(before))
+    )
+
+  def test_a_conditional_branch_starts_after_the_ops_before_it(self):
+    marker = self._marked_after(self._barrier(), branch="if")
+    self.assertTrue(lowering._warpgroup_synced_before(marker))
+
+  def test_a_loop_body_also_follows_its_previous_iteration(self):
+    marker = self._marked_after(self._barrier(), branch="for")
+    self.assertFalse(lowering._warpgroup_synced_before(marker))
+
+  def test_assembly_that_goes_on_past_its_barrier_does_not_sync(self):
+    # One inline assembly block syncing, then reading shared memory: the read
+    # follows the barrier, so the block orders no later copy.
+    def before():
+      mgpu_utils.inline_ptx(
+          f"bar.sync $1, {mgpu_utils.WARPGROUP_SIZE}; ld.shared.u32 $0, [$1];",
+          arith.constant(ir.IntegerType.get_signless(32), 1),
+          result_types=ir.IntegerType.get_signless(32),
+          has_side_effects=True,
+      )
+    self.assertFalse(
+        lowering._warpgroup_synced_before(self._marked_after(before))
+    )
+
+  def test_a_barrier_of_one_warp_does_not_sync_the_warpgroup(self):
+    marker = self._marked_after(self._barrier(threads=32))
+    self.assertFalse(lowering._warpgroup_synced_before(marker))
+
+  @staticmethod
+  def _nvvm_barrier(threads):
+    """An `nvvm.barrier` of `threads` (a constant count, "unknown" for a value
+    no constant defines, None for none: the whole CTA)."""
+    def emit():
+      i32 = ir.IntegerType.get_signless(32)
+      operands = []
+      if threads == "unknown":
+        operands = [llvm.UndefOp(i32).result]
+      elif threads is not None:
+        operands = [arith.constant(i32, ir.IntegerAttr.get(i32, threads))]
+      ir.Operation.create(
+          "nvvm.barrier",
+          operands=operands,
+          attributes={
+              "operandSegmentSizes": ir.DenseI32ArrayAttr.get(
+                  [0, len(operands)]
+              )
+          },
+      )
+    return emit
+
+  @parameterized.parameters(
+      (None, True),
+      (mgpu_utils.WARPGROUP_SIZE, True),
+      (2 * mgpu_utils.WARPGROUP_SIZE, True),
+      (32, False),
+      ("unknown", False),
+  )
+  def test_an_nvvm_barrier_syncs_the_warpgroup_only_for_a_count_it_proves(
+      self, threads, synced
+  ):
+    marker = self._marked_after(self._nvvm_barrier(threads))
+    self.assertEqual(lowering._warpgroup_synced_before(marker), synced)
+
   def test_initialize_barrier_op_lowering_rule(self):
     num_barriers = 4
     arrival_count = 1337
@@ -2650,6 +2775,52 @@ class DialectLoweringTest(MosaicGpuTest):
         ValueError, "missing a layout and can not be lowered"
     ):
       mgpu.lower_mgpu_dialect(self.module, launch_ctx)
+
+  def test_the_divisibility_analysis_answers_each_subproblem_once(self):
+    # A product's power-of-two splits ask after its operands again and again:
+    # a chain of ten squarings of an unknown index is analysed in work linear
+    # in its length, not exponential (each subproblem once per analysis).
+    index = ir.IndexType.get()
+    with self.kernel():
+      value = llvm.UndefOp(index).result
+      for _ in range(10):
+        value = arith.muli(value, value)
+      known = {}
+      with mock.patch.object(
+          mgpu_utils, "_is_known_divisible", wraps=mgpu_utils._is_known_divisible
+      ) as analysed:
+        for bit in range(1, 11):
+          mgpu_utils.is_known_divisible(value, 1 << bit, known=known)
+    self.assertLessEqual(analysed.call_count, 11 * 11 * 11)
+
+  def test_an_untiled_copy_s_offset_is_known_as_the_divisibility_analysis_proves(
+      self,
+  ):
+    # The untiled CP_ASYNC copy's alignment reads its offset's divisibility
+    # from Mosaic GPU's one analysis (`utils.is_known_divisible`): a select of
+    # multiples, a minimum, a product of two strided values, an unsigned cast.
+    index, i64 = ir.IndexType.get(), ir.IntegerType.get_signless(64)
+    i1 = ir.IntegerType.get_signless(1)
+    with self.kernel():
+      def c(value):
+        return arith.constant(index, value)
+      pred = llvm.UndefOp(i1).result
+      selected = arith.select(pred, c(2), c(4))
+      other = arith.select(pred, c(8), c(16))
+      unknown = llvm.UndefOp(index).result
+      known = {
+          "select": launch_context._known_multiple(selected),
+          "min": launch_context._known_multiple(arith.minui(c(8), c(16))),
+          "product": launch_context._known_multiple(arith.muli(selected, other)),
+          "cast": launch_context._known_multiple(
+              arith.index_castui(index, arith.index_castui(i64, other))
+          ),
+          "unknown": launch_context._known_multiple(unknown),
+      }
+    self.assertEqual(
+        known,
+        {"select": 2, "min": 8, "product": 16, "cast": 8, "unknown": 1},
+    )
 
   def test_lowering_load_and_store_with_only_swizzle_lowers(self):
     shape = (128, 128)
