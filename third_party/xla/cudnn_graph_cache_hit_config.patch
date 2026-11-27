@@ -1,0 +1,141 @@
+diff --git a/xla/backends/gpu/tests/gpu_fused_mha_test.cc b/xla/backends/gpu/tests/gpu_fused_mha_test.cc
+index 164979de51..849f74eb02 100644
+--- a/xla/backends/gpu/tests/gpu_fused_mha_test.cc
++++ b/xla/backends/gpu/tests/gpu_fused_mha_test.cc
+@@ -941,6 +941,57 @@ class FlashAttentionBMMScaleSoftmaxBMM : public MultiHeadedAttentionTest {
+     return hlo_text;
+   }
+ 
++  const std::string  // NOLINT
++  GetModuleFlash_Attention_CuDNN_Training_BMM1_Softmax_BMM2_Deterministic_Two_Backward_HloString_BF16() {  // NOLINT
++    const std::string hlo_text = R"(
++    HloModule jit__unnamed_wrapped_function_, entry_computation_layout={(bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,64,1024]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0})->(bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,64,1024]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0})}, allow_spmd_sharding_propagation_to_output={true,true,true,true,true,true,true}
++
++    ENTRY main.72 {
++      Arg_0.1 = bf16[2,6,1024,64]{3,2,1,0} parameter(0), sharding={replicated}
++      Arg_1.2 = bf16[2,6,64,1024]{3,2,1,0} parameter(1), sharding={replicated}
++      transpose = bf16[2,6,1024,64]{3,2,1,0} transpose(Arg_1.2), dimensions={0,1,3,2}
++      Arg_2.3 = bf16[2,6,1024,64]{3,2,1,0} parameter(2), sharding={replicated}
++      fmha-bmm-softmax-bmm = (bf16[2,6,1024,64]{3,2,1,0}, f32[2,6,1024]{2,1,0}, u8[0]{0}) custom-call(Arg_0.1, transpose, Arg_2.3), custom_call_target="__cudnn$fmhaSoftmax", operand_layout_constraints={bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}}, backend_config={"cudnn_fmha_backend_config":{"algorithm":{"algo_id":"0","math_type":"TENSOR_OP_MATH","tuning_knobs":{"17":"1","24":"0"},"workspace_size":"0"},"fmha_scale":37,"dropout_rate":0,"bmm1_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["3"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm2_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"intermediate_tensor_shape":{"element_type":"BF16","dimensions":["2","6","1024","1024"],"tuple_shapes":[],"layout":{"dim_level_types":[],"dim_unique":[],"dim_ordered":[],"minor_to_major":["3","2","1","0"],"tiles":[],"tail_padding_alignment_in_elements":"1","element_size_in_bits":"0","memory_space":"0","index_primitive_type":"PRIMITIVE_TYPE_INVALID","pointer_primitive_type":"PRIMITIVE_TYPE_INVALID","dynamic_shape_metadata_prefix_bytes":"0","split_configs":[]},"is_dynamic_dimension":[false,false,false,false]},"seed":"42","is_flash_attention":false,"is_causal_mask":false,"mask_type":"NO_MASK"}}
++      get-tuple-element = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm), index=0
++      transpose.2 = bf16[2,6,1024,64]{3,2,1,0} transpose(Arg_1.2), dimensions={0,1,3,2}
++      get-tuple-element.2 = f32[2,6,1024]{2,1,0} get-tuple-element(fmha-bmm-softmax-bmm), index=1
++      Arg_4.5 = bf16[2,6,1024,64]{3,2,1,0} parameter(3), sharding={replicated}
++      Arg_5.6 = bf16[2,6,1024,64]{3,2,1,0} parameter(4), sharding={replicated}
++      fmha-bmm-softmax-bmm-backward = (bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, u8[0]{0}) custom-call(Arg_0.1, transpose.2, Arg_2.3, get-tuple-element.2, Arg_4.5, /*index=5*/get-tuple-element), custom_call_target="__cudnn$fmhaSoftmaxBackward", operand_layout_constraints={bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, f32[2,6,1024]{2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}}, backend_config={"cudnn_fmha_backend_config":{"algorithm":{"algo_id":"0","math_type":"TENSOR_OP_MATH","tuning_knobs":{"24":"0","17":"1"},"workspace_size":"0"},"fmha_scale":37,"dropout_rate":0,"intermediate_tensor_shape":{"element_type":"BF16","dimensions":["2","6","1024","1024"],"tuple_shapes":[],"layout":{"dim_level_types":[],"dim_unique":[],"dim_ordered":[],"minor_to_major":["3","2","1","0"],"tiles":[],"tail_padding_alignment_in_elements":"1","element_size_in_bits":"0","memory_space":"0","index_primitive_type":"PRIMITIVE_TYPE_INVALID","pointer_primitive_type":"PRIMITIVE_TYPE_INVALID","dynamic_shape_metadata_prefix_bytes":"0","split_configs":[]},"is_dynamic_dimension":[false,false,false,false]},"bmm1_grad_gemm1_dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm1_grad_gemm2_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm2_grad_gemm1_dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm2_grad_gemm2_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["3"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"seed":"42","is_flash_attention":false,"is_causal_mask":false,"mask_type":"NO_MASK","sliding_window_length":0}}
++      fmha-bmm-softmax-bmm-backward.2 = (bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, u8[0]{0}) custom-call(Arg_0.1, transpose.2, Arg_2.3, get-tuple-element.2, Arg_5.6, /*index=5*/get-tuple-element), custom_call_target="__cudnn$fmhaSoftmaxBackward", operand_layout_constraints={bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, f32[2,6,1024]{2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}}, backend_config={"cudnn_fmha_backend_config":{"algorithm":{"algo_id":"0","math_type":"TENSOR_OP_MATH","tuning_knobs":{"24":"0","17":"1"},"workspace_size":"0"},"fmha_scale":37,"dropout_rate":0,"intermediate_tensor_shape":{"element_type":"BF16","dimensions":["2","6","1024","1024"],"tuple_shapes":[],"layout":{"dim_level_types":[],"dim_unique":[],"dim_ordered":[],"minor_to_major":["3","2","1","0"],"tiles":[],"tail_padding_alignment_in_elements":"1","element_size_in_bits":"0","memory_space":"0","index_primitive_type":"PRIMITIVE_TYPE_INVALID","pointer_primitive_type":"PRIMITIVE_TYPE_INVALID","dynamic_shape_metadata_prefix_bytes":"0","split_configs":[]},"is_dynamic_dimension":[false,false,false,false]},"bmm1_grad_gemm1_dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm1_grad_gemm2_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm2_grad_gemm1_dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["2"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"bmm2_grad_gemm2_dot_dimension_numbers":{"lhs_contracting_dimensions":["3"],"rhs_contracting_dimensions":["3"],"lhs_batch_dimensions":["0","1"],"rhs_batch_dimensions":["0","1"]},"seed":"42","is_flash_attention":false,"is_causal_mask":false,"mask_type":"NO_MASK","sliding_window_length":0}}
++      get-tuple-element.3 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward), index=0
++      get-tuple-element.4 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward), index=1
++      transpose.1 = bf16[2,6,64,1024]{3,2,1,0} transpose(get-tuple-element.4), dimensions={0,1,3,2}
++      get-tuple-element.5 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward), index=2
++      get-tuple-element.6 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward.2), index=0
++      get-tuple-element.7 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward.2), index=1
++      get-tuple-element.8 = bf16[2,6,1024,64]{3,2,1,0} get-tuple-element(fmha-bmm-softmax-bmm-backward.2), index=2
++      ROOT tuple.71 = (bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,64,1024]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}, bf16[2,6,1024,64]{3,2,1,0}) tuple(get-tuple-element, get-tuple-element.3, transpose.1, get-tuple-element.5, get-tuple-element.6, get-tuple-element.7, get-tuple-element.8)
++    } // main.72
++  )";
++    return hlo_text;
++  }
++
++  // Two backward calls the cuDNN custom call compiler fingerprints alike before
++  // it compiles them, neither stating force_deterministic, which the first's
++  // compile sets under the fixture's determinism: the second takes the first's
++  // graph and that backend config, so its thunk finds the graph's
++  // serialization.
++  void TestImpl_Flash_Attention_Training_BMM1_Softmax_BMM2_Deterministic_Two_Backward() {
++    if (skip_reason_) GTEST_SKIP() << *skip_reason_;
++    auto cc = GetCudaComputeCapability();
++    if (device_description().dnn_version() <
++            stream_executor::SemanticVersion(9, 0, 0) ||
++        !cc.IsAtLeastHopper() || cc.minor != 0) {
++      GTEST_SKIP() << "Flash Attention deterministic kernels requires cuDNN >= "
++                      "9.0.0 and Hopper arch.";
++    }
++    std::string hlo_string =
++        GetModuleFlash_Attention_CuDNN_Training_BMM1_Softmax_BMM2_Deterministic_Two_Backward_HloString_BF16();  // NOLINT
++    EXPECT_TRUE(
++        RunAndCompareTwoModules(hlo_string, hlo_string, ErrorSpec{1e-8, 1e-8}));
++  }
++
+   void TestImpl_Flash_Attention_Training_BMM1_Softmax_BMM2() {
+     if (skip_reason_) GTEST_SKIP() << *skip_reason_;
+     if (device_description().dnn_version() <
+@@ -1585,6 +1636,11 @@ TEST_F(FlashAttentionBMMScaleSoftmaxBMM,
+   TestImpl_Flash_Attention_Training_BMM1_Softmax_BMM2_Deterministic();
+ }
+ 
++TEST_F(FlashAttentionBMMScaleSoftmaxBMM,
++       Flash_Attention_Training_BMM1_Softmax_BMM2_Deterministic_Two_Backward_BF16) {
++  TestImpl_Flash_Attention_Training_BMM1_Softmax_BMM2_Deterministic_Two_Backward();
++}
++
+ // BMM1 - Scale - PaddingMask - Softmax - BMM2
+ TEST_F(FlashAttentionBMMScalePaddingMaskSoftmaxBMM,
+        Flash_Attention_Training_BMM1_PaddingMask_Softmax_BMM2_BF16) {
+diff --git a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
+index b9d9c6e077..f36b59fa01 100644
+--- a/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
++++ b/xla/backends/gpu/transforms/cudnn_custom_call_compiler.cc
+@@ -18,6 +18,7 @@ limitations under the License.
+ #include <cstdint>
+ #include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "absl/container/flat_hash_map.h"
+@@ -563,9 +564,8 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+ 
+     ABSL_ASSIGN_OR_RETURN(const std::string fingerprint_without_workspace,
+                           FingerprintWithBackendConfig<GpuBackendConfig>(*hlo));
+-    auto workspace_size_it =
+-        workspace_sizes_.find(fingerprint_without_workspace);
+-    if (workspace_size_it == workspace_sizes_.cend()) {
++    auto compiled_it = compiled_.find(fingerprint_without_workspace);
++    if (compiled_it == compiled_.cend()) {
+       ABSL_ASSIGN_OR_RETURN(
+           se::dnn::DnnSupport * dnn_support,
+           ResolveCudnnSupport(hlo->GetModule()->config().debug_options(),
+@@ -578,8 +578,14 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+                                     DynCast<HloCustomCallInstruction>(hlo)));
+ 
+       const int64_t workspace_size = graph.Graph().get_workspace_size();
+-      workspace_sizes_.insert(workspace_size_it,
+-                              {fingerprint_without_workspace, workspace_size});
++      // Building the graph may have set fields of the call's backend config
++      // (the backward's force_deterministic), which the emitter's fingerprint
++      // reads: a later call of this fingerprint takes them too.
++      ABSL_ASSIGN_OR_RETURN(GpuBackendConfig compiled_config,
++                            hlo->backend_config<GpuBackendConfig>());
++      compiled_.insert(compiled_it,
++                       {fingerprint_without_workspace,
++                        {workspace_size, std::move(compiled_config)}});
+       AddWorkspace(*hlo, workspace_size);
+ 
+       std::vector<uint8_t> serialized_graph;
+@@ -594,7 +600,8 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+                       serialized_graph.size());
+     } else {
+       VLOG(4) << "Cache hit.";
+-      AddWorkspace(*hlo, workspace_size_it->second);
++      ABSL_RETURN_IF_ERROR(hlo->set_backend_config(compiled_it->second.config));
++      AddWorkspace(*hlo, compiled_it->second.workspace_size);
+     }
+ 
+     MarkAsChanged();
+@@ -605,7 +612,14 @@ class CuDnnCustomCallVisitor : public DfsHloRewriteVisitor {
+   se::StreamExecutor* stream_exec_;
+   const se::DeviceDescription& gpu_device_info_;
+   BinaryMap& compilation_results_;
+-  absl::flat_hash_map<std::string, int64_t> workspace_sizes_;
++  // A compiled call's workspace size and backend config, by its fingerprint
++  // before the compile: a call of the same fingerprint takes both, so the
++  // emitter fingerprints it as the serialized graph's.
++  struct Compiled {
++    int64_t workspace_size;
++    GpuBackendConfig config;
++  };
++  absl::flat_hash_map<std::string, Compiled> compiled_;
+ };
+ 
+ }  // namespace
