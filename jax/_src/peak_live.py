@@ -51,6 +51,9 @@ class LiveBuffer:
       whole of that element: a scan's stacked output, the residual each step
       writes a row of (``_loop_named``).
     parameter: the entry parameter's number, for a ``parameter`` buffer.
+    role: what it is of the instruction making it, where that is more than
+      its value: ``workspace`` for a cuBLAS call's scratch, the last element
+      of its result tuple (``_role``); empty otherwise.
     dims: for each of its dimensions the (argument, axis) pairs it descends
       from, each argument by its flat index among the call's (``args_info``'s
       leaves), through the dimension maps of the ops that made it
@@ -67,6 +70,7 @@ class LiveBuffer:
   source: str
   names: tuple[str, ...] = ()
   parameter: int | None = None
+  role: str = ""
   dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
@@ -292,6 +296,8 @@ class _Read:
             made.metadata.op_name if made is not None else ""),
         source=f"{metadata.source_file}:{metadata.source_line}",
         names=tuple(named.split(",")) if named else (),
+        role=_role(made, within) if made is not None else _role(
+            instruction, tuple(buffer.defined_at.shape_index)),
         parameter=self.parameters.get(allocation),
         dims=(tuple(None for _ in shape.dimensions) if dims is None
               else tuple(dims)))
@@ -313,6 +319,17 @@ def _fused_root(instruction: Any, index: Any, instructions: dict[int, Any],
   if root.opcode == "tuple" and index:
     root, index = instructions[root.operand_ids[index[0]]], index[1:]
   return root, index
+
+
+def _role(maker: Any, index: tuple[int, ...]) -> str:
+  """What the element ``index`` of ``maker``'s output is beyond its value:
+  ``workspace`` for a cuBLAS call's last tuple element past its first, the
+  scratch XLA's gemm rewriter appends after its result (and any auxiliary
+  output); "" for any other."""
+  cublas = (maker.opcode == "custom-call"
+            and maker.custom_call_target.startswith("__cublas$"))
+  last = len(maker.shape.tuple_shapes) - 1
+  return "workspace" if cublas and index == (last,) and last > 0 else ""
 
 
 def _names_output(maker: Any, index: tuple[int, ...]) -> bool:

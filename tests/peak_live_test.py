@@ -216,7 +216,8 @@ ENTRY e {
     # result and its 32 MiB workspace, named by the checkpoint its dot is in.
     # The name is the result's alone (the call's first element); the workspace,
     # and every element of another instruction's tuple, keep the op_name and
-    # take no name.
+    # take no name. The workspace says so (its role), apart from an unnamed
+    # value.
     hlo = """
 HloModule m, entry_computation_layout={(f32[8192,128]{1,0}, f32[128,64]{1,0})->(f32[8192,64]{1,0}, s8[33554432]{0}, f32[2]{0}, f32[2]{0})}
 
@@ -261,11 +262,11 @@ ENTRY e {
       peak.logical_buffer_ids.append(buffer_id)
     live = peak_live.live(assignment.SerializeToString(), module)
     self.assertEqual(
-        [(each.shape, each.op_name, each.names) for each in live],
-        [((8192, 64), "jit(f)/down_proj/dot_general", ("down_proj",)),
-         ((33554432,), "jit(f)/down_proj/dot_general", ()),
-         ((2,), "jit(f)/pair", ()),
-         ((2,), "jit(f)/pair", ())])
+        [(each.shape, each.op_name, each.names, each.role) for each in live],
+        [((8192, 64), "jit(f)/down_proj/dot_general", ("down_proj",), ""),
+         ((33554432,), "jit(f)/down_proj/dot_general", (), "workspace"),
+         ((2,), "jit(f)/pair", (), ""),
+         ((2,), "jit(f)/pair", (), "")])
 
   @jtu.run_on_devices("cpu", "cuda")
   def test_a_residual_a_policy_saves_is_named_by_its_checkpoint_name(self):
