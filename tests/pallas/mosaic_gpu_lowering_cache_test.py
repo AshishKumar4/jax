@@ -944,49 +944,6 @@ class LoweringCacheTest(harness.LoweringCacheTestCase):
         self.assertEqual(first["events"], ["miss"], first)
         self.assertIn(second["events"], expected, second)
 
-  # -- a constant of the lowering's code is read, not assumed
-
-  def test_a_constant_of_the_lowering_that_is_replaced_is_part_of_the_key(self):
-    # `SMEM_ALIGNMENT` is assigned a literal by the sealed source of the lowering:
-    # a process that gives it a value of its own (one the key can hold) is another
-    # key, before the first lookup and after the first lowering.
-    self.kernel = "smem"
-    stock = self.lower()
-    self.assertEqual(stock["events"], ["miss"], stock)
-    run = self.lower(tweaks=["smem_alignment:2048"])
-    fresh = self.lower(cache=False, tweaks=["smem_alignment:2048"])
-    self.assertEqual(run["events"], ["miss"], run)
-    self.assert_lowers_as_fresh(run, fresh)
-    self.assertNotEqual(run["normalized"]["module"], stock["normalized"]["module"])
-    again = self.lower(tweaks=["smem_alignment:2048"])
-    self.assertEqual(again["events"], ["hit"], again)
-    self.cache_dir = self.tmp / "cache-after"
-    warm, replaced = self.run_child(after=["smem_alignment:2048"])["runs"]
-    self.assertEqual(warm["events"], ["miss"], warm)
-    self.assertEqual(replaced["events"], ["miss"], replaced)
-
-  def test_a_constant_replaced_by_what_a_key_cannot_hold_is_unsealed(self):
-    # An object, a NumPy scalar and an instance of a subclass of int: none is the
-    # literal kind of value the source assigns the constant, so the lowering
-    # bypasses the cache, before the first lookup or after the first lowering.
-    self.kernel = "smem"
-    for tweak in ("smem_alignment_object", "smem_alignment_numpy:2048",
-                  "smem_alignment_subclass:2048"):
-      with self.subTest(f"{tweak} before the first lookup"):
-        self.cache_dir = self.tmp / f"cache-before-{tweak}"
-        run = self.lower(tweaks=[tweak])
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(run["events"], ["unsealed"], run)
-        self.assert_lowers_as_fresh(run, fresh)
-        self.assertEmpty(self.entries())
-      with self.subTest(f"{tweak} after the first lowering"):
-        self.cache_dir = self.tmp / f"cache-after-{tweak}"
-        warm, replaced = self.run_child(after=[tweak])["runs"]
-        fresh = self.lower(cache=False, tweaks=[tweak])
-        self.assertEqual(warm["events"], ["miss"], warm)
-        self.assertEqual(replaced["events"], ["unsealed"], replaced)
-        self.assert_lowers_as_fresh(replaced, fresh)
-
   # -- what a lowering reads of the process
 
   def test_a_lowering_reads_the_inputs_it_is_given(self):

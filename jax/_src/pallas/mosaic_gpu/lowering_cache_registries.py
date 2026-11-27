@@ -80,6 +80,9 @@ class Table:
   by_primitive: bool
 
 
+_DISCHARGE = "jax.state.discharge._discharge_rules"
+
+
 def tables() -> list[Table]:
   """Every registry a lowering dispatches through."""
   rules = [
@@ -92,8 +95,7 @@ def tables() -> list[Table]:
             lambda: lowering._resource_estimators, True),
       Table("jax.lax.eval_jaxpr.call_primitives",
             lambda: eval_jaxpr_lib.call_primitives, True),
-      Table("jax.state.discharge._discharge_rules",
-            lambda: discharge._discharge_rules, True),
+      Table(_DISCHARGE, lambda: discharge._discharge_rules, True),
       Table("mosaic_gpu.dialect_lowering._lowerings",
             lambda: dialect_lowering._lowerings, False),
       Table("mosaic_gpu.dialect_lowering._supported_warp_lowerings",
@@ -158,10 +160,11 @@ class State:
   # Each primitive-keyed table and its entries, as `entries` holds them.
   primitive_tables: tuple[tuple[Table, dict[Any, Any]], ...] = (
       dataclasses.field(default=(), repr=False, compare=False))
-  # Each primitive outside `lowered` a kernel held: its entries' encoding and
-  # whether it met an extension's code (`reached`), made once.
-  _own: dict[jax_core.Primitive, tuple[bytes, bool]] = dataclasses.field(
-      default_factory=dict, repr=False, compare=False)
+  # Each primitive outside `lowered` a kernel held: its entries' encoding,
+  # whether it met an extension's code, and whether it has a state discharge
+  # rule (`reached`), made once.
+  _own: dict[jax_core.Primitive, tuple[bytes, bool, bool]] = (
+      dataclasses.field(default_factory=dict, repr=False, compare=False))
 
   def reached(
       self, primitives: Iterable[jax_core.Primitive]
@@ -171,7 +174,10 @@ class State:
     of those primitives outside `lowered` (a state discharge rule, run on a body
     an equation holds), and whether any rule of it runs an extension's code.
 
-    Raises Unsealed if an entry it reaches is not sealed code.
+    Raises Unsealed if an entry it reaches is not sealed code, or if a primitive
+    has no rule it is keyed by: one outside `lowered` (which holds every call
+    primitive and every primitive a Mosaic GPU rule lowers, as the very object
+    the registry holds) is lowered only once a state discharge rule removes it.
     """
     own = []
     extended = self.extended
@@ -188,7 +194,14 @@ class State:
             held.append(
                 encoding.seq(b"entry", [encoding.string(table.name), entry]))
         # Lowerings on several threads may each make it: the same bytes.
-        found = self._own.setdefault(primitive, (b"".join(held), enc.extended))
+        found = self._own.setdefault(primitive, (
+            b"".join(held), enc.extended, any(
+                table.name == _DISCHARGE and primitive in live
+                for table, live in self.primitive_tables)))
+      if not found[2]:
+        raise sealing.Unsealed(
+            "no sealed lowering or discharge rule for the primitive"
+            f" {primitive.name}")
       if found[0]:
         own.append(found[0])
         extended |= found[1]
@@ -255,21 +268,3 @@ def current() -> State:
 def unchanged(since: State) -> bool:
   """Whether the registries are the objects `since` was made of."""
   return _token() == since.token
-
-
-def check_primitives(primitives: dict[jax_core.Primitive, bool]) -> None:
-  """Raises Unsealed unless each primitive of a kernel has a rule it is keyed by.
-
-  A primitive is a call primitive (lowered as its body, which the key holds), or
-  has a Mosaic GPU lowering rule or a state discharge rule, as the very object
-  the registry holds (a primitive of the same name that is another object has
-  none).
-  """
-  known: set[jax_core.Primitive] = set(discharge._discharge_rules.copy())
-  for rules in list(lowering.mosaic_lowering_rules.values()):
-    known.update(rules.copy())
-  for primitive, is_call in primitives.items():
-    if not is_call and primitive not in known:
-      raise sealing.Unsealed(
-          f"no sealed lowering or discharge rule for the primitive {primitive.name}"
-      )

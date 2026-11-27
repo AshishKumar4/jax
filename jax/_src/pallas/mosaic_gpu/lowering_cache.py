@@ -38,9 +38,10 @@ The contract is the one of JAX's persistent compilation cache:
   wheel's, a missing ``RECORD`` (an editable or source install), a jax module
   loaded later that no ``RECORD`` lists, a rule the lowering reaches, registered
   in or replaced in a registry it dispatches through (``lowering_cache_registries``),
-  that is not sealed code, a registry that changes after the key was made, and a constant of
-  the lowering's packages that is gone or holds what the key cannot hold
-  (``lowering_cache_constants``).
+  that is not sealed code, and a registry that changes after the key was made.
+* *What the cache assumes:* a module-level constant of the lowering's packages
+  holds the value its sealed source assigns. A process that assigns one another
+  value (``gpu_core.SMEM_ALIGNMENT = ...``) must not enable the cache.
 * *A value the encoder cannot encode exactly bypasses the cache, counted as
   ``uncacheable``:* a class, enum, pytree node or aval no sealed module owns (a
   user's layout class), a primitive no sealed module holds, a mutable container.
@@ -99,7 +100,6 @@ from jax._src.lax import parallel as lax_parallel
 from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
-from jax._src.pallas.mosaic_gpu import lowering_cache_constants as constants_lib
 from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as encoding
 from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries_lib
 from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing
@@ -476,13 +476,11 @@ def _key(
     inputs: mgpu_lowering_inputs.LoweringInputs,
     code: sealing.Seal,
     dispatch: registries_lib.State,
-    constants: bytes,
 ) -> str:
   # Placed where it reads its mesh, or where a rule it reaches is an
   # extension's, which may read the mesh by any of its inputs.
   placed = dispatch.extended or _reads_jax_mesh(jaxpr, jax_mesh)
   enc, jaxpr_enc = _jaxpr_encoded(jaxpr, placed)
-  registries_lib.check_primitives(enc.primitives)
   # The rules its lowering reaches (`State.reached`): its jaxpr's primitives'
   # are the same whether it is placed.
   reached, extended = dispatch.reached(enc.primitives)
@@ -493,7 +491,6 @@ def _key(
       "version": b"mosaic-gpu-lowering-cache-key-v1",
       "installation": code.digest or b"",
       "what it dispatches through": reached,
-      "constants": constants,
       "jaxpr": jaxpr_enc,
       # The rule's arguments.
       "input avals": enc.encode(tuple(in_shapes)),
@@ -676,7 +673,7 @@ def lower_unpipelined_jaxpr_to_module(
     dispatch = registries_lib.current()
     key = _key(
         ctx, gpu_mesh, jax_mesh, jaxpr, in_shapes, out_shapes, params, inputs,
-        code, dispatch, constants_lib.digest(),
+        code, dispatch,
     )
   except sealing.Unsealed as e:
     _say_once(str(e))

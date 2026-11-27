@@ -238,3 +238,32 @@ def jaxpr_once():
       "same later part": first_encoder.encode(later) == second_encoder.encode(later),
       "same primitives": first_encoder.primitives == second_encoder.primitives,
   }
+
+
+def rules():
+  """Which primitives a kernel may hold (`lowering_cache_registries.State.
+  reached`): a call primitive, one a Mosaic GPU rule lowers, and one only a
+  state discharge rule removes are reached; one with neither rule is refused."""
+  from jax._src.lax import linalg  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries  # pylint: disable=g-import-not-at-top
+  from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing  # pylint: disable=g-import-not-at-top
+  from jax._src.state import discharge  # pylint: disable=g-import-not-at-top
+
+  state = registries.current()
+  discharged = sorted(
+      (p for p in discharge._discharge_rules.copy() if p not in state.lowered),
+      key=lambda p: p.name)
+
+  def outcome(primitive):
+    try:
+      state.reached([primitive])
+    except sealing.Unsealed:
+      return "refused"
+    return "reached"
+
+  return {
+      "a Mosaic GPU rule": outcome(jax.lax.sin_p),
+      "a discharge rule alone": sorted({outcome(p) for p in discharged}),
+      "how many": len(discharged),
+      "no rule": outcome(linalg.cholesky_p),
+  }

@@ -47,7 +47,6 @@ from jax._src import effects as jax_effects
 from jax._src import layout as jax_layout
 from jax._src import mesh as mesh_lib
 from jax._src.pallas.mosaic_gpu import lowering
-from jax._src.pallas.mosaic_gpu import lowering_cache_constants as constants
 from jax._src.pallas.mosaic_gpu import lowering_cache_registries as registries
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental import pallas as pl
@@ -213,6 +212,17 @@ def _is_function_of_the_installation(value: Any) -> bool:
       value, types.BuiltinFunctionType)
 
 
+def _in_scope(module: str) -> bool:
+  """Whether `module` is of the packages a Mosaic GPU lowering runs, and not
+  of the cache's own modules."""
+  return module.startswith(
+      ("jax._src.pallas.", "jax.experimental.mosaic.gpu")
+  ) and not module.startswith((
+      "jax._src.pallas.mosaic_gpu.lowering_cache",
+      "jax.experimental.mosaic.gpu.lowering_inputs",
+  ))
+
+
 def _covered(module: str, name: str, value: Any, table_ids: set[int],
              contexts: dict[int, str]) -> str | None:
   """Why the cache covers this global, or None."""
@@ -222,7 +232,7 @@ def _covered(module: str, name: str, value: Any, table_ids: set[int],
     return contexts[id(value)]
   if any(value is holder for holder in config.config._value_holders.values()):
     return "a config flag (jax.config.values)"
-  if constants.in_scope(module) and isinstance(value, functools.partial):
+  if _in_scope(module) and isinstance(value, functools.partial):
     return "a partial the installed code defines (the seal's digest)"
   return None
 
@@ -237,7 +247,7 @@ def _accepted(module: str, name: str, value: Any) -> str | None:
     return "an immutable aval"
   if _short(value) == "builtins.NotImplementedType":
     return "a builtin singleton"
-  if (constants.in_scope(module)
+  if (_in_scope(module)
       and _short(value) == "jax.experimental.mosaic.gpu.fragmented_array.TiledLayout"):
     return _LAYOUT
   if _is_function_of_the_installation(value):

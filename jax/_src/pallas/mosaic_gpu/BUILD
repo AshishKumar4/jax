@@ -83,15 +83,6 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
-    name = "lowering_cache_constants",
-    srcs = ["lowering_cache_constants.py"],
-    deps = [
-        ":lowering_cache_encoding",
-        ":lowering_cache_seal",
-    ],
-)
-
-pytype_strict_library(
     name = "lowering_cache_registries",
     srcs = ["lowering_cache_registries.py"],
     deps = [
@@ -118,7 +109,6 @@ pytype_strict_library(
     deps = [
         ":core",
         ":lowering",
-        ":lowering_cache_constants",
         ":lowering_cache_encoding",
         ":lowering_cache_registries",
         ":lowering_cache_seal",

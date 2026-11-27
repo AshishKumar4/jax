@@ -53,68 +53,16 @@ class JaxprEncodedOnceTest(harness.LoweringCacheTestCase):
     self.assertTrue(result["same primitives"])
 
 
-class ConstantNamesTest(absltest.TestCase):
-  """Which names of a module's source are constants (an analysis of the source)."""
+class RulesTest(harness.LoweringCacheTestCase):
 
-  def test_a_name_assigned_a_literal_at_module_level_is_a_constant(self):
-    from jax._src.pallas.mosaic_gpu import lowering_cache_constants  # pylint: disable=g-import-not-at-top
-    source = b"""
-A = 1
-B: int = -2
-C = (1, "x", None)
-D = 1 + 2
-E = 1
-E = compute()
-F = 0
-def bump():
-  global F
-  F += 1
-G, H = 1, 2
-import os
-P = 1
-from sys import path as P
-Q = 1
-del Q
-R = 1
-for R in range(3):
-  pass
-S = 1
-S += 1
-T = 1
-try:
-  pass
-except ValueError as T:
-  pass
-U = 1
-def U(): pass
-V = 1
-class V: pass
-if flag:
-  I = 3
-else:
-  I = 4
-try:
-  J = "j"
-except ImportError:
-  J = None
-K = ...
-L = [1, 2]
-__all__ = ["A"]
-class M:
-  N = 1
-"""
-    names = lowering_cache_constants.constant_names(source, "<test>")
-    # A computed value, one a name is also assigned elsewhere, one a function
-    # assigns (the state of the process), a tuple target, an Ellipsis, a list,
-    # a dunder and a class attribute are not.
-    self.assertEqual(names, ("A", "B", "C", "I", "J"))
-
-  def test_the_constants_of_the_lowerings_core_include_its_alignment(self):
-    from jax._src.pallas.mosaic_gpu import core as gpu_core  # pylint: disable=g-import-not-at-top
-    from jax._src.pallas.mosaic_gpu import lowering_cache_constants  # pylint: disable=g-import-not-at-top
-    with open(gpu_core.__file__, "rb") as f:
-      names = lowering_cache_constants.constant_names(f.read(), gpu_core.__file__)
-    self.assertIn("SMEM_ALIGNMENT", names)
+  def test_a_primitive_with_no_rule_is_refused_and_one_with_a_rule_reached(self):
+    # A kernel's primitive is lowered by a Mosaic GPU rule or removed by a state
+    # discharge rule; one with neither is not cached (`State.reached`).
+    result = self.run_child(mode="rules")["rules"]
+    self.assertEqual(result["a Mosaic GPU rule"], "reached")
+    self.assertGreater(result["how many"], 0)
+    self.assertEqual(result["a discharge rule alone"], ["reached"])
+    self.assertEqual(result["no rule"], "refused")
 
 
 if __name__ == "__main__":

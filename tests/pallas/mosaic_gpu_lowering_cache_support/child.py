@@ -374,20 +374,10 @@ def apply_tweak(spec):
     from jax._src import lowering_cache_test_registrant as registrant  # pylint: disable=g-import-not-at-top
     discharge._discharge_rules[registrant.registered_p] = wrap(
         discharge._discharge_rules[registrant.registered_p])
-  elif name == "smem_alignment":
-    gpu_core.SMEM_ALIGNMENT = int(arg)
-  elif name == "smem_alignment_numpy":
-    gpu_core.SMEM_ALIGNMENT = np.int64(int(arg))
-  elif name == "smem_alignment_object":
-    gpu_core.SMEM_ALIGNMENT = object()
-  elif name == "smem_alignment_subclass":
-    gpu_core.SMEM_ALIGNMENT = _MyInt(int(arg))
   else:
     raise ValueError(spec)
 
 
-class _MyInt(int):
-  """A subclass of int, which a key cannot hold as it holds an int."""
 
 
 def set_up_touching(case):
@@ -512,6 +502,9 @@ def run(case):
   if case.get("mode") == "jaxpr once":
     from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
     return {"jaxpr once": encoder_cases.jaxpr_once()}
+  if case.get("mode") == "rules":
+    from mosaic_gpu_lowering_cache_support import encoder_cases  # pylint: disable=g-import-not-at-top
+    return {"rules": encoder_cases.rules()}
   if case.get("mode") == "reach":
     return {"reach": reach()}
   if case.get("mode") == "audit":
