@@ -28,12 +28,148 @@ archive_override(
     integrity = "sha256-P7BJQ3ExN21wEg+hITdln+PCAFJPiFe9QibjC+1ZXKc=",
     strip_prefix = "rules_ml_toolchain-cd8176c0dd2ff1f2f8cf3fc8e098e2577d227235",
     urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/cd8176c0dd2ff1f2f8cf3fc8e098e2577d227235.tar.gz"],
+    patch_strip = 1,
+    # Its compiles' dependency files list every header they read (-MD), external repositories' included, so a kept
+    # output base rebuilds what a changed header reaches (Dew row 6757).
+    patches = ["//third_party:rules_ml_toolchain/dependency_file.patch"],
 )
 
 bazel_dep(name = "xla")
 archive_override(
     module_name = "xla",
     integrity = "sha256-ZVE4oF3x+lQLuk9wcCNPqagchXZmk6VJUfzHROS5xf0=",
+    patch_strip = 1,
+    patches = [
+        # Triton's pipeliner gives a load used twice, raw by a local_alloc a wgmma reads and in registers, one
+        # async-copy buffer, which the next cp.async overwrites while the wgmma still reads it (Dew ledger 3521).
+        "//third_party:xla/triton_pipeliner_multiuse_load.patch",
+        # A cuDNN convolution compiled with no algorithm (the autotuner's default, -1, which a compile with
+        # no device keeps) runs the first deterministic engine (no Winograd, no down-converted input) cuDNN's
+        # heuristics give it that needs no workspace, as none is allocated it, and is refused where none
+        # exists, never relaxing that policy to find one; engine -1 failed its first run with
+        # CUDNN_STATUS_BAD_PARAM (Dew's FS-DEVICELESS-AUTO-gh200).
+        "//third_party:xla/cudnn_conv_default_engine.patch",
+        # A deviceless compile's cuDNN device description states the global memory bus width, which cuDNN
+        # 9.27 requires of one ("!json_object.HasMember(key)" without it: every cuDNN graph compiled with no
+        # device failed, Dew's FS-CUDNNPROPS-gh200).
+        "//third_party:xla/cudnn_device_props_memory_bus_width.patch",
+        # A cuDNN call the custom call compiler fingerprints as one it compiled takes that one's backend config
+        # too, which the compile set (a backward's force_deterministic under deterministic ops): otherwise its
+        # thunk's fingerprint names no serialized graph (Dew ledger 5322).
+        "//third_party:xla/cudnn_graph_cache_hit_config.patch",
+        # A reducer rooted in a copy of its reduction (Shardy's export holds a region root's sharding so)
+        # reduces by the copied operation: AllReducePromotion aborted a CPU bf16 psum's compile on it, and
+        # MatchReductionComputation read it as no reduction (Dew row 5900).
+        "//third_party:xla/reducer_copy_root.patch",
+        # cuDNN frontend 1.32.3: the packed d256 attention backward's plan holds 577 MiB of engine workspace
+        # where 1.26.0's held 9.68 GB at a 12,288-token call (Dew row 5916).
+        "//third_party:xla/cudnn_frontend_1_32_3.patch",
+        # The CUDA plugin serves its executables' metadata (PJRT_ExecutableMetadata_Extension), and the C API
+        # client reads their buffer assignment from it into memory_analysis().
+        "//third_party:xla/executable_metadata_gpu.patch",
+        # FFI handlers that instantiate concurrently (Mosaic GPU's) are instantiated together on the compile
+        # threads before thunk emission, a program's Mosaic kernels compiled in parallel: only the calls the
+        # generic emitter takes, as the emitter's own dispatch decides (SpecializedCustomCall).
+        "//third_party:xla/instantiate_concurrently.patch",
+        # A compile over xla_gpu_memory_limit_early_exit_bytes stops after buffer assignment: one check there,
+        # whose bytes the executable carries (and serializes), states its memory and buffer assignment and
+        # refuses to run; within the limit it finishes. A start compiles its step once whether it fits or not.
+        # An early exit's overrides are read in every form XLA parses them (IsEarlyExitCompilation).
+        "//third_party:xla/memory_limit_early_exit.patch",
+        # YNNPACK's unary kernels read an input of any innermost stride as given, a broadcast's stride zero among
+        # them, gathering it into a buffer of the call's own: a bf16 convert of a broadcast scalar read past it
+        # (row 5495), where writing the stride on the shared input crashed (row 6829).
+        "//third_party:xla/ynn_unary_strided.patch",
+        # Triton's combine keeps a float add of a dot's result apart from its accumulator: a residual r + x @ w
+        # fused into a nested GEMM took r as the accumulator's start and rounded 1.7 times as far from float64
+        # as the add kept apart (row 6759).
+        "//third_party:xla/triton_dot_add_kept.patch",
+        # HloEvaluator's float32 dot over an empty contraction is zeros, where its Eigen contraction divided by
+        # the depth: XLA:CPU's constant folding died of SIGFPE on one with the algebraic simplifier off (row 6942).
+        "//third_party:xla/evaluator_empty_contraction.patch",
+        # A float add, subtract or multiply labeled xla_no_contract (jax.experimental.xla_metadata) rounds on its
+        # own on the CPU, fenced (llvm.arithmetic.fence) where XLA:CPU makes its arithmetic contractible, its
+        # unlabeled twins kept apart by CSE and contracted as before; LLVM widens the fence (row 7953: Dew's
+        # error-free transforms' products contracted into fused multiply-adds, their compensations lost). Delete
+        # when upstream XLA honours a no-contract mark on an op (an upstream issue, not yet filed).
+        "//third_party:xla/no_contract_mark.patch",
+        # A small dot strength-reduces as its precision algorithm states, each multiplied and summed as it says
+        # (F16_F16_F32's, F16_F16_F16's, BF16_BF16_BF16's, F64_F64_F64's, the ANY_F8 ones'), where XLA:GPU
+        # refused every one with INVALID_ARGUMENT (an A100's ragged dot of half operands, row 8554). At this pin
+        # upstream keeps such a dot a dot (StrengthReduceAlgorithmSupports): delete when an A100 build without it
+        # compiles and computes lax_test's testSmallDotComputesAsItsAlgorithmStates and SmallF8 cases as stated.
+        "//third_party:xla/dot_algorithm_multiply.patch",
+        # DotStrengthReduction multiplies in the accumulator type when an implicit GEMV is reduced.
+        "//third_party:xla/gpu_dot_strength_wide.patch",
+        # A sliced parameter whose slice reads a buffer another of the hero's sliced parameters makes (a slice
+        # of a dynamic slice) stays an operand of its dynamic-slice fusion: planned in, its slice was cloned
+        # before that buffer's chain and CreateFusionBody threw std::out_of_range (Dew's 4B step on one GH200).
+        "//third_party:xla/gpu_dynamic_slice_nested_slice.patch",
+        # A compile-only GPU device states the client's memory spaces (device, pinned_host), so a program compiled
+        # ahead for one keeps its host offloads, which canonicalizing "pinned_host" to the default memory dropped
+        # (row 8372: a host step prepared without a GPU compiled other programs than its run). Delete when
+        # upstream's StreamExecutorGpuTopologyDescription states its devices' memory spaces.
+        "//third_party:xla/compile_only_memory_spaces.patch",
+        # A spill warning's function is read whatever name ptxas quotes: a PTX name holding `$` (LLVM's NVPTX
+        # backend writes `_$_` into a name it makes valid) spilled with no stats recorded, read as no spill by
+        # Mosaic GPU's kernel facts (row 9649). Delete when upstream's ExtractModuleStatsFromLog reads a quoted
+        # function name of any characters.
+        "//third_party:xla/ptxas_spill_function_names.patch",
+        # A variadic or mixed precision reduce over degenerate dimensions alone is left for the reduction
+        # emitters, which read its init and reducer: ReductionDegenerateDimRemover replaced a variadic one with
+        # one bitcast of its first input and failed the compile (RET_CHECK hlo_computation.cc: reduce ((f32[32],
+        # f32[32])) vs bitcast (f32[32]), a compensated (hi, lo) sum over a one-element axis on an A100, row
+        # 10742), and bitcast a mixed precision one across element types.
+        "//third_party:xla/reduce_degenerate_variadic.patch",
+        # A reduce no result of which is used, kept by dead code elimination for its reducer's function call,
+        # is left as it is: StableHLO's ReduceOpUnusedResultCanon rebuilt it with no inputs, and type inference
+        # read the first input's type of none, a SIGSEGV converting the program to HLO on every backend.
+        "//third_party:xla/stablehlo_reduce_unused_results.patch",
+        # A scatter's indices are flattened in their own type: ScatterDeterminismExpander's S64 strides made S32
+        # indices an s32 x s64 dot, which the elemental emitter multiplied as `arith.muli (i32, i64)` and LLVM IR
+        # translation refused (RET_CHECK mlir_kernel_emitter.cc:705) under deterministic ops with the algebraic
+        # simplifier off, an accuracy check's reference as written (row 10741). Delete when upstream's
+        # FlattenIndices converts its strides to the indices' type.
+        "//third_party:xla/mixed_index_dot.patch",
+        # A rank whose collective kernel fails before a rendezvous of its local
+        # clique (its scratch past the device's memory, its kernel, its
+        # pointers' copy) joins it carrying the failure, which its peers return
+        # rather than wait for it: the parameters' exchange, and one after every
+        # fallible step where it registers symmetric memory, only as the state
+        # is built; and a local clique's rendezvous ends at the termination
+        # timeout.
+        "//third_party:xla/collective_peer_failure.patch",
+        # A CUDA executor loads the kernels its graphs' conditionals and
+        # barriers launch as it makes its first command buffer and holds
+        # them, so recording a graph loads no module: one loaded there under
+        # the driver's lock never returned where another GPU's graph of the
+        # process waited in a collective for this one.
+        "//third_party:xla/command_buffer_kernels_held.patch",
+        # A command buffer's graph is instantiated only at thunk initialization:
+        # one instantiated as it executed never returned where another device's
+        # collective waited on it.
+        "//third_party:xla/command_buffer_first_record.patch",
+        # A compile-only client deserializes an unloaded executable (the GPU plugin's
+        # PJRT_ExecutableDeserialize_Extension, PjRtCApiCompiler and IFRT's Compiler::DeserializeExecutable), so
+        # jaxlib's CompileOnlyPyClient reads the persistent cache back (row 5403: two compile-only processes that
+        # met one program both compiled it). Delete when upstream's PJRT C API deserializes without a client.
+        "//third_party:xla/compile_only_deserialize.patch",
+        # The HLO reader states a collective's device groups (its device list flattened: listed, iota or over a
+        # mesh's axes) and a collective permute's pairs, so a reader of a compiled module takes XLA's groups rather
+        # than decoding replica_groups itself (row 5856). Delete when upstream's HloInstruction binding states them.
+        "//third_party:xla/instruction_device_groups.patch",
+        # A ragged dot's row reads its own group's matrix alone where XLA expands it (RaggedDotRewriter, the
+        # non-contracting mode no cuDNN, cuBLASLt or Triton backend claims): a loop over the groups, each step
+        # one group's product selected into its rows (no product for each group held), where the zero-masked
+        # contraction over groups made 0 * inf NaN in every other group's rows (Dew row 13562). Delete when
+        # upstream's rewriter selects each row's own group.
+        "//third_party:xla/ragged_dot_own_group.patch",
+        # A finished GPU compile serializes no memory limit, and its memory stats
+        # and compiled module say whether it stopped at one (the executable's own
+        # bit), so its bytes are one under any limit it fits and jax writes no
+        # stopped compile to its cache.
+        "//third_party:xla/memory_limit_canonical.patch",
+    ],
     strip_prefix = "xla-2b26bc3432b9e01ba65a66ce2a858031b8a63e8d",
     urls = ["https://github.com/openxla/xla/archive/2b26bc3432b9e01ba65a66ce2a858031b8a63e8d.tar.gz"],
 )
