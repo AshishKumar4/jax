@@ -55,6 +55,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Set
 import dataclasses
 import functools
+import threading
 from typing import Any
 
 
@@ -109,15 +110,24 @@ class JaxprInputEffect(Effect):
     return f"{self.__class__.__name__}({self.input})"
 
 class EffectTypeSet:
+  """A set of effect types, read by any thread without a lock.
+
+  Its types are an immutable snapshot, replaced whole under a lock as a type is
+  added: a module imported lazily on one thread registers its effect types while
+  another thread asks whether an effect is of one, which iterating a set that
+  the registration grows in place broke ("Set changed size during iteration").
+  """
 
   def __init__(self):
-    self._effect_types: set[type[Effect]] = set()
+    self._lock = threading.Lock()
+    self._effect_types: frozenset[type[Effect]] = frozenset()
 
   def __repr__(self):
-    return f"EffectTypeSet({self._effect_types})"
+    return f"EffectTypeSet({set(self._effect_types)})"
 
   def add_type(self, effect_type: type[Effect]):
-    self._effect_types.add(effect_type)
+    with self._lock:
+      self._effect_types = self._effect_types | {effect_type}
 
   def contains(self, eff: Effect) -> bool:
     return any(isinstance(eff, eff_type) for eff_type in self._effect_types)
