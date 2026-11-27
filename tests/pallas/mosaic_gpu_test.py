@@ -35,9 +35,11 @@ import jax
 from jax import export
 from jax import lax
 from jax import sharding
+from jax.extend import core as jex_core
 from jax._src import config
 from jax._src import core as jax_core
 from jax._src import dtypes
+from jax._src import hijax
 from jax._src import test_util as jtu
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith as arith_dialect
@@ -163,6 +165,690 @@ def run_on_sm80(method):
   """A marker that allows a test case to run on Ampere GPUs."""
   method._min_capability = "8.0"
   return method
+
+
+class CtaBarrierLoweringTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      (f"{name}_{semantics.name.lower()}", arrive, semantics)
+      for name, arrive in (
+          ("arrive", plgpu.barrier_arrive),
+          ("arrive_and_wait", plgpu.barrier_arrive_and_wait),
+      )
+      for semantics in (
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      )
+  )
+  def test_conditional_warp_cannot_arrive_on_cta_barrier(
+      self, arrive, lowering_semantics
+  ):
+    # Lower for an abstract GPU on CPU; never execute the unsafe barrier.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[plgpu.CtaBarrier(num_arrivals=1)],
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(o_ref, barrier):
+      @plgpu.warp_map
+      def _(warp):
+        @pl.when(warp == 0)
+        def _():
+          arrive(barrier)
+      o_ref[...] = jnp.ones_like(o_ref)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="NVIDIA H100 80GB HBM3", platform="gpu", num_cores=132,
+        compute_capability="9.0",
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      with self.assertRaisesRegex(
+          NotImplementedError,
+          "Arriving on a CTA barrier is not supported in a warp context",
+      ):
+        jax.jit(kernel).trace().lower(lowering_platforms=("cuda",))
+
+
+class PredicateReductionLoweringTest(jtu.JaxTestCase):
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      capability=("9.0", "10.0"),
+      lowering_semantics=(
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      ),
+  )
+  def test_a_predicate_reduction_lowers_for_hopper_and_blackwell(
+      self, op, capability, lowering_semantics
+  ):
+    # Lowered for an abstract GPU on CPU: a row vector's any or all, reduced
+    # over the warpgroup to the scalar `pl.when` takes.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      rows = jnp.max(
+          plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False),
+          axis=-1,
+      )
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(rows > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
+  @parameterized.product(
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+          ("9.0", plgpu.Layout.WGMMA),
+          ("10.0", plgpu.Layout.TCGEN05),
+      ),
+  )
+  def test_a_barriered_row_beside_its_zeros_lowers(self, tile):
+    # Lowered for an abstract GPU on CPU: an accumulator tile's row maxima
+    # made a [1, n] row and held with zeros of its shape through an
+    # optimization barrier, as a compensated sum's TwoSum takes its operands,
+    # then added and stored. Layout inference lays the row's [1, n] out in the
+    # row's own layout, its new dimension untiled.
+    capability, layout = tile
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((1, 128), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      rows = jnp.max(tile, axis=-1)[None, :]
+      held, zeros = lax.optimization_barrier((rows, jnp.zeros_like(rows)))
+      o_ref[...] = held + zeros
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all, jnp.sum, jnp.max),
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+          ("9.0", plgpu.Layout.WGMMA),
+          ("10.0", plgpu.Layout.TCGEN05),
+      ),
+      lowering_semantics=(
+          plgpu.LoweringSemantics.Lane,
+          plgpu.LoweringSemantics.Warpgroup,
+      ),
+  )
+  def test_a_tiled_arrays_whole_reduction_lowers(
+      self, op, tile, lowering_semantics
+  ):
+    # Lowered for an abstract GPU on CPU: a 2D tile in its accumulator's tiled
+    # layout reduced whole to a scalar, as `pl.when` takes a predicate's.
+    capability, layout = tile
+    predicate = op in (jnp.any, jnp.all)
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=lowering_semantics
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      if predicate:
+        o_ref[...] = jnp.float32(0)
+
+        @pl.when(op(jnp.isfinite(tile)))
+        def _():
+          o_ref[...] = jnp.float32(1)
+      else:
+        o_ref[...] = op(tile)
+
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      jax.jit(kernel).trace(
+          jax.ShapeDtypeStruct((128, 128), jnp.float32)
+      ).lower(lowering_platforms=("cuda",))
+
+
+class _HiMultiAndConst(hijax.HiPrim):
+  """HiPrim with splat shaped constant, multiple outputs, and a literal scalar output."""
+
+  def __init__(self, in_aval, fill: float):
+    self.in_avals = (in_aval,)
+    self.out_aval = (
+        in_aval,
+        in_aval,
+        jax_core.ShapedArray((), jnp.float32),
+    )
+    self.params = {"fill": fill}
+    self._splat = np.full(in_aval.shape, fill, dtype=np.float32)
+    super().__init__()
+
+  def expand(self, x):
+    return x + self._splat, x * x, jnp.float32(3.0)
+
+
+class _HiNonSplatConst(hijax.HiPrim):
+  """HiPrim closing over a non-splat shaped constant (refused by Mosaic GPU)."""
+
+  def __init__(self, in_aval):
+    self.in_avals = (in_aval,)
+    self.out_aval = in_aval
+    self.params = {"shape": in_aval.shape}
+    self._const = np.arange(math.prod(in_aval.shape), dtype=np.float32).reshape(
+        in_aval.shape
+    )
+    super().__init__()
+
+  def expand(self, x):
+    return x + self._const
+
+
+class _HiSignedZeroConst(hijax.HiPrim):
+  """HiPrim closing over a mixed +0.0/-0.0 array (bitwise non-splat)."""
+
+  def __init__(self, in_aval):
+    self.in_avals = (in_aval,)
+    self.out_aval = in_aval
+    self.params = {"shape": in_aval.shape}
+    arr = np.zeros(in_aval.shape, dtype=np.float32)
+    arr.reshape(-1)[1::2] = np.float32(-0.0)
+    self._const = arr
+    super().__init__()
+
+  def expand(self, x):
+    return x + self._const
+
+
+class _HiBoolSplatConst(hijax.HiPrim):
+  """HiPrim closing over a boolean splat shaped constant."""
+
+  def __init__(self, in_aval, fill: bool):
+    self.in_avals = (in_aval,)
+    self.out_aval = in_aval
+    self.params = {"fill": fill}
+    self._mask = np.full(in_aval.shape, fill, dtype=np.bool_)
+    super().__init__()
+
+  def expand(self, x):
+    return jnp.where(self._mask, x + 1.0, x - 1.0)
+
+
+class _HiAxis0Sum(hijax.HiPrim):
+  """HiPrim performing a cross-warp reduction (requires reduction scratch)."""
+
+  def __init__(self, in_aval):
+    self.in_avals = (in_aval,)
+    self.out_aval = jax_core.ShapedArray((in_aval.shape[1],), in_aval.dtype)
+    self.params = {}
+    super().__init__()
+
+  def expand(self, x):
+    return jnp.sum(x, axis=0)
+
+
+class _HiWriteRef(hijax.HiPrim):
+  """Effectful HiPrim reading one ref and writing another."""
+
+  def __init__(self, in_ref_aval, out_ref_aval):
+    from jax._src import state as jax_state
+
+    self.in_avals = (in_ref_aval, out_ref_aval)
+    self.out_aval = ()
+    self.effects = frozenset({
+        jax_state.ReadEffect(0),
+        jax_state.WriteEffect(1),
+    })
+    self.params = {}
+    super().__init__()
+
+  def expand(self, x_ref, o_ref):
+    x = plgpu.load(x_ref, optimized=False)
+    plgpu.store(o_ref, x + 2.0, optimized=False)
+    return ()
+
+
+def _make_raw_hi_jaxpr(prim, avals_in):
+  from jax._src import api_util as jax_api_util
+  from jax._src import flattree as jax_ft
+  from jax._src.interpreters import partial_eval as jax_pe
+
+  def _call(*vals):
+    return tuple(hijax.call_hi_primitive_p.bind(*vals, _prim=prim))
+
+  dbg = jax_api_util.debug_info("test_hi_wrap", _call, avals_in, {})
+  jaxpr, _ = jax_pe.trace_to_jaxpr(
+      _call, jax_ft.flatten_args(*avals_in), debug_info=dbg, requires_low=False
+  )
+  return jaxpr
+
+
+_test_hi_wrap_p = jex_core.Primitive("_test_hi_wrap")
+_test_hi_wrap_p.multiple_results = True
+
+
+@_test_hi_wrap_p.def_effectful_abstract_eval
+def _test_hi_wrap_abstract_eval(*avals, prim):
+  del avals
+  return prim.out_avals_flat, prim.effects
+
+
+@mgpu_lowering._register_resource_estimator(_test_hi_wrap_p)
+def _test_hi_wrap_resource_estimator(ctx, *args, prim):
+  return mgpu_lowering._estimate_resources(ctx, _make_raw_hi_jaxpr(prim, args))
+
+
+@mgpu_lowering.register_lowering_rule(
+    _test_hi_wrap_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _test_hi_wrap_lowering_wg(ctx, *in_nodes, prim):
+  jaxpr = _make_raw_hi_jaxpr(prim, ctx.avals_in)
+  ir_in = tuple(
+      mgpu_lowering._ensure_ir_value(v, a.dtype)
+      if isinstance(a, jax_core.ShapedArray)
+      else v
+      for v, a in zip(in_nodes, ctx.avals_in)
+  )
+  return mgpu_lowering.lower_jaxpr_to_mosaic_gpu(
+      ctx.module_ctx, ctx.launch_ctx, jaxpr, ir_in, jaxpr.consts
+  )
+
+
+def _layout_3d_reduce():
+  """3D tiled layout for (2, 64, 64) sharding axis 1 over warps and axis 2 over lanes."""
+  return plgpu.Layout.TILED(
+      plgpu.Tiling(((1, 4, 32), (1,))),
+      warp_dims=(-3,),
+      lane_dims=(-2,),
+      vector_dim=-1,
+  )
+
+
+class WarpgroupLoweringRulesTest(jtu.JaxTestCase):
+  """CPU-runnable lowering tests for Warpgroup semantics primitives:
+  stop_gradient, split, call_hi_primitive, unit-stride slice, and
+  partial-axis reduce_or."""
+
+  @staticmethod
+  def _lower_for(capability: str, kernel, *specs):
+    device = jax.sharding.AbstractDevice(
+        device_kind="GPU", platform="gpu", num_cores=132,
+        compute_capability=capability,
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+      return jax.jit(kernel).trace(*specs).lower(lowering_platforms=("cuda",))
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_stop_gradient_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      plgpu.store(o_ref, lax.stop_gradient(x) + 1.0, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_split_lowers_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      left, right = lax.split(x, (32, 32), axis=1)
+      plgpu.store(o_ref, left + right, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_split_elides_dead_empty_part_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      _, left, right = lax.split(x, (0, 32, 32), axis=1)
+      plgpu.store(o_ref, left + right, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  def test_split_rejects_live_empty_part_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      empty, left, right = lax.split(x, (0, 32, 32), axis=1)
+      plgpu.store(
+          o_ref,
+          lax.concatenate((empty, left), dimension=1) + right,
+          optimized=False,
+      )
+
+    with self.assertRaisesRegex(NotImplementedError, "Zero-sized splits"):
+      self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  def test_slice_rejects_empty_slice_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      empty = lax.slice(x, (0, 0), (128, 0), strides=(1, 1))
+      left = lax.slice(x, (0, 0), (128, 32), strides=(1, 1))
+      plgpu.store(
+          o_ref, lax.concatenate((empty, left), dimension=1), optimized=False
+      )
+
+    with self.assertRaisesRegex(NotImplementedError, "Zero-sized slices"):
+      self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_call_hi_primitive_multi_const_literal_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiMultiAndConst(jax_core.typeof(x), 2.0)
+      added, sq, lit = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, added + sq + lit, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  def test_call_hi_primitive_requires_registration_and_refuses_non_splat_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def splat_kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiMultiAndConst(jax_core.typeof(x), 2.0)
+      added, _, lit = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, added + lit, optimized=False)
+
+    rules = mgpu_lowering.mosaic_lowering_rules[gpu_core.WGxWG_SEMANTICS]
+    saved = rules.pop(hijax.call_hi_primitive_p)
+    try:
+      with self.assertRaisesRegex(NotImplementedError, "call_hi_primitive"):
+        self._lower_for("9.0", splat_kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    finally:
+      rules[hijax.call_hi_primitive_p] = saved
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def non_splat_kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiNonSplatConst(jax_core.typeof(x))
+      (out,) = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, out, optimized=False)
+
+    with self.assertRaisesRegex(NotImplementedError, "non-splat shaped"):
+      self._lower_for("9.0", non_splat_kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def signed_zero_kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiSignedZeroConst(jax_core.typeof(x))
+      (out,) = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, out, optimized=False)
+
+    with self.assertRaisesRegex(NotImplementedError, "non-splat shaped"):
+      self._lower_for("9.0", signed_zero_kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.product(capability=("8.0", "9.0", "10.0"), fill=(True, False))
+  def test_call_hi_primitive_bool_splat_const_lowers_wg(self, capability, fill):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiBoolSplatConst(jax_core.typeof(x), fill)
+      (out,) = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, out, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_call_hi_primitive_ref_and_scratch_lowers_wg(self, capability):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def ref_kernel(x_ref, o_ref):
+      prim = _HiWriteRef(jax_core.typeof(x_ref), jax_core.typeof(o_ref))
+      _test_hi_wrap_p.bind(x_ref, o_ref, prim=prim)
+
+    self._lower_for(capability, ref_kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+    layout = (
+        plgpu.Layout.MMA_ACC(jnp.float32) if capability == "8.0"
+        else plgpu.Layout.TCGEN05 if capability == "10.0"
+        else plgpu.Layout.WGMMA
+    )
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64,), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def scratch_kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      prim = _HiAxis0Sum(jax_core.typeof(x))
+      (summed,) = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, summed, optimized=False)
+
+    self._lower_for(capability, scratch_kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  @parameterized.parameters(
+      ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+      ("9.0", plgpu.Layout.WGMMA),
+      ("10.0", plgpu.Layout.TCGEN05),
+  )
+  def test_unit_stride_slice_lowers_wg(self, capability, layout):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((128, 32), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      sliced = lax.slice(x, (0, 32), (128, 64), strides=(1, 1))
+      plgpu.store(o_ref, sliced, optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  def test_non_unit_stride_slice_rejected_wg(self):
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      sliced = lax.slice(x, (0, 0), (64, 64), strides=(2, 1))
+      plgpu.store(o_ref, sliced, optimized=False)
+
+    with self.assertRaisesRegex(NotImplementedError, "Strides are not supported"):
+      self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((64, 64), jnp.float32))
+
+  @parameterized.product(
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32)),
+          ("9.0", plgpu.Layout.WGMMA),
+          ("10.0", plgpu.Layout.TCGEN05),
+      ),
+      axis=(0, 1),
+  )
+  def test_partial_reduce_or_lowers_wg(self, tile, axis):
+    capability, layout = tile
+    out_dim = 64 if axis == 0 else 128
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((out_dim,), jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      any_pos = lax.reduce_or(x > 0, axes=(axis,))
+      plgpu.store(o_ref, any_pos.astype(jnp.int32), optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((128, 64), jnp.float32))
+
+  def test_partial_reduce_or_axis0_two_warpgroups_allocates_scratch_wg(self):
+    # Axis-0 reduction crosses warps in each warpgroup and requires SMEM scratch;
+    # verify both 2-warpgroup lowering and the resource estimator's scratch request.
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((2, 64), jnp.int32),
+        num_threads=2,
+        thread_name="wg",
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      wg = lax.axis_index("wg")
+      x = plgpu.load(x_ref.at[wg], layout=plgpu.Layout.WGMMA, optimized=False)
+      any_pos = lax.reduce_or(x > 0, axes=(0,))
+      plgpu.store(o_ref.at[wg], any_pos.astype(jnp.int32), optimized=False)
+
+    self._lower_for("9.0", kernel, jax.ShapeDtypeStruct((2, 128, 64), jnp.float32))
+
+    est_ctx = mgpu_lowering.ResourceEstimatorContext(
+        reduction_scratch_bytes=2048,
+        axis_names=mgpu_lowering._AxisNames(grid=()),
+        lowering_semantics=mgpu.LoweringSemantics.Warpgroup,
+    )
+    bool_aval = jax_core.ShapedArray((128, 64), jnp.bool_)
+    partial_res = mgpu_lowering._reduce_or_resource_estimator(
+        est_ctx, bool_aval, axes=(0,)
+    )
+    whole_res = mgpu_lowering._reduce_or_resource_estimator(
+        est_ctx, bool_aval, axes=(0, 1)
+    )
+    self.assertEqual(partial_res.smem_scratch_bytes, 2048)
+    self.assertEqual(whole_res.smem_scratch_bytes, 0)
+
+  @parameterized.parameters("8.0", "9.0", "10.0")
+  def test_multi_axis_partial_reduce_or_lowers_wg(self, capability):
+    layout_3d = _layout_3d_reduce()
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct((64,), jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout_3d, optimized=False)
+      any_pos = lax.reduce_or(x > 0, axes=(0, 1))
+      plgpu.store(o_ref, any_pos.astype(jnp.int32), optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct((2, 64, 64), jnp.float32))
+
+  @parameterized.product(
+      tile=(
+          ("8.0", plgpu.Layout.MMA_ACC(jnp.float32), (2, 64, 64)),
+          ("9.0", plgpu.Layout.WGMMA, (2, 64, 64)),
+          ("10.0", plgpu.Layout.TCGEN05, (2, 128, 64)),
+      ),
+      axes=((0, 1), (0, 2)),
+  )
+  def test_multi_axis_partial_reduce_or_untiled_prefix_lowers_wg(self, tile, axes):
+    capability, layout, shape = tile
+    out_axis = ({0, 1, 2} - set(axes)).pop()
+    out_shape = (shape[out_axis],)
+
+    @_kernel(
+        out_type=jax.ShapeDtypeStruct(out_shape, jnp.int32),
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      any_pos = lax.reduce_or(x > 0, axes=axes)
+      plgpu.store(o_ref, any_pos.astype(jnp.int32), optimized=False)
+
+    self._lower_for(capability, kernel, jax.ShapeDtypeStruct(shape, jnp.float32))
 
 
 class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
@@ -296,6 +982,58 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     x = jnp.linspace(-5.0, 5.0, 128, dtype=jnp.float32)
     np.testing.assert_allclose(kernel(x), jax.nn.relu(x) * 2.0)
 
+  def test_call_primitive_computes_its_body(self):
+    # A primitive `create_call_primitive` makes lowers as its body, inlined.
+    call_p = jex_core.create_call_primitive("test_call")
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((128,), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      closed = jax.make_jaxpr(lambda v: v * 2.0 + 1.0)(x)
+      o_ref[...] = call_p.bind(x, call_jaxpr=closed)[0]
+
+    x = jnp.linspace(-5.0, 5.0, 128, dtype=jnp.float32)
+    np.testing.assert_array_equal(kernel(x), x * 2.0 + 1.0)
+
+  @parameterized.parameters("custom_vjp", "custom_vjp_in_vjp", "custom_jvp")
+  def test_custom_derivative_call_computes_its_primal(self, name):
+    # A kernel takes no derivative of its own body: a custom-derivative call
+    # in it, however nested, lowers as its primal function.
+    @jax.custom_vjp
+    def softcap(x):
+      return 0.5 * jnp.tanh(x / 0.5)
+
+    def softcap_fwd(x):
+      capped = softcap(x)
+      return capped, capped
+
+    softcap.defvjp(softcap_fwd, lambda capped, g: (g * (1 - (capped / 0.5) ** 2),))
+
+    @jax.custom_jvp
+    def scaled_tanh(x):
+      return 2.0 * jnp.tanh(x)
+
+    scaled_tanh.defjvp(
+        lambda p, t: (scaled_tanh(p[0]), t[0] * (2.0 - scaled_tanh(p[0]) ** 2 / 2.0))
+    )
+    fns = {
+        "custom_vjp": softcap,
+        "custom_vjp_in_vjp": lambda x: jax.vjp(softcap, x)[1](x)[0],
+        "custom_jvp": scaled_tanh,
+    }
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((128,), jnp.float32),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = fns[name](x_ref[...])
+
+    x = jax.random.normal(jax.random.key(0), (128,), jnp.float32)
+    np.testing.assert_allclose(
+        kernel(x), jax.jit(fns[name])(x), rtol=1e-6, atol=1e-6
+    )
+
   def test_barrier_ref_shape(self):
     # A single barrier is referred to by a scalar reference, so that uses of a
     # barrier array can be told apart from uses of a single barrier.
@@ -386,6 +1124,8 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
           lax.round,
           lax.clz,
           lambda x: lax.round(x, lax.RoundingMethod.TO_NEAREST_EVEN),
+          lambda x: lax.erf(x / 64),
+          lambda x: lax.atan2(x, x + 1),
       ],
       approx_math=[True, False],
   )
@@ -405,6 +1145,46 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         kernel(x), op(x), rtol=1e-5 if approx_math else 3e-7
     )
 
+  @parameterized.parameters(jnp.int32, jnp.int8, jnp.float32)
+  def test_a_number_converts_to_a_boolean_by_comparing_with_zero(self, dtype):
+    # lax converts to a boolean by comparing with zero: 2 and 0.5 are True,
+    # where a truncation to the low bit read them as False.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.int32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = lax.convert_element_type(x_ref[...], jnp.bool_).astype(jnp.int32)
+
+    x = (jnp.arange(256) % 4).astype(dtype)
+    if jnp.issubdtype(dtype, jnp.floating):
+      x = x / 2
+    np.testing.assert_array_equal(kernel(x), (x != 0).astype(jnp.int32))
+
+  def test_a_booleans_negation_is_its_complement(self):
+    # Under both semantics; the warpgroup's negated ~int(x), -1 or -2, which
+    # converted back to a boolean is true either way.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.int32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = jnp.logical_not(x_ref[...] > 1).astype(jnp.int32)
+
+    x = jnp.arange(256, dtype=jnp.int32) % 4
+    np.testing.assert_array_equal(kernel(x), (x <= 1).astype(jnp.int32))
+
+  def test_is_finite(self):
+    # A hook keeping the finite values of a row and zeroing the rest.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([256], jnp.float32)
+    )
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      o_ref[...] = jnp.where(jnp.isfinite(x), x, 0.0)
+
+    x = np.arange(256, dtype=np.float32) - 128
+    x[[3, 50, 100, 200]] = [np.inf, -np.inf, np.nan, np.finfo(np.float32).max]
+    np.testing.assert_array_equal(kernel(x), np.where(np.isfinite(x), x, 0.0))
+
   @parameterized.parameters(False, True)
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_sqrt(self, approx_math):
@@ -423,6 +1203,24 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     else:
       y = kernel(x)
     np.testing.assert_allclose(y, lax.sqrt(x), rtol=1e-5)
+
+  @parameterized.parameters(1, 3)
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_min_blocks_per_sm(self, min_blocks_per_sm):
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+        compiler_params=plgpu.CompilerParams(
+            min_blocks_per_sm=min_blocks_per_sm
+        ),
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.0
+
+    x = jnp.arange(256).astype(jnp.float32)
+    with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as out:
+      y = jax.block_until_ready(kernel(x))
+    self.assertIn(f".minnctapersm {min_blocks_per_sm}", out())
+    np.testing.assert_array_equal(y, x + 1.0)
 
   @parameterized.product(
       approx_math=(False, True),
@@ -563,6 +1361,88 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       x = x - x.size // 2  # include negative values.
     np.testing.assert_array_equal(kernel(x), op(x))
 
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      layout=(None, plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+      marked=("none", "first", "last", "every", "every_but_first",
+              "every_but_last"),
+  )
+  def test_predicate_reduction_guards_a_branch(self, op, layout, marked):
+    # Whether any or every element holds, as the scalar `pl.when` takes: of a
+    # strided array's elements, or of a block's row maxima, a row vector whose
+    # rows a tiled layout spreads over threads (WGMMA's over four lanes each).
+    rows = {
+        "none": [], "first": [0], "last": [127], "every": range(128),
+        "every_but_first": range(1, 128), "every_but_last": range(127),
+    }[marked]
+    x = np.full((128, 128), -1.0, np.float32)
+    for r in rows:
+      if layout is None:
+        x[r] = 1.0
+      else:
+        x[r, (37 * r) % 128] = 1.0
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.int32))
+    def kernel(x_ref, o_ref):
+      if layout is None:
+        values = x_ref[...]
+      else:
+        values = jnp.max(
+            plgpu.load(x_ref, layout=layout, optimized=False), axis=-1
+        )
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(values > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    held = op(x > 0) if layout is None else op(x.max(axis=-1) > 0)
+    self.assertEqual(int(kernel(jnp.asarray(x))), int(held))
+
+  @parameterized.product(
+      op=(jnp.any, jnp.all),
+      layout=(plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+      marked=("none", "first", "last", "every", "every_but_first",
+              "every_but_last"),
+  )
+  def test_predicate_reduction_of_a_whole_tile_guards_a_branch(
+      self, op, layout, marked
+  ):
+    # Whether any or every element of a 2D tile in an accumulator's tiled
+    # layout holds, the tile reduced whole.
+    rows = {
+        "none": [], "first": [0], "last": [127], "every": range(128),
+        "every_but_first": range(1, 128), "every_but_last": range(127),
+    }[marked]
+    x = np.full((128, 128), -1.0, np.float32)
+    for r in rows:
+      x[r] = 1.0
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.int32))
+    def kernel(x_ref, o_ref):
+      tile = plgpu.load(x_ref, layout=layout, optimized=False)
+      o_ref[...] = jnp.int32(0)
+
+      @pl.when(op(tile > 0))
+      def _():
+        o_ref[...] = jnp.int32(1)
+
+    self.assertEqual(int(kernel(jnp.asarray(x))), int(op(x > 0)))
+
+  @parameterized.product(
+      op=(jnp.sum, jnp.max),
+      layout=(plgpu.Layout.WGMMA, plgpu.Layout.TCGEN05),
+  )
+  def test_a_whole_tiles_reduction(self, op, layout):
+    # A 2D tile in an accumulator's tiled layout reduced whole to a scalar.
+    x = jax.random.uniform(jax.random.key(0), (128, 128), jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((), jnp.float32))
+    def kernel(x_ref, o_ref):
+      o_ref[...] = op(plgpu.load(x_ref, layout=layout, optimized=False))
+
+    np.testing.assert_allclose(kernel(x), op(x), rtol=1e-5)
+
   def test_reshape(self):
     shape1, shape2 = (128,), (2, 16, 4)
 
@@ -600,6 +1480,35 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       with self.assertRaisesRegex(Exception, "GMEM transfer does not access"):
         run_kernel(optimized=True)
       np.testing.assert_array_equal(run_kernel(optimized=False), x + 1)
+
+  def test_plain_scratch_read_at_a_row_offset_no_tiling_divides(self):
+    # A scratch ref only a plain layout serves, declared plain: its rows are
+    # written whole and read from a row offset of 63, which no tiling divides.
+    shape = (64, 32)
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct(shape, jnp.float32),
+        scratch_types=[
+            plgpu.SMEM(
+                (2 * shape[0], shape[1]),
+                jnp.float32,
+                transforms=(plgpu.PlainTransform(),),
+            ),
+        ],
+    )
+    def kernel(x_ref, out_ref, scratch_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      plgpu.store(scratch_ref.at[pl.ds(0, 64)], jnp.zeros_like(x), optimized=False)
+      plgpu.store(scratch_ref.at[pl.ds(64, 64)], x, optimized=False)
+      plgpu.commit_smem()
+      shifted = plgpu.load(
+          scratch_ref.at[pl.ds(63, 64)], layout=plgpu.Layout.WGMMA, optimized=False
+      )
+      plgpu.store(out_ref, shifted, optimized=False)
+
+    x = jnp.arange(math.prod(shape), dtype=jnp.float32).reshape(shape)
+    expected = jnp.concatenate([jnp.zeros((1, shape[1]), jnp.float32), x[:-1]])
+    np.testing.assert_array_equal(kernel(x), expected)
 
   def test_reshape_tiled(self):
     shape1, shape2 = (6 * 64, 8), (2, 3, 64, 8)
@@ -852,6 +1761,179 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     np.testing.assert_array_equal(
         kernel(), jax.lax.broadcasted_iota(dtype, (128, 128), dimension)
     )
+
+  @parameterized.product(
+      axis=(0, 1),
+      operation=("direct", "cast", "compare", "multiply"),
+      offset=(0, 5),
+  )
+  def test_unit_axis_slice_pointwise_broadcast(self, axis, operation, offset):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup layout inference.")
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((64, 64), jnp.float32),
+    )
+    def kernel(o_ref):
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = rows * 64 + cols
+      x = q[offset:offset + 1, :] if axis == 0 else q[:, offset:offset + 1]
+      if operation == "cast":
+        x = x.astype(jnp.float32)
+      elif operation == "compare":
+        x = x >= 100
+      elif operation == "multiply":
+        x = x * 2
+      plgpu.store(o_ref, x.astype(jnp.float32) + q.astype(jnp.float32), optimized=False)
+
+    q = np.arange(64 * 64, dtype=np.int32).reshape(64, 64)
+    x = q[offset:offset + 1, :] if axis == 0 else q[:, offset:offset + 1]
+    if operation == "cast":
+      x = x.astype(np.float32)
+    elif operation == "compare":
+      x = x >= 100
+    elif operation == "multiply":
+      x = x * 2
+    np.testing.assert_array_equal(kernel(), x.astype(np.float32) + q.astype(np.float32))
+
+  @parameterized.product(
+      axis=(0, 1),
+      dtype=(
+          jnp.bool_, jnp.int8, jnp.uint8, jnp.int16, jnp.uint16,
+          jnp.float16, jnp.bfloat16, jnp.int32,
+      ),
+  )
+  def test_unit_axis_slice_bit_patterns(self, axis, dtype):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup layout inference.")
+    shape = (64, 64)
+    storage_dtype = jnp.int32 if dtype == jnp.bool_ else dtype
+
+    @functools.partial(
+        self.kernel, out_type=jax.ShapeDtypeStruct(shape, storage_dtype)
+    )
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+      if dtype == jnp.bool_:
+        x = x > 0
+      x = x[5:6, :] if axis == 0 else x[:, 5:6]
+      if dtype == jnp.bool_:
+        x = x.astype(jnp.int32)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(x, shape), plgpu.Layout.WGMMA
+      )
+      plgpu.store(o_ref, result, optimized=False)
+
+    # Integer patterns include negative values. For the 16-bit floating types,
+    # use all-bit patterns including NaNs and signed zeros, without arithmetic.
+    bits = (np.arange(4096, dtype=np.uint16) * 37).reshape(shape)
+    bits.flat[:4] = [0, 0x8000, 0x7e01, 0xffff]
+    bits[5, :4] = bits[:4, 5] = [0, 0x8000, 0x7e01, 0xffff]
+    if jnp.dtype(dtype).itemsize == 2:
+      x = bits.view(jnp.dtype(dtype))
+    else:
+      x = (bits.astype(np.int32) - 32768).astype(jnp.dtype(storage_dtype))
+    values = (x > 0).astype(np.int32) if dtype == jnp.bool_ else x
+    expected = values[5:6, :] if axis == 0 else values[:, 5:6]
+    result = np.asarray(kernel(x))
+    expected = np.broadcast_to(expected, shape)
+    np.testing.assert_array_equal(
+        result.view(np.uint8), expected.copy().view(np.uint8)
+    )
+
+  def test_unit_axis_slice_mixed_multi_warpgroup_reductions(self):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for warpgroup reduction scratch partitioning.")
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((128, 64), jnp.int32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(o_ref):
+      wg = lax.axis_index("wg")
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = rows * 64 + cols + wg * 4096
+      selected = q[5:6, :]
+      values = plgpu.broadcasted_iota(
+          jnp.int32, (128,), 0,
+          layout=plgpu.Layout.WG_STRIDED((128,), vec_size=1),
+      )
+      total = jnp.sum(values + wg)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(selected, (64, 64)), plgpu.Layout.WGMMA
+      ) + total
+      plgpu.store(o_ref.at[pl.ds(wg * 64, 64)], result, optimized=False)
+
+    cols = np.arange(64, dtype=np.int32)
+    expected = np.concatenate([
+        np.broadcast_to(5 * 64 + cols + wg * 4096 + 8128 + wg * 128, (64, 64))
+        for wg in range(2)
+    ])
+    for _ in range(8):
+      np.testing.assert_array_equal(kernel(), expected)
+
+  @parameterized.parameters(jnp.int16, jnp.bfloat16)
+  def test_unit_axis_row_of_16_bits_fits_four_warpgroups_scratch(self, dtype):
+    if not self.is_wg_semantics():
+      self.skipTest("Regression for the 16-bit selection's scratch.")
+
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((256, 64), jnp.float32),
+        num_threads=4,
+        thread_name="wg",
+    )
+    def kernel(o_ref):
+      wg = lax.axis_index("wg")
+      rows = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 0, layout=plgpu.Layout.WGMMA
+      )
+      cols = plgpu.broadcasted_iota(
+          jnp.int32, (64, 64), 1, layout=plgpu.Layout.WGMMA
+      )
+      q = (rows * 64 + cols + wg * 7).astype(dtype)
+      selected = q[5:6, :].astype(jnp.float32)
+      result = plgpu.layout_cast(
+          jnp.broadcast_to(selected, (64, 64)), plgpu.Layout.WGMMA
+      )
+      plgpu.store(o_ref.at[pl.ds(wg * 64, 64)], result, optimized=False)
+
+    cols = np.arange(64, dtype=np.int32)
+    expected = np.concatenate([
+        np.broadcast_to(
+            (5 * 64 + cols + wg * 7).astype(dtype).astype(np.float32), (64, 64)
+        )
+        for wg in range(4)
+    ])
+    np.testing.assert_array_equal(kernel(), expected)
+
+  def test_leading_unit_reshape_preserves_lane_layout(self):
+    if self.is_wg_semantics():
+      self.skipTest("Regression for the existing Lane reshape path.")
+    layout = plgpu.Layout.WGMMA.reduce(0)
+
+    @functools.partial(
+        self.kernel, out_type=jax.ShapeDtypeStruct((1, 64), jnp.int32)
+    )
+    def kernel(o_ref):
+      a = plgpu.broadcasted_iota(jnp.int32, (64,), 0, layout=layout)
+      b = plgpu.broadcasted_iota(jnp.int32, (1, 64), 1, layout=layout)
+      plgpu.store(o_ref, a.reshape((1, 64)) + b, optimized=False)
+
+    np.testing.assert_array_equal(kernel(), 2 * np.arange(64)[None, :])
 
   @parameterized.parameters(jnp.bfloat16, jnp.int16, jnp.uint16)
   def test_inline_mgpu(self, jnp_type):
@@ -1923,6 +3005,35 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     np.testing.assert_array_equal(output[128:], jnp.zeros((128,)))
     np.testing.assert_array_equal(completed, jnp.zeros((2,), dtype=jnp.int32))
 
+  def test_multiple_of_in_a_warp(self):
+    # A warp's scalar annotated as a multiple, as a persistent kernel's load
+    # warp aligns a tile's slice start, lowers in the warp's code too.
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct([256], jnp.float32),
+        scratch_types=[plgpu.SMEM([128], jnp.float32), plgpu.Barrier()],
+        grid=(2,),
+        grid_names=("block",),
+    )
+    def kernel(x_ref, o_ref, scratch_ref, barrier_ref):
+      block_id = jax.lax.axis_index("block")
+
+      @plgpu.warp_map
+      def _(warp_id):
+        start = pl.multiple_of(block_id * 128, 128)
+        plgpu.copy_gmem_to_smem(
+            x_ref.at[pl.ds(start, 128)],
+            scratch_ref,
+            barrier_ref,
+            predicate=warp_id == 0,
+        )
+
+      plgpu.barrier_wait(barrier_ref)
+      plgpu.copy_smem_to_gmem(scratch_ref, o_ref.at[pl.ds(block_id * 128, 128)])
+      plgpu.wait_smem_to_gmem(0)
+
+    x = jnp.arange(256).astype(jnp.float32)
+    np.testing.assert_array_equal(kernel(x), x)
+
   @parameterized.parameters(jnp.float32, jnp.float4_e2m1fn)
   def test_collective_copy_gmem_to_smem(self, dtype):
 
@@ -2034,6 +3145,50 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         test_barrier()
 
     np.testing.assert_array_equal(kernel(), np.array([0, 0, 1, 0, 1]))
+
+  def test_barrier_wait_at_explicit_phases(self):
+    # Two arrivals complete phases 0 and 1 of the barrier; a wait at each
+    # returns, and the barrier's tracked phases are left alone.
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[plgpu.Barrier()],
+    )
+    def kernel(o_ref, barrier):
+      plgpu.barrier_arrive(barrier)
+      plgpu.barrier_wait(barrier, phase=0)
+      plgpu.barrier_arrive(barrier)
+      plgpu.barrier_wait(barrier, phase=jnp.int32(1))
+      o_ref[...] = jnp.ones_like(o_ref)
+
+    np.testing.assert_array_equal(kernel(), np.ones((128,), np.float32))
+
+  def test_cta_barrier_arrive_and_wait(self):
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=[
+            plgpu.SMEM((128,), jnp.float32), plgpu.CtaBarrier(num_arrivals=2)
+        ],
+        num_threads=2,
+        thread_name="threads",
+    )
+    def kernel(o_ref, smem_ref, barrier):
+      t_idx = lax.axis_index("threads")
+
+      @pl.when(t_idx == 0)
+      def _():
+        smem_ref[...] = jnp.full((128,), 42.0, dtype=jnp.float32)
+        plgpu.barrier_arrive(barrier)
+
+      @pl.when(t_idx == 1)
+      def _():
+        plgpu.barrier_arrive_and_wait(barrier)
+        o_ref[...] = smem_ref[...]
+
+    np.testing.assert_array_equal(
+        kernel(), np.full((128,), 42.0, dtype=jnp.float32)
+    )
 
   def test_barrier_arrive_and_wait(self):
     @functools.partial(
@@ -2388,6 +3543,29 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     perm = jax.random.permutation(key, smem_shape[0]).astype(jnp.uint32)
     expected = jnp.zeros_like(tokens).at[perm].set(tokens)
     np.testing.assert_array_equal(kernel(tokens, perm)[:, 64:], expected)
+
+  @parameterized.parameters(-3, -2, -1, 0, 1, 2, 3)
+  def test_integer_pow(self, y):
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], jnp.float32)
+    )
+    def kernel(x_ref, o_ref):
+      o_ref[...] = lax.integer_pow(x_ref[...], y)
+
+    x = jnp.linspace(0.5, 2.0, 128, dtype=jnp.float32)
+    np.testing.assert_allclose(kernel(x), x ** y, rtol=1e-6)
+
+  def test_linear_transpose_lowers_its_sums(self):
+    # Transposing `x + x` sums the two cotangents with add_any.
+    @functools.partial(
+        self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], jnp.float32)
+    )
+    def kernel(x_ref, o_ref):
+      x = x_ref[...]
+      [o_ref[...]] = jax.linear_transpose(lambda t: t + t, x)(x)
+
+    x = jnp.arange(128, dtype=jnp.float32)
+    np.testing.assert_array_equal(kernel(x), 2 * x)
 
   @parameterized.product(
       src_transposed=(False, True), shape=((128, 128), (1, 128, 128))
@@ -3648,6 +4826,26 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
         convert(x), jax.lax.bitcast_convert_type(x, out_dtype)
     )
 
+  def test_a_product_marked_uncontracted_rounds_before_its_sum(self):
+    # x * y + z, z the negation of XLA's rounded x * y, under the no-contract
+    # mark: zero at every element where the product rounds on its own, its
+    # rounding error where it fuses into the add.
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    x = jax.random.normal(jax.random.key(0), (128,), jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (128,), jnp.float32)
+    z = -jax.jit(jnp.multiply)(x, y)
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct((128,), jnp.float32),
+    )
+    def kernel(x_ref, y_ref, z_ref, o_ref):
+      with set_xla_metadata(xla_no_contract=True):
+        o_ref[...] = x_ref[...] * y_ref[...] + z_ref[...]
+
+    np.testing.assert_array_equal(kernel(x, y, z), jnp.zeros_like(x))
+
   def test_optimization_barrier(self):
     @functools.partial(
         self.pallas_call,
@@ -4032,6 +5230,54 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
 
     x, y = (jnp.arange(128).astype(jnp.float32) for _ in range(2))
     np.testing.assert_array_equal(kernel(x, y), x + y)
+
+  @parameterized.parameters((2, 3, 4), (2, 3, 4, 5))
+  def test_fresh_axis_index(self, *grid):
+    # A squashed grid (more than three axes) unravels its third block coordinate.
+    names = tuple("abcd"[: len(grid)])
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((*grid, len(grid), 128), jnp.int32),
+        grid=grid,
+        grid_names=names,
+    )
+    def kernel(o_ref):
+      place = tuple(lax.axis_index(name) for name in names)
+      for axis, name in enumerate(names):
+        o_ref[(*place, axis)] = lax.broadcast(
+            plgpu.fresh_axis_index(name), (128,)
+        )
+
+    coordinates = np.stack(
+        np.meshgrid(*map(np.arange, grid), indexing="ij"), axis=-1
+    )
+    np.testing.assert_array_equal(
+        kernel(), np.broadcast_to(coordinates[..., None], (*grid, len(grid), 128))
+    )
+
+  def test_fresh_axis_index_reads_at_each_use(self):
+    # Each fresh read is its own: none is merged with another, so the PTX reads
+    # the coordinate once more for each one more.
+    def reads(count):
+      @self.kernel(
+          out_type=jax.ShapeDtypeStruct((2, 3, 128), jnp.int32),
+          grid=(2, 3),
+          grid_names=("a", "b"),
+      )
+      def kernel(o_ref):
+        total = sum(plgpu.fresh_axis_index("b") for _ in range(count))
+        o_ref[lax.axis_index("a"), lax.axis_index("b")] = lax.broadcast(
+            total, (128,)
+        )
+
+      with jtu.set_env(MOSAIC_GPU_DUMP_PTX="1"), self.capture_stdout() as ptx:
+        np.testing.assert_array_equal(
+            kernel(),
+            np.broadcast_to(count * np.arange(3)[None, :, None], (2, 3, 128)),
+        )
+      return ptx().count("%ctaid")
+
+    self.assertEqual(reads(3) - reads(1), 2)
 
   @parameterized.product(
       sm_steps=(1, 2, 3),
@@ -5164,6 +6410,89 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
       atol = rtol = 1e-12 if dtype == jnp.float64 else 1e-2
       np.testing.assert_allclose(res, ref, atol=atol, rtol=rtol)
 
+  @parameterized.product(
+      m_warps=(1, 2, 4), bounds=((0, 64), (1, 48), (16, 17), (47, 127))
+  )
+  @run_on_sm80
+  def test_mma_row_bound(self, m_warps, bounds):
+    m = 64
+    k = 32
+    n = 32
+    dtype = jnp.bfloat16
+
+    # Two warpgroups, each its own bound read from memory at run time, each
+    # writing its own output: a warp's row block is its own warpgroup's.
+    @functools.partial(
+        self.kernel,
+        out_type=jax.ShapeDtypeStruct((2, m, n), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(a_ref, b_ref, acc_ref, bounds_ref, o_ref):
+      wg = lax.axis_index("wg")
+      layouts = dict(m_warps=m_warps)
+      acc = plgpu.load(
+          acc_ref, layout=plgpu.Layout.MMA_ACC(dtype, **layouts),
+          optimized=False,
+      )
+      a = plgpu.load(
+          a_ref, layout=plgpu.Layout.MMA_LHS(dtype, **layouts), optimized=False
+      )
+      b = plgpu.load(
+          b_ref.T, layout=plgpu.Layout.MMA_RHS(dtype, **layouts),
+          optimized=False,
+      )
+      result = plgpu.mma(acc, a, b, m_warps=m_warps, rows=bounds_ref[wg])
+      plgpu.store(o_ref.at[wg], result, optimized=False)
+
+    prng = np.random.default_rng(0)
+    # Small integers, so every product and sum is exact in fp32.
+    a = prng.integers(-4, 4, (m, k)).astype(dtype)
+    b = prng.integers(-4, 4, (n, k)).astype(dtype)
+    acc = prng.integers(-4, 4, (m, n)).astype(jnp.float32)
+    res = kernel(a, b, acc, jnp.asarray(bounds, jnp.int32))
+    full = acc + a.astype(np.float32) @ b.astype(np.float32).T
+    for wg, rows in enumerate(bounds):
+      # A warp's 16-row block that begins at or past `rows` keeps `acc`.
+      issued = np.arange(m)[:, None] // 16 * 16 < rows
+      np.testing.assert_array_equal(res[wg], np.where(issued, full, acc))
+
+  def test_mma_m_warps_is_held_to_its_operands_split(self):
+    # Lane semantics reads the split from the operands' layouts: a stated
+    # m_warps they do not carry is refused, never silently another split.
+    # (Warpgroup semantics lays the operands out as the stated split asks.)
+    self.skip_if_wg_semantics()
+    m, k, n = 64, 32, 32
+    dtype = jnp.bfloat16
+
+    def kernel_with(m_warps):
+      @functools.partial(
+          self.kernel, out_type=jax.ShapeDtypeStruct((m, n), jnp.float32)
+      )
+      def kernel(a_ref, b_ref, o_ref):
+        layouts = dict(m_warps=4)
+        acc = plgpu.layout_cast(
+            jnp.zeros((m, n), jnp.float32),
+            plgpu.Layout.MMA_ACC(dtype, **layouts),
+        )
+        a = plgpu.load(
+            a_ref, layout=plgpu.Layout.MMA_LHS(dtype, **layouts),
+            optimized=False,
+        )
+        b = plgpu.load(
+            b_ref.T, layout=plgpu.Layout.MMA_RHS(dtype, **layouts),
+            optimized=False,
+        )
+        plgpu.store(o_ref, plgpu.mma(acc, a, b, m_warps=m_warps),
+                    optimized=False)
+      return kernel
+
+    a = jnp.ones((m, k), dtype)
+    b = jnp.ones((n, k), dtype)
+    jax.jit(kernel_with(4)).lower(a, b)
+    with self.assertRaisesRegex(ValueError, "m_warps=2 is not its operands"):
+      jax.jit(kernel_with(2)).lower(a, b)
+
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   def test_griddepcontrol_warp_mesh(self):
     @jax.jit
@@ -5758,6 +7087,21 @@ class PallasCallWGTest(
       )
 
   @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
+  def test_dump_to_with_a_named_kind_dumps_that_kind_alone(self):
+    x = jnp.ones((64, 64), dtype=jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct(x.shape, x.dtype))
+    def kernel(x_gmem, o_gmem):
+      o_gmem[...] = plgpu.load(x_gmem, optimized=False)
+
+    with tempfile.TemporaryDirectory() as dump_dir:
+      with jtu.set_env(MOSAIC_GPU_DUMP_TO=dump_dir, MOSAIC_GPU_DUMP_PTX="1"):
+        jax.jit(kernel).lower(x).compile()
+      files = os.listdir(dump_dir)
+      self.assertTrue(any(f.endswith(".ptx") for f in files), files)
+      self.assertFalse(any(f.endswith("_layout_inference.txt") for f in files), files)
+
+  @jtu.thread_unsafe_test()  # Modifies ``os.environ``.
   @parameterized.parameters(None, plgpu.TraceScope.WARP, plgpu.TraceScope.WARPGROUP)
   def test_dump_resources(self, profile_trace_scope):
     x = jax.ShapeDtypeStruct((64, 64), jnp.float32)
@@ -5799,9 +7143,14 @@ class PallasCallWGTest(
 
     with (jtu.set_env(MOSAIC_GPU_DUMP_RESOURCES="1"),
           self.capture_stdout() as rs):
-      jax.jit(kernel).lower(x)
+      ir_text = str(jax.jit(kernel).lower(x).compiler_ir())
     self.assertIn(f"smem_scratch_bytes={expected_smem_bytes}", rs())
     self.assertIn(f"tmem_scratch_cols={expected_tmem_cols}", rs())
+    # The estimate names its kernel and the hash of the module its custom call
+    # carries, which carries no estimate.
+    (named,) = re.findall(r"^(\S+) [0-9a-f]{64} Resources\(", rs(), re.M)
+    self.assertIn("kernel", named)
+    self.assertNotIn("mosaic_gpu.resources", ir_text)
 
   def test_identical_kernels_share_a_kernel_hash(self):
     x = jnp.ones((64, 64), dtype=jnp.float32)
@@ -5821,6 +7170,108 @@ class PallasCallWGTest(
     )
     self.assertLen(kernel_hashes, 2)
     self.assertLen(set(kernel_hashes), 1)
+
+  @run_on_sm80
+  def test_stop_gradient_wg(self):
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      plgpu.store(o_ref, lax.stop_gradient(x) + 1.0, optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), x + 1.0)
+
+  @run_on_sm80
+  def test_split_and_unit_stride_slice_wg(self):
+    layout = plgpu.Layout.MMA_ACC(jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 32), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      _, left, right = lax.split(x, (0, 32, 32), axis=1)
+      tail = lax.slice(x, (0, 32), (64, 64), strides=(1, 1))
+      plgpu.store(o_ref, left + right + tail, optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), x[:, :32] + 2.0 * x[:, 32:])
+
+  @run_on_sm80
+  def test_call_hi_primitive_wg(self):
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, optimized=False)
+      prim = _HiMultiAndConst(jax_core.typeof(x), 2.0)
+      added, sq, lit = _test_hi_wrap_p.bind(x, prim=prim)
+      plgpu.store(o_ref, added + sq + lit, optimized=False)
+
+    x = jnp.arange(64 * 64, dtype=jnp.float32).reshape(64, 64)
+    np.testing.assert_array_equal(kernel(x), (x + 2.0) + x * x + 3.0)
+
+    for fill in (True, False):
+      @self.kernel(out_type=jax.ShapeDtypeStruct((64, 64), jnp.float32))
+      def bool_kernel(x_ref, o_ref, _fill=fill):
+        x = plgpu.load(x_ref, optimized=False)
+        prim = _HiBoolSplatConst(jax_core.typeof(x), _fill)
+        (out,) = _test_hi_wrap_p.bind(x, prim=prim)
+        plgpu.store(o_ref, out, optimized=False)
+
+      np.testing.assert_array_equal(bool_kernel(x), x + 1.0 if fill else x - 1.0)
+
+  @parameterized.parameters((0,), (1,))
+  @run_on_sm80
+  def test_partial_reduce_or_wg(self, axes):
+    layout = plgpu.Layout.MMA_ACC(jnp.float32)
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64,), jnp.int32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout, optimized=False)
+      plgpu.store(
+          o_ref, lax.reduce_or(x > 0, axes=axes).astype(jnp.int32),
+          optimized=False,
+      )
+
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-1.0, 0.02, (64, 64)).astype(np.float32)
+    x[0, :] = -1.0
+    x[:, 0] = -1.0
+    x[1, 37] = 1.0
+    np.testing.assert_array_equal(
+        kernel(jnp.asarray(x)), np.any(x > 0, axis=axes).astype(np.int32)
+    )
+
+  @run_on_sm80
+  def test_multi_axis_partial_reduce_or_wg(self):
+    layout_3d = _layout_3d_reduce()
+
+    @self.kernel(out_type=jax.ShapeDtypeStruct((64,), jnp.int32))
+    def kernel(x_ref, o_ref):
+      x = plgpu.load(x_ref, layout=layout_3d, optimized=False)
+      plgpu.store(
+          o_ref, lax.reduce_or(x > 0, axes=(0, 1)).astype(jnp.int32),
+          optimized=False,
+      )
+
+    rng = np.random.default_rng(1)
+    x = rng.uniform(-1.0, 0.005, (2, 64, 64)).astype(np.float32)
+    x[:, :, 0] = -1.0
+    x[1, 33, 5] = 1.0
+    np.testing.assert_array_equal(
+        kernel(jnp.asarray(x)), np.any(x > 0, axis=(0, 1)).astype(np.int32)
+    )
+
+    mma = plgpu.Layout.MMA_ACC(jnp.float32)
+    for axes in ((0, 1), (0, 2)):
+      @self.kernel(out_type=jax.ShapeDtypeStruct((64,), jnp.int32))
+      def untiled_kernel(x_ref, o_ref, _axes=axes):
+        x = plgpu.load(x_ref, layout=mma, optimized=False)
+        plgpu.store(
+            o_ref, lax.reduce_or(x > 0, axes=_axes).astype(jnp.int32),
+            optimized=False,
+        )
+
+      np.testing.assert_array_equal(
+          untiled_kernel(jnp.asarray(x)), np.any(x > 0, axis=axes).astype(np.int32)
+      )
 
 
 class PallasCallSm90ATest(PallasSm90ATest):
@@ -6178,6 +7629,37 @@ class PallasCallSm90ATest(PallasSm90ATest):
     np.testing.assert_allclose(
         res, jnp.matmul(a, b, precision="high"), rtol=1e-3
     )
+
+  def test_wgmma_accumulator_negated_and_signed(self):
+    # A sign op on the accumulator's registers is a float instruction: as an
+    # integer op (`fneg`'s expansion into a sign-bit xor) ptxas 12.9 folded it
+    # through the accumulator's value before the MMA, storing -0.0.
+    def kernel(a_ref, b_ref, o_ref, s_ref):
+      def scope(acc_ref):
+        plgpu.wgmma(acc_ref, a_ref, b_ref)
+        return acc_ref[...]
+      acc = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+      plgpu.store(o_ref, -acc, optimized=False)
+      # sign's lowering takes copysign(1, acc) where acc is nonzero.
+      plgpu.store(s_ref, jnp.sign(acc), optimized=False)
+
+    key1, key2 = jax.random.split(jax.random.key(7), 2)
+    a = jax.random.randint(key1, (64, 128), -2, 3).astype(jnp.bfloat16)
+    b = jax.random.randint(key2, (128, 128), -2, 3).astype(jnp.bfloat16)
+
+    transforms = self.default_transforms(dtype=jnp.bfloat16)
+    out = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    negated, signed = self.pallas_call(
+        kernel,
+        in_specs=[
+            plgpu.BlockSpec(transforms=transforms),
+            plgpu.BlockSpec(transforms=transforms),
+        ],
+        out_shape=(out, out),
+    )(a, b)
+    product = jnp.matmul(a, b, preferred_element_type=jnp.float32)
+    np.testing.assert_array_equal(negated, -product)
+    np.testing.assert_array_equal(signed, jnp.sign(product))
 
   @parameterized.parameters(jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2)
   def test_wgmma_registers_8bit(self, input_dtype):
@@ -9376,6 +10858,48 @@ class PipelineTest(PallasTest):
         jnp.full(block_size, num_steps, dtype=dtype)
     )
 
+  @parameterized.product(num_steps=[0, 5], max_concurrent_steps=[2, 3])
+  @run_on_sm80
+  def test_emit_pipeline_dynamic_grid_over_operands_on_a_mesh(
+      self, num_steps, max_concurrent_steps
+  ):
+    # Operands on a concrete mesh give the kernel's values that mesh's
+    # sharding: a `zeros_like` of one (the dynamic grid's own count's, and
+    # the pipeline's on cp.async) binds a reshard of a literal, which lowers
+    # to the literal itself.
+    dtype = jnp.float32
+    block_size = 128
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((block_size,), dtype),
+        scratch_types=[plgpu.SMEM((block_size,), dtype)],
+    )
+    def kernel(num_steps_gmem, x_gmem, o_gmem, acc_ref):
+      acc_ref[...] = jnp.zeros_like(acc_ref)
+      steps = num_steps_gmem[...]
+
+      def body(_, x_smem):
+        acc_ref[...] += x_smem[...]
+
+      plgpu.emit_pipeline(
+          body,
+          in_specs=[pl.BlockSpec((block_size,), lambda i: (i,))],
+          grid=(lax.max(steps, jnp.zeros_like(steps)),),
+          max_concurrent_steps=max_concurrent_steps,
+      )(x_gmem)
+
+      o_gmem[...] = acc_ref[...]
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ("x",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    x = jax.device_put(
+        jnp.ones(max(num_steps, 1) * block_size, dtype=dtype), placed
+    )
+    steps = jax.device_put(jnp.int32(num_steps), placed)
+    np.testing.assert_array_equal(
+        jax.jit(kernel)(steps, x), jnp.full(block_size, num_steps, dtype=dtype)
+    )
+
   def test_pipeline_oob_mode(self):
     # This test crashes with the default OOB fill mode of ZEROS because
     # it can't copy large 1D arrays.
@@ -10350,6 +11874,53 @@ class KernelTest(PallasTest, jtu.CudaArchSpecificTest):
     np.testing.assert_array_equal(
         kernel(), np.repeat(np.arange(2), 128).reshape(2, 128)
     )
+
+  def test_warpgroups_sum_columns_at_once(self):
+    # Two warpgroups sum the columns of their own tiles at once, a reduction
+    # across warps through shared scratch. Each takes its own scratch, so
+    # neither reads the other's partial sums; integer-valued sums are exact.
+    count, rows, columns = 64, 64, 64
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((2, count, columns), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(x_ref, o_ref):
+      wg = jax.lax.axis_index("wg")
+
+      @pl.loop(0, count)
+      def _(step):
+        tile = plgpu.load(
+            x_ref.at[wg, step], layout=plgpu.Layout.WGMMA, optimized=False
+        )
+        o_ref[wg, step, :] = jnp.sum(tile, axis=0)
+
+    x = (jnp.arange(2 * count * rows * columns) % 31 - 15).astype(jnp.float32)
+    x = x.reshape(2, count, rows, columns)
+    np.testing.assert_array_equal(kernel(x), jnp.sum(x, axis=2))
+
+  def test_warpgroups_sum_to_scalars_at_once(self):
+    if not self.is_wg_semantics():
+      self.skipTest("Lane semantics takes no full reduction under threads")
+    # As above, each warpgroup summing its own rows to a scalar at once.
+    count, length = 64, 128
+
+    @self.kernel(
+        out_type=jax.ShapeDtypeStruct((2, count), jnp.float32),
+        num_threads=2,
+        thread_name="wg",
+    )
+    def kernel(x_ref, o_ref):
+      wg = jax.lax.axis_index("wg")
+
+      @pl.loop(0, count)
+      def _(step):
+        o_ref[wg, step] = jnp.sum(x_ref[wg, step])
+
+    x = (jnp.arange(2 * count * length) % 31 - 15).astype(jnp.float32)
+    x = x.reshape(2, count, length)
+    np.testing.assert_array_equal(kernel(x), jnp.sum(x, axis=2))
 
   def test_multiple_wg_with_grid(self):
 

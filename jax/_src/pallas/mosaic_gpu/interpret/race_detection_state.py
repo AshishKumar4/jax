@@ -70,11 +70,18 @@ class GPURaceDetectionState(race_detection_state.RaceDetectionState):
       buffer_key,
       rnge: interpret_utils.Access,
       source_info=None,
+      reads_clock=None,
   ):
-    super().check_write(thread, clock, buffer_key, rnge.range, source_info)
-    self._check_ref_union(thread, clock, buffer_key, True, source_info)
+    super().check_write(
+        thread, clock, buffer_key, rnge.range, source_info, reads_clock
+    )
+    self._check_ref_union(
+        thread, clock, buffer_key, True, source_info, reads_clock
+    )
 
-  def _check_ref_union(self, thread, clock, buffer_key, is_write, source_info):
+  def _check_ref_union(
+      self, thread, clock, buffer_key, is_write, source_info, reads_clock=None
+  ):
     with self.lock:
       membership = self.ref_union_members.get(buffer_key)
     if membership is None:
@@ -103,7 +110,8 @@ class GPURaceDetectionState(race_detection_state.RaceDetectionState):
       other_thread, other_clock, other_group, other_write, other_frame = other
       if other_group == group or not (is_write or other_write):
         continue
-      if other_clock.ordered(clock):
+      ordering = clock if other_write or reads_clock is None else reads_clock
+      if other_clock.ordered(ordering):
         if is_write or i != last_write:
           continue
         raise ValueError(

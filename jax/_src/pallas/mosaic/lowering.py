@@ -30,6 +30,7 @@ from jax._src import ad_util
 from jax._src import checkify
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src.lax import eval_jaxpr as eval_jaxpr_lib
 from jax._src import custom_derivatives
 from jax._src import debugging
 from jax._src import dtypes
@@ -1838,7 +1839,10 @@ def jaxpr_subcomp(
     )
     with (source_info_util.user_context(eqn.source_info.traceback), loc,
           eqn.ctx.manager):
-      if eqn.primitive in lowering_rules[ctx.kernel_type]:
+      # Any call primitive lowers as `eval_jaxpr_p`, its body inlined.
+      primitive = (jax_core.eval_jaxpr_p
+                   if eqn.primitive in eval_jaxpr_lib.call_primitives else eqn.primitive)
+      if primitive in lowering_rules[ctx.kernel_type]:
         if (eqn.primitive, ctx.kernel_type) not in skip_mlir_conversions:
           invals = [
               _ensure_valid_argument(x, cast(ShapedAbstractValue, v.aval))
@@ -1865,8 +1869,12 @@ def jaxpr_subcomp(
         rule_context = None
 
         # TODO(phawkins): allow KeyScalarBundle/AccRef here as well as ir.Value.
-        can_cache = _is_cacheable_eqn(eqn) and all(
-            isinstance(x, ir.Value) for x in invals
+        # A call primitive's body is inlined where it is, as its own function it
+        # would read no grid (`program_id`).
+        can_cache = (
+            _is_cacheable_eqn(eqn)
+            and eqn.primitive not in eval_jaxpr_lib.call_primitives
+            and all(isinstance(x, ir.Value) for x in invals)
         )
         if can_cache:
           grid_arity = (
@@ -1909,7 +1917,7 @@ def jaxpr_subcomp(
             try:
               cache_entry = _emit_pallas_lowering_rule_as_fun(
                   ctx, eqn.primitive,
-                  lowering_rules[ctx.kernel_type][eqn.primitive],
+                  lowering_rules[ctx.kernel_type][primitive],
                   rule_context, cast(list[ir.Value], invals), **eqn.params
               )
               if ctx.dynamic_shape_env is not None:
@@ -1934,7 +1942,7 @@ def jaxpr_subcomp(
         else:
           try:
             assert rule_context is not None
-            ans = lowering_rules[ctx.kernel_type][eqn.primitive](
+            ans = lowering_rules[ctx.kernel_type][primitive](
                 rule_context, *invals, **eqn.params
             )
           except LoweringException:
@@ -3696,6 +3704,14 @@ def _fold_and_get_constant_value(x):
 def _stop_gradient_lowering_rule(_: LoweringRuleContext, x):
   return x
 
+
+@register_lowering_rule(lax.optimization_barrier_p)
+def _optimization_barrier_lowering_rule(_: LoweringRuleContext, *args):
+  # The operands as they are: Mosaic keeps a kernel's multiply and add apart,
+  # no fused multiply-add (a v5e's x * y + z, z the negated rounded product, is
+  # zero), so each operation keeps its own rounding.
+  return args
+
 @register_lowering_rule(
     lax.max_p, ensure_mlir_values=False, kernel_types=[*tpu_core.CoreType]
 )
@@ -5429,6 +5445,7 @@ def _run_scoped_lowering_rule(
 ):
   if collective_axes:
     raise NotImplementedError("run_scoped lowering does not support collective axes")
+  jaxpr = jaxpr.with_consts(consts)  # Its leading invars are its operands.
   region = tpu.RegionOp(map(ctx.aval_to_ir_type, ctx.avals_out))
   in_avals = [v.aval for v in jaxpr.invars]
   with ctx.lowering_context.grid_name_context():
