@@ -473,9 +473,10 @@ def compile_or_get_cached(
   # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
   # serializes its options alone, which deserialize as no executable: where the
   # persistent cache is used, it reads nothing of it (a PGLE profile's entry
-  # included) and writes nothing to it.
+  # included) and writes nothing to it. A stock jaxlib states no early exit,
+  # and makes none.
   if (compilation_cache.is_cache_used(backend)
-      and compile_options.is_early_exit):
+      and getattr(compile_options, "is_early_exit", False)):
     return backend_compile_and_load(
         backend, computation, executable_devices, compile_options,
         host_callbacks)

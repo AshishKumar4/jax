@@ -27,7 +27,6 @@ import jax
 from jax._src import core as jax_core
 from jax._src import sharding_impls
 from jax._src.interpreters import mlir
-from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
 from jax._src.pallas.mosaic_gpu import lowering_cache
@@ -201,7 +200,9 @@ def mpmd_map_mgpu_lowering_rule(
   if debug:
     print(f"\nThe Mosaic GPU module for mpmd_map {jaxpr.debug_info.func_src_info}:")
     if lowering_result.module is None:  # A cached lowering's.
-      print(ir.Module.parse(lowering_result.serialized.module_asm).operation)
+      # Its serialized kernel, its operations in their own dialects again.
+      print(mgpu.core.deserialized(
+          lowering_result.serialized.module_asm).operation)
     else:
       print(lowering_result.module.operation)
 

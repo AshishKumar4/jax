@@ -1343,8 +1343,10 @@ _NO_THREAD_SMEM_ACCESS = (
     "memref.extract_strided_metadata", "scf.yield",
 )
 _STRUCTURED = ("scf.if", "scf.index_switch", "scf.for")
+# Inline assembly that is one barrier instruction and nothing else: one that
+# goes on past it (a shared memory read after the sync) is an access.
 _WARPGROUP_BARRIER = re.compile(
-    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;"
+    r"^\s*bar(rier)?\.sync(\.aligned)?\s+[^,;]+(,\s*(\d+))?\s*;\s*$"
 )
 
 

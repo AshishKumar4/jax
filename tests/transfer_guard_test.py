@@ -270,6 +270,24 @@ class TransferGuardTest(jtu.JaxTestCase):
             np.asarray(cold)
 
   @jtu.run_on_devices("cpu")
+  def test_a_batched_read_refused_reads_none_of_its_cpu_arrays(self):
+    # A device_get refused for one of its leaves (a deleted array) has read no
+    # other: a cold CPU array among them is held as it was.
+    with jax.transfer_guard_host_to_device("allow"):
+      cold = jnp.arange(4.)
+      deleted = jnp.arange(4.)
+    deleted.delete()
+    with self.assertRaisesRegex(Exception, "deleted"):
+      jax.device_get((cold, deleted))
+    with jax.transfer_guard("disallow"):
+      with self.assertDisallows("device_to_host_np_asarray_after_refused_get"):
+        np.asarray(cold)
+    jax.device_get(cold)
+    with jax.transfer_guard("disallow"):
+      with self.assertAllows("device_to_host_np_asarray_after_get"):
+        np.asarray(cold)
+
+  @jtu.run_on_devices("cpu")
   def test_disallow_allows_a_cpu_array_in_host_memory(self):
     with jax.transfer_guard_host_to_device("allow"):
       x = jnp.arange(4.)

@@ -38,37 +38,91 @@ index e22b4de..a5116f9 100644
        std::unique_ptr<gpu::GpuExecutableBufferAllocator::ExecutionScope>
            allocation_scope,
 diff --git a/xla/pjrt/pjrt_executable.cc b/xla/pjrt/pjrt_executable.cc
-index 231e703..9a8ad75 100644
+index 231e703..720c2ae 100644
 --- a/xla/pjrt/pjrt_executable.cc
 +++ b/xla/pjrt/pjrt_executable.cc
-@@ -177,9 +177,16 @@ bool IsEarlyExitCompilation(const xla::CompileOptions& compile_options) {
-   // Some callers may not have called compile_options.ApplyAllOptionOverrides,
-   // so we check the env_option_overrides directly.
-   for (const auto& [k, v] : compile_options.env_option_overrides) {
-+    // Read in each form ApplyAllOptionOverrides parses it: a bool or its
-+    // string, an enum's name or its number.
-     if (k == "xla_early_exit_with_layouts") {
-       if (const bool* b = std::get_if<bool>(&v)) {
-         early_exit_with_layouts = *b;
-+      } else if (const std::string* s = std::get_if<std::string>(&v)) {
-+        bool parsed;
-+        if (absl::SimpleAtob(*s, &parsed)) {
-+          early_exit_with_layouts = parsed;
-+        }
-       }
-     } else if (k == "xla_gpu_experimental_early_exit") {
-       if (const std::string* s = std::get_if<std::string>(&v)) {
-@@ -187,6 +194,10 @@ bool IsEarlyExitCompilation(const xla::CompileOptions& compile_options) {
-         if (DebugOptions::EarlyExitPoint_Parse(*s, &override_point)) {
-           early_exit_point = override_point;
-         }
-+      } else if (const int64_t* n = std::get_if<int64_t>(&v)) {
-+        if (DebugOptions::EarlyExitPoint_IsValid(*n)) {
-+          early_exit_point = static_cast<DebugOptions::EarlyExitPoint>(*n);
-+        }
-       }
+@@ -164,35 +164,27 @@ absl::StatusOr<CompileOptions> CompileOptions::FromProto(
+ }
+ 
+ bool IsEarlyExitCompilation(const xla::CompileOptions& compile_options) {
+-  bool early_exit_with_layouts =
+-      compile_options.executable_build_options.has_debug_options() &&
+-      compile_options.executable_build_options.debug_options()
+-          .xla_early_exit_with_layouts();
+-  DebugOptions::EarlyExitPoint early_exit_point =
+-      compile_options.executable_build_options.has_debug_options()
+-          ? compile_options.executable_build_options.debug_options()
+-                .xla_gpu_experimental_early_exit()
+-          : DebugOptions::EARLY_EXIT_POINT_UNSET;
+-
+-  // Some callers may not have called compile_options.ApplyAllOptionOverrides,
+-  // so we check the env_option_overrides directly.
+-  for (const auto& [k, v] : compile_options.env_option_overrides) {
+-    if (k == "xla_early_exit_with_layouts") {
+-      if (const bool* b = std::get_if<bool>(&v)) {
+-        early_exit_with_layouts = *b;
+-      }
+-    } else if (k == "xla_gpu_experimental_early_exit") {
+-      if (const std::string* s = std::get_if<std::string>(&v)) {
+-        DebugOptions::EarlyExitPoint override_point;
+-        if (DebugOptions::EarlyExitPoint_Parse(*s, &override_point)) {
+-          early_exit_point = override_point;
+-        }
+-      }
++  // The options as a compile applies them: its debug options with its early
++  // exit's overrides applied by `CompileOptions::ApplyOption`, XLA's own
++  // parser (a bool or its string, an enum's name, its number or its numeral),
++  // since some callers never call ApplyAllOptionOverrides. An override the
++  // parser refuses leaves the option as it was.
++  xla::CompileOptions applied;
++  if (compile_options.executable_build_options.has_debug_options()) {
++    *applied.executable_build_options.mutable_debug_options() =
++        compile_options.executable_build_options.debug_options();
++  }
++  for (const auto& [key, value] : compile_options.env_option_overrides) {
++    if (key == "xla_early_exit_with_layouts" ||
++        key == "xla_gpu_experimental_early_exit") {
++      applied.ApplyOption(key, value).IgnoreError();
      }
    }
+-
+-  return early_exit_with_layouts ||
+-         early_exit_point != DebugOptions::EARLY_EXIT_POINT_UNSET;
++  const xla::DebugOptions& debug_options =
++      applied.executable_build_options.debug_options();
++  return debug_options.xla_early_exit_with_layouts() ||
++         debug_options.xla_gpu_experimental_early_exit() !=
++             DebugOptions::EARLY_EXIT_POINT_UNSET;
+ }
+ 
+ MultiSliceConfig::~MultiSliceConfig() = default;
+diff --git a/xla/pjrt/pjrt_executable_test.cc b/xla/pjrt/pjrt_executable_test.cc
+index 7e2e02d..a9a567a 100644
+--- a/xla/pjrt/pjrt_executable_test.cc
++++ b/xla/pjrt/pjrt_executable_test.cc
+@@ -299,6 +299,22 @@ TEST(IsEarlyExitCompilationTest,
+   EXPECT_FALSE(IsEarlyExitCompilation(options));
+ }
+ 
++// Each form ApplyOption parses classifies as the compile applies it: an
++// enum's numeral and number, and a bool's string.
++TEST(IsEarlyExitCompilationTest, EnvOptionOverridesInEveryParsedForm) {
++  using Override = CompileOptions::OptionOverride;
++  for (const Override& value :
++       {Override(std::string("1")), Override(int64_t{1})}) {
++    CompileOptions options;
++    options.env_option_overrides = {{"xla_gpu_experimental_early_exit", value}};
++    EXPECT_TRUE(IsEarlyExitCompilation(options));
++  }
++  CompileOptions layouts;
++  layouts.env_option_overrides = {
++      {"xla_early_exit_with_layouts", std::string("True")}};
++  EXPECT_TRUE(IsEarlyExitCompilation(layouts));
++}
++
+ TEST(IsEarlyExitCompilationTest, CombinedEnvOptionOverrides) {
+   CompileOptions options;
+   options.env_option_overrides = {
 diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
 index ca80bc5..6c8bcd0 100644
 --- a/xla/service/gpu/BUILD

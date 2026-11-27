@@ -1744,6 +1744,17 @@ class LaxTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError, "complex preferred_element_type"):
       lax.dot(lhs, rhs, precision="F32_F32_F32",
               preferred_element_type=np.float32)
+    # Traced under x64 and lowered outside it, a complex128 dot's real
+    # products keep the recorded float64: lowered at float32 they would not
+    # match the complex128 result its jaxpr states.
+    with jax.enable_x64(True):
+      wide = (rng((3, 4), np.complex128), rng((4, 3), np.complex128))
+      traced = jax.jit(lambda a, b: lax.dot(
+          a, b, precision="F64_F64_F64",
+          preferred_element_type=np.complex128)).trace(*wide)
+    text = traced.lower().as_text()
+    self.assertIn("complex<f64>", text)
+    self.assertNotIn("complex<f32>", text)
 
   def testDotAlgorithmAllowedOutputStorage(self):
     # see https://github.com/jax-ml/jax/issues/24794

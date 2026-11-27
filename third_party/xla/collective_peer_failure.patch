@@ -327,10 +327,10 @@ index e12d81a..a345cca 100644
    GlobalDeviceId id0 = GlobalDeviceId(0);
    GlobalDeviceId id1 = GlobalDeviceId(1);
 diff --git a/xla/backends/gpu/runtime/collective_kernel_thunk.cc b/xla/backends/gpu/runtime/collective_kernel_thunk.cc
-index 3b05949..4b43a2c 100644
+index 3b05949..d84f300 100644
 --- a/xla/backends/gpu/runtime/collective_kernel_thunk.cc
 +++ b/xla/backends/gpu/runtime/collective_kernel_thunk.cc
-@@ -673,59 +673,84 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
+@@ -673,73 +673,111 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
    const CollectiveMetadataLayout metadata_layout(num_devices, num_parameters,
                                                   layout.AnyMultimem());
  
@@ -346,9 +346,8 @@ index 3b05949..4b43a2c 100644
 +  // would never join; a clique spanning processes has none to tell.
 +  const bool exchanges = layout.Any(SymmetricMemoryType::kXlaRendezvous);
 +  const bool registers = layout.Any(SymmetricMemoryType::kLoadStoreAccessible);
-+  // Whether this call built the device's state (its first): later calls find
-+  // it built, or its failure kept.
-+  bool building = false;
++  // The device's state, built once: later calls find it built, or its failure
++  // kept (a peer's among it, where the ranks met).
 +  absl::Status built = per_device_state_.GetOrCreateAndInitialize(
        params.executor->device_ordinal(),
        [&](StreamState* state) -> absl::Status {
@@ -363,7 +362,6 @@ index 3b05949..4b43a2c 100644
 -          for (size_t i = 0; i < kernel_spec_.scratch_buffers.size(); ++i) {
 -            scratch_slices.push_back(scratch_allocation.address().GetByteSlice(
 -                layout.scratch_offsets[i], layout.scratch_sizes[i]));
-+        building = true;
 +        absl::Status prepared = [&]() -> absl::Status {
 +          se::DeviceAddressHandle scratch_allocation;
 +          std::vector<se::DeviceAddressBase> scratch_slices;
@@ -443,11 +441,33 @@ index 3b05949..4b43a2c 100644
 +                                         rank.value(), metadata_layout));
 +          return absl::OkStatus();
 +        }();
-+        if (!prepared.ok()) {
-+          return clique_key.is_local() && exchanges
-+                     ? GpuCliqueRendezvous::JoinFailed(clique_key, *rank,
-+                                                       prepared)
-+                     : prepared;
++        absl::Status copied = [&]() -> absl::Status {
++          if (!prepared.ok()) {
++            return clique_key.is_local() && exchanges
++                       ? GpuCliqueRendezvous::JoinFailed(clique_key, *rank,
++                                                         prepared)
++                       : prepared;
++          }
++          ABSL_ASSIGN_OR_RETURN(state->param_to_peers_ptrs,
++                                CollectParamToPeersWithRendezvous(
++                                    layout, clique_key, state->rank,
++                                    GetSymmetricParameterAddresses(
++                                        layout, *params.buffer_allocations,
++                                        state->scratch_slices)));
++          return CopyParamToPeersPtrsToDevice(params.stream, metadata_layout,
++                                              state->metadata,
++                                              state->param_to_peers_ptrs);
++        }();
++        if (!registers || !clique_key.is_local()) {
++          return copied;
++        }
++        // Every local rank's fallible work is done before any registers its
++        // symmetric memory: the ranks meet here as they build their state,
++        // one that failed anywhere above joining as failed, so no peer waits
++        // for it in NCCL. The meeting's outcome is the state's, kept for every
++        // later execution: a rank whose peer failed never registers alone.
++        if (!copied.ok()) {
++          return GpuCliqueRendezvous::JoinFailed(clique_key, *rank, copied);
          }
 -        kernel->set_use_pdl(use_pdl_);
 -        // Step2: Populate the stream state.
@@ -455,36 +475,29 @@ index 3b05949..4b43a2c 100644
 -                             std::move(kernel), std::move(scratch_allocation),
 -                             std::move(scratch_slices));
 -
--        ABSL_ASSIGN_OR_RETURN(
+         ABSL_ASSIGN_OR_RETURN(
 -            state->metadata,
 -            AllocateCollectiveMetadata(params.executor, params.stream,
 -                                       rank.value(), metadata_layout));
- 
-         ABSL_ASSIGN_OR_RETURN(state->param_to_peers_ptrs,
-                               CollectParamToPeersWithRendezvous(
-@@ -737,9 +762,24 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
-         return CopyParamToPeersPtrsToDevice(params.stream, metadata_layout,
-                                             state->metadata,
-                                             state->param_to_peers_ptrs);
+-
+-        ABSL_ASSIGN_OR_RETURN(state->param_to_peers_ptrs,
+-                              CollectParamToPeersWithRendezvous(
+-                                  layout, clique_key, state->rank,
+-                                  GetSymmetricParameterAddresses(
+-                                      layout, *params.buffer_allocations,
+-                                      state->scratch_slices)));
+-
+-        return CopyParamToPeersPtrsToDevice(params.stream, metadata_layout,
+-                                            state->metadata,
+-                                            state->param_to_peers_ptrs);
 -      }));
-+      });
- 
+-
 -  if (!layout.Any(SymmetricMemoryType::kLoadStoreAccessible)) {
-+  if (!registers || !clique_key.is_local() || !building) {
-+    ABSL_RETURN_IF_ERROR(built);
-+  } else {
-+    // Every local rank's fallible work is done before any registers its
-+    // symmetric memory: the ranks meet here as they build their state, one
-+    // that failed anywhere above joining as failed, so no peer waits for it
-+    // in NCCL.
-+    if (!built.ok()) {
-+      return GpuCliqueRendezvous::JoinFailed(clique_key, *rank, built);
-+    }
-+    ABSL_ASSIGN_OR_RETURN(
-+        std::shared_ptr<GpuCliqueRendezvous> ready,
-+        GpuCliqueRendezvous::Join(clique_key, *rank, int32_t{0}));
-+    ABSL_RETURN_IF_ERROR(ready->PeersReady());
-+  }
++            std::shared_ptr<GpuCliqueRendezvous> ready,
++            GpuCliqueRendezvous::Join(clique_key, *rank, int32_t{0}));
++        return ready->PeersReady();
++      });
++  ABSL_RETURN_IF_ERROR(built);
 +  if (!registers) {
      return absl::OkStatus();
    }

@@ -49,7 +49,6 @@ limitations under the License.
 #include "jaxlib/py_client.h"
 #include "jaxlib/py_device_list.h"
 #include "xla/array.h"
-#include "xla/backends/cpu/target_machine_options.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/builder/xla_computation.h"
@@ -299,14 +298,6 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .value("UNSPECIFIED", DebugOptions::AUTOTUNE_CACHE_MODE_UNSPECIFIED)
       .value("UPDATE", DebugOptions::AUTOTUNE_CACHE_MODE_UPDATE)
       .value("READ", DebugOptions::AUTOTUNE_CACHE_MODE_READ);
-
-  // The CPU XLA:CPU compiles for under `debug_options` (its triple, its CPU and
-  // the features it enables): the persistent cache keys a CPU executable by it.
-  m.def("cpu_target_machine", [](const DebugOptions& debug_options) {
-    xla::cpu::TargetMachineOptions target(debug_options);
-    return nb::make_tuple(target.triple(), target.cpu(),
-                          target.GetTargetMachineFeatures());
-  });
 
   nb::class_<DebugOptions>(m, "DebugOptions")
       .def("__repr__", &DebugOptions::DebugString)

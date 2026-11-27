@@ -2682,6 +2682,20 @@ class DialectLoweringTest(MosaicGpuTest):
     marker = self._marked_after(self._barrier(), branch="for")
     self.assertFalse(lowering._warpgroup_synced_before(marker))
 
+  def test_assembly_that_goes_on_past_its_barrier_does_not_sync(self):
+    # One inline assembly block syncing, then reading shared memory: the read
+    # follows the barrier, so the block orders no later copy.
+    def before():
+      mgpu_utils.inline_ptx(
+          f"bar.sync $1, {mgpu_utils.WARPGROUP_SIZE}; ld.shared.u32 $0, [$1];",
+          arith.constant(ir.IntegerType.get_signless(32), 1),
+          result_types=ir.IntegerType.get_signless(32),
+          has_side_effects=True,
+      )
+    self.assertFalse(
+        lowering._warpgroup_synced_before(self._marked_after(before))
+    )
+
   def test_a_barrier_of_one_warp_does_not_sync_the_warpgroup(self):
     marker = self._marked_after(self._barrier(threads=32))
     self.assertFalse(lowering._warpgroup_synced_before(marker))

@@ -7744,10 +7744,12 @@ def _complex_dot_by_parts(lhs, rhs, *, dimension_numbers, precision,
       return real(x), imag(x)
     return x, None
 
+  # Bound at the recorded result's real type: canonicalized again (`dot_general`)
+  # outside the x64 scope that traced it, a complex128 dot's parts would narrow.
   def dot(x, y):
-    return dot_general(x, y, dimension_numbers, precision=precision,
-                       preferred_element_type=np.finfo(out_dtype).dtype,
-                       out_sharding=out_sharding)
+    return _dot_general_bound(x, y, dimension_numbers, precision=precision,
+                              preferred_element_type=np.finfo(out_dtype).dtype,
+                              out_sharding=out_sharding)
 
   (a, b), (c, d) = parts(lhs), parts(rhs)
   re = dot(a, c) if b is None or d is None else sub(dot(a, c), dot(b, d))

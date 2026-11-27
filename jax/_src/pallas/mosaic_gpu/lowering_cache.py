@@ -716,6 +716,12 @@ def lower_unpipelined_jaxpr_to_module(
             f" in: {', '.join(differences)}"
         )
       _count("verified")
+    elif not registries_lib.unchanged(dispatch):
+      # A rule registered or replaced since the key was made (while the store
+      # was read): the entry is the lowering of rules the process no longer
+      # dispatches through.
+      _count("unsealed")
+      return fresh()
     _count("hit")
     monitoring.record_event_duration_secs(
         _EVENT_PREFIX + "seconds_saved", entry.seconds

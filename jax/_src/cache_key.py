@@ -115,12 +115,6 @@ def get(
           lambda hash_obj: _hash_platform(hash_obj, backend)
       ),
       (
-          "host CPU",
-          lambda hash_obj: _hash_host_cpu(
-              hash_obj, backend, compile_options.executable_build_options
-              .debug_options)
-      ),
-      (
           "XLA flags",
           lambda hash_obj: _hash_xla_flags(hash_obj, get_flag_prefixes()),
       ),
@@ -396,6 +390,12 @@ def _hash_accelerator_config(hash_obj, accelerators: xla_client.DeviceList):
                 "accelerator config, falling back to hashing "
                 "devices %s (type %s)", ex, type(ex))
     _hash_devices(hash_obj, accelerators)
+    # XLA:CPU compiles for the CPU its topology states (its target machine,
+    # which the fingerprint holds): with none, the host's, so an executable
+    # from a host of another CPU, which need not link or run here, is another
+    # key.
+    if any(device.platform == "cpu" for device in accelerators):
+      _hash_string(hash_obj, host_cpu())
 
 # LINT.IfChange(xla_flags)
 xla_flags_to_exclude_from_cache_key = [
@@ -521,26 +521,6 @@ def jax_version() -> str:
   entries ("Invalid metadata payload id"). The key names jax's version too.
   """
   return jax_version_module.__version__
-
-
-def _hash_host_cpu(hash_obj, backend, debug_options):
-  # XLA:CPU compiles a program for the CPU features of the host that compiles
-  # it, so an executable from a host of another CPU need not link or run here
-  # ("Failed to materialize symbols", after which the process compiles nothing
-  # more): on the CPU backend, the key names the CPU XLA compiles for. Other
-  # backends' keys are unchanged.
-  if backend.platform == "cpu":
-    _hash_string(hash_obj, cpu_target(debug_options))
-
-
-def cpu_target(debug_options) -> str:
-  """The CPU XLA:CPU compiles for under `debug_options`, as XLA itself states
-  it (its triple, its CPU and the features it enables, an ISA cap among the
-  options applied); this host's CPU (`host_cpu`) with a jaxlib that states
-  none."""
-  if (target := getattr(_jax, "cpu_target_machine", None)) is None:
-    return host_cpu()
-  return "\n".join(target(debug_options))
 
 
 @functools.cache

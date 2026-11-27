@@ -428,11 +428,16 @@ class Encoder:
       weak = bool(getattr(x, "aval", None) is not None and x.aval.weak_type) \
           if cls is jax_literals.TypedNdArray else False
       array = np.ascontiguousarray(x)
+      # Its values, and what a reader observes of its layout beside them (a
+      # callback a lowering runs may read either): its strides, as it is, and
+      # whether it can be written.
       return seq(b"A", [
           frame(b"K", f"{cls.__module__}:{cls.__qualname__}".encode()),
           self._np_dtype(array.dtype),
           self._e(tuple(int(d) for d in array.shape), 1),
           frame(b"Y", array.tobytes()), self._e(weak, 1),
+          self._e(tuple(int(d) for d in x.strides), 1),
+          self._e(bool(x.flags.writeable), 1),
       ])
     if x.dtype.kind == "O":
       raise Uncacheable("an object scalar has no encoding")

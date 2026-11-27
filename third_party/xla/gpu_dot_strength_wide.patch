@@ -26,7 +26,7 @@ index 1ba894f..68aba1c 100644
    ASSERT_OK_AND_ASSIGN(bool matched, RunFileCheck(m->ToString(), kPattern));
    EXPECT_TRUE(matched);
 diff --git a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
-index 3e60f60..4e87064 100644
+index d3d8cb3..695a216 100644
 --- a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
 +++ b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
 @@ -55,6 +55,9 @@ absl::StatusOr<HloInstruction*> Mult(HloInstruction* lhs, HloInstruction* rhs) {
@@ -80,10 +80,10 @@ index 3e60f60..4e87064 100644
  
  absl::StatusOr<HloInstruction*>
 diff --git a/xla/backends/gpu/transforms/dot_strength_reduction.cc b/xla/backends/gpu/transforms/dot_strength_reduction.cc
-index 487937a..d3d5b9d 100644
+index dcce2e9..858a82e 100644
 --- a/xla/backends/gpu/transforms/dot_strength_reduction.cc
 +++ b/xla/backends/gpu/transforms/dot_strength_reduction.cc
-@@ -639,14 +639,28 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
+@@ -647,23 +647,28 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
    }
    const OpMetadata* metadata = &dot->metadata();
    ABSL_ASSIGN_OR_RETURN(auto dot_dims, DotOperandDims::FromDot(dot));
@@ -104,17 +104,25 @@ index 487937a..d3d5b9d 100644
  
    std::array<HloInstruction*, 2> operands = {dot->mutable_operand(0),
                                               dot->mutable_operand(1)};
+-  // An F8 algorithm's operands are exact in F32, its accumulator type, which a
+-  // narrower result type (an E4M3FN result of E5M2 operands) would round.
+-  const PrecisionConfig::Algorithm algorithm =
+-      dot->precision_config().algorithm();
+-  const PrimitiveType operand_type =
+-      algorithm == PrecisionConfig::ALG_DOT_ANY_F8_ANY_F8_F32 ||
+-              algorithm == PrecisionConfig::ALG_DOT_ANY_F8_ANY_F8_F32_FAST_ACCUM
+-          ? F32
+-          : dot->shape().element_type();
    for (int i = 0; i < 2; ++i) {
      DotOperandDims& our_dims = dot_dims[i];
      DotOperandDims& other_dims = dot_dims[1 - i];
--    // Convert operands to the dot resulting type.
--    operands[i] = ConvertTo(operands[i], dot->shape().element_type(), metadata);
-+    // Convert operands to the type they multiply in.
+     // Convert operands to the type they multiply in.
+-    operands[i] = ConvertTo(operands[i], operand_type, metadata);
 +    operands[i] = ConvertTo(operands[i], multiply_type, metadata);
      // Ensure dimensions are in "batch, non-contracting, contracting" order.
      operands[i] = PermuteDotOperandDimensions(operands[i], &our_dims, metadata);
  
-@@ -669,17 +683,16 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
+@@ -686,17 +691,16 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
    ABSL_ASSIGN_OR_RETURN(
        HloInstruction * flow,
        MakeMultiplyForDotPrecisionAlgorithm(

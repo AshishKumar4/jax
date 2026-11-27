@@ -335,8 +335,10 @@ class PyArray : public nanobind::object {
   // completed (`MarkInPlaceHostRead`) or a copy to host was issued: an
   // accelerator array is held until its first copy caches its host value. One
   // in a host memory kind is on the host already, and is not held.
-  absl::Status GuardInPlaceHostRead();
-  void MarkInPlaceHostRead();
+  // `read`, the IFRT array the read takes, which the array may no longer hold
+  // by the time the read completes (its buffer replaced meanwhile).
+  absl::Status GuardInPlaceHostRead(const xla::ifrt::ArrayRef& read);
+  void MarkInPlaceHostRead(const xla::ifrt::ArrayRef& read);
 
  private:
   absl::StatusOr<tsl::Future<>> CopyToHostAsync();

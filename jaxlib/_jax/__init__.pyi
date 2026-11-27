@@ -163,8 +163,6 @@ class AutotuneCacheMode(enum.Enum):
 
   READ = 2
 
-def cpu_target_machine(debug_options: DebugOptions) -> tuple[str, str, str]: ...
-
 class DebugOptions:
   def __repr__(self) -> str: ...
 

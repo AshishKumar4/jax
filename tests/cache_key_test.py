@@ -37,6 +37,7 @@ from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src.interpreters import mlir
+from jax._src.lib import _jax
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.mesh import Mesh
@@ -147,42 +148,34 @@ class CacheKeyTest(jtu.JaxTestCase):
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
 
-  @jtu.thread_unsafe_test()  # patches cache_key.cpu_target for the process
-  def test_a_cpu_program_s_key_names_the_cpu_it_compiles_for(self):
-    # XLA:CPU compiles for the features of the host that compiles, so a CPU
-    # executable from a host of another CPU is not this host's to read.
-    computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    cpu = xla_bridge.get_backend("cpu")
-    devices = xla_client.DeviceList((cpu.local_devices()[0],))
-    compile_options = compiler.get_compile_options(
-        num_replicas=1, num_partitions=1
-    )
-    original_cpu_target = cache_key.cpu_target
-    keys = []
+  @jtu.thread_unsafe_test()  # patches the topology and host_cpu for the process
+  def test_a_cpu_key_with_no_topology_names_the_host_s_cpu(self):
+    # XLA:CPU compiles for the CPU its topology states, which the topology's
+    # fingerprint holds; a backend that serves no topology keys a CPU program
+    # by the host's CPU, and an accelerator's by its devices alone.
+    def no_topology(_):
+      raise _jax.JaxRuntimeError("no topology")
+
+    original = (cache_key.xla_client.get_topology_for_devices,
+                cache_key.host_cpu)
+    cache_key.xla_client.get_topology_for_devices = no_topology
     try:
-      for described in ("x86_64-unknown-linux-gnu\nznver4\n+avx2,+avx512f",
-                        "x86_64-unknown-linux-gnu\nznver3\n+avx2"):
-        cache_key.cpu_target = lambda _, described=described: described
-        keys.append(cache_key.get(computation, devices, compile_options, cpu))
+      for platform_name, differs in (("cpu", True), ("gpu", False)):
+        devices = [types.SimpleNamespace(platform=platform_name,
+                                         device_kind="kind")]
+        hashes = []
+        for described in ("vendor_id: AuthenticAMD\nflags: avx2 avx512f",
+                          "vendor_id: AuthenticAMD\nflags: avx2"):
+          cache_key.host_cpu = lambda described=described: described
+          hash_obj = hashlib.sha256()
+          cache_key._hash_accelerator_config(hash_obj, devices)
+          hashes.append(hash_obj.digest())
+        self.assertEqual(hashes[0] != hashes[1], differs, platform_name)
     finally:
-      cache_key.cpu_target = original_cpu_target
-    self.assertNotEqual(keys[0], keys[1])
+      cache_key.xla_client.get_topology_for_devices, cache_key.host_cpu = (
+          original)
     if os.path.exists("/proc/cpuinfo"):
       self.assertRegex(cache_key.host_cpu(), "flags: |Features: ")
-
-  def test_the_cpu_target_is_xla_s_under_the_compile_s_options(self):
-    # XLA states the CPU it compiles for: its triple, its CPU and the features
-    # it enables, one each a line, the same for the same options.
-    if not hasattr(cache_key._jax, "cpu_target_machine"):
-      self.skipTest("this jaxlib states no CPU target")
-    options = compiler.get_compile_options(num_replicas=1, num_partitions=1)
-    debug_options = options.executable_build_options.debug_options
-    triple, cpu, features = cache_key.cpu_target(debug_options).split("\n")
-    self.assertIn("-", triple)
-    self.assertNotEmpty(cpu)
-    self.assertTrue(all(f[0] in "+-" for f in features.split(",") if f))
-    self.assertEqual(cache_key.cpu_target(debug_options),
-                     "\n".join((triple, cpu, features)))
 
   @jtu.thread_unsafe_test()  # patches cache_key.jax_version for the process
   def test_a_program_s_key_names_its_jax_build(self):
@@ -204,13 +197,6 @@ class CacheKeyTest(jtu.JaxTestCase):
       cache_key.jax_version = original_jax_version
     self.assertNotEqual(keys[0], keys[1])
     self.assertEqual(cache_key.jax_version(), jax.__version__)
-
-  def test_an_accelerator_program_s_key_leaves_the_host_cpu_out(self):
-    for platform_name in ("gpu", "tpu"):
-      with_cpu, without = hashlib.sha256(), hashlib.sha256()
-      cache_key._hash_host_cpu(
-          with_cpu, types.SimpleNamespace(platform=platform_name), None)
-      self.assertEqual(with_cpu.digest(), without.digest())
 
   def test_hash_string(self):
     hash1 = self.get_hashed_value(cache_key._hash_string, "foo")

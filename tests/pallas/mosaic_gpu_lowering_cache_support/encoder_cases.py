@@ -140,6 +140,12 @@ def cases():
       ("bfloat16 and float16", np.dtype(jnp.bfloat16), np.dtype(np.float16), "different"),
       ("array dtype", np.array([1], np.int32), np.array([1.4e-45], np.float32), "different"),
       ("array values", np.array([1, 2]), np.array([1, 3]), "different"),
+      # What a reader observes of an array beside its values: its strides (a
+      # transposed copy's), and whether it can be written.
+      ("array strides", np.arange(4.).reshape(2, 2).T.copy(),
+       np.asfortranarray(np.arange(4.).reshape(2, 2).T), "different"),
+      ("array writeability", np.arange(2.), np.arange(2.).view(), "equal"),
+      ("array read-only", np.arange(2.), _read_only(np.arange(2.)), "different"),
       ("weak and strong type", jax_core.ShapedArray((), f32, weak_type=True),
        jax_core.ShapedArray((), f32, weak_type=False), "different"),
       ("weak aval alike", jax_core.ShapedArray((), f32, weak_type=True),
@@ -186,6 +192,11 @@ def cases():
        _custom_jvp_jaxpr(_primal, 2.0), _custom_jvp_jaxpr(_other_primal, 2.0),
        "different"),
   ]
+
+
+def _read_only(x):
+  x.flags.writeable = False
+  return x
 
 
 def _installed_layout():
