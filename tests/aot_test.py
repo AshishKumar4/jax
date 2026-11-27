@@ -15,6 +15,7 @@
 import contextlib
 import functools
 import io
+import pickle
 import re
 import unittest
 from absl.testing import absltest, parameterized
@@ -68,6 +69,25 @@ class JaxAotTest(jtu.JaxTestCase):
     verify_serialization(
         jax.pmap(lambda x: x * x).lower(
             np.zeros((len(jax.devices()), 4), dtype=np.float32)))
+
+  def test_deserialized_outputs_type_as_fresh_outputs(self):
+    # A deserialized executable's outputs carry the abstract values a fresh one's do, their layout
+    # `AutoLayout` itself, so a jit traced over either reads one aval and lowers one program.
+    from jax._src.layout import AutoLayout
+
+    f = jax.jit(lambda x: (x * 2, x.sum()))
+    x = jnp.arange(8, dtype=jnp.float32)
+    compiled = f.lower(x).compile()
+    serialized, in_tree, out_tree = serialize(compiled)
+    loaded = deserialize_and_load(serialized, in_tree, out_tree)(x)
+    fresh = compiled(x)
+    for got, want in zip(loaded, fresh):
+      self.assertIs(jax.typeof(got).layout, AutoLayout)
+      self.assertEqual(jax.typeof(got), jax.typeof(want))
+    self.assertIs(pickle.loads(pickle.dumps(AutoLayout)), AutoLayout)
+    g = jax.jit(lambda a, b: (jnp.where(b > 0, a, 1), jnp.where(b > 0, a, 0)))
+    self.assertEqual(g.lower(loaded[1], fresh[1]).as_text(),
+                     g.lower(fresh[1], fresh[1]).as_text())
 
   def test_topology_jit_serialize(self):
     try:
@@ -203,6 +223,74 @@ class JaxAotTest(jtu.JaxTestCase):
       self.assertEqual(events.count('/jax/compilation_cache/cache_misses'), 1)
       self.assertEqual(events.count('/jax/compilation_cache/cache_hits'), 1)
       self.assertEqual(result.sharding.device_set, set(jax.devices('tpu')))
+      self.assertArraysEqual(result, x_np * x_np + 1.0)
+
+  @jtu.run_on_devices('cuda')
+  @jtu.thread_unsafe_test()
+  def test_a_compile_only_client_reads_back_the_entry_it_wrote(self):
+    # A compile-only client's compile writes its entry and, compiling again,
+    # reads it back as an unloaded executable (the plugin's
+    # PJRT_ExecutableDeserialize_Extension): a second compile is a hit, its
+    # optimized program the first's; the attached GPU's run reads the entry
+    # too. An early-exit compile (a peak-memory probe's) neither reads nor
+    # writes an entry.
+    compilation_cache.reset_cache()
+    self.addCleanup(compilation_cache.reset_cache)
+    # The cache's initialization under a minimum entry size of 0 sets the
+    # global value to its default (`compilation_cache._initialize_cache`): it is
+    # restored before the suite's check that a test changes no global config.
+    entry_size = "jax_persistent_cache_min_entry_size_bytes"
+    self.addCleanup(config.config.update, entry_size,
+                    config.config.values[entry_size])
+    cache_dir = self.create_tempdir().full_path
+    target_config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
+    with (
+        config.enable_compilation_cache(True),
+        config.raise_persistent_cache_errors(True),
+        config.persistent_cache_min_compile_time_secs(0),
+        config.persistent_cache_min_entry_size_bytes(0),
+        config.compilation_cache_dir(cache_dir),
+    ):
+      events = []
+      monitoring.register_event_listener(events.append)
+      self.addCleanup(monitoring.unregister_event_listener, events.append)
+
+      @jax.jit
+      def fn(x):
+        return x * x + 1.0
+
+      aot_topo = topologies.get_topology_desc(
+          platform="cuda", target_config=target_config, topology="1x1x1")
+      self.assertEqual(
+          aot_topo.devices[0].client.runtime_type, "compile_only_runtime")
+      aot_mesh = topologies.make_mesh(aot_topo, (1,), ("x",))
+      x_shape = jax.ShapeDtypeStruct(
+          shape=(16, 16), dtype=jnp.float32,
+          sharding=jax.sharding.NamedSharding(aot_mesh, P("x")))
+      texts = []
+      for _ in range(2):
+        fn.clear_cache()
+        texts.append(fn.lower(x_shape).compile().as_text())
+      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
+      self.assertEqual(texts[0], texts[1])
+
+      # By its enum's name or its number (1), as XLA parses either.
+      for early_exit in ("EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT", 1):
+        fn.clear_cache()
+        fn.lower(x_shape).compile(
+            {"xla_gpu_experimental_early_exit": early_exit})
+      self.assertEqual(events.count("/jax/compilation_cache/cache_misses"), 1)
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 1)
+
+      # The attached GPU's run of the same program (its operand sharded alike
+      # over a mesh of its device) reads the entry.
+      fn.clear_cache()
+      gpu_mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
+      x_np = np.arange(256, dtype=np.float32).reshape(16, 16)
+      result = fn(jax.device_put(
+          x_np, jax.sharding.NamedSharding(gpu_mesh, P("x"))))
+      self.assertEqual(events.count("/jax/compilation_cache/cache_hits"), 2)
       self.assertArraysEqual(result, x_np * x_np + 1.0)
 
   def test_lower_as_text_with_and_without_debug_info(self):
@@ -507,6 +595,43 @@ class JaxAotTest(jtu.JaxTestCase):
     input = jnp.array([[0., 1.], [2., 3.]], dtype=jnp.float32, device=jax.devices()[0])
     result = compiled(input)
     self.assertEqual(result, 14.)
+
+  @jtu.run_on_devices('cuda')
+  @jtu.thread_unsafe_test()  # Mosaic GPU registers its passes once a process.
+  def test_mosaic_gpu_kernels_compile_ahead_for_two_capabilities_in_one_process(
+      self):
+    # Each Mosaic GPU kernel assembles for the capability its own compile
+    # targets, however many a process compiles for: a capability fixed when
+    # Mosaic GPU registered its passes assembled every later compile's PTX for
+    # the first's ("SM version specified by .target is higher than default SM
+    # version assumed").
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    config = xc.get_topology_for_devices(jax.devices()[:1]).target_config
+
+    def body(x_ref, o_ref):
+      o_ref[...] = x_ref[...] + 1.0
+
+    for major, minor, extension in ((8, 0, "NONE"),
+                                    (9, 0, "ACCELERATED_FEATURES")):
+      stated = re.sub(
+          r"cuda_compute_capability\s*\{[^}]*\}",
+          f"cuda_compute_capability {{ major: {major} minor: {minor} "
+          f"feature_extension: {extension} }}",
+          config)
+      topology = topologies.get_topology_desc(
+          platform="cuda", target_config=stated, topology="1x1x1")
+      mesh = topologies.make_mesh(
+          topo=topology, mesh_shape=(1,), axis_names=("x",))
+      x = jax.ShapeDtypeStruct(
+          (256,), jnp.float32,
+          sharding=jax.sharding.NamedSharding(mesh, P()))
+      kernel = pl.pallas_call(
+          body, out_shape=jax.ShapeDtypeStruct((256,), jnp.float32),
+          compiler_params=plgpu.CompilerParams())
+      with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        jax.jit(kernel).lower(x).compile()
 
   @jtu.run_on_devices('gpu')
   def test_cross_compile_with_real_gpu(self):

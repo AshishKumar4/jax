@@ -49,6 +49,7 @@ limitations under the License.
 #include "jaxlib/py_client.h"
 #include "jaxlib/py_device_list.h"
 #include "xla/array.h"
+#include "xla/backends/cpu/target_machine_options.h"
 #include "xla/client/executable_build_options.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/builder/xla_computation.h"
@@ -251,6 +252,12 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .def_ro("executable_build_options",
               &CompileOptions::executable_build_options)
       .def_rw("env_option_overrides", &CompileOptions::env_option_overrides)
+      // Whether XLA stops the compile after a pass (an early exit, by its
+      // debug options or their overrides), its executable no runnable one.
+      .def_prop_ro("is_early_exit",
+                   [](const CompileOptions& options) {
+                     return xla::IsEarlyExitCompilation(options);
+                   })
       .def_prop_rw(
           "num_replicas",
           [](const CompileOptions& options) {
@@ -293,6 +300,14 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
       .value("UPDATE", DebugOptions::AUTOTUNE_CACHE_MODE_UPDATE)
       .value("READ", DebugOptions::AUTOTUNE_CACHE_MODE_READ);
 
+  // The CPU XLA:CPU compiles for under `debug_options` (its triple, its CPU and
+  // the features it enables): the persistent cache keys a CPU executable by it.
+  m.def("cpu_target_machine", [](const DebugOptions& debug_options) {
+    xla::cpu::TargetMachineOptions target(debug_options);
+    return nb::make_tuple(target.triple(), target.cpu(),
+                          target.GetTargetMachineFeatures());
+  });
+
   nb::class_<DebugOptions>(m, "DebugOptions")
       .def("__repr__", &DebugOptions::DebugString)
       .def_prop_rw("xla_backend_optimization_level",
@@ -333,6 +348,9 @@ void BuildXlaCompilerSubmodule(nb::module_& m) {
                    [](DebugOptions* self, std::string value) {
                      self->set_xla_gpu_load_autotune_results_from(value);
                    })
+      .def_prop_rw("xla_gpu_memory_limit_early_exit_bytes",
+                   &DebugOptions::xla_gpu_memory_limit_early_exit_bytes,
+                   &DebugOptions::set_xla_gpu_memory_limit_early_exit_bytes)
       .def_prop_rw("xla_gpu_cuda_data_dir",
                    &DebugOptions::xla_gpu_cuda_data_dir,
                    [](DebugOptions* self, std::string value) {

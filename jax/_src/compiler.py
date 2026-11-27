@@ -453,6 +453,7 @@ def register_xla_runtime_error_handler(
   _XLA_RUNTIME_ERROR_HANDLERS.append(handler_fn)
 
 
+
 def compile_or_get_cached(
     backend: xc.Client,
     computation: ir.Module,
@@ -468,6 +469,16 @@ def compile_or_get_cached(
     logger.info("Dumped the module to %s.", dumped_to)
 
   is_multi_process = len(executable_devices.process_indices) > 1
+
+  # An early-exit compile (XLA stops after a pass, as a peak-memory probe asks)
+  # serializes its options alone, which deserialize as no executable: where the
+  # persistent cache is used, it reads nothing of it (a PGLE profile's entry
+  # included) and writes nothing to it.
+  if (compilation_cache.is_cache_used(backend)
+      and compile_options.is_early_exit):
+    return backend_compile_and_load(
+        backend, computation, executable_devices, compile_options,
+        host_callbacks)
 
   # cache_key: may be None if compilation caching is disabled
   cache_key, compile_options = _resolve_compilation_strategy(
@@ -487,6 +498,7 @@ def compile_or_get_cached(
 
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
+  # A compile-only client reads an entry back as an unloaded executable.
   cache_retrieval_start = time.monotonic()
   retrieved_executable, retrieved_compile_time = _cache_read(
       module_name, cache_key, compile_options, backend, executable_devices,
@@ -739,9 +751,13 @@ def _compile_and_share_module(
     first_process_id: int
 ) -> xc.LoadedExecutable:
   share_timeout = config.share_binary_between_hosts_timeout_ms.value
+  # What the hosts share is keyed by its memory limit too: a compile stopped at
+  # a smaller limit serves no request at a larger one, as the disk cache, which
+  # writes no stopped compile, can key without it.
+  shared = _shared_key(cache_key, compile_options)
 
-  if cache_key in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
-    return _compile_and_share_module.modules_cache[cache_key]  # pyrefly: ignore[missing-attribute]
+  if shared in _compile_and_share_module.modules_cache:  # pyrefly: ignore[missing-attribute]
+    return _compile_and_share_module.modules_cache[shared]  # pyrefly: ignore[missing-attribute]
 
   if distributed.global_state.process_id == first_process_id:
     logger.debug("Process %d compiling and sharing module: %s",
@@ -759,12 +775,12 @@ def _compile_and_share_module(
     serialized_executable = compilation_cache.compress_executable(
         serialized_executable
     )
-    global_client.key_value_set_bytes(cache_key, serialized_executable)
+    global_client.key_value_set_bytes(shared, serialized_executable)
   else:
     logger.debug("Waiting for module: %s from process %d", module_name,
                  first_process_id)
     serialized_executable = global_client.blocking_key_value_get_bytes(
-        cache_key, share_timeout
+        shared, share_timeout
     )
     serialized_executable = compilation_cache.decompress_executable(
         serialized_executable
@@ -773,8 +789,29 @@ def _compile_and_share_module(
         serialized_executable, executable_devices, compile_options,
         host_callbacks)
 
-  _compile_and_share_module.modules_cache[cache_key] = executable  # pyrefly: ignore[missing-attribute]
+  _compile_and_share_module.modules_cache[shared] = executable  # pyrefly: ignore[missing-attribute]
   return executable
+
+
+def _shared_key(cache_key: str, compile_options: xc.CompileOptions) -> str:
+  """`cache_key` and the GPU memory limit the compile takes (`_memory_limit`):
+  what hosts sharing a compile, and a process keeping one, key it by, so a
+  compile stopped at a smaller limit serves no request at a larger one, every
+  other option as the disk key reads it, alike across hosts."""
+  return f"{cache_key}-limit{_memory_limit(compile_options)}"
+
+
+def _memory_limit(compile_options: xc.CompileOptions) -> int:
+  """The xla_gpu_memory_limit_early_exit_bytes a compile takes, as XLA reads it:
+  its last override, else its debug option, which XLA_FLAGS set as the options
+  were made and an explicit 0 (no limit) replaces; 0 on a jaxlib without it."""
+  overridden = [
+      value for name, value in compile_options.env_option_overrides
+      if name.lstrip("-") == "xla_gpu_memory_limit_early_exit_bytes"]
+  if overridden:
+    return int(overridden[-1])
+  debug_options = compile_options.executable_build_options.debug_options
+  return int(getattr(debug_options, "xla_gpu_memory_limit_early_exit_bytes", 0))
 
 
 _compile_and_share_module.modules_cache = {}  # pyrefly: ignore[missing-attribute]
@@ -794,8 +831,33 @@ def _compile_and_write_cache(
       backend, computation, executable_devices, compile_options, host_callbacks
   )
   compile_time = time.monotonic() - start_time
-  _cache_write(cache_key, compile_time, module_name, backend, executable)
+  if _stopped_by_memory_limit(executable, backend):
+    logger.log(
+        logging.WARNING if config.explain_cache_misses.value else logging.DEBUG,
+        "Not writing persistent cache entry for '%s': its compile stopped at "
+        "its memory limit", module_name)
+  else:
+    _cache_write(cache_key, compile_time, module_name, backend, executable)
   return executable
+
+
+def _stopped_by_memory_limit(executable: Any, backend: xc.Client) -> bool:
+  """Whether `executable`'s compile stopped at its GPU memory limit
+  (xla_gpu_memory_limit_early_exit_bytes), as XLA states it in its memory stats
+  (`stopped_at_memory_limit`, however the limit was given: an option, an
+  override, XLA_FLAGS). Its cache key leaves the limit out, so such an
+  executable, which refuses to run, is never written: a run under a larger
+  limit would read it. On a GPU, stats that cannot say (they raise, or state no
+  verdict) read as stopped: written never, rather than wrongly. No other
+  backend takes the limit."""
+  if backend.platform not in ("cuda", "rocm", "gpu"):
+    return False
+  try:
+    stats = executable.get_compiled_memory_stats()
+  except (xc.XlaRuntimeError, NotImplementedError):
+    return True
+  stopped = getattr(stats, "stopped_at_memory_limit", None)
+  return True if stopped is None else bool(stopped)
 
 
 def _should_raise_persistent_cache_error(ex: Exception) -> bool:
@@ -833,6 +895,12 @@ def _cache_read(
         cache_key, compile_options, backend, executable_devices,
         host_callbacks)
   except Exception as ex:
+    # A compile-only client whose plugin deserializes no unloaded executable
+    # (it has no PJRT_ExecutableDeserialize_Extension) reads nothing back.
+    if (isinstance(backend, _jax.CompileOnlyPyClient)
+        and isinstance(ex, _jax.JaxRuntimeError)
+        and ex.error_code_string == "UNIMPLEMENTED"):
+      return None, None
     if _should_raise_persistent_cache_error(ex):
       raise
     warnings.warn(
