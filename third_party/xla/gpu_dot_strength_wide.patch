@@ -10,8 +10,77 @@ index 5cf4cf6..a496f3c 100644
          "//xla/hlo/testlib:filecheck",
          "//xla/hlo/testlib:hlo_hardware_independent_test_base",
          "//xla/hlo/testlib:verified_hlo_module",
+diff --git a/xla/backends/gpu/transforms/algebraic_simplifier_test.cc b/xla/backends/gpu/transforms/algebraic_simplifier_test.cc
+index 1ba894f..68aba1c 100644
+--- a/xla/backends/gpu/transforms/algebraic_simplifier_test.cc
++++ b/xla/backends/gpu/transforms/algebraic_simplifier_test.cc
+@@ -234,8 +234,9 @@ TEST_F(
+   ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kModuleStr));
+   AlgebraicSimplifierOptions options;
+   ASSERT_TRUE(GpuAlgebraicSimplifier(options, Ampere()).Run(m.get()).value());
++  // Each of the six partial products of bf16 parts in f32, where it is exact.
+   constexpr absl::string_view kPattern = R"(
+-    CHECK-COUNT-6: %[[partial_result:.*]] = bf16[] multiply
++    CHECK-COUNT-6: %[[partial_result:.*]] = f32[] multiply
+   )";
+   ASSERT_OK_AND_ASSIGN(bool matched, RunFileCheck(m->ToString(), kPattern));
+   EXPECT_TRUE(matched);
+diff --git a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
+index 3e60f60..4e87064 100644
+--- a/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
++++ b/xla/backends/gpu/transforms/dot_algorithm_rewriter.cc
+@@ -55,6 +55,9 @@ absl::StatusOr<HloInstruction*> Mult(HloInstruction* lhs, HloInstruction* rhs) {
+ }
+ 
+ HloInstruction* UpcastToF32(HloInstruction* instr) {
++  if (instr->shape().element_type() == PrimitiveType::F32) {
++    return instr;
++  }
+   Shape new_shape = instr->shape();
+   new_shape.set_element_type(PrimitiveType::F32);
+   return instr->AddInstruction(HloInstruction::CreateConvert(new_shape, instr));
+@@ -264,7 +267,10 @@ absl::StatusOr<HloInstruction*> MakeMultiplyWithOperandPairs(
+   std::vector<HloInstruction*> partial_products;
+   partial_products.reserve(operand_pairs.size());
+   for (auto [lhs, rhs] : operand_pairs) {
+-    ABSL_ASSIGN_OR_RETURN(HloInstruction * product, Mult(lhs, rhs));
++    // Each pair's product in f32, where a bf16 pair's is exact: multiplied in
++    // bf16, it was rounded before the sum.
++    ABSL_ASSIGN_OR_RETURN(HloInstruction * product,
++                          Mult(UpcastToF32(lhs), UpcastToF32(rhs)));
+     partial_products.push_back(product);
+   }
+   return AccumulatePartialProducts(partial_products, SumToF32);
+@@ -408,17 +414,16 @@ DotAlgorithmRewriter::MakeMultiplyForBF16BF16F32(HloInstruction* lhs,
+   TF_RET_CHECK(rhs->shape().element_type() == PrimitiveType::F32 ||
+                rhs->shape().element_type() == PrimitiveType::BF16)
+       << "Algorithm field set to BF16_BF16_F32, but the rhs isn't F32 or BF16.";
+-  if (lhs->shape().element_type() == PrimitiveType::BF16 &&
+-      rhs->shape().element_type() == PrimitiveType::BF16) {
+-    ABSL_ASSIGN_OR_RETURN(auto result_bf16,
+-                          MakeBinaryHlo(HloOpcode::kMultiply, lhs, rhs));
+-    return UpcastToF32(result_bf16);
+-  }
+-  auto lhs_bf16 = RoundToBF16(lhs);
+-  auto rhs_bf16 = RoundToBF16(rhs);
+-  ABSL_ASSIGN_OR_RETURN(auto result_bf16, MakeBinaryHlo(HloOpcode::kMultiply,
+-                                                        lhs_bf16, rhs_bf16));
+-  return UpcastToF32(result_bf16);
++  // The operands rounded to bf16, their product in f32, where it is exact
++  // (BF16_BF16_F32 multiplies bf16 inputs into f32): multiplied in bf16, each
++  // product was rounded before the dot summed it.
++  auto as_bf16 = [](HloInstruction* operand) {
++    return operand->shape().element_type() == PrimitiveType::BF16
++               ? operand
++               : RoundToBF16(operand);
++  };
++  return MakeBinaryHlo(HloOpcode::kMultiply, UpcastToF32(as_bf16(lhs)),
++                       UpcastToF32(as_bf16(rhs)));
+ }
+ 
+ absl::StatusOr<HloInstruction*>
 diff --git a/xla/backends/gpu/transforms/dot_strength_reduction.cc b/xla/backends/gpu/transforms/dot_strength_reduction.cc
-index 487937a..7300300 100644
+index 487937a..d3d5b9d 100644
 --- a/xla/backends/gpu/transforms/dot_strength_reduction.cc
 +++ b/xla/backends/gpu/transforms/dot_strength_reduction.cc
 @@ -639,14 +639,28 @@ absl::StatusOr<HloInstruction*> DotStrengthReduction::ExpandInstruction(
@@ -24,14 +93,14 @@ index 487937a..7300300 100644
 +  const int64_t contracting_dims =
 +      dot_dims[0].Rank(DotOperandDims::kContracting);
 +  const PrimitiveType accumulator_type = GetGemmAccumulatorType(dot);
-+  // The type the operands multiply in: a dot with an implicit algorithm must
-+  // not round each product to the output type before summation, so it
-+  // multiplies in its accumulator's; outer products and explicit algorithms
-+  // keep the output type they used before.
-+  const PrimitiveType multiply_type =
-+      algorithm == PrecisionConfig::ALG_UNSET && contracting_dims != 0
-+          ? accumulator_type
-+          : output_type;
++  // The operands multiply in the dot's accumulator type, whatever its
++  // algorithm: no product is rounded to a narrower output type before it is
++  // summed (a bf16 dot's products are exact in f32), and an explicit
++  // algorithm's multiply takes the f32 operands it splits or rounds itself
++  // (MakeMultiplyForDotPrecisionAlgorithm). An outer product sums nothing:
++  // its exact product rounded once to the output type is the output type's
++  // own product.
++  const PrimitiveType multiply_type = accumulator_type;
  
    std::array<HloInstruction*, 2> operands = {dot->mutable_operand(0),
                                               dot->mutable_operand(1)};
@@ -67,10 +136,18 @@ index 487937a..7300300 100644
  }
  
 diff --git a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
-index 303c4d4..f899335 100644
+index 303c4d4..3f5684e 100644
 --- a/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
 +++ b/xla/backends/gpu/transforms/dot_strength_reduction_test.cc
-@@ -34,6 +34,7 @@ limitations under the License.
+@@ -24,6 +24,7 @@ limitations under the License.
+ #include <string>
+ 
+ #include "absl/log/check.h"
++#include "absl/strings/str_replace.h"
+ #include "absl/strings/string_view.h"
+ #include "absl/strings/substitute.h"
+ #include "xla/hlo/evaluator/hlo_evaluator.h"
+@@ -34,6 +35,7 @@ limitations under the License.
  #include "xla/literal_util.h"
  #include "xla/stream_executor/cuda/cuda_compute_capability.h"
  #include "xla/stream_executor/device_description.h"
@@ -78,7 +155,7 @@ index 303c4d4..f899335 100644
  #include "xla/stream_executor/rocm/rocm_compute_capability.h"
  #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
  
-@@ -75,6 +76,34 @@ ENTRY test {
+@@ -75,6 +77,72 @@ ENTRY test {
    EXPECT_TRUE(filecheck_result);
  }
  
@@ -110,10 +187,48 @@ index 303c4d4..f899335 100644
 +  EXPECT_EQ(result.GetAsDouble({1}), 1.0078125);
 +}
 +
++// A one-row bf16 dot under an explicit BF16_BF16_F32 algorithm: its products
++// exact in f32 and summed there, whatever its output type, where each was
++// rounded to bf16 before the sum (Dew rows 13666 and 13678: an opt-in decode
++// region's bf16 dots 0.69 from float64 against 0.029 allowed).
++TEST_F(DotStrengthReductionTest, OneRowBf16DotUnderAnAlgorithmSumsExactProducts) {
++  for (const char* output : {"bf16", "f32"}) {
++    SCOPED_TRACE(output);
++    ASSERT_OK_AND_ASSIGN(
++        auto module, ParseAndReturnVerifiedModule(absl::StrReplaceAll(R"(
++HloModule one_row
++ENTRY main {
++  lhs = bf16[1,2] parameter(0)
++  rhs = bf16[2,2] parameter(1)
++  ROOT dot = OUT[1,2] dot(lhs, rhs), lhs_contracting_dims={1},
++      rhs_contracting_dims={0}, algorithm=dot_bf16_bf16_f32
++})",
++                                                               {{"OUT", output}})));
++    DotStrengthReduction pass{
++        se::GpuComputeCapability(se::CudaComputeCapability::Hopper())};
++    ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&pass, module.get()));
++    ASSERT_TRUE(changed);
++    CHECK_OK(module->Verify());
++
++    ASSERT_OK_AND_ASSIGN(
++        auto lhs,
++        LiteralUtil::CreateR2<float>({{1.0078125f, 1.f}}).Convert(BF16));
++    ASSERT_OK_AND_ASSIGN(
++        auto rhs,
++        LiteralUtil::CreateR2<float>({{1.0078125f, 1.f}, {-1.015625f, 0.f}})
++            .Convert(BF16));
++    ASSERT_OK_AND_ASSIGN(Literal result,
++                         HloEvaluator().Evaluate(*module, {&lhs, &rhs}));
++    // (1 + 2^-7)^2 - (1 + 2^-6) = 2^-14; each product rounded to bf16, 0.
++    EXPECT_EQ(result.GetAsDouble({0, 0}), 0x1p-14);
++    EXPECT_EQ(result.GetAsDouble({0, 1}), 1.0078125);
++  }
++}
++
  TEST_F(DotStrengthReductionTest, UpcastInReduction) {
    const char* hlo_text = R"(
  HloModule test
-@@ -95,8 +124,7 @@ ENTRY test {
+@@ -95,8 +163,7 @@ ENTRY test {
    CHECK_OK(module->Verify());
  
    const char* filecheck_pattern = R"(
@@ -123,7 +238,7 @@ index 303c4d4..f899335 100644
  // CHECK: f32[] constant(0)
  // CHECK: f32[256]{0} reduce
  // CHECK: bf16[256]{0} convert
-@@ -128,8 +156,7 @@ ENTRY test {
+@@ -128,8 +195,7 @@ ENTRY test {
    CHECK_OK(module->Verify());
  
    const char* filecheck_pattern = R"(
@@ -133,7 +248,7 @@ index 303c4d4..f899335 100644
  // CHECK: f32[256]{0} reduce{{.*}}, metadata={op_name="test"}
  // CHECK: bf16[256]{0} convert{{.*}}, metadata={op_name="test"}
  )";
-@@ -160,8 +187,7 @@ ENTRY test {
+@@ -160,8 +226,7 @@ ENTRY test {
    CHECK_OK(module->Verify());
  
    const char* filecheck_pattern = R"(
