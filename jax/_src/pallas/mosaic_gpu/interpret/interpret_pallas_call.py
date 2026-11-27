@@ -388,7 +388,7 @@ def interpret_pallas_call(
   # the interpreted kernel, to ensure that execution of this interpreted kernel
   # cannot overlap with the interpretation of any other kernel.
   token = jnp.int32(thread_map.TOP_LEVEL_TOKEN_VALUE)
-  token = callback.io_callback(
+  token = callback.io_callback_numpy_inputs(
       gpu_callbacks.ordering_barrier,
       gpu_callbacks.TOKEN_SHAPE_DTYPE,
       token,
@@ -397,6 +397,8 @@ def interpret_pallas_call(
 
   token = gpu_callbacks.call_initialize_shared_memory(
       token=token,
+      execution_id=gpu_callbacks.call_execution_id(
+          token, tuple(device_info.axis_sizes)),
       num_gpus=jnp.int32(device_info.num_devices),
       num_threads_per_block=jnp.int32(num_threads_per_block),
       num_blocks_per_cluster=jnp.int32(num_blocks_per_cluster),
@@ -503,7 +505,7 @@ def interpret_pallas_call(
     )
     token, _ = jaxpr_interpreter.interpret(jaxpr, token, *kernel_buffer_keys)
 
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.kernel_thread_finished),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
@@ -544,10 +546,11 @@ def interpret_pallas_call(
         use_ordered_callback=True,
         on_exception=gpu_callbacks.fail,
     )
-    token = callback.io_callback(
+    token = callback.io_callback_numpy_inputs(
         functools.partial(gpu_callbacks.cluster_finished),
         gpu_callbacks.TOKEN_SHAPE_DTYPE,
         token=token,
+        device=device,
     )
     return token
     # TODO(nrink): Determine if any synchronization between the vector clocks is
@@ -581,11 +584,11 @@ def interpret_pallas_call(
   # correctly by the kernel/threads. (Specifically, it is checked that if a
   # thread has observed any completed barrier arrival and later allocates
   # another barrier, it has in fact observed all completed arrivals.)
-  token = gpu_callbacks.call_assert_no_barriers_allocated(token)
+  token = gpu_callbacks.call_assert_no_barriers_allocated(token, device)
 
   token = gpu_callbacks.call_clean_up_shared_memory(token)
 
-  callback.io_callback(
+  callback.io_callback_numpy_inputs(
       gpu_callbacks.ordering_barrier,
       gpu_callbacks.TOKEN_SHAPE_DTYPE,
       token,

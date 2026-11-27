@@ -14,17 +14,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import contextlib
 import dataclasses
 import functools
 import inspect
+import itertools
+import math
 import threading
 from typing import Any
 
 import jax
 from jax import numpy as jnp
 from jax._src import callback
+from jax._src import config
 from jax._src import source_info_util
 from jax._src.pallas.mosaic.interpret import thread_map
 from jax._src.pallas.mosaic.interpret import utils as interpret_utils
@@ -47,6 +50,16 @@ def is_gmem_memory_space(space: mosaic_gpu_core.MemorySpace | None) -> bool:
 
 _shared_memory: memory.GPUSharedMemory | None = None
 _shared_memory_init_lock = threading.Lock()
+# Signalled when `_shared_memory` is cleared. A kernel's interpretation admits
+# its own devices to the live shared memory and no more: the initialization of
+# another kernel (one running concurrently, e.g. a second execution of a program
+# under asynchronous dispatch, or from another Python thread) waits until the
+# live one is cleaned up, rather than joining (and corrupting) its memory.
+_shared_memory_cleared = threading.Condition(_shared_memory_init_lock)
+_shared_memory_devices_joined = 0
+# The execution whose kernel holds the shared memory (`_initialize_shared_memory`).
+_live_execution: int | None = None
+_execution_tickets = itertools.count()
 _races: GPURaceDetectionState | None = None
 
 
@@ -56,9 +69,11 @@ def _get_shared_memory() -> memory.GPUSharedMemory:
 
 
 def _clear_shared_memory():
-  global _shared_memory
-  with _shared_memory_init_lock:
+  global _shared_memory, _shared_memory_devices_joined
+  with _shared_memory_cleared:
     _shared_memory = None
+    _shared_memory_devices_joined = 0
+    _shared_memory_cleared.notify_all()
 
 
 def get_races() -> GPURaceDetectionState:
@@ -79,10 +94,12 @@ def reset_gpu_interpret_mode_state():
   clean-up did not run (e.g. because interpreting the kernel was interrupted),
   the shared state must be reset before any further kernels are interpreted.
   """
-  global _shared_memory, _races
-  with _shared_memory_init_lock:
+  global _shared_memory, _races, _shared_memory_devices_joined
+  with _shared_memory_cleared:
     _shared_memory = None
     _races = None
+    _shared_memory_devices_joined = 0
+    _shared_memory_cleared.notify_all()
 
 
 TOKEN_SHAPE_DTYPE = jax.ShapeDtypeStruct((), jnp.int32)
@@ -156,23 +173,52 @@ def ordering_barrier(token):
 # on to the corresponding function (1).
 
 
+def _execution_ticket(token):
+  """A number no other device's call returns: an execution's devices take the
+  greatest of theirs as its identity (`call_execution_id`)."""
+  del token
+  return np.int32(next(_execution_tickets) % np.iinfo(np.int32).max)
+
+
+def call_execution_id(token, axis_names):
+  """The identity of the execution interpreting this kernel: the same on each of
+  its devices (`axis_names`' collective), another for every other execution."""
+  ticket = callback.io_callback_numpy_inputs(
+      _execution_ticket, TOKEN_SHAPE_DTYPE, token)
+  return jax.lax.pmax(ticket, tuple(axis_names)) if axis_names else ticket
+
+
 def _initialize_shared_memory(
     *,
     token: jax.Array,
+    execution_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
     interpret_params: InterpretGPUParams,
 ):
-  global _shared_memory, _races
+  global _shared_memory, _races, _shared_memory_devices_joined, _live_execution
 
+  execution = int(execution_id)
   num_gpus_as_int = int(num_gpus)
   num_threads_per_block_as_int = int(num_threads_per_block)
   num_blocks_per_cluster_as_int = int(num_blocks_per_cluster)
-  del num_gpus, num_threads_per_block, num_blocks_per_cluster
+  del execution_id, num_gpus, num_threads_per_block, num_blocks_per_cluster
 
-  with _shared_memory_init_lock:
+  with _shared_memory_cleared:
+    # The live kernel's memory and barriers are its execution's alone: another
+    # execution's device waits for its clean-up, as does any once every device
+    # of the live kernel has joined. Counting joins alone admitted another
+    # execution's devices beside the live one's, which then shared its memory
+    # and barriers, or deadlocked waiting for each other's.
+    while _shared_memory is not None and (
+        execution != _live_execution
+        or _shared_memory_devices_joined >= _shared_memory.num_devices
+    ):
+      _shared_memory_cleared.wait()
+    _shared_memory_devices_joined += 1
     if _shared_memory is None:
+      _live_execution = execution
       _races = GPURaceDetectionState(on_race=interpret_params.on_race)
       _shared_memory = memory.GPUSharedMemory(
           num_devices=num_gpus_as_int,
@@ -196,18 +242,20 @@ def _initialize_shared_memory(
 def call_initialize_shared_memory(
     *,
     token: jax.Array,
+    execution_id: jax.Array,
     num_gpus: jax.Array,
     num_threads_per_block: jax.Array,
     num_blocks_per_cluster: jax.Array,
     interpret_params: InterpretGPUParams,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _initialize_shared_memory,
           interpret_params=interpret_params,
       ),
       TOKEN_SHAPE_DTYPE,
       token=token,
+      execution_id=execution_id,
       num_gpus=num_gpus,
       num_threads_per_block=num_threads_per_block,
       num_blocks_per_cluster=num_blocks_per_cluster,
@@ -222,7 +270,7 @@ def _clean_up_shared_memory(token):
 
 
 def call_clean_up_shared_memory(token):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _clean_up_shared_memory, TOKEN_SHAPE_DTYPE, token
   )
 
@@ -235,7 +283,7 @@ def _update_clocks_for_device_barrier(token, device: memory.Device):
 
 
 def call_update_clocks_for_device_barrier(token, device: memory.Device):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _update_clocks_for_device_barrier,
       TOKEN_SHAPE_DTYPE,
       token,
@@ -266,38 +314,6 @@ def _make_allocation_request_array(
   ).as_np_array
 
 
-@fail_on_exception
-def _tag_ref_union(
-    token: jax.Array,
-    member_keys_as_array: np.ndarray,
-    alias_group_idxs: tuple[int, ...],
-) -> jax.Array:
-  """Tells race detection that `member_keys_as_array` names one `RefUnion`.
-
-  The union is identified by its first member's key.
-  """
-  races = get_races()
-  keys = [HostAllocationKey.from_array(k) for k in member_keys_as_array]
-  for key, alias_group_idx in zip(keys, alias_group_idxs, strict=True):
-    races.tag_ref_union_member(key, keys[0], alias_group_idx)
-  return token
-
-
-def call_tag_ref_union(
-    token: jax.Array,
-    member_keys_as_array: jax.Array,
-    alias_group_idxs: Sequence[int],
-) -> jax.Array:
-  return callback.io_callback(
-      functools.partial(
-          _tag_ref_union, alias_group_idxs=tuple(alias_group_idxs)
-      ),
-      TOKEN_SHAPE_DTYPE,
-      token,
-      member_keys_as_array,
-  )
-
-
 def call_make_allocation_request_array(
     *,
     token: jax.Array,
@@ -305,7 +321,7 @@ def call_make_allocation_request_array(
     memory_space_id: int,
     initial_ref_count: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       _make_allocation_request_array,
       (TOKEN_SHAPE_DTYPE, HostAllocationRequest.shape_and_dtype()),
       token=token,
@@ -406,7 +422,7 @@ def call_allocate_buffer_for_all_threads(
     value: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _allocate_buffer_for_all_threads, source_info=source_info
       ),
@@ -483,7 +499,7 @@ def call_allocate_buffer(
     value: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_allocate_buffer, source_info=source_info),
       (TOKEN_SHAPE_DTYPE, HostAllocationKey.shape_and_dtype()),
       token,
@@ -521,7 +537,7 @@ def call_deallocate_buffer(
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_deallocate_buffer, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -603,35 +619,114 @@ def _validate_transforms(transforms):
         raise ValueError(f"Unsupported transform: {transform}")
 
 
+class _Packed:
+  """An access's arguments packed for its callback: every integer or boolean
+  array among them (a buffer's key, a location's coordinates, a dynamic index)
+  in one vector, which crosses to the host as one operand, any other array as
+  an operand of its own (`operands`).
+
+  At run time the arguments are rebuilt from the operands, each array leaf as
+  the callback was handed it before (its dtype and shape), and decoded
+  (`decode`) once for each distinct vector where no other operand crosses: an
+  access's key, location and indices are rebuilt once, not at every access
+  (each callback otherwise rebuilds every pytree it is handed). It holds no
+  traced value.
+  """
+
+  def __init__(self, args: Any, decode: Callable[..., Any]):
+    leaves, self._tree = jax.tree.flatten(args)
+    self._dtype = np.dtype(jnp.int64 if config.enable_x64.value else jnp.int32)
+    self._leaves: list[Any] = []
+    self._slots: list[tuple[int, int, tuple[int, ...], np.dtype]] = []
+    self._others: list[int] = []
+    vectors, others, offset = [], [], 0
+    for position, leaf in enumerate(leaves):
+      if isinstance(leaf, (int, np.integer)):
+        self._leaves.append(leaf)  # Static: it stays a leaf of the template.
+        continue
+      self._leaves.append(None)
+      dtype = np.dtype(leaf.dtype)
+      if not (jnp.issubdtype(dtype, jnp.integer) or dtype == np.bool_):
+        self._others.append(position)
+        others.append(leaf)
+        continue
+      self._slots.append((position, offset, tuple(leaf.shape), dtype))
+      vectors.append(jnp.ravel(leaf).astype(self._dtype))
+      offset += math.prod(leaf.shape)
+    self._decode = decode
+    self._decoded: dict[tuple[int, ...], Any] = {}
+    self._operands = [
+        jnp.concatenate(vectors) if vectors else jnp.zeros((0,), self._dtype),
+        *others,
+    ]
+
+  def operands(self) -> list[jax.Array]:
+    """The vector of the arguments' packed leaves, then their other array
+    leaves: this trace's, which the instance keeps no longer."""
+    operands, self._operands = self._operands, []
+    return operands
+
+  def unpacked(self, vector: np.ndarray, *others: np.ndarray) -> Any:
+    """The decoded arguments the operands give."""
+    values = tuple(vector.tolist())
+    decoded = None if others else self._decoded.get(values)
+    if decoded is None:
+      leaves = list(self._leaves)
+      for position, offset, shape, dtype in self._slots:
+        leaves[position] = np.asarray(
+            values[offset:offset + math.prod(shape)], self._dtype
+        ).astype(dtype).reshape(shape)
+      for position, other in zip(self._others, others, strict=True):
+        leaves[position] = other
+      decoded = self._decode(*self._tree.unflatten(leaves))
+      if not others:
+        if len(self._decoded) >= _DECODED_HELD:
+          self._decoded.clear()
+        self._decoded[values] = decoded
+    return decoded
+
+
+# The distinct argument vectors an access keeps decoded (`_Packed`): one of a
+# kernel's loads reads at most this many places before it decodes afresh.
+_DECODED_HELD = 1 << 14
+
+
+def _decoded_access(mesh_location, allocation_key_as_array, transforms, *rest):
+  """An access's arguments as its callback takes them: its buffer's key, its
+  transforms with their indices as Python ints, and each index tuple as one."""
+  return (
+      mesh_location,
+      HostAllocationKey.from_array(allocation_key_as_array),
+      jax.tree.map(int, transforms),
+      *(None if part is None else tuple(int(x) for x in part)
+        for part in rest),
+  )
+
+
 @fail_on_exception
 def _get(
     token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread | None,
-    allocation_key_as_array: jax.Array,
-    transforms,
-    block_indices=None,
-    grid_loop_idx=None,
+    operands: Sequence[np.ndarray],
     clock=None,
+    *,
+    access: _Packed,
+    thread: memory.Thread | None,
     increment_clock: bool = True,
     source_info=None,
     input_name=None,
 ) -> tuple[jax.Array, np.ndarray]:
-  """Performs a read from the buffer for `allocation_key_as_array` from the given device and thread."""
-  allocation_key = HostAllocationKey.from_array(allocation_key_as_array)
-  del allocation_key_as_array
-
+  """Performs a read from the buffer `access`'s arguments name (`operands`) from the given device and thread."""
+  mesh_location, allocation_key, transforms, block_indices, grid_loop_idx = (
+      access.unpacked(*operands)
+  )
   _validate_transforms(transforms)
-  transforms = jax.tree.map(int, transforms)
 
   if input_name is not None:
     # NOTE: input_name, block_indices, and grid_loop_idx are set only if this
     # function is being called to read a block from a pallas_call input (at the
     # start of one iteration of the kernel body).
     assert block_indices is not None
-    block_indices = tuple(int(x) for x in block_indices)
     assert grid_loop_idx is not None
-    grid_loop_idx = tuple(int(x) for x in grid_loop_idx)
 
   shared_memory = _get_shared_memory()
 
@@ -688,39 +783,40 @@ def call_get(
     source_info=None,
     input_name=None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
-      functools.partial(_get, source_info=source_info, input_name=input_name),
+  access = _Packed(
+      (mesh_location, allocation_key_as_array, transforms, block_indices,
+       grid_loop_idx),
+      _decoded_access,
+  )
+  return callback.io_callback_numpy_inputs(
+      functools.partial(
+          _get, access=access, source_info=source_info, input_name=input_name
+      ),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
-      mesh_location,
-      thread,
-      allocation_key_as_array,
-      transforms,
-      block_indices,
-      grid_loop_idx,
+      access.operands(),
       clock,
+      # Its own operand, rebuilt before the access decodes the rest, so a
+      # failure there is its thread's (`fail_on_exception`).
+      thread=thread,
   )
 
 @fail_on_exception
 def _swap(
     token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
-    transforms,
+    operands: Sequence[np.ndarray],
     val: np.ndarray,
     mask: jax.Array | None,
     *,
+    access: _Packed,
+    thread: memory.Thread,
     clock=None,
     increment_clock: bool = True,
     source_info=None,
 ) -> tuple[jax.Array, np.ndarray]:
-  """Performs a swap into the buffer for `allocation_key` from the given device and thread."""
-  allocation_key = HostAllocationKey.from_array(allocation_key_as_array)
-  del allocation_key_as_array
-
+  """Performs a swap into the buffer `access`'s arguments name (`operands`) from the given device and thread."""
+  mesh_location, allocation_key, transforms = access.unpacked(*operands)
   _validate_transforms(transforms)
-  transforms = jax.tree.map(int, transforms)
 
   if mask is not None:
     assert mask.shape == val.shape
@@ -784,165 +880,255 @@ def call_swap(
     clock=None,
     source_info=None,
 ) -> tuple[jax.Array, jax.Array]:
-  return callback.io_callback(
-      functools.partial(_swap, source_info=source_info),
+  access = _Packed(
+      (mesh_location, allocation_key_as_array, transforms), _decoded_access
+  )
+  return callback.io_callback_numpy_inputs(
+      functools.partial(_swap, access=access, source_info=source_info),
       (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
       token,
-      mesh_location,
-      thread,
-      allocation_key_as_array,
-      transforms,
+      access.operands(),
       val,
       mask,
       clock=clock,
+      thread=thread,
+  )
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopedBuffer:
+  """A buffer a `run_scoped` allocates (`call_allocate_scope`): its logical
+  shape and dtype, its memory space's index, the value every element starts
+  at (uninitialized memory's), and, for a `RefUnion`'s member, the position of
+  the union's first member among the scope's allocations and its alias group."""
+  shape: tuple[int, ...]
+  dtype: np.dtype
+  memory_space_id: int
+  fill: Any
+  union: tuple[int, int] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopedBarriers:
+  """An array of barriers of `shape` a `run_scoped` allocates
+  (`call_allocate_scope`), each of `num_arrivals` arrivals: a block's, or a
+  cluster's, shared over the cluster's axes `cluster` names (its dimensions and
+  which of them are collective)."""
+  shape: tuple[int, ...]
+  num_arrivals: int
+  orders_tensor_core: bool = False
+  cluster: tuple[tuple[int, ...], tuple[bool, ...]] | None = None
+
+  @property
+  def count(self) -> int:
+    return math.prod(self.shape)
+
+
+ScopedAllocation = ScopedBuffer | ScopedBarriers
+
+
+def _num_keys(allocations: Sequence[ScopedAllocation]) -> int:
+  return sum(
+      a.count if isinstance(a, ScopedBarriers) else 1 for a in allocations
   )
 
 
 @fail_on_exception
-def _allocate_barriers(
-    *,
+def _allocate_scope(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    num_arrivals: jax.Array,
-    orders_tensor_core: jax.Array,
-    flat_num_barriers: jax.Array,
-    ref_count: jax.Array,
+    *,
+    allocations: tuple[ScopedAllocation, ...],
+    collective: bool,
+    ref_count: int,
+    cluster_ref_count: int,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, np.ndarray]:
-  num_arrivals_as_int = int(num_arrivals)
-  orders_tensor_core_as_bool = bool(orders_tensor_core)
-  flat_num_barriers_as_int = int(flat_num_barriers)
-  ref_count_as_int = int(ref_count)
-  del num_arrivals, flat_num_barriers, ref_count
+  """Allocates a `run_scoped`'s buffers and barriers, in their order.
 
+  Each thread makes the same sequence of allocations, so the buffer IDs (and
+  with them the keys) of a buffer or barrier its threads share agree, as they
+  did when each was its own callback; a `MemorySpace.REGS` buffer, which
+  threads may allocate differently, takes its ID from a sequence of its own.
+
+  Returns the allocations' keys, a row a buffer or barrier, in their order.
+  """
   shared_memory = _get_shared_memory()
-
+  logging_info = memory.GPULoggingInfo(mesh_location, thread, source_info)
+  regs_id = memory.get_memory_space_idx(mosaic_gpu_core.MemorySpace.REGS)
+  smem_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
   keys = []
-  for _ in range(flat_num_barriers_as_int):
-    # Advance `shared_memory`'s internal buffer id counter for all threads that
-    # call into this function.
-    barrier_id = shared_memory.get_next_buffer_id(thread)
-    smem_space_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
+  for allocation in allocations:
+    if isinstance(allocation, ScopedBuffer):
+      if allocation.memory_space_id == regs_id:
+        buffer_id = shared_memory.get_next_wgmma_accumulator_id(thread)
+      else:
+        buffer_id = shared_memory.get_next_buffer_id(thread)
+      key = HostAllocationKey(
+          memory_space_id=allocation.memory_space_id,
+          device_id=int(thread.device_id),
+          block_id=int(thread.block_id),
+          # A buffer the block's threads share is its first thread's.
+          thread_id=0 if collective else int(thread.warpgroup_id),
+          initial_ref_count=ref_count,
+          buffer_id=buffer_id,
+      )
+      shared_memory.allocate_buffer(
+          key,
+          ref_count=ref_count,
+          value=np.full(allocation.shape, allocation.fill, allocation.dtype),
+          logging_info=logging_info,
+      )
+      keys.append(key.as_np_array)
+      if allocation.union is not None:
+        first, alias_group_idx = allocation.union
+        get_races().tag_ref_union_member(
+            key, HostAllocationKey.from_array(keys[first]), alias_group_idx
+        )
+      continue
+    for _ in range(allocation.count):
+      # Barriers advance the buffer IDs as buffers do.
+      buffer_id = shared_memory.get_next_buffer_id(thread)
+      if allocation.cluster is None:
+        # A block's barrier is shared by its threads.
+        key = HostAllocationKey(
+            memory_space_id=smem_id,
+            device_id=int(thread.device_id),
+            block_id=int(thread.block_id),
+            thread_id=0,
+            initial_ref_count=ref_count,
+            buffer_id=buffer_id,
+        )
+        shared_memory.allocate_barrier(
+            key,
+            thread,
+            ref_count=ref_count,
+            num_arrivals=allocation.num_arrivals,
+            orders_tensor_core=allocation.orders_tensor_core,
+            logging_info=logging_info,
+        )
+      else:
+        # A cluster barrier is shared by the cluster's threads. Its key names
+        # SMEM, where each of the blocks' barriers it is made of lives on a GPU.
+        axes_dims, is_axis_collective = allocation.cluster
+        key = HostAllocationKey(
+            memory_space_id=smem_id,
+            device_id=int(thread.device_id),
+            block_id=0,
+            thread_id=0,
+            initial_ref_count=cluster_ref_count,
+            buffer_id=buffer_id,
+        )
+        shared_memory.allocate_cluster_barrier(
+            key,
+            thread,
+            axes_dims=axes_dims,
+            is_axis_collective=is_axis_collective,
+            ref_count=cluster_ref_count,
+            num_arrivals=allocation.num_arrivals,
+            logging_info=logging_info,
+        )
+      keys.append(key.as_np_array)
+  return token, np.array(keys, dtype=np.int32).reshape(
+      len(keys), *HostAllocationKey.shape_and_dtype().shape
+  )
 
-    # Barriers are shared between threads. For each group of threads that share
-    # a barrier, we compute the thread ID to be used for the allocation key.
-    # Invariant: `thread_id` is the same for all threads in a group that
-    # shares the barrier.
-    key = HostAllocationKey(
-        memory_space_id=smem_space_id,
-        device_id=thread.device_id,
-        block_id=thread.block_id,
-        thread_id=0,
-        initial_ref_count=ref_count_as_int,
-        buffer_id=barrier_id,
-    )
 
-    shared_memory.allocate_barrier(
-        key,
-        thread,
-        ref_count=ref_count_as_int,
-        num_arrivals=num_arrivals_as_int,
-        orders_tensor_core=orders_tensor_core_as_bool,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
-    )
-    keys.append(key.as_np_array)
-
-  assert len(keys) == flat_num_barriers_as_int
-  return token, np.array(keys, dtype=np.int32)
-
-
-def call_allocate_barriers(
+def call_allocate_scope(
     *,
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    num_arrivals: jax.Array,
-    orders_tensor_core: bool,
-    flat_num_barriers: int | jax.Array,
-    ref_count: jax.Array,
+    allocations: Sequence[ScopedAllocation],
+    collective: bool,
+    ref_count: int,
+    cluster_ref_count: int,
     source_info: source_info_util.SourceInfo | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  shape_and_dtype = HostAllocationKey.shape_and_dtype()
-  result_shape = (flat_num_barriers, *shape_and_dtype.shape)
-  result_shape_and_dtype = jax.ShapeDtypeStruct(
-      result_shape, shape_and_dtype.dtype
+  """Allocates a `run_scoped`'s buffers and barriers in one callback.
+
+  Returns the token and the allocations' keys, `[n, key size]` (`_num_keys`).
+  """
+  keys_shape = (
+      _num_keys(allocations), *HostAllocationKey.shape_and_dtype().shape
   )
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
-          _allocate_barriers,
+          _allocate_scope,
+          allocations=tuple(allocations),
+          collective=collective,
+          ref_count=ref_count,
+          cluster_ref_count=cluster_ref_count,
           source_info=source_info,
       ),
-      (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
-      token=token,
-      mesh_location=mesh_location,
-      thread=thread,
-      num_arrivals=num_arrivals,
-      orders_tensor_core=orders_tensor_core,
-      flat_num_barriers=flat_num_barriers,
-      ref_count=ref_count,
+      (TOKEN_SHAPE_DTYPE, jax.ShapeDtypeStruct(keys_shape, jnp.int32)),
+      token,
+      mesh_location,
+      thread,
   )
 
 
 @fail_on_exception
-def _deallocate_barrier(
+def _deallocate_scope(
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
+    keys: np.ndarray,
+    *,
+    allocations: tuple[ScopedAllocation, ...],
     source_info: source_info_util.SourceInfo | None = None,
-    cluster_barrier: bool = False,
-):
+) -> jax.Array:
+  """Releases a `run_scoped`'s buffers and barriers (`_allocate_scope`'s), in
+  their order: each buffer's reference count drops, and the buffer goes once
+  no thread holds it."""
   # TODO(paulbib): Add race-check validation on deallocation, i.e.: make sure
   # there are no outstanding async copies from or to the deallocated buffer.
-
-  flat_allocation_keys = np.reshape(
-      allocation_key_as_array, (-1, *HostAllocationKey.shape_and_dtype().shape)
-  )
-  num_barriers = flat_allocation_keys.shape[0]
-
-  keys_to_deallocate = []
-  for i in range(num_barriers):
-    keys_to_deallocate.append(flat_allocation_keys[i, :])
-
   shared_memory = _get_shared_memory()
-
-  # TODO(nrink): If we had a dedicated memory space for cluster barriers
-  # (and/or for 'normal' barriers too), we could select the deallocation
-  # function based on the memory space of the allocation key (instead of needing
-  # the `deallocate_cluster_barrier` argument).
-  deallocate_fn = (
-      shared_memory.deallocate_cluster_barrier
-      if cluster_barrier
-      else shared_memory.deallocate_barrier
-  )
-
-  for key in keys_to_deallocate:
-    barrier_allocation_key = HostAllocationKey.from_array(key)
-    deallocate_fn(
-        barrier_allocation_key,
-        thread,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
+  logging_info = memory.GPULoggingInfo(mesh_location, thread, source_info)
+  rows = iter(keys)
+  for allocation in allocations:
+    if isinstance(allocation, ScopedBuffer):
+      shared_memory.deallocate_buffer(
+          HostAllocationKey.from_array(next(rows)), logging_info=logging_info
+      )
+      continue
+    release = (
+        shared_memory.deallocate_barrier
+        if allocation.cluster is None
+        else shared_memory.deallocate_cluster_barrier
     )
+    for _ in range(allocation.count):
+      release(
+          HostAllocationKey.from_array(next(rows)),
+          thread,
+          logging_info=logging_info,
+      )
   return token
 
 
-def call_deallocate_barrier(
+def call_deallocate_scope(
+    *,
     token: jax.Array,
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
-    allocation_key_as_array: jax.Array,
+    keys: jax.Array,
+    allocations: Sequence[ScopedAllocation],
     source_info: source_info_util.SourceInfo | None = None,
-    cluster_barrier: bool = False,
-):
-  return callback.io_callback(
-      functools.partial(_deallocate_barrier, source_info=source_info),
+) -> jax.Array:
+  """Releases a `run_scoped`'s allocations (`call_allocate_scope`'s) in one
+  callback."""
+  return callback.io_callback_numpy_inputs(
+      functools.partial(
+          _deallocate_scope,
+          allocations=tuple(allocations),
+          source_info=source_info,
+      ),
       TOKEN_SHAPE_DTYPE,
       token,
       mesh_location,
       thread,
-      allocation_key_as_array,
-      cluster_barrier=cluster_barrier,
+      keys,
   )
 
 
@@ -952,6 +1138,7 @@ def _barrier_wait(
     mesh_location: memory.MeshLocation,
     thread: memory.Thread,
     allocation_key_as_array: jax.Array,
+    phase: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
   barrier_key = HostAllocationKey.from_array(allocation_key_as_array)
@@ -965,6 +1152,7 @@ def _barrier_wait(
   barrier.wait(
       thread,
       logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
+      phase=None if int(phase) < 0 else int(phase),
   )
   return token
 
@@ -976,14 +1164,17 @@ def call_barrier_wait(
     thread: memory.Thread,
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
+    phase: jax.Array | None = None,
 ):
-  return callback.io_callback(
+  """Waits at a barrier; at `phase` where given (`barrier_wait`'s)."""
+  return callback.io_callback_numpy_inputs(
       functools.partial(_barrier_wait, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
       mesh_location,
       thread,
       allocation_key_as_array,
+      jnp.int32(-1) if phase is None else jnp.asarray(phase, jnp.int32),
   )
 
 
@@ -1029,7 +1220,7 @@ def call_barrier_arrive(
     allocation_key_as_array: jax.Array,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(_barrier_arrive, source_info=source_info),
       TOKEN_SHAPE_DTYPE,
       token,
@@ -1087,7 +1278,7 @@ def call_named_barrier(
     sync: bool,
     source_info: source_info_util.SourceInfo | None = None,
 ):
-  return callback.io_callback(
+  return callback.io_callback_numpy_inputs(
       functools.partial(
           _named_barrier,
           num_threads=num_threads,
@@ -1103,107 +1294,14 @@ def call_named_barrier(
 
 
 @fail_on_exception
-def _assert_no_barriers_allocated(token):
-  _get_shared_memory().assert_no_barriers_allocated()
+def _assert_no_barriers_allocated(token, device: memory.Device):
+  _get_shared_memory().assert_no_barriers_allocated(device)
   return token
 
 
-def call_assert_no_barriers_allocated(token):
-  return callback.io_callback(
-      _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token
-  )
-
-
-@fail_on_exception
-def _allocate_cluster_barriers(
-    *,
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    axes_dims: tuple[int, ...],
-    is_axis_collective: tuple[bool, ...],
-    num_arrivals: jax.Array,
-    flat_num_barriers: jax.Array,
-    ref_count: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, np.ndarray]:
-  num_arrivals_as_int = int(num_arrivals)
-  flat_num_barriers_as_int = int(flat_num_barriers)
-  ref_count_as_int = int(ref_count)
-  del num_arrivals, flat_num_barriers, ref_count
-
-  shared_memory = _get_shared_memory()
-
-  keys = []
-  for _ in range(flat_num_barriers_as_int):
-    # Advance `shared_memory`'s internal buffer id counter for all threads that
-    # call into this function.
-    barrier_id = shared_memory.get_next_buffer_id(thread)
-
-    # Use `SMEM` for the cluster barrier's allocation key below. Note that on
-    # real GPUs, there is not a single cluster barrier object that resides in
-    # SMEM (or any other memory space). We nonetheless use `SMEM` here to
-    # indicate that the (per thread-block) `Barrier`s that the `ClusterBarrier`
-    # is composed of are each allocated in `SMEM` (on a real GPU).
-    smem_space_id = memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.SMEM]
-
-    # Cluster barriers are shared between all threads in a cluster. Hence use 0
-    # for the thread/block ID in the allocation `key` below.
-    key = HostAllocationKey(
-        memory_space_id=smem_space_id,
-        device_id=thread.device_id,
-        block_id=0,
-        thread_id=0,
-        initial_ref_count=ref_count_as_int,
-        buffer_id=barrier_id,
-    )
-
-    shared_memory.allocate_cluster_barrier(
-        key,
-        thread,
-        axes_dims=axes_dims,
-        is_axis_collective=is_axis_collective,
-        ref_count=ref_count_as_int,
-        num_arrivals=num_arrivals_as_int,
-        logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
-    )
-    keys.append(key.as_np_array)
-
-  assert len(keys) == flat_num_barriers_as_int
-  return token, np.array(keys, dtype=np.int32)
-
-
-def call_allocate_cluster_barriers(
-    *,
-    token: jax.Array,
-    mesh_location: memory.MeshLocation,
-    thread: memory.Thread,
-    axes_dims: tuple[int, ...],
-    is_axis_collective: tuple[bool, ...],
-    num_arrivals: jax.Array,
-    flat_num_barriers: int | jax.Array,
-    ref_count: jax.Array,
-    source_info: source_info_util.SourceInfo | None = None,
-) -> tuple[jax.Array, jax.Array]:
-  shape_and_dtype = HostAllocationKey.shape_and_dtype()
-  result_shape = (flat_num_barriers, *shape_and_dtype.shape)
-  result_shape_and_dtype = jax.ShapeDtypeStruct(
-      result_shape, shape_and_dtype.dtype
-  )
-  return callback.io_callback(
-      functools.partial(
-          _allocate_cluster_barriers,
-          source_info=source_info,
-          axes_dims=axes_dims,
-          is_axis_collective=is_axis_collective,
-      ),
-      (TOKEN_SHAPE_DTYPE, result_shape_and_dtype),
-      token=token,
-      mesh_location=mesh_location,
-      thread=thread,
-      num_arrivals=num_arrivals,
-      flat_num_barriers=flat_num_barriers,
-      ref_count=ref_count,
+def call_assert_no_barriers_allocated(token, device: memory.Device):
+  return callback.io_callback_numpy_inputs(
+      _assert_no_barriers_allocated, TOKEN_SHAPE_DTYPE, token, device
   )
 
 
@@ -1396,12 +1494,17 @@ class AsyncCopyGmemToSmemTask(AsyncCopyTask):
       assert self.clock is not None
       self.clock.inc(tma_thread_id)
 
+      # The generic proxy's writes are ordered before the copy's by a proxy
+      # fence (`commit_smem`), its reads by the thread's synchronization alone:
+      # a ring's slot refilled once its readers arrive at its barrier, as
+      # Pallas's warp-specialized pipeline releases a slot.
       get_races().check_write(
           self.thread,
           self.clock.async_smem_clock.copy(),
           self.dst_allocation_key,
           self.dst_access,
           source_info=self.source_info,
+          reads_clock=self.clock.generic_clock.copy(),
       )
 
   def post_write(self, tma_thread_id: int, shared_memory: memory.GPUSharedMemory):
@@ -1744,9 +1847,8 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
       pipeline_clock: memory.GpuClockBundle | None,
       tma_thread_id: int,
   ) -> memory.GpuClockBundle | None:
-    # TODO(paulbib): Support scales and sparse metadata.
-    assert self.a_scale_key is None
-    assert self.b_scale_key is None
+    # TODO(paulbib): Support sparse metadata.
+    assert (self.a_scale_key is None) == (self.b_scale_key is None)
     assert self.a_sparse_metadata_key is None
     assert self.collective_axis is None, "collective_axis not supported yet"
 
@@ -1801,9 +1903,43 @@ class TcGen05Mma(memory.PipelineableAsyncTask):
           self.b_access,
           source_info=self.source_info,
       )
+      # A block-scaled MMA reads its scales (in TMEM) as it reads its
+      # operands.
+      for key, transforms in ((self.a_scale_key, self.a_scale_transforms),
+                              (self.b_scale_key, self.b_scale_transforms)):
+        if key is None:
+          continue
+        get_races().check_read(
+            self.thread,
+            clock.async_smem_clock
+            if key.memory_space_id
+            == memory.IDX_BY_GPU_MEMORY_SPACE[mosaic_gpu_core.MemorySpace.SMEM]
+            else clock.generic_clock,
+            key,
+            shared_memory.access(key, transforms or ()),
+            source_info=self.source_info,
+        )
 
     acc_range = self.acc_access
     acc_dtype = shared_memory.buffer_shape_and_dtype(self.acc_key).dtype
+
+    if self.a_scale_key is not None and self.b_scale_key is not None:
+      # A block-scaled MMA: each operand's values times their blocks' scales
+      # (`a_scale` one row of K scales for each of a's M rows, `b_scale` one for
+      # each of b's N columns), multiplied exactly in float32.
+      scale_contents = []
+      for key, transforms in ((self.a_scale_key, self.a_scale_transforms),
+                              (self.b_scale_key, self.b_scale_transforms)):
+        content, _, _ = shared_memory.get_buffer_content(
+            key,
+            shared_memory.access(key, transforms or ()),
+            self.thread,
+            logging_info=logging_info,
+        )
+        assert content is not None
+        scale_contents.append(content)
+      a = _scaled(a, scale_contents[0], contracted_axis=1)
+      b = _scaled(b, scale_contents[1], contracted_axis=0)
 
     if self.accumulate:
       acc, _, _ = shared_memory.get_buffer_content(
@@ -1950,6 +2086,10 @@ class TcGen05Copy(memory.PipelineableAsyncTask):
   tmem_access: interpret_utils.Access
   collective_axis: str | None = None
   source_info: source_info_util.SourceInfo | None = None
+  # Whether the copy is `async_copy_scales_to_tmem`'s: block scales laid out
+  # in SMEM as `tcgen05.scales_layout` tiles them, (MN / 128, K / 4, 32, 16),
+  # land in TMEM as the MMA reads them, one row of K scales per row of MN.
+  scales: bool = False
 
   def forms_pipeline(self, parent: memory.PipelineableAsyncTask) -> bool:
     return False
@@ -1994,6 +2134,8 @@ class TcGen05Copy(memory.PipelineableAsyncTask):
       )
 
     tmem_range = self.tmem_access
+    if self.scales:
+      smem = _untiled_scales(smem)
 
     shared_memory.store_buffer_content(
         self.tmem_key,
@@ -2029,6 +2171,7 @@ def async_copy_smem_to_tmem(
     tmem_transforms: tuple[Any, ...],
     collective_axis: str | None = None,
     source_info: source_info_util.SourceInfo | None = None,
+    scales: bool = False,
 ):
   smem_allocation_key = HostAllocationKey.from_array(
       smem_allocation_key_as_array
@@ -2053,10 +2196,37 @@ def async_copy_smem_to_tmem(
           tmem_access=shared_memory.access(tmem_allocation_key, tmem_transforms),
           collective_axis=collective_axis,
           source_info=source_info,
+          scales=scales,
       ),
       thread,
   )
   return token
+
+
+def _untiled_scales(tiled: np.ndarray) -> np.ndarray:
+  """Block scales laid out as `tcgen05.scales_layout` tiles them in SMEM,
+  `(MN / 128, K / 4, 32, 16)`, as `(MN, K)`: row `i` of MN and column `j` of K
+  at `[i // 128, j // 4, i % 32, (i // 32) % 4 * 4 + j % 4]`."""
+  groups, columns, _, _ = tiled.shape
+  return (
+      tiled.reshape(groups, columns, 32, 4, 4)
+      .transpose(0, 3, 2, 1, 4)
+      .reshape(groups * 128, columns * 4)
+  )
+
+
+def _scaled(
+    operand: np.ndarray, scales: np.ndarray, contracted_axis: int
+) -> np.ndarray:
+  """`operand` in float32 times its block scales `scales` (one row of K scales
+  a row of its other axis, each over `K / scales.shape[1]` of its `K`)."""
+  block = operand.shape[contracted_axis] // scales.shape[1]
+  expanded = np.repeat(scales.astype(np.float32), block, axis=1)
+  if contracted_axis == 0:
+    expanded = expanded[: operand.shape[1]].T
+  else:
+    expanded = expanded[: operand.shape[0]]
+  return operand.astype(np.float32) * expanded
 
 
 @fail_on_exception
@@ -2267,13 +2437,14 @@ def kernel_thread_finished(
 def cluster_finished(
     *,
     token: jax.Array,
+    device: memory.Device,
 ):
-  """Called when a cluster finishes execution of a kernel.
+  """Called when a cluster of `device` finishes execution of a kernel.
 
-  Since clusters are executed sequentially in interpret mode, when this
-  function is called no code is running and we can reset shared memory state
-  if needed
+  A device's clusters run one after another, so none of `device`'s code is
+  running and its per-cluster state is reset; the other devices of a mesh run
+  at once, their state untouched (`reset_per_cluster_state`).
   """
   shared_memory = _get_shared_memory()
-  shared_memory.reset_per_cluster_state()
+  shared_memory.reset_per_cluster_state(device)
   return token

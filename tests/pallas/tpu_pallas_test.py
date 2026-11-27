@@ -2412,6 +2412,21 @@ class PallasCallTest(ptu.PallasTPUTest):
         r'scf\.if %(?P=cmp)',
     )
 
+  def test_a_product_beside_its_barriered_self_rounds_on_its_own(self):
+    # x * y - barrier(x * y): each product rounds on its own, so the difference
+    # is zero; contracted into an FMA it would be the product's rounding error.
+    def kernel(x_ref, y_ref, out_ref):
+      x, y = x_ref[...], y_ref[...]
+      (rounded,) = lax.optimization_barrier((x * y,))
+      out_ref[...] = x * y - rounded
+
+    x = jax.random.normal(jax.random.key(0), (8, 128), dtype=jnp.float32)
+    y = jax.random.normal(jax.random.key(1), (8, 128), dtype=jnp.float32)
+    out = self.pallas_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    )(x, y)
+    self.assertArraysEqual(out, jnp.zeros_like(out))
+
   def test_memory_space_like(self):
     x = jax.ShapeDtypeStruct((2, 3), jnp.float32)
     ref = pltpu.VMEM.like(x)

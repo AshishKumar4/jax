@@ -57,12 +57,12 @@ def _to_int(x):
 
   Useful for classes like MeshLocation that can be called in 3 contexts:
   1. By the user at trace time with tuples of jax tracers
-  2. By io_callback at runtime with tuples of jax array scalars
+  2. By io_callback at runtime with tuples of jax or NumPy array scalars
   3. By the user at runtime with python integer tuples
   """
   if isinstance(x, jax.core.Tracer):
     return x
-  if isinstance(x, jax.Array):
+  if isinstance(x, (jax.Array, np.ndarray, np.generic)):
     return x.item()
   if isinstance(x, int):
     return x
@@ -569,7 +569,23 @@ class GPUSharedMemory(
 
     self.num_blocks_per_cluster = num_blocks_per_cluster
     self.num_pallas_threads_per_block = num_threads_per_block
-    self.reset_per_cluster_state()
+    # The sequences of IDs, never reset: an ID a device's running cluster holds
+    # must not be handed out again when another device's cluster finishes.
+    self.next_tma_thread_id = 0
+    self.next_regs_id = collections.defaultdict(lambda: -100)
+    self.next_pipelineable_task_id = 0
+    self.named_barriers = {}
+    self.pending_smem_to_gmem_read_clocks = {}
+    self.pending_smem_to_gmem_write_clocks = {}
+    self.pipelineable_async_tasks = collections.defaultdict(set)
+    self.tcgen05_completion_clocks = collections.defaultdict(
+        lambda: self.VectorClock(self.vector_clock_size)
+    )
+    self.pending_tmem_stores = {}
+    self.pending_tmem_loads = {}
+    self.reallocation_checker = BarrierReallocationChecker()
+    for device_id in range(num_devices):
+      self.reset_per_cluster_state(Device(device_id))
 
   def buffer_shape_and_dtype(self, key: MemKey) -> memory.ShapeAndDtype:
     """The logical shape and dtype of `key`'s buffer."""
@@ -629,33 +645,40 @@ class GPUSharedMemory(
       result = result.transpose(access.permutation)
     return result, shape_and_dtype, clock
 
-  def reset_per_cluster_state(self):
-    """Resets the per-cluster state of the shared memory."""
-    with self.lock:
-      self.next_tma_thread_id = 0
-      self.next_regs_id = collections.defaultdict(lambda: -100)
-      self.named_barriers = {}
-      self.clocks = {
-          thread: self.VectorClock(self.vector_clock_size)
-          for thread in self.all_concurrent_threads
-      }
+  def reset_per_cluster_state(self, device: Device):
+    """Resets `device`'s per-cluster state, as its cluster has finished.
 
-      self.pending_smem_to_gmem_read_clocks = {
-          thread: collections.deque()
-          for thread in self.all_concurrent_threads
+    Only `device`'s: the devices of a mesh interpret their kernels at once, so
+    another device's cluster may be running, its threads' state in use. Its
+    threads' clocks, pending copies, pipelineable tasks and tensor core clocks,
+    the named barriers of its blocks, and the reallocation checks of its
+    warpgroups go; the sequences of IDs (`next_regs_id`, `next_tma_thread_id`,
+    `next_pipelineable_task_id`) are never reset, as an ID a running cluster
+    holds would be handed out again (a REGS buffer allocated twice, its scope's
+    deallocation failing).
+    """
+    with self.lock:
+      for thread in self.concurrent_threads(device):
+        self.clocks[thread] = self.VectorClock(self.vector_clock_size)
+        self.pending_smem_to_gmem_read_clocks[thread] = collections.deque()
+        self.pending_smem_to_gmem_write_clocks[thread] = collections.deque()
+      self.named_barriers = {
+          key: barrier
+          for key, barrier in self.named_barriers.items()
+          if key[0] != device.device_id
       }
-      self.pending_smem_to_gmem_write_clocks = {
-          thread: collections.deque()
-          for thread in self.all_concurrent_threads
-      }
-      self.pipelineable_async_tasks = collections.defaultdict(set)
-      self.next_pipelineable_task_id = 0
-      self.tcgen05_completion_clocks = collections.defaultdict(
-          lambda: self.VectorClock(self.vector_clock_size)
-      )
-      self.pending_tmem_stores = {}
-      self.pending_tmem_loads = {}
-      self.reallocation_checker = BarrierReallocationChecker()
+      for by_thread in (
+          self.pipelineable_async_tasks,
+          self.tcgen05_completion_clocks,
+          self.pending_tmem_stores,
+          self.pending_tmem_loads,
+      ):
+        for thread in [
+            thread for thread in by_thread
+            if thread.device_id == device.device_id
+        ]:
+          del by_thread[thread]
+      self.reallocation_checker.forget(device)
 
   def _abort_waiters(self):
     # Called by `set_failed` while `self.lock` is held. Acquiring a barrier's
@@ -898,8 +921,20 @@ class GPUSharedMemory(
           )
         self.mem.pop(key)
 
-  def assert_no_barriers_allocated(self):
-    for key, alloc in self.mem.items():
+  def assert_no_barriers_allocated(self, device: Device):
+    """Asserts that `device`'s kernel left none of its barriers allocated.
+
+    Only `device`'s: the devices of a mesh interpret their kernels at once, so
+    another device's barriers may still be allocated when this device's kernel
+    ends.
+    """
+    with self.lock:
+      held = [
+          (key, alloc)
+          for key, alloc in self.mem.items()
+          if key.device_id == device.device_id
+      ]
+    for key, alloc in held:
       assert not isinstance(
           alloc, Barrier
       ), f"Barrier remains allocated at key `{key}`."
@@ -1131,6 +1166,20 @@ class BarrierReallocationChecker:
       if not barrier.has_zero_ref_count():
         self.reallocated[id(barrier)].add(warpgroup)
 
+  def forget(self, device: Device):
+    """Forgets the checks of `device`'s warpgroups, as its cluster finished."""
+    for warpgroup in [
+        warpgroup for warpgroup in self.deallocated
+        if warpgroup.device_id == device.device_id
+    ]:
+      del self.deallocated[warpgroup]
+    for barrier_id, warpgroups in list(self.reallocated.items()):
+      warpgroups.difference_update(
+          [w for w in warpgroups if w.device_id == device.device_id]
+      )
+      if not warpgroups:
+        del self.reallocated[barrier_id]
+
   def on_final_deallocate(self, barrier: Barrier):
     """Called when the last thread holding `barrier` deallocates it."""
     for warpgroup in self.reallocated.pop(id(barrier), ()):
@@ -1224,6 +1273,11 @@ class Barrier(memory.Allocation):
     self.last_observed_phase_by_thread: dict[Thread, int] = (
         {}
     )  # Protected by `self.cv`'s lock.
+    # The threads whose waits on the barrier name their phase (`wait`'s
+    # `phase`): each wait is checked against the barrier as it waits, so such a
+    # thread may let phases pass it between its waits (consumers of alternate
+    # tiles of one ring).
+    self.naming_threads: set[Thread] = set()  # Protected by `self.cv`'s lock.
 
     # Invariant: We allow the lock on `self.cv` to be acquired and held in a
     # scope where `self.shared_memory.lock` is already held, but *not* the other
@@ -1344,6 +1398,8 @@ class Barrier(memory.Allocation):
             i,
             last_observed_phase,
         ) in self.last_observed_phase_by_thread.items():
+          if i in self.naming_threads:
+            continue
           if last_observed_phase < self.phase - 2:
             raise ValueError(
                 f"Thread {i} only observed barrier up to phase"
@@ -1364,23 +1420,39 @@ class Barrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
+      phase: int | None = None,
   ):
+    """Waits for the next phase `thread` observes, or for `phase` where given
+    (counted from 0, the barrier's first completion)."""
     # Fail early if the kernel has already failed. This cannot be done while
     # holding the lock on `self.cv`, so the below loop checks `self.aborted`
     # and we only call `check_failed` again once `self.cv` has been released.
     self.shared_memory.check_failed()
     try:
-      self._wait(thread, logging_info)
+      self._wait(thread, logging_info, phase)
     except _BarrierAborted:
       self.shared_memory.check_failed()
       raise RuntimeError(
           f"Barrier {id(self)} was aborted, but no failure was recorded."
       ) from None
 
+  def _check_named(self, thread: Thread, phase: int):
+    """Refuses a wait at `phase` the hardware's wait at its parity would take
+    another phase for: the barrier's latest completed phase or the one it is
+    completing are the two it can wait at (`self.cv`'s lock held)."""
+    if not self.phase - 1 <= phase <= self.phase:
+      taken = self.phase - (phase - self.phase) % 2
+      raise ValueError(
+          f"Thread {thread} is waiting at barrier {id(self)} for phase"
+          f" {phase}, but the barrier has completed {self.phase} phases:"
+          f" the hardware's wait at that parity takes phase {taken}."
+      )
+
   def _wait(
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
+      phase: int | None = None,
   ):
     with self.cv:
       last_observed_phase = self.last_observed_phase_by_thread.get(
@@ -1392,10 +1464,26 @@ class Barrier(memory.Allocation):
             thread.warpgroup(), None
         )
 
+      if phase is not None:
+        # The hardware waits at the named phase's parity: for the latest phase
+        # the barrier completed where that has its parity, else for the one it
+        # is completing. Any other phase it names is taken for one of those, a
+        # phase of the same parity: two or more behind, or one ahead or more.
+        self._check_named(thread, phase)
+        # A waiter that names its phase may have skipped those before it, and
+        # may skip more before its next wait (`arrive`'s check passes it by):
+        # it, a warpgroup's warps and a warp's warpgroup (whose observation its
+        # warps' give it).
+        last_observed_phase = phase
+        warpgroup = thread.warpgroup()
+        self.naming_threads |= {thread, warpgroup, *(
+            warpgroup.warp(i)
+            for i in range(mosaic_gpu_core.WarpMesh._NUM_WARPS_PER_WARPGROUP)
+        )}
       # Since not all threads in a block may use the barrier, we must lazily
       # initialize the `last_observed_phase_by_thread` array the first time each
       # thread participates in the barrier.
-      if last_observed_phase is None:
+      elif last_observed_phase is None:
         if self.phase > 1:
           raise ValueError(
               f"Thread {thread} is waiting at barrier {id(self)} for"
@@ -1462,6 +1550,10 @@ class Barrier(memory.Allocation):
             )
           self.cv.wait()
 
+        if phase is not None:
+          # Woken past the phase it named, the hardware's poll at its parity
+          # would not have seen it complete.
+          self._check_named(thread, phase)
         if self.enable_logging and logging_info is not None:
           self._log(
               logging_info.format(
@@ -1664,6 +1756,7 @@ class ClusterBarrier(memory.Allocation):
       self,
       thread: Thread,
       logging_info: GPULoggingInfo | None = None,
+      phase: int | None = None,
   ):
     if self.enable_logging and logging_info is not None:
       with self.lock:
@@ -1674,7 +1767,7 @@ class ClusterBarrier(memory.Allocation):
             )
         )
 
-    self.block_barrier(thread).wait(thread, logging_info)
+    self.block_barrier(thread).wait(thread, logging_info, phase)
 
   def block_barrier(self, thread: Thread) -> Barrier:
     """The barrier for the block that `thread` belongs to."""

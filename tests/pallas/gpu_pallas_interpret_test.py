@@ -14,9 +14,14 @@
 
 import dataclasses
 import functools
+import threading
 import math
+import subprocess
+import sys
+import textwrap
 from typing import Any
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax._src import test_util as jtu
 from jax._src.pallas import mpmd
@@ -37,6 +42,87 @@ def _maybe_reverse(arg: tuple[Any], reverse: bool) -> tuple[Any]:
     return tuple(reversed(arg))
   else:
     return arg
+
+
+class InterpretExecutionGateTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      ("single_execution", "none"),
+      # B's device asks for admission between A's two devices: B's first
+      # (A0, B0, A1 deadlocked on a count of joins) or B's second (A0, B1, both
+      # new devices, paired into one memory by a gate keyed on devices).
+      ("overlapping_execution", "overlap"),
+  )
+  def test_an_execution_owns_the_shared_memory_until_its_clean_up(self, overlap):
+    # The real host callbacks in a child: another execution's device joins
+    # nothing of the live kernel's (its memory, its barriers) until the live
+    # one has cleaned up, and both executions finish.
+    program = textwrap.dedent("""
+        import faulthandler
+        import sys
+        import threading
+        import numpy as np
+        from jax._src.pallas.mosaic_gpu.interpret import gpu_callbacks as cb
+        from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
+
+        overlap = sys.argv[1]
+        params = InterpretGPUParams()
+        token = np.int32(0)
+        errors = []
+        b_admitted = threading.Event()
+
+        def initialize(execution, threads):
+          return cb._initialize_shared_memory(
+              token=token, execution_id=np.int32(execution),
+              num_gpus=np.int32(2), num_threads_per_block=np.int32(threads),
+              num_blocks_per_cluster=np.int32(1), interpret_params=params)
+
+        def run(fn):
+          def guarded():
+            try:
+              fn()
+            except BaseException as e:
+              errors.append(e)
+          thread = threading.Thread(target=guarded, daemon=True)
+          thread.start()
+          return thread
+
+        # Execution A (1): its first device joins.
+        initialize(1, 1)
+        b = None
+        if overlap != "none":
+          def b_device():
+            initialize(2, 2)
+            # Admitted into a memory of its own execution's, A's gone.
+            assert cb._live_execution == 2, "B joined A's live shared memory"
+            b_admitted.set()
+          b = run(b_device)
+          # B asks for admission while A is live: it must wait.
+          assert not b_admitted.wait(0.25), "B joined A's live shared memory"
+
+        def a_device_0():
+          cb._clean_up_shared_memory(token)
+
+        def a_device_1():
+          initialize(1, 1)
+          cb._clean_up_shared_memory(token)
+
+        a0, a1 = run(a_device_0), run(a_device_1)
+        a0.join(5)
+        a1.join(5)
+        if a0.is_alive() or a1.is_alive():
+          faulthandler.dump_traceback()
+        assert not a0.is_alive() and not a1.is_alive(), "A's devices hung"
+        if b is not None:
+          b.join(5)
+          assert b_admitted.is_set(), "B was never admitted after A's clean-up"
+        assert not errors, errors
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", program, overlap],
+        capture_output=True, text=True, timeout=30,
+    )
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 # TODO(nrink): Figure out how to safely run different instance of GPU
@@ -134,6 +220,22 @@ class InterpretTest(jtu.JaxTestCase):
 
     x = jnp.arange(128 * 64, dtype=jnp.float32).reshape(128, 64)
     np.testing.assert_array_equal(_kernel(x), x)
+
+  def test_fresh_axis_index_is_axis_index(self):
+    def body(o_ref):
+      a, b = jax.lax.axis_index('a'), jax.lax.axis_index('b')
+      o_ref[a, b] = plgpu.fresh_axis_index('a') * 10 + plgpu.fresh_axis_index('b')
+
+    out = plgpu.kernel(
+        body,
+        out_type=jax.ShapeDtypeStruct((2, 3), jnp.int32),
+        grid=(2, 3),
+        grid_names=('a', 'b'),
+        interpret=InterpretParams(),
+    )()
+    np.testing.assert_array_equal(
+        out, np.arange(2)[:, None] * 10 + np.arange(3)[None, :]
+    )
 
   def test_load(self):
     @functools.partial(
@@ -394,6 +496,73 @@ class InterpretTest(jtu.JaxTestCase):
     b = jax.random.uniform(jax.random.key(1), (128, 128), jnp.float16)
     expected = 2 * np.matmul(np.asarray(a), np.asarray(b), dtype=np.float32)
     self.assertArraysEqual(_kernel(a, b), expected)
+
+  def test_block_scaled_mma_multiplies_each_block_by_its_scales(self):
+    # Each operand's blocks of 32 along K times their E8M0 scales, copied to
+    # TMEM from the tiles `tcgen05.scales_layout` lays them out in.
+    m = n = 128
+    k, block = 256, 32
+    scales = k // block
+
+    def tiled(values):
+      # `values` (MN, K / 32) as `async_copy_scales_to_tmem` reads them.
+      mn, kk = values.shape
+      return (
+          values.reshape(mn // 128, 4, 32, kk // 4, 4)
+          .transpose(0, 3, 2, 1, 4)
+          .reshape(mn // 128, kk // 4, 32, 16)
+      )
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        scratch_types=dict(
+            a_smem=plgpu.SMEM((m, k), jnp.float8_e4m3fn),
+            b_smem=plgpu.SMEM((n, k), jnp.float8_e4m3fn),
+            a_scale_smem=plgpu.SMEM((m // 128, scales // 4, 32, 16),
+                                    jnp.float8_e8m0fnu),
+            b_scale_smem=plgpu.SMEM((n // 128, scales // 4, 32, 16),
+                                    jnp.float8_e8m0fnu),
+            acc=plgpu.TMEM((m, n), jnp.float32),
+            a_scale=plgpu.TMEM((m, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            b_scale=plgpu.TMEM((n, scales), jnp.float8_e8m0fnu,
+                               layout=plgpu.TMEMLayout.SCALES_LAYOUT),
+            barrier=plgpu.Barrier(orders_tensor_core=True),
+        ),
+        interpret=InterpretParams(),
+    )
+    def _kernel(a, b, a_scales, b_scales, out_ref, a_smem, b_smem,
+                a_scale_smem, b_scale_smem, acc, a_scale, b_scale, barrier):
+      a_smem[...] = a[...]
+      b_smem[...] = b[...]
+      a_scale_smem[...] = a_scales[...]
+      b_scale_smem[...] = b_scales[...]
+      plgpu.commit_smem()
+      plgpu.async_copy_scales_to_tmem(a_scale_smem, a_scale)
+      plgpu.async_copy_scales_to_tmem(b_scale_smem, b_scale)
+      plgpu.tcgen05_mma(acc, a_smem, b_smem.transpose((1, 0)),
+                        a_scale=a_scale, b_scale=b_scale, accumulate=False)
+      plgpu.tcgen05_commit_arrive(barrier)
+      plgpu.barrier_wait(barrier)
+      out_ref[...] = plgpu.async_load_tmem(acc)
+
+    a = jax.random.normal(jax.random.key(0), (m, k)).astype(jnp.float8_e4m3fn)
+    b = jax.random.normal(jax.random.key(1), (n, k)).astype(jnp.float8_e4m3fn)
+    a_scales = jax.lax.bitcast_convert_type(
+        jax.random.randint(jax.random.key(2), (m, scales), 122, 132,
+                           dtype=jnp.uint8), jnp.float8_e8m0fnu)
+    b_scales = jax.lax.bitcast_convert_type(
+        jax.random.randint(jax.random.key(3), (n, scales), 122, 132,
+                           dtype=jnp.uint8), jnp.float8_e8m0fnu)
+    result = _kernel(a, b, tiled(a_scales), tiled(b_scales))
+
+    def dequantized(values, scales):
+      return np.asarray(values, np.float32) * np.repeat(
+          np.asarray(scales, np.float32), block, axis=1)
+
+    expected = np.matmul(dequantized(a, a_scales), dequantized(b, b_scales).T)
+    np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-6)
 
   def test_transpose_ref(self):
     @functools.partial(
@@ -1073,6 +1242,233 @@ class InterpretTest(jtu.JaxTestCase):
 
     y = _kernel(x)
     np.testing.assert_array_equal(y, x + 2)
+
+  @jtu.parameterized.parameters(1, 2)
+  def test_consumers_of_alternate_tiles_of_one_ring_skip_its_phases(
+      self, rotations):
+    # A two-slot ring, each tile `rotations` rotations of its steps, whose tiles
+    # two consumers take in turn: each waits at a slot's phases of its own
+    # tiles, naming each (a ping-pong over one ring), and lets its partner's
+    # pass, two or more a slot where a tile takes two rotations; the producer
+    # waits for each slot's release at the phase it names. A tile's consumer
+    # starts once the tile before it has had its steps (`order`, a phase a
+    # tile, each consumer waiting at every other): no consumer names a phase
+    # two ahead.
+    stages, tiles = 2, 4
+    steps = stages * rotations
+    turns = tiles * steps
+    x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=x,
+        scratch_types=dict(
+            smem=plgpu.SMEM((stages, 128), x.dtype),
+            full=plgpu.Barrier(num_barriers=stages),
+            consumed=plgpu.Barrier(num_barriers=stages),
+            order=plgpu.Barrier(),
+        ),
+        num_threads=3,
+        thread_name='t',
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(x_ref, out_ref, smem, full, consumed, order):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def producer():
+        @pl.loop(0, turns)
+        def _(turn):
+          slot, rotation = turn % stages, turn // stages
+          pl.when(rotation > 0)(lambda: plgpu.barrier_wait(
+              consumed.at[slot], phase=rotation - 1))
+          smem[slot] = x_ref[turn] + 1
+          plgpu.barrier_arrive(full.at[slot])
+
+      def consumer(first):
+        @pl.loop(first, tiles, step=2)
+        def _(tile):
+          pl.when(tile > 0)(
+              lambda: plgpu.barrier_wait(order, phase=tile - 1))
+          for step in range(steps):
+            turn, slot = tile * steps + step, step % stages
+            plgpu.barrier_wait(full.at[slot], phase=turn // stages)
+            out_ref[turn] = smem[slot] + 1
+            plgpu.barrier_arrive(consumed.at[slot])
+          plgpu.barrier_arrive(order)
+
+      pl.when(thread_id == 1)(lambda: consumer(0))
+      pl.when(thread_id == 2)(lambda: consumer(1))
+
+    np.testing.assert_array_equal(_kernel(x), x + 2)
+
+  def test_consumer_warps_of_alternate_tiles_of_one_ring_skip_its_phases(self):
+    # The ping-pong over one ring with its consumers the four warps of one
+    # warpgroup, each the tiles of its index modulo four in turn (a turn
+    # barrier a warp, its predecessor arriving once its tile is done: one
+    # order barrier would have a warp name a phase two ahead before its
+    # first tile): three tiles pass a warp by between its own, so a slot's
+    # phases pass the warpgroup its warps' observations give it as well as
+    # each warp.
+    stages, tiles, warps = 2, 8, 4
+    turns = tiles * stages
+    x = jnp.arange(turns * 128, dtype=jnp.float32).reshape(turns, 128)
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=x,
+        scratch_types=dict(
+            smem=plgpu.SMEM((stages, 128), x.dtype),
+            full=plgpu.Barrier(num_barriers=stages),
+            consumed=plgpu.Barrier(num_barriers=stages),
+            ordered=plgpu.Barrier(num_barriers=warps),
+        ),
+        num_threads=2,
+        thread_name='t',
+        interpret=InterpretParams(detect_races=True),
+    )
+    def _kernel(x_ref, out_ref, smem, full, consumed, ordered):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def producer():
+        @pl.loop(0, turns)
+        def _(turn):
+          slot, rotation = turn % stages, turn // stages
+          pl.when(rotation > 0)(lambda: plgpu.barrier_wait(
+              consumed.at[slot], phase=rotation - 1))
+          smem[slot] = x_ref[turn] + 1
+          plgpu.barrier_arrive(full.at[slot])
+
+      @pl.when(thread_id == 1)
+      def consumers():
+        @plgpu.warp_map
+        def _(warp_id):
+          @pl.loop(warp_id, tiles, step=warps)
+          def _(tile):
+            # Warp 0's j-th tile waits its predecessor's (j - 1)-th arrival,
+            # every other warp's its j-th.
+            pl.when(tile > 0)(lambda: plgpu.barrier_wait(
+                ordered.at[warp_id],
+                phase=tile // warps - (warp_id == 0).astype(jnp.int32)))
+            for step in range(stages):
+              turn = tile * stages + step
+              plgpu.barrier_wait(full.at[step], phase=turn // stages)
+              out_ref[turn] = smem[step] + 1
+              plgpu.barrier_arrive(consumed.at[step])
+            plgpu.barrier_arrive(ordered.at[(warp_id + 1) % warps])
+
+    np.testing.assert_array_equal(_kernel(x), x + 2)
+
+  def test_a_named_wait_woken_past_its_phase_is_refused(self):
+    # A waiter blocked at the phase the barrier is completing, which completes
+    # it and two more before the waiter runs again (they arrive while the
+    # barrier's lock is held, the waiter inside its wait): the hardware's poll
+    # at its phase's parity would see none of them, so its wait is refused.
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
+
+    memory = shared_memory.GPUSharedMemory(
+        num_devices=1, out_of_bounds_reads="raise", dma_execution_mode="eager",
+        uninitialized_memory="nan", detect_races=False,
+        barrier=threading.Barrier(1), clean_up_barrier=threading.Barrier(1),
+        num_threads_per_block=2, num_blocks_per_cluster=1,
+        num_tma_threads_per_device=1)
+    barrier = shared_memory.Barrier(
+        memory, num_pallas_threads_per_block=2, ref_count=1, num_arrivals=1,
+        orders_tensor_core=False)
+    waiter = shared_memory.Warpgroup(0, 0, 0, 0)
+    barrier.arrive(None)
+    barrier.wait(waiter, phase=0)
+
+    entered, refused = threading.Event(), []
+    blocked = barrier.cv.wait
+
+    def waiting(*args, **kwargs):
+      entered.set()
+      return blocked(*args, **kwargs)
+
+    barrier.cv.wait = waiting
+
+    def wait():
+      try:
+        barrier.wait(waiter, phase=1)
+      except ValueError as error:
+        refused.append(error)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    entered.wait()
+    with barrier.cv:
+      for _ in range(3):
+        barrier.arrive(None)
+    thread.join()
+    self.assertLen(refused, 1)
+    self.assertIn("the hardware's wait at that parity", str(refused[0]))
+
+  def test_a_finished_cluster_resets_its_devices_state_alone(self):
+    # The devices of a mesh interpret their kernels at once: device 0's cluster
+    # finishing leaves device 1's running cluster its named barriers, and hands
+    # out no REGS ID device 1 holds again, while device 0's state goes.
+    from jax._src.pallas.mosaic_gpu.interpret import shared_memory
+
+    memory = shared_memory.GPUSharedMemory(
+        num_devices=2, out_of_bounds_reads="raise", dma_execution_mode="eager",
+        uninitialized_memory="nan", detect_races=False,
+        barrier=threading.Barrier(1), clean_up_barrier=threading.Barrier(1),
+        num_threads_per_block=1, num_blocks_per_cluster=1,
+        num_tma_threads_per_device=1)
+    running = shared_memory.Warpgroup(1, 0, 0, 0)
+    finished = shared_memory.Warpgroup(0, 0, 0, 0)
+    held = memory.get_next_wgmma_accumulator_id(running)
+    named = memory.named_barrier(running, 0, 128)
+    gone = memory.named_barrier(finished, 0, 128)
+    memory.reset_per_cluster_state(shared_memory.Device(0))
+    self.assertNotEqual(memory.get_next_wgmma_accumulator_id(running), held)
+    self.assertIs(memory.named_barrier(running, 0, 128), named)
+    self.assertIsNot(memory.named_barrier(finished, 0, 128), gone)
+
+  @jtu.parameterized.parameters(
+      ("behind", 3, 0), ("ahead", 1, 2), ("latest", 3, 2), ("pending", 0, 0))
+  def test_a_wait_names_the_latest_or_the_pending_phase(
+      self, name, observed, phase):
+    # A thread observes `observed` phases, each as it completes, then waits at
+    # `phase`: two behind the latest completion, or past the one the barrier is
+    # completing, is a phase the hardware's parity wait takes another for; the
+    # latest and the pending phase are waited at. The other thread completes
+    # the pending phase.
+    del name
+    refused = not observed - 1 <= phase <= observed
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((128,), jnp.float32),
+        scratch_types=dict(barrier=plgpu.Barrier()),
+        num_threads=2,
+        thread_name='t',
+        interpret=InterpretParams(),
+    )
+    def _kernel(out_ref, barrier):
+      thread_id = jax.lax.axis_index('t')
+
+      @pl.when(thread_id == 0)
+      def _():
+        for completed in range(observed):
+          plgpu.barrier_arrive(barrier)
+          plgpu.barrier_wait(barrier, phase=completed)
+        plgpu.barrier_wait(barrier, phase=phase)
+        out_ref[...] = jnp.ones_like(out_ref)
+
+      @pl.when(thread_id == 1)
+      def _():
+        if phase == observed:
+          plgpu.barrier_arrive(barrier)
+
+    if refused:
+      with self.assertRaisesRegex(
+          jax.errors.JaxRuntimeError, "the hardware's wait at that parity"):
+        _kernel().block_until_ready()
+    else:
+      np.testing.assert_array_equal(_kernel(), np.ones((128,), np.float32))
 
   @jtu.parameterized.product(with_race=[True, False])
   def test_barrier_multidimensional_1d(self, with_race):

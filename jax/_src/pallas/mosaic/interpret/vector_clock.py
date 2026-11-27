@@ -45,6 +45,9 @@ class NpVectorClock(VectorClockProto):
   def update(self, other: Self) -> None:
     self.clock[:] = np.maximum(self.clock[:], other.clock[:])
 
+  def __repr__(self) -> str:
+    return f'{type(self).__name__}({self.clock.tolist()})'
+
   def lt(self, other: Self) -> bool:
     return bool((self.clock <= other.clock).all() & (self.clock < other.clock).any())
 
