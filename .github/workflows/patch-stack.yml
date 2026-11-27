@@ -314,7 +314,8 @@ jobs:
             exit 0
           fi
           version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
-          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version")
+          # shellcheck disable=SC2086 # Each machine its own word.
+          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version" --machines $MACHINES)
           if [ -z "$plugins" ]; then
             echo "::error::no plugin release holds $version's native code: build plugin-$version (dew/build_plugin.sh)"
             exit 1

@@ -136,6 +136,21 @@ if [ -n "${DEW_PLUGIN_TESTS_BUILT:-}" ]; then
     [ "$code" = 0 ] || { grep -m 60 -E "error:|ERROR:" "$out/test-$name.log" || true; red=$code; }
   done
 fi
+# What one cell's build read (row 5670), taken right after it, its repositories as it fetched them, before the next
+# cell's options fetch others. Its configured source files by cquery under each wheel's own invocation as build.py
+# ran it (its log's [EXECUTING] lines: the options build.py appends itself, --config=cuda_libraries_from_stubs among
+# them, beside the `build` options it wrote to .jax_configure.bazelrc, which cquery reads too); the BUILD and .bzl
+# files loaded for them (query, which reads no `build` option, given every --repo_env cquery announced, so it
+# fetches the cell's repositories and no other); and its repositories' markers and the lockfile
+# (`patch_stack.py record`). A query that fails fails the build: a record short of a file would pair a release that
+# changed it.
+record_cell() {
+  local cell="cp${1/./}-cuda$2"
+  mkdir -p "$out/read"
+  DEW_BAZEL="${DEW_BAZEL:-bazel}" python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" record "$PWD" \
+    "$out/plugin-$cell.log" "$out/read/$cell.log" > "$out/read/$cell.json" ||
+    { tail -20 "$out/read/$cell.log"; return 1; }
+}
 printf 'python\tcuda\tseconds\texit\n' > "$out/builds.tsv"
 for python in $pythons; do
   for cuda in $cudas; do
@@ -158,6 +173,7 @@ for python in $pythons; do
       --bazel_options=--repo_env=ML_WHEEL_VERSION_SUFFIX="$suffix" \
       --bazel_options=--copt=-g1 --bazel_options=--strip=never --bazel_options=--linkopt=-Wl,--build-id \
       --bazel_options=--keep_going --output_path="$out/dist" --verbose > "$out/plugin-cp${python/./}-cuda$cuda.log" 2>&1 || code=$?
+    [ "$code" != 0 ] || record_cell "$python" "$cuda" || code=$?
     printf '%s\t%s\t%s\t%s\n' "$python" "$cuda" "$(( $(date +%s) - started ))" "$code" >> "$out/builds.tsv"
     # Each error with the lines after it, where Bazel says why (an analysis failure's "Error in fail: ..." follows
     # its "ERROR: ... in <rule> rule" line, 2026-11-18: two red builds said only that the rule failed).
@@ -179,6 +195,12 @@ done
 # DEW_DEBUG_SPLIT names the splitter where this script is staged apart from it (a fleet job's extra/).
 python3 "${DEW_DEBUG_SPLIT:-$here/debug_split.py}" "$out/dist" "$out/debug" | tee "$out/debug.txt"
 tar -C "$out/debug" -czf "$out/debug-$(uname -m).tar.gz" .build-id
+# What the build read, each cell's (row 5670), merged with the wheels as they are published (after the split
+# rewrote them): a later release ships beside these plugins only where it holds every file of every cell's as read
+# (`patch_stack.py plugins`). DEW_PATCH_STACK names patch_stack.py where this script is staged apart from it (a
+# fleet job's extra/).
+python3 "${DEW_PATCH_STACK:-$here/patch_stack.py}" merged "$(cat "$out/commit.txt")" "$out/dist" "$out"/read/*.json \
+  > "$out/sources-$(uname -m).json"
 (cd "$out/dist" && sha256sum *.whl) | tee "$out/wheels.sha256"
 column -t -s $'\t' "$out/builds.tsv"
 # A red test leaves the wheels built and fails the job.
