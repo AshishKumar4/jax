@@ -1640,6 +1640,7 @@ cc_library(
         "@xla//xla:util",
         "@xla//xla:xla_data_proto_cc",
         "@xla//xla:xla_proto_cc",
+        "@xla//xla/backends/cpu:target_machine_options",
         "@xla//xla/client:executable_build_options",
         "@xla//xla/hlo/builder:xla_computation",
         "@xla//xla/hlo/ir:hlo",

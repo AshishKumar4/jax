@@ -147,8 +147,8 @@ class CacheKeyTest(jtu.JaxTestCase):
       hash3 = self.get_hashed_value(cache_key._hash_platform, cpu_backend)
       self.assertNotEqual(hash1, hash3)
 
-  @jtu.thread_unsafe_test()  # patches cache_key.host_cpu for the process
-  def test_a_cpu_program_s_key_names_its_host_s_cpu(self):
+  @jtu.thread_unsafe_test()  # patches cache_key.cpu_target for the process
+  def test_a_cpu_program_s_key_names_the_cpu_it_compiles_for(self):
     # XLA:CPU compiles for the features of the host that compiles, so a CPU
     # executable from a host of another CPU is not this host's to read.
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
@@ -157,20 +157,32 @@ class CacheKeyTest(jtu.JaxTestCase):
     compile_options = compiler.get_compile_options(
         num_replicas=1, num_partitions=1
     )
-    original_host_cpu = cache_key.host_cpu
+    original_cpu_target = cache_key.cpu_target
     keys = []
     try:
-      for described in ("vendor_id: AuthenticAMD\ncpu family: 25\nmodel: 17\n"
-                        "flags: avx2 avx512f",
-                        "vendor_id: AuthenticAMD\ncpu family: 25\nmodel: 1\n"
-                        "flags: avx2"):
-        cache_key.host_cpu = lambda described=described: described
+      for described in ("x86_64-unknown-linux-gnu\nznver4\n+avx2,+avx512f",
+                        "x86_64-unknown-linux-gnu\nznver3\n+avx2"):
+        cache_key.cpu_target = lambda _, described=described: described
         keys.append(cache_key.get(computation, devices, compile_options, cpu))
     finally:
-      cache_key.host_cpu = original_host_cpu
+      cache_key.cpu_target = original_cpu_target
     self.assertNotEqual(keys[0], keys[1])
     if os.path.exists("/proc/cpuinfo"):
       self.assertRegex(cache_key.host_cpu(), "flags: |Features: ")
+
+  def test_the_cpu_target_is_xla_s_under_the_compile_s_options(self):
+    # XLA states the CPU it compiles for: its triple, its CPU and the features
+    # it enables, one each a line, the same for the same options.
+    if not hasattr(cache_key._jax, "cpu_target_machine"):
+      self.skipTest("this jaxlib states no CPU target")
+    options = compiler.get_compile_options(num_replicas=1, num_partitions=1)
+    debug_options = options.executable_build_options.debug_options
+    triple, cpu, features = cache_key.cpu_target(debug_options).split("\n")
+    self.assertIn("-", triple)
+    self.assertNotEmpty(cpu)
+    self.assertTrue(all(f[0] in "+-" for f in features.split(",") if f))
+    self.assertEqual(cache_key.cpu_target(debug_options),
+                     "\n".join((triple, cpu, features)))
 
   @jtu.thread_unsafe_test()  # patches cache_key.jax_version for the process
   def test_a_program_s_key_names_its_jax_build(self):
@@ -252,26 +264,37 @@ class CacheKeyTest(jtu.JaxTestCase):
 
   @jtu.thread_unsafe_test()
   def test_a_rebuilt_plugin_keys_its_own_entries(self):
-    # A CUDA client's platform version names the runtime its plugin loads, not
-    # the plugin's build: two builds of one plugin under one jax and jaxlib key
-    # apart, the same build alike, and a platform no plugin build is stated for
-    # keys as before.
+    # A client is keyed by the build of the plugin that made it, as the plugin
+    # registered it: two builds of one plugin under one jax and jaxlib key
+    # apart, the same build alike, and a client no registration states a build
+    # for keys as one with none. Its platform version (the CUDA runtime the
+    # plugin loads) and its `platform` ("gpu" for CUDA and ROCm alike) tell no
+    # build apart.
     class Client:
       platform = "gpu"
       platform_version = "cuda 12090"
 
+      def devices(self):
+        raise RuntimeError("no topology")
+
+    client = Client()
+
     def platform_hash(build):
-      saved = dict(xla_bridge.plugin_builds)
-      xla_bridge.plugin_builds.clear()
-      if build is not None:
-        xla_bridge.plugin_builds["cuda"] = build
+      registrations = dict(xla_bridge._backend_factories)
+      backends = dict(xla_bridge._backends)
       try:
+        if build is not None:
+          xla_bridge._backend_factories["fake_plugin"] = (
+              xla_bridge.BackendRegistration(lambda: client, 0, build=build))
+          xla_bridge._backends["fake_plugin"] = client
         hash_obj = hashlib.sha256()
-        cache_key._hash_platform(hash_obj, Client())
+        cache_key._hash_platform(hash_obj, client)
         return hash_obj.digest()
       finally:
-        xla_bridge.plugin_builds.clear()
-        xla_bridge.plugin_builds.update(saved)
+        xla_bridge._backend_factories.clear()
+        xla_bridge._backend_factories.update(registrations)
+        xla_bridge._backends.clear()
+        xla_bridge._backends.update(backends)
 
     earlier = platform_hash("0.12.0.1.post71")
     self.assertEqual(earlier, platform_hash("0.12.0.1.post71"))

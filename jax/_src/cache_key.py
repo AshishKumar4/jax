@@ -116,7 +116,9 @@ def get(
       ),
       (
           "host CPU",
-          lambda hash_obj: _hash_host_cpu(hash_obj, backend)
+          lambda hash_obj: _hash_host_cpu(
+              hash_obj, backend, compile_options.executable_build_options
+              .debug_options)
       ),
       (
           "XLA flags",
@@ -506,20 +508,7 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
 def _hash_platform(hash_obj, backend):
   _hash_string(hash_obj, backend.platform)
   _hash_string(hash_obj, backend.platform_version)
-  _hash_string(hash_obj, _plugin_build(backend))
-
-
-def _plugin_build(backend) -> str:
-  """The build of the PJRT plugin that compiles for `backend` ("" where none is
-  stated): a plugin rebuilt under one jax and jaxlib compiles with its own XLA,
-  which the platform version (the CUDA runtime it loads) does not tell apart, so
-  a cache keyed without it served the executables an earlier build compiled, a
-  miscompile the rebuild fixed included. The plugin is the one registered under
-  the platform version's runtime ("cuda 12090": 'cuda'), a live client's and a
-  compile-only one's alike: XLA states a compile-only topology's platform
-  version as its live client does (openxla/xla#50858)."""
-  runtime = backend.platform_version.split(" ", 1)[0]
-  return xla_bridge.plugin_builds.get(runtime, "")
+  _hash_string(hash_obj, xla_bridge.plugin_build(backend))
 
 
 def jax_version() -> str:
@@ -534,14 +523,24 @@ def jax_version() -> str:
   return jax_version_module.__version__
 
 
-def _hash_host_cpu(hash_obj, backend):
+def _hash_host_cpu(hash_obj, backend, debug_options):
   # XLA:CPU compiles a program for the CPU features of the host that compiles
   # it, so an executable from a host of another CPU need not link or run here
   # ("Failed to materialize symbols", after which the process compiles nothing
-  # more): on the CPU backend, the key names the host's CPU. Other backends'
-  # keys are unchanged.
+  # more): on the CPU backend, the key names the CPU XLA compiles for. Other
+  # backends' keys are unchanged.
   if backend.platform == "cpu":
-    _hash_string(hash_obj, host_cpu())
+    _hash_string(hash_obj, cpu_target(debug_options))
+
+
+def cpu_target(debug_options) -> str:
+  """The CPU XLA:CPU compiles for under `debug_options`, as XLA itself states
+  it (its triple, its CPU and the features it enables, an ISA cap among the
+  options applied); this host's CPU (`host_cpu`) with a jaxlib that states
+  none."""
+  if (target := getattr(_jax, "cpu_target_machine", None)) is None:
+    return host_cpu()
+  return "\n".join(target(debug_options))
 
 
 @functools.cache
