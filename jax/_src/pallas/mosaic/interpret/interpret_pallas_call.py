@@ -1520,11 +1520,12 @@ def _interpret_jaxpr(
           raise NotImplementedError(
               'run_scoped_p with collective axes is not supported'
           )
-        # Allocate a buffer or semaphore for each element of
-        # eqn.params['jaxpr'].invars. It is assumed that each core
-        # runs the same sequence of `run_scoped`s.
+        # Allocate a buffer or semaphore for each of its scoped refs: its
+        # body's invars past its operands, which lead them. It is assumed that
+        # each core runs the same sequence of `run_scoped`s.
+        scoped = eqn.params['jaxpr'].invars[len(eqn.invars):]
         allocs = []
-        for v in eqn.params['jaxpr'].invars:
+        for v in scoped:
           if v.aval.memory_space is _SEMAPHORE:
             token, alloc = callback.io_callback(
                 _allocate_semaphores,
@@ -1562,7 +1563,7 @@ def _interpret_jaxpr(
             eqn.params['jaxpr'], *deferred_invals(), *allocs, token=token
         )
 
-        for a, v in zip(allocs, eqn.params['jaxpr'].invars):
+        for a, v in zip(allocs, scoped):
           if v.aval.memory_space is _SEMAPHORE:
             # TODO(jburnim): De-allocate semaphores.
             # callback.io_callback(

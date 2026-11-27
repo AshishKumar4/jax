@@ -135,6 +135,9 @@ class CompilerParams:
     skip_device_barrier: If True, skips the cross-device barrier before kernel
       launch. Improper use of this flag can lead to race conditions. !!!Use with
       caution!!! Defaults to False.
+    metadata: What the caller states of this kernel's launch (an identity, a
+      resource decision), opaque to Mosaic, kept in the compiled call's
+      serialization (MosaicGpuKernelProto.caller_metadata).
     is_multi_process: If True, indicates that the kernel runs in a multi-process
       environment and performs cross-process device communication. This is
       mostly needed when compiling distributed-over-processes code with an
@@ -147,6 +150,11 @@ class CompilerParams:
       must have a different collective_id if they perform communication between
       different sets of devices (e.g. if one kernel does neighbor comms on mesh
       axis x, while another does neighbor comms on mesh axis y).
+    min_blocks_per_sm: The minimum number of blocks of the kernel that should
+      be resident on one SM at once, as the second argument of CUDA's
+      ``__launch_bounds__``. ptxas limits the registers per thread so that this
+      many blocks fit the register file (spilling if it must). Defaults to 1,
+      which leaves ptxas free to use up to 255 registers per thread.
   """
   approx_math: bool = False
   dimension_semantics: Sequence[DimensionSemantics] | None = None
@@ -161,6 +169,8 @@ class CompilerParams:
   skip_device_barrier: bool = False
   is_multi_process: bool = False
   collective_id: int | None = None
+  metadata: bytes = b""
+  min_blocks_per_sm: int = 1
 
   def __post_init__(self):
     if self.collective_id is not None and not (
@@ -1492,6 +1502,49 @@ class UnswizzleRef(state_types.Transform):
     return pp.text(f"{{unswizzle({self.swizzle})}}")
 
 
+@dataclasses.dataclass(frozen=True)
+class PlainTransform(state_types.Transform):
+  """Lays an SMEM ref out plainly: neither tiled nor swizzled.
+
+  Under warpgroup semantics, layout inference chooses the transforms of a ref
+  that states none, searching every tiling and swizzle its uses admit. A ref
+  that only a plain layout serves (one sliced at row offsets no tiling divides)
+  states it, so the search takes it as given.
+  """
+
+  def transform_type(
+      self, x: jax_core.AbstractValue
+  ) -> jax_core.AbstractValue:
+    return x
+
+  def transform_array(self, x: Any) -> Any:
+    return x
+
+  def undo(self, x: jax_core.AbstractValue) -> state_types.Transform:
+    return PlainRef()
+
+
+@tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class PlainRef(state_types.Transform):
+  """A ref declared plain (`PlainTransform`): it changes no type and commutes
+  with every other transform unchanged."""
+
+  def transform_type(self, x: jax_core.AbstractValue) -> jax_core.AbstractValue:
+    return x
+
+  def undo(self, x: jax_core.AbstractValue) -> state_types.Transform:
+    return PlainTransform()
+
+  def commute(
+      self, other: state_types.Transform
+  ) -> tuple[state_types.Transform, PlainRef]:
+    return other, self
+
+  def pretty_print(self, context: jax_core.JaxprPpContext) -> pp.Doc:
+    return pp.text("{plain}")
+
+
 @tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class CollapseLeadingBatchDimensionsTransform(state_types.Transform):
@@ -1698,6 +1751,17 @@ class ClusterBarrierType(dtypes.ExtendedDType):
     return self.name
 
 
+@dataclasses.dataclass(frozen=True)
+class CtaBarrierType(dtypes.ExtendedDType):
+  type: ClassVar[Any] = barrier_dtype  # pyrefly: ignore[bad-override]
+  name: ClassVar[str] = "cta_barrier"
+
+  num_arrivals: int
+
+  def __str__(self):
+    return self.name
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Barrier:
   """Describes a barrier reference.
@@ -1730,6 +1794,41 @@ class Barrier:
 
   def get_ref_aval(self) -> state.AbstractRef:
     ty = BarrierType(self.num_arrivals, self.orders_tensor_core)
+    return state.AbstractRef(jax_core.ShapedArray(self.num_barriers, ty), SMEM)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CtaBarrier:
+  """Describes a named CTA barrier reference (`bar.arrive` and `bar.sync`).
+
+  A hardware barrier of the thread block, numbered past the ones Mosaic GPU
+  reserves for the block and its warpgroups (`mgpu.CtaBarrier`): arriving does
+  not wait, and arriving and waiting (`barrier_arrive_and_wait`) blocks until
+  `num_arrivals` warpgroups have arrived at it in this phase, without polling
+  shared memory as an mbarrier's wait does. It has no separate wait.
+
+  Attributes:
+    num_arrivals: The number of warpgroups that arrive at it in a phase.
+    num_barriers: The shape of the barrier array to create. By default a single
+      barrier is created, and the reference to it has an empty shape.
+  """
+  num_arrivals: int = 1
+  num_barriers: int | Sequence[int] = ()
+
+  def __post_init__(self):
+    if (n := self.num_arrivals) < 1:
+      raise ValueError(f"Num arrivals must be at least 1, but got {n}")
+
+    if isinstance(self.num_barriers, int):
+      object.__setattr__(self, "num_barriers", (self.num_barriers,))
+    else:
+      object.__setattr__(self, "num_barriers", tuple(self.num_barriers))
+
+  def get_array_aval(self) -> jax_core.ShapedArray:
+    raise ValueError("CTA barriers are not arrays")
+
+  def get_ref_aval(self) -> state.AbstractRef:
+    ty = CtaBarrierType(self.num_arrivals)
     return state.AbstractRef(jax_core.ShapedArray(self.num_barriers, ty), SMEM)
 
 

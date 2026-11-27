@@ -26,6 +26,7 @@ import weakref
 
 import jax
 import jax.numpy as jnp
+from jax._src import custom_call_targets
 from jax._src import util
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir import passmanager
@@ -114,7 +115,7 @@ def _find_mgpu_call(block: ir.Block, args: list[ir.Value]):
   value_names: Mapping[ir.Value, int] = defaultdict(lambda: next(name_source))
   for op in block.operations:
     op = cast(Any, op)
-    if _is_custom_call(op, "AllocateBuffer"):
+    if _is_custom_call(op, custom_call_targets.ALLOCATE_BUFFER):
       result_type = ir.ShapedType(op.result.type)
       def allocate_torch_buffer(
           env,
@@ -125,7 +126,7 @@ def _find_mgpu_call(block: ir.Block, args: list[ir.Value]):
       ):
         env[_result_name] = torch.empty(_shape, dtype=_dtype, device=device)
       to_evaluate.append(allocate_torch_buffer)
-    elif _is_custom_call(op, "mosaic_gpu_v2"):
+    elif _is_custom_call(op, custom_call_targets.MOSAIC_GPU):
       if mgpu_call is not None:
         raise ValueError("Multiple Mosaic GPU kernels found in the module")
       mgpu_call = op
