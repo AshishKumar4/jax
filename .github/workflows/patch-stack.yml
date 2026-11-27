@@ -261,6 +261,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      # The plugin release whose native wheels it shipped (`patch_stack.py plugins`), which `staging` indexes as it is.
+      plugins: ${{ steps.native.outputs.plugins }}
     env:
       RELEASE: ${{ needs.carry.outputs.release }}
       # The native projects a stack with native patches ships beside jax, each built for every supported Python
@@ -297,6 +300,7 @@ jobs:
           venv/bin/python -m pip download -q --no-deps --only-binary :all: --dest dist "jax==$RELEASE"
           ls dist
       - name: Its native artifacts, all of them
+        id: native
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -314,14 +318,32 @@ jobs:
             exit 0
           fi
           version=$(ls dist/jax-"$RELEASE".post*-py3-none-any.whl | sed -n 's|^dist/jax-\(.*\)-py3-none-any.whl$|\1|p')
-          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version")
+          # shellcheck disable=SC2086 # Each machine its own word.
+          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$version" --machines $MACHINES \
+            --wheels ../verified.json)
           if [ -z "$plugins" ]; then
             echo "::error::no plugin release holds $version's native code: build plugin-$version (dew/build_plugin.sh)"
             exit 1
           fi
           echo "$version's native code is $plugins's"
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
           version=${plugins#plugin-}
-          gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "*.whl"
+          # The wheels its records bound, by name, each checked against its digest: an asset uploaded since the
+          # pairing read the release is none of them. A release whose builds recorded nothing, all its wheels.
+          if [ "$(python3 -c 'import json; print(len(json.load(open("verified.json"))))')" = 0 ]; then
+            gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "*.whl"
+          else
+            python3 -c 'import json; print("\n".join(json.load(open("verified.json"))))' | while read -r wheel; do
+              gh release download "$plugins" --repo "$GITHUB_REPOSITORY" --dir native --pattern "$wheel"
+            done
+            python3 - <<'CHECK'
+          import hashlib, json, pathlib, sys
+          for name, want in json.load(open("verified.json")).items():
+              got = hashlib.sha256(pathlib.Path("native", name).read_bytes()).hexdigest()
+              if got != want:
+                  sys.exit(f"::error::{name}: sha256 {got}, its record binds {want}")
+          CHECK
+          fi
           missing=()
           # Its jaxlib, where the release carries one, for every Python and machine; none, the release's stock one.
           if ls native/jaxlib-*.whl > /dev/null 2>&1; then
@@ -435,13 +457,15 @@ jobs:
   # has landed (`index`). Written once: a page a lock may name is never rewritten (a page there with other bytes is
   # refused).
   staging:
-    needs: [carry, stage]
+    needs: [carry, assemble, stage]
     if: always() && needs.carry.result == 'success' && (needs.stage.result == 'success' || inputs.staging != '')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       VERSION: ${{ inputs.staging || needs.stage.outputs.version }}
+      # The plugin release this run's `assemble` shipped; none for a staging run alone (`staging`).
+      PLUGINS: ${{ needs.assemble.outputs.plugins }}
       BUCKET: ${{ secrets.R2_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -463,8 +487,13 @@ jobs:
           # Its native wheels from the plugin release whose native code the stack holds, as assemble chose it
           # (`patch_stack.py plugins`): its own version's, or an earlier one's for a release of Python fixes alone,
           # which may be staged and not yet indexed (review).
-          git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
-          plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION")
+          # The one `assemble` chose and shipped, not chosen again (a release uploaded since would be another); a
+          # staging run alone chooses it as `assemble` did.
+          plugins=$PLUGINS
+          if [ -z "$plugins" ]; then
+            git clone -q --filter=blob:none --branch "release/$VERSION" "https://github.com/$GITHUB_REPOSITORY.git" jax
+            plugins=$(cd jax && python3 ../dew/dew/patch_stack.py plugins "$VERSION")
+          fi
           if [ -n "$plugins" ]; then
             gh api "repos/$GITHUB_REPOSITORY/releases/tags/$plugins" > "assets/plugin.json"
           fi

@@ -6,6 +6,7 @@ release to the next.
     python dew/patch_stack.py tests RELEASE     # the stack's own test files, in a clone holding jax-vRELEASE
     python dew/patch_stack.py plugins VERSION   # the plugin release the stack at VERSION ships beside its jax
     python dew/patch_stack.py fixes [--topic T] [--status S]   # the fixes the stack carries, by its manifest
+    python dew/patch_stack.py record WORKSPACE LOG ERRORS   # what a plugin build cell read (`recorded`)
     python dew/patch_stack.py index MANIFEST SITE FILE...   # the package index, FILEs added to MANIFEST
     python dew/patch_stack.py index MANIFEST SITE --yank FILE... --reason WHY   # FILEs yanked (PEP 592)
 
@@ -46,20 +47,33 @@ audited and retired on its own when an upstream release holds it: its entry stat
 `plugins` prints the plugin release (plugin-X, its CUDA and PJRT plugins) the stack checked out ships beside its
 jax: its own where the fork has one, else an earlier post release's built from the same native code; nothing
 where neither is, and its plugins are to be built (dew/build_plugin.sh).
+
+`record`, run by dew/build_plugin.sh after each build cell, queries Bazel for what the cell's wheel builds read
+(`read_by`, under each build's own options in its log) and prints it with digests (`recorded`); `merged` joins a
+machine's cells with its published wheels as sources-<machine>.json, which the plugin release carries and
+`plugins` compares a later release against.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import base64
+import contextlib
 import hashlib
 import html
+import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -104,7 +118,331 @@ def native(base: str) -> list[str]:
     return git("diff", "--name-only", base, "HEAD", "--", ".", *(f":(exclude){path}" for path in PYTHON_ONLY)).split()
 
 
-def plugins(version: str) -> str:
+SOURCES = re.compile(r"sources-(x86_64|aarch64)(-py[0-9.-]+)?\.json")
+"""A plugin release's record of what its build read on one machine (`recorded`, dew/build_plugin.sh)."""
+MACHINES = ("x86_64", "aarch64")
+CONFIGURED = (".bazelrc", ".bazelversion", "MODULE.bazel", "platform_mappings", "bazel_downloader.cfg",
+              "build/build.py")
+"""What configures a build beside the files it reads (`recorded`): Bazel's flags and its version, the modules and
+their overrides, and the driver that names its targets and options: a flag or a macro changed over the same sources
+builds other code. MODULE.bazel.lock is none: Bazel writes it from MODULE.bazel at a build, and no tree holds it
+(it is ignored)."""
+STAMP = re.compile(rb'^_release_version: str \| None = (?:"[^"]*"|None)$', re.MULTILINE)
+"""A release's version stamp (`RELEASE`), which every release changes and no native code reads as code, as a
+release holds it or as a plugin build writes it (None, dew/build_plugin.sh): a digest (`digest`) is of a file
+with it blanked."""
+LOCATION = re.compile(r"^(.+?):\d+:\d+: ")
+"""A path in `bazel query --output=location`'s line."""
+LABEL = re.compile(r"^@@([^/]*)//([^:]*):(.+)$")
+"""A canonical label (`bazel query --output=label --consistent_labels`'s): its repository (empty: the main
+one), package and name."""
+MARKED = re.compile(r"^@@([^/]*)//(.*)$")
+"""A file a repository rule read, as its repository's marker names it (Bazel's RepoRecordedInput: `@@repo//path`,
+a path, not a label; the main repository's `@@//path`), escaped (`unescaped`)."""
+
+
+def unescaped(text: str) -> str:
+    """A marker's field as Bazel wrote it: `\\s` a space, `\\n` a newline, `\\\\` a backslash."""
+    return re.sub(r"\\(.)", lambda escape: {"s": " ", "n": "\n"}.get(escape[1], escape[1]), text)
+
+
+def digest(data: bytes) -> str:
+    """The SHA-256 of a file's bytes, its release stamp (`STAMP`) blanked."""
+    return hashlib.sha256(STAMP.sub(b'_release_version: str | None = ""', data)).hexdigest()
+
+
+def overrides(module: str) -> dict[str, dict]:
+    """Each archive_override of MODULE.bazel text `module`, by its module_name: its literal arguments."""
+    found = {}
+    for call in ast.walk(ast.parse(module)):
+        if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "archive_override":
+            arguments = {}
+            for keyword in call.keywords:
+                with contextlib.suppress(ValueError, SyntaxError):
+                    arguments[keyword.arg] = ast.literal_eval(keyword.value)
+            if "module_name" in arguments:
+                found[arguments["module_name"]] = arguments
+    return found
+
+
+def labelled(label: str) -> str:
+    """The main repository's path a label names (//third_party/xla:fix.patch: third_party/xla/fix.patch)."""
+    package, _, name = label.split("//", 1)[1].partition(":")
+    return f"{package}/{name}" if package else name
+
+
+STARLARK = ("BUILD", "BUILD.bazel", "MODULE.bazel", "REPO.bazel", "WORKSPACE", "WORKSPACE.bazel")
+"""Files Bazel evaluates by name (beside every .bzl file): a change to one can change what a build does though no
+record names it (a module extension's implementation, whose transitive loads Bazel digests apart), so a release
+whose tree changes one a build could have read is paired with no earlier plugins (`differences`)."""
+LEGACY_THROUGH = {"0.12.0.1": 142, "0.12.2": 1}
+"""Each release series' last post release whose plugin builds recorded nothing (`recorded`): a later one's plugins
+pair a release only through a record of every machine's build (`built_from`); a series it names none of records
+from its first."""
+
+
+def starlark(path: str) -> bool:
+    """Whether Bazel evaluates `path` (`STARLARK`)."""
+    return path.endswith(".bzl") or Path(path).name in STARLARK
+
+
+def recorded(workspace: Path, output_base: Path, read: list[str]) -> dict:
+    """What one plugin build cell read (a Python and a CUDA, as dew/build_plugin.sh builds them), each file's
+    `digest`, taken right after the cell's build, its repositories as it fetched them: every file `read` names, by
+    its path (`bazel query --output=location`'s lines) or its canonical label (`--output=label
+    --consistent_labels`'s, cquery's with its configuration after it: the cell's configured source files, and the
+    BUILD and .bzl files loaded for them), every file a repository rule read (each repository's marker in
+    OUTPUT_BASE/external) or a module extension did (MODULE.bazel.lock's recorded inputs, written at the build),
+    and what configures the build (`CONFIGURED`): the main repository's by path (`main`), each external
+    repository's by its canonical name (`external`), Bazel's own (its install base) none. The patches each
+    archive_override applies are kept apart (`patches`, by module): their effect is the patched repository's
+    files, which a release compares (`differences`)."""
+    workspace, external = workspace.resolve(), (output_base / "external").resolve()
+    main: dict[str, str] = {}
+    outer: dict[str, dict[str, str]] = {}
+
+    def take(path: Path) -> None:
+        if not path.is_file():
+            return
+        real = path.resolve()
+        # Keyed where its bytes lie: a repository that vendors another (TSL within XLA's tree, linked as its own
+        # repository) records the file as the vendoring repository's, whose patches change it (`differences`).
+        within = real if real.is_relative_to(external) else path
+        if real.is_relative_to(workspace):
+            main[str(real.relative_to(workspace))] = digest(real.read_bytes())
+        elif within.is_relative_to(external) and len(within.relative_to(external).parts) > 1:
+            repository, *rest = within.relative_to(external).parts
+            outer.setdefault(repository, {})[str(Path(*rest))] = digest(real.read_bytes())
+
+    def marked(name: str) -> None:
+        # A file as a marker or the lockfile names it: @@repo//path, escaped.
+        name = unescaped(name)
+        if found := MARKED.match(name):
+            take((workspace if not found[1] else external / found[1]) / found[2])
+        elif name.startswith("/"):
+            take(Path(name))
+
+    for line in read:
+        if found := LOCATION.match(line):
+            take(Path(found[1]))
+        elif found := LABEL.match(line.strip().split(" (", 1)[0]):  # cquery's: its configuration after it.
+            take((workspace if not found[1] else external / found[1]) / found[2] / found[3])
+    for marker in sorted(external.glob("*.marker")):
+        for line in marker.read_text(errors="replace").splitlines():
+            if line.startswith("FILE:"):
+                marked(line.removeprefix("FILE:").rsplit(" ", 1)[0])
+    lock = workspace / "MODULE.bazel.lock"
+
+    def inputs(value) -> None:
+        # Every recorded input a module extension read, wherever the lockfile holds it.
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                if isinstance(key, str) and key.startswith("FILE:"):
+                    marked(key.removeprefix("FILE:"))
+                inputs(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                if isinstance(inner, str) and inner.startswith("FILE:"):
+                    marked(inner.removeprefix("FILE:").rsplit(" ", 1)[0])
+                inputs(inner)
+
+    if lock.is_file():
+        inputs(json.loads(lock.read_text()))
+    for name in CONFIGURED:
+        take(workspace / name)
+    # The build drivers the checkout tracks (build.py's tools), not what running them left (their __pycache__).
+    tracked = subprocess.run(["git", "-C", str(workspace), "ls-files", "-z", "build/tools"], capture_output=True,
+                             check=True).stdout.decode().split("\0")
+    for tool in sorted(filter(None, tracked)):
+        take(workspace / tool)
+    module = (workspace / "MODULE.bazel").read_text() if (workspace / "MODULE.bazel").is_file() else ""
+    patches = {}
+    for name, override in overrides(module).items():
+        paths = [labelled(label) for label in override.get("patches", [])]
+        patches[name] = {path: digest((workspace / path).read_bytes()) for path in paths}
+        for path in paths:
+            main.pop(path, None)
+    return {"main": main, "external": outer, "patches": patches}
+
+
+def invocations(log: str) -> list[tuple[str, list[str], str]]:
+    """Each wheel build a cell's log shows build.py running (its "[EXECUTING] <bazel> build <options> <target>"
+    lines), as (the Bazel it ran, which build.py may have fetched into the workspace; its options; its target): what
+    each cell's record queries with and under, so the record reads what that build configured, the options
+    build.py appends itself (--config=cuda_libraries_from_stubs) among them."""
+    found = []
+    for line in log.splitlines():
+        if executed := re.search(r"\[EXECUTING\] (\S+) build (.+)$", line):
+            words = shlex.split(executed[2])
+            found.append((executed[1], words[:-1], words[-1]))
+    return found
+
+
+def announced_envs(said: str) -> list[str]:
+    """Each --repo_env Bazel's announced options set (`--announce_rc`'s lines, read one at a time), as an option."""
+    return sorted({f"--repo_env={found}" for line in said.splitlines()
+                   for found in re.findall(r"--repo_env[= ]([^\s']+)", line)})
+
+
+def read_by(log: str, errors: Path) -> tuple[str, list[str]]:
+    """What a cell's wheel builds read (its `log`'s `invocations`), as Bazel labels it, and the Bazel they ran:
+    each build's configured source files, by cquery with that build's own Bazel and under its own options, and the
+    BUILD and .bzl files loaded for them, by query (which reads no `build` option) given every --repo_env cquery
+    announced (`announced_envs`), so it fetches the cell's repositories and no other. Bazel's own output goes to
+    `errors`; a query that fails is a CalledProcessError: a record short of a file would pair a release that
+    changed it."""
+    builds = invocations(log)
+    if not builds:
+        raise ValueError("no wheel build in the cell's log to record")
+    labels, announced = [], []
+    with errors.open("w") as said:
+        for bazel, options, target in builds:
+            done = subprocess.run([bazel, "cquery", *options, "--announce_rc", "--color=no",
+                                   "--consistent_labels", "--output=label",
+                                   f"kind('source file', deps({target}))"], capture_output=True, text=True,
+                                  check=False)
+            said.write(done.stderr)
+            done.check_returncode()
+            labels += done.stdout.splitlines()
+            announced.append(done.stderr)
+        bazel = builds[0][0]
+        targets = " + ".join(target for _, _, target in builds)
+        done = subprocess.run([bazel, "query", *announced_envs("\n".join(announced)), "--color=no",
+                               "--consistent_labels", "--output=label", f"buildfiles(deps({targets}))"],
+                              capture_output=True, text=True, check=False)
+        said.write(done.stderr)
+        done.check_returncode()
+    return bazel, labels + done.stdout.splitlines()
+
+
+def merged(cells: dict[str, dict], commit: str, wheels: list[Path]) -> dict:
+    """One machine's record of its build (`SOURCES`): the commit it checked out and built (`commit`, which a
+    release's tag may not be: an attach names the version, not the tree), each wheel it made by name and digest
+    (`wheels`, which bind the record to the assets it describes, `bound`), each cell's (`recorded`) by its name,
+    and the patches their one tree applies."""
+    patches = [cell["patches"] for cell in cells.values()]
+    if any(other != patches[0] for other in patches):
+        raise ValueError("a build's cells applied different patches")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not wheels:
+        raise ValueError("a build's record names its commit, a full sha, and at least one wheel")
+    return {"commit": commit,
+            "wheels": {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest() for wheel in wheels},
+            "cells": {name: {"main": cell["main"], "external": cell["external"]} for name, cell in cells.items()},
+            "patches": patches[0] if patches else {}}
+
+
+def materialized(override: dict, commit: str, into: Path) -> Path:
+    """The repository an archive_override makes at `commit` (its archive, verified by its integrity, its
+    strip_prefix taken, each of its patches as `commit` holds them applied in order, as Bazel applies them, with
+    no fuzz) made under `into`: its root."""
+    with urllib.request.urlopen(override["urls"][0], timeout=600) as response:
+        data = response.read()
+    algorithm, _, expected = override["integrity"].partition("-")
+    if hashlib.new(algorithm, data).digest() != base64.b64decode(expected):
+        raise ValueError(f"{override['urls'][0]} is not its integrity's archive")
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        archive.extractall(into, filter="data")
+    root = into / override.get("strip_prefix", "")
+    for label in override.get("patches", []):
+        patch = into / "patch"
+        patch.write_bytes(subprocess.run(["git", "show", f"{commit}:{labelled(label)}"], check=True,
+                                         capture_output=True).stdout)
+        subprocess.run(["patch", f"-p{override.get('patch_strip', 0)}", "-F0", "-s", "--no-backup-if-mismatch",
+                        "-d", str(root), "-i", str(patch)], check=True, capture_output=True)
+    return root
+
+
+def tree(root: Path) -> dict[str, str]:
+    """Each file under `root` by its path in it: its `digest`."""
+    return {str(path.relative_to(root)): digest(path.read_bytes()) for path in root.rglob("*") if path.is_file()}
+
+
+def differences(record: dict, built: str, commit: str = "HEAD") -> list[str]:
+    """What `commit` holds that could build otherwise than the plugin build at commit `built` did (a machine's
+    record, `merged`), each named; none where its native code is the build's. Every cell's main files are compared
+    by digest, and a .bzl file `commit` changes over `built` refuses (an extension's code, read by no record). An
+    archive_override whose patches `commit` holds as the build did is the same repository (its archive pinned by
+    its integrity, MODULE.bazel among the main files); one whose patches differ is made at both commits
+    (`materialized`) and refused for any file that differs between them that a cell read, that `commit` adds (a
+    glob may take it) or that Bazel evaluates (`starlark`): only a file read by none, unadded and no Starlark, a
+    patch's own test changed, pairs; a patch's message changes no file. A repository a module extension generated
+    (a canonical name holding "++") is made from inputs the record holds."""
+    differing = []
+    for name, cell in sorted(record["cells"].items()):
+        for path, wanted in sorted(cell["main"].items()):
+            held = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True)
+            if held.returncode != 0 or digest(held.stdout) != wanted:
+                differing.append(f"{name}: {path}")
+    # A .bzl file anywhere, and any other Starlark file (`starlark`) in a package holding a file a cell read,
+    # changed or added: a BUILD.bazel beside a recorded BUILD takes its place, and a new BUILD file below a
+    # recorded package takes files from its globs, though no recorded byte moves. A package no cell read (a test
+    # package's BUILD) pairs.
+    read_main = {path for cell in record["cells"].values() for path in cell["main"]}
+    changed = git("diff", "--name-only", built, commit).split()
+    differing += [f"{path}: Starlark" for path in changed if path.endswith(".bzl") or starlark(path) and any(
+        (package := str(Path(path).parent)) == "." or read == package or read.startswith(f"{package}/")
+        for read in read_main)]
+    if differing:
+        return sorted(set(differing))
+    module = subprocess.run(["git", "show", f"{commit}:MODULE.bazel"], capture_output=True, text=True).stdout
+    for name, override in overrides(module).items():
+        paths = [labelled(label) for label in override.get("patches", [])]
+        held = {path: digest(subprocess.run(["git", "show", f"{commit}:{path}"], check=True,
+                                            capture_output=True).stdout) for path in paths}
+        if record["patches"].get(name) == held:
+            continue
+        read = {path for cell in record["cells"].values() for repository, files in cell["external"].items()
+                if repository in (f"{name}+", f"{name}~") for path in files}
+        with tempfile.TemporaryDirectory() as then, tempfile.TemporaryDirectory() as now:
+            try:
+                before = tree(materialized(override, built, Path(then)))
+                after = tree(materialized(override, commit, Path(now)))
+            except (OSError, ValueError, subprocess.CalledProcessError, urllib.error.URLError) as failure:
+                return [f"{name}'s patched archive: {failure}"]
+        for path in sorted(set(before) | set(after)):
+            if before.get(path) == after.get(path):
+                continue
+            why = ("read" if path in read else "added" if path not in before else "Starlark" if starlark(path)
+                   else None)
+            if why:
+                differing.append(f"@{name}//{path}: {why}")
+    return differing
+
+
+def assets(tag: str) -> dict[str, str]:
+    """Plugin release `tag`'s uploaded files by name: each one's sha256 as GitHub's release API states it ("" where
+    it states none, which binds nothing, `bound`)."""
+    address = f"https://api.github.com/repos/AshishKumar4/jax/releases/tags/{tag}"
+    with urllib.request.urlopen(address, timeout=120) as response:
+        found = json.loads(response.read())
+    return {asset["name"]: (asset.get("digest") or "").removeprefix("sha256:") for asset in found["assets"]}
+
+
+def bound(record: dict, uploaded: dict[str, str]) -> bool:
+    """Whether a machine's record (`merged`) describes the wheels release assets `uploaded` (`assets`) hold: each
+    wheel it made is there under its name at its digest. An attach uploads each file apart: a record of one build
+    beside another build's wheels of the same version (the first attach's record failed, a rebuild's took its
+    place, its wheels kept by the no-replace upload) pairs nothing."""
+    return bool(record.get("wheels")) and all(uploaded.get(name) == wanted for name, wanted in
+                                              record["wheels"].items())
+
+
+def built_from(tag: str) -> list[tuple[str, dict]]:
+    """The records of what plugin release `tag`'s builds read, each with its machine: every asset `SOURCES` names
+    (sources-<machine>-py<Pythons>.json, one a build, as its checksum file is named), so two builds of one machine
+    for different Pythons each have theirs; none for a release built before the builds recorded
+    (`LEGACY_THROUGH`)."""
+    found = []
+    for name in sorted(assets(tag)):
+        if (matched := SOURCES.fullmatch(name)) is None:
+            continue
+        address = f"{FORK.removesuffix('.git')}/releases/download/{tag}/{name}"
+        with urllib.request.urlopen(address, timeout=120) as response:
+            found.append((matched[1], json.loads(response.read())))
+    return found
+
+
+def plugins(version: str, machines: tuple[str, ...] = MACHINES, verified: dict[str, str] | None = None) -> str:
     """The plugin release whose CUDA and PJRT plugins the stack checked out, at `version` (X.postN), ships beside
     its jax: its own, plugin-VERSION, where origin has one; else the newest of an earlier post release of X whose
     native code is HEAD's: HEAD differs only in `PYTHON_ONLY` (jax's Python package, its tests, its docs) from
@@ -115,15 +453,42 @@ def plugins(version: str) -> str:
     change no build reads (a carried patch's own test, its message), which its own publish pairs with those
     plugins: a later Python-only release then has that stack's native code byte for byte, though not the tag's
     (post82 on post81, 2026-11-12, refused post81's plugins for one patch file's test and header). A dev build's
-    (X.postN.devM) is never one: the index never listed it."""
+    (X.postN.devM) is never one: the index never listed it. `machines`, those whose plugins the publish ships (its
+    `machines`), each with a record where the release's builds record. `verified`, where given, is filled with the
+    wheels its records bound by name and digest, which the publish then downloads alone and checks (a release whose
+    builds recorded nothing leaves it empty): an asset uploaded after this read is none of them."""
     release, _, post = version.rpartition(".post")
     tags = git("ls-remote", "origin", "refs/tags/plugin-*").split()[1::2]
     published = {int(match.group(2)): tag for tag in tags
                  if (match := PLUGINS.match(tag)) and match.group(1) == release and int(match.group(2)) <= int(post)}
     for found in sorted(published, reverse=True):
         tag = published[found]
+        name = tag.removeprefix("refs/tags/")
+        # A release built since its builds record what they read pairs only through every machine's record,
+        # each bound to the wheels the release holds (`bound`), HEAD holding all of each as it was read at the
+        # commit the record names (its tag names the version alone); an earlier one, by the path rule below. Its
+        # own version's release too: a record of another build than its wheels' is no evidence of them.
+        built = built_from(name)
+        records = [record for _, record in built]
+        if records or found > LEGACY_THROUGH.get(release, 0):
+            uploaded = assets(name) if records else {}
+            # Every machine shipped has a record, each bound to its wheels, and the records together cover every
+            # wheel the release holds: an upload no record describes pairs nothing.
+            wheels = {asset for asset in uploaded if asset.endswith(".whl")}
+            covered = {wheel for record in records for wheel in record.get("wheels", {})}
+            if (not set(machines) <= {machine for machine, _ in built} or wheels != covered
+                    or not all(bound(record, uploaded) for record in records)):
+                continue
+            for commit in sorted({record["commit"] for record in records}):
+                git("fetch", "-q", "--no-tags", "origin", commit)
+            # Its own version's too: its native code is compared with what its builds read.
+            if not any(differences(record, record["commit"]) for record in records):
+                if verified is not None:
+                    verified.update({wheel: digest for record in records for wheel, digest in record["wheels"].items()})
+                return name
+            continue
         if found == int(post):
-            return tag.removeprefix("refs/tags/")
+            return name
         git("fetch", "-q", "--no-tags", "origin", f"+{tag}:{tag}")
         stack = f"refs/remotes/origin/release/{release}.post{found}"
         git("fetch", "-q", "--no-tags", "origin", f"+refs/heads/release/{release}.post{found}:{stack}", check=False)
@@ -498,7 +863,20 @@ def main() -> int:
     rebasing.add_argument("old")
     rebasing.add_argument("new")
     commands.add_parser("tests").add_argument("release")
-    commands.add_parser("plugins").add_argument("version")
+    shipping = commands.add_parser("plugins")
+    shipping.add_argument("version")
+    shipping.add_argument("--machines", nargs="+", choices=MACHINES, default=list(MACHINES),
+                          help="the machines whose plugins the publish ships (patch-stack.yml's `machines`)")
+    shipping.add_argument("--wheels", type=Path,
+                          help="where to write the wheels its records bound, by name and sha256 (JSON)")
+    recording = commands.add_parser("record", help="what one plugin build cell read (`recorded`, `read_by`)")
+    recording.add_argument("workspace", type=Path)
+    recording.add_argument("log", type=Path, help="the cell's build log, whose wheel builds it queries")
+    recording.add_argument("errors", type=Path, help="where Bazel's own output of the queries goes")
+    merging = commands.add_parser("merged", help="a machine's cells' records, as sources-<machine>.json")
+    merging.add_argument("commit", help="the commit the build checked out (its commit.txt)")
+    merging.add_argument("dist", type=Path, help="the directory of the wheels it made")
+    merging.add_argument("cells", type=Path, nargs="+", help="each cell's record, named <cell>.json")
     commands.add_parser("native").add_argument("release")
     listing = commands.add_parser("fixes", help="the fixes the stack carries, by its manifest")
     listing.add_argument("--topic")
@@ -537,10 +915,24 @@ def main() -> int:
         print(" ".join(tests(args.release)))
         return 0
     if args.command == "plugins":
-        print(plugins(args.version))
+        verified: dict[str, str] = {}
+        print(plugins(args.version, tuple(args.machines), verified))
+        if args.wheels is not None:
+            args.wheels.write_text(json.dumps(verified, sort_keys=True))
         return 0
     if args.command == "fixes":
         print("\n".join(fixes(json.loads(MANIFEST.read_text()), args.topic, args.status)))
+        return 0
+    if args.command == "record":
+        # In the workspace the cell built, with the Bazel its builds ran.
+        bazel, read = read_by(args.log.read_text(errors="replace"), args.errors)
+        output_base = subprocess.run([bazel, "info", "output_base"], capture_output=True, text=True,
+                                     check=True).stdout.strip()
+        print(json.dumps(recorded(args.workspace, Path(output_base), read), sort_keys=True))
+        return 0
+    if args.command == "merged":
+        print(json.dumps(merged({path.stem: json.loads(path.read_text()) for path in args.cells}, args.commit,
+                                sorted(args.dist.glob("*.whl"))), sort_keys=True))
         return 0
     if args.command == "native":
         print("\n".join(native(f"jax-v{args.release}")))

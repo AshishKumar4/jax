@@ -65,7 +65,9 @@ jobs:
           [[ "$CACHE" =~ ^(on|off)$ ]] || { echo "::error::cache: on or off"; exit 1; }
       - uses: actions/checkout@v4
         with:
-          ref: dew
+          # The tooling of the commit this run was dispatched from (`github.sha`), not the branch's tip then: a
+          # push to the dew branch during the run changes no build it records.
+          ref: ${{ github.sha }}
           sparse-checkout: dew
           persist-credentials: false
       - name: Build
@@ -92,7 +94,7 @@ jobs:
           # One checksum file a machine and set of Pythons: a later build for other Pythons (cp313 after cp312 and
           # cp314) adds its own beside the first's, never over it.
           cp wheels.sha256 "wheels-$(uname -m)-py$(echo "$PYTHONS" | tr ' ' '-').sha256"
-          mkdir -p "$RUNNER_TEMP/made" && cp dist/*.whl wheels-*.sha256 debug-*.tar.gz "$RUNNER_TEMP/made/"
+          mkdir -p "$RUNNER_TEMP/made" && cp dist/*.whl wheels-*.sha256 debug-*.tar.gz sources-*.json "$RUNNER_TEMP/made/"
       - uses: actions/upload-artifact@v4
         with:
           name: made
@@ -122,4 +124,4 @@ jobs:
           name: made
           path: made
       - name: Attach
-        run: gh release upload "$RELEASE" made/*.whl made/wheels-*.sha256 made/debug-*.tar.gz -R "$GITHUB_REPOSITORY"
+        run: gh release upload "$RELEASE" made/*.whl made/wheels-*.sha256 made/debug-*.tar.gz made/sources-*.json -R "$GITHUB_REPOSITORY"
