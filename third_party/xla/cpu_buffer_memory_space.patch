@@ -1,0 +1,40 @@
+diff --git a/xla/pjrt/plugin/xla_cpu/cpu_topology_description.cc b/xla/pjrt/plugin/xla_cpu/cpu_topology_description.cc
+index a4db0e52695..a62c1c880db 100644
+--- a/xla/pjrt/plugin/xla_cpu/cpu_topology_description.cc
++++ b/xla/pjrt/plugin/xla_cpu/cpu_topology_description.cc
+@@ -253,6 +253,10 @@ absl::StatusOr<xla::Shape> MakeDefaultCpuBufferShape(
+         xla::LayoutUtil::ValidateLayoutForShape(*layout, shape));
+     shape.mutable_layout()->mutable_minor_to_major()->assign(
+         layout->minor_to_major().begin(), layout->minor_to_major().end());
++    // The memory space a layout states (a host buffer's S(5) or S(6)) is the
++    // buffer's, kept as the caller gave it: a copy out of host memory passes
++    // its source's layout, which the default layout alone never matched.
++    shape.mutable_layout()->set_memory_space(layout->memory_space());
+   }
+   auto element_type = shape.element_type();
+   if (primitive_util::IsSubByteNonPredType(element_type)) {
+diff --git a/xla/pjrt/plugin/xla_cpu/cpu_topology_description_test.cc b/xla/pjrt/plugin/xla_cpu/cpu_topology_description_test.cc
+index f6c938ce250..0c014e10416 100644
+--- a/xla/pjrt/plugin/xla_cpu/cpu_topology_description_test.cc
++++ b/xla/pjrt/plugin/xla_cpu/cpu_topology_description_test.cc
+@@ -223,6 +223,20 @@ TEST(CpuTopologyDescriptionTest, GetDefaultLayout) {
+     EXPECT_EQ(default_layout, canonical_from_untiled.layout());
+   }
+ 
++  // A host buffer's layout states its memory space, which the canonical
++  // shape keeps: a copy out of pinned or unpinned host memory passes it.
++  const Shape f32_shape = ShapeUtil::MakeShape(F32, {8});
++  for (int64_t memory_space :
++       {Layout::kHostMemorySpace, Layout::kUnpinnedHostMemorySpace}) {
++    Layout host_layout = LayoutUtil::MakeDescendingLayout(1);
++    host_layout.set_memory_space(memory_space);
++    ASSERT_OK_AND_ASSIGN(
++        Shape canonical_host,
++        topology.MakeCanonicalShapeForMemorySpace(
++            CpuDeviceMemorySpace::kKindId, f32_shape, &host_layout));
++    EXPECT_EQ(canonical_host.layout(), host_layout);
++  }
++
+   const Shape s4_shape = ShapeUtil::MakeShape(S4, {2, 3});
+   Layout bad_s4_layout = LayoutUtil::MakeDescendingLayout(2);
+   bad_s4_layout.set_element_size_in_bits(8);
