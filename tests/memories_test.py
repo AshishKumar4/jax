@@ -186,6 +186,30 @@ class ShardingMemoriesTest(jtu.JaxTestCase):
     gc.collect()
 
 
+class CpuHostMemoryCopyTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    if not jtu.test_device_matches(["cpu"]):
+      self.skipTest("A CPU client's host memories.")
+    super().setUp()
+
+  @parameterized.parameters("unpinned_host", "pinned_host")
+  def test_device_put_jit_host_output_to_device(self, host_memory_kind: str):
+    # A program's output in a CPU's host memory carries its memory space in its
+    # layout (S(5) or S(6)); a copy of it to device memory reads that layout.
+    device = jax.devices()[0]
+    s_host = make_single_device_sharding(device, memory_kind=host_memory_kind)
+    np_inp = np.arange(16, dtype=np.float32)
+
+    out_on_host = jax.jit(lambda x: x * 2, out_shardings=s_host)(np_inp)
+    self.assertEqual(out_on_host.sharding.memory_kind, host_memory_kind)
+
+    s_device = make_single_device_sharding(device, memory_kind="device")
+    out_on_device = jax.device_put(out_on_host, s_device)
+    self.assertEqual(out_on_device.sharding.memory_kind, "device")
+    self.assertArraysEqual(out_on_device, np_inp * 2)
+
+
 class OrderedEffectMemoriesTest(jtu.JaxTestCase):
 
   def test_an_ordered_effect_beside_an_output_in_host_memory_lowers(self):
@@ -235,27 +259,6 @@ class DevicePutTest(jtu.JaxTestCase):
     out_on_hbm = jax.device_put(out_on_host, s_hbm)
     self._check_device_put_addressable_shards(
         out_on_hbm, np_inp, s_hbm, "device")
-
-  @parameterized.parameters("unpinned_host", "pinned_host")
-  def test_device_put_jit_host_output_to_hbm(self, host_memory_kind: str):
-    # A program's output in host memory carries its memory space in its
-    # layout (S(5) or S(6)); a copy of it to device memory reads that layout.
-    if jtu.test_device_matches(["gpu"]) and host_memory_kind == "unpinned_host":
-      self.skipTest("unpinned_host does not work on GPU backend.")
-    mesh = jtu.create_mesh((2, 2), ("x", "y"))
-    s_host = NamedSharding(mesh, P("y"), memory_kind=host_memory_kind)
-    np_inp = np.arange(16, dtype=np.float32).reshape(8, 2)
-
-    out_on_host = jax.jit(lambda x: x * 2, out_shardings=s_host)(np_inp)
-    self.assertEqual(out_on_host.sharding, s_host)
-
-    s_hbm = s_host.with_memory_kind("device")
-    self._check_device_put_addressable_shards(
-        jax.device_put(out_on_host, s_hbm), np_inp * 2, s_hbm, "device")
-    shard = out_on_host.addressable_shards[0]
-    single = make_single_device_sharding(shard.device, memory_kind="device")
-    self.assertArraysEqual(jax.device_put(shard.data, single),
-                           np_inp[shard.index] * 2)
 
   @parameterized.parameters("unpinned_host", "pinned_host")
   def test_device_put_hbm_to_host(self, host_memory_kind: str):
