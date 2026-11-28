@@ -161,8 +161,8 @@ class CacheKeyTest(jtu.JaxTestCase):
     cache_key.xla_client.get_topology_for_devices = no_topology
     try:
       for platform_name, differs in (("cpu", True), ("gpu", False)):
-        devices = [types.SimpleNamespace(platform=platform_name,
-                                         device_kind="kind")]
+        devices = np.array([types.SimpleNamespace(platform=platform_name,
+                                                  device_kind="kind")])
         hashes = []
         for described in ("vendor_id: AuthenticAMD\nflags: avx2 avx512f",
                           "vendor_id: AuthenticAMD\nflags: avx2"):
@@ -182,7 +182,7 @@ class CacheKeyTest(jtu.JaxTestCase):
     # A patch stack's releases over one jaxlib are builds of their own: one's
     # cache entries are not another's to read.
     computation = jax.jit(lambda x, y: x + y).lower(1, 1).compiler_ir()
-    devices = xla_client.DeviceList((jax.local_devices()[0],))
+    devices = np.array([[jax.local_devices()[0]]])
     compile_options = compiler.get_compile_options(
         num_replicas=1, num_partitions=1
     )
