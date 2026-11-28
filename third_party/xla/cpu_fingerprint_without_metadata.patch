@@ -1,0 +1,66 @@
+diff --git a/xla/pjrt/cpu/cpu_client.cc b/xla/pjrt/cpu/cpu_client.cc
+index 4d9fb8b6d13..8f46383ee67 100644
+--- a/xla/pjrt/cpu/cpu_client.cc
++++ b/xla/pjrt/cpu/cpu_client.cc
+@@ -1219,11 +1219,15 @@ PjRtCpuExecutable::PjRtCpuExecutable(
+     }
+   }
+ 
+-  // Compute fingerprint of the executable from the HloModule.
++  // Compute fingerprint of the executable from the HloModule, without its
++  // metadata: two processes running one program, one compiling it and one
++  // loading it from a cache another source location wrote, name it alike, so
++  // their collectives' run ids (and Gloo's tags) agree.
+   tsl::Fprint128 fingerprint = tsl::Fingerprint128(fingerprint_);
+   fingerprint = tsl::FingerprintCat128(
+       tsl::Fingerprint128(fingerprint_),
+-      tsl::Fingerprint128(cpu_executable_->module().ToString()));
++      tsl::Fingerprint128(cpu_executable_->module().ToString(
++          HloPrintOptions::Default().set_print_metadata(false))));
+   fingerprint_ = absl::StrCat(fingerprint.low64, fingerprint.high64);
+ }
+ 
+diff --git a/xla/pjrt/cpu/cpu_client_test.cc b/xla/pjrt/cpu/cpu_client_test.cc
+index 3fa56b7569c..726d231495d 100644
+--- a/xla/pjrt/cpu/cpu_client_test.cc
++++ b/xla/pjrt/cpu/cpu_client_test.cc
+@@ -143,6 +143,39 @@ TEST(PjRtCpuClientTest, MemorySpace) {
+   }
+ }
+ 
++TEST(PjRtCpuClientTest, FingerprintIgnoresMetadata) {
++  // One program whose instructions' metadata (their source locations) differ:
++  // its executables are fingerprinted alike, so processes running it, one
++  // compiling and one loading it from a cache, agree on its collectives'
++  // run ids.
++  static constexpr char kFirst[] = R"(
++HloModule Summed
++
++ENTRY Summed {
++  %x = f32[4] parameter(0), metadata={op_name="sum" source_file="a.py" source_line=1}
++  ROOT %y = f32[4] add(%x, %x), metadata={op_name="sum" source_file="a.py" source_line=1}
++})";
++  static constexpr char kSecond[] = R"(
++HloModule Summed
++
++ENTRY Summed {
++  %x = f32[4] parameter(0), metadata={op_name="sum" source_file="b.py" source_line=9}
++  ROOT %y = f32[4] add(%x, %x), metadata={op_name="sum" source_file="b.py" source_line=9}
++})";
++  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
++  std::vector<std::string> fingerprints;
++  for (const char* program : {kFirst, kSecond}) {
++    TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
++                            ParseAndReturnUnverifiedModule(program, {}));
++    XlaComputation xla_computation(hlo_module->ToProto());
++    TF_ASSERT_OK_AND_ASSIGN(auto executable,
++                            client->CompileAndLoad(xla_computation, {}));
++    TF_ASSERT_OK_AND_ASSIGN(fingerprints.emplace_back(),
++                            executable->FingerprintExecutable());
++  }
++  EXPECT_EQ(fingerprints[0], fingerprints[1]);
++}
++
+ TEST(PjRtCpuClientTest, DonationWithExecutionError) {
+   static constexpr char kProgram[] =
+       R"(
