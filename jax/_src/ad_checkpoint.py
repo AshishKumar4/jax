@@ -954,15 +954,34 @@ def _name_lowering(ctx, x, *, name):
   # custom call's, a variadic sort's) is not named, since XLA reads one
   # instruction's attribute for each of its results' buffers. A sharding
   # constraint is no defining op: XLA replaces it and keeps only its sharding,
-  # so its operand's producer carries the names (`mlir._get_owner`).
-  del ctx
+  # so its operand's producer carries the names (`mlir._get_owner`). A
+  # reduce-precision to the value's own exponent and mantissa (the anchor
+  # `_insert_reduce_precision` puts on a residual) rounds nothing, and XLA's
+  # simplifier removes it once it is fused, taking its attributes with it: on
+  # sm90 a scan's named tanh fused into the dynamic-update-slice writing its
+  # stack was read unnamed. Its operand's producer is named too.
+  aval, = ctx.avals_in
   op = _defining(x)
   while op is not None and _one_array(op):
     _named(op, name)
-    if op.name != "stablehlo.reshape":
+    if not _holds_operand(op, aval.dtype):
       break
     op = _defining(op.operands[0])
   return [x]
+
+def _holds_operand(op, dtype):
+  """Whether ``op``, of a value of ``dtype``, holds its operand's values
+  exactly, so XLA can make its result its operand's buffer or drop it: a
+  reshape, or a reduce-precision to at least ``dtype``'s own exponent and
+  mantissa bits."""
+  if op.name == "stablehlo.reshape":
+    return True
+  if op.name != "stablehlo.reduce_precision":
+    return False
+  finfo = dtypes.finfo(dtype)
+  return (ir.IntegerAttr(op.attributes["exponent_bits"]).value >= finfo.nexp
+          and ir.IntegerAttr(op.attributes["mantissa_bits"]).value
+          >= finfo.nmant)
 
 def _defining(value):
   """The operation defining ``value``, through any sharding constraint on it
