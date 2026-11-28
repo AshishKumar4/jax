@@ -1,5 +1,5 @@
 diff --git a/xla/pjrt/cpu/cpu_client.cc b/xla/pjrt/cpu/cpu_client.cc
-index 4d9fb8b6d13..8f46383ee67 100644
+index 4d9fb8b6d13..7a356db103c 100644
 --- a/xla/pjrt/cpu/cpu_client.cc
 +++ b/xla/pjrt/cpu/cpu_client.cc
 @@ -1219,11 +1219,15 @@ PjRtCpuExecutable::PjRtCpuExecutable(
@@ -16,7 +16,7 @@ index 4d9fb8b6d13..8f46383ee67 100644
        tsl::Fingerprint128(fingerprint_),
 -      tsl::Fingerprint128(cpu_executable_->module().ToString()));
 +      tsl::Fingerprint128(cpu_executable_->module().ToString(
-+          HloPrintOptions::Default().set_print_metadata(false))));
++          HloPrintOptions().set_print_metadata(false))));
    fingerprint_ = absl::StrCat(fingerprint.low64, fingerprint.high64);
  }
  
