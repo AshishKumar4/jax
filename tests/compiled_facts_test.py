@@ -64,6 +64,25 @@ class CheckpointNameTest(jtu.JaxTestCase):
         jnp.ones((4, 4)))
     self.assertEqual(named, ["stablehlo.dot_general", "stablehlo.reshape"])
 
+  def test_a_name_tags_its_values_producer_through_a_residual_anchor(self):
+    # JAX anchors a saved residual with a reduce-precision to its own type,
+    # which XLA may remove once fused: the value's producer carries the name.
+    def loss(x):
+      saved = jax.checkpoint(
+          lambda x: jnp.sin(checkpoint_name(jnp.tanh(x), "hidden")),
+          policy=jax.checkpoint_policies.save_only_these_names("hidden"))
+      return saved(x).sum()
+    self.assertEqual(self.named_ops(jax.grad(loss), jnp.ones(4)),
+                     ["stablehlo.tanh", "stablehlo.reduce_precision"])
+
+  def test_a_name_stops_at_a_reduce_precision_that_rounds(self):
+    rounded = lambda x: lax.reduce_precision(x, exponent_bits=5,
+                                             mantissa_bits=10)
+    named = self.named_ops(
+        lambda x: checkpoint_name(rounded(jnp.tanh(x)), "hidden"),
+        jnp.ones(4, jnp.float32))
+    self.assertEqual(named, ["stablehlo.reduce_precision"])
+
   def test_a_name_on_one_result_of_a_variadic_op_tags_nothing(self):
     # sort's two results share one instruction: naming its op would name the
     # unnamed sibling's buffer too.
