@@ -1203,6 +1203,22 @@ class JitTest(jtu.BufferDonationTestCase):
     live_refs = len([ref for ref in refs if ref() is not None])
     self.assertLessEqual(live_refs, 100)
 
+  @config.use_simplified_jaxpr_constants(True)
+  def test_jit_lower_in_avals_exclude_hoisted_constants(self):
+    # A closed-over array is hoisted as a const arg ahead of the arguments;
+    # the lowering's input avals are its arguments' alone, an unused one too.
+    const = np.arange(64, dtype=np.float32)
+
+    def f(x, unused):
+      del unused
+      return x * const
+
+    x = jax.ShapeDtypeStruct((64,), np.float32)
+    lowered = jit(f).lower(x, x)
+    shaped = core.ShapedArray((64,), np.float32)
+    self.assertEqual(lowered.in_avals, ((shaped, shaped), {}))
+    self.assertEqual(lowered.in_avals, lowered.compile().in_avals)
+
   def test_jit_lower_compile(self):
     def f(x):
       return jnp.sqrt(x ** 2) + 1.

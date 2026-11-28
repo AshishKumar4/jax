@@ -689,13 +689,17 @@ class Lowered(Stage):
 
   @property
   def in_avals(self):
-    in_avals_ = self._lowering.compile_args["global_in_avals"]
+    # Including dead args, but not the const_args hoisted ahead of them, which
+    # the lowering's avals, kept indices and args info all lead with.
+    nr_const_args = len(getattr(self._lowering, "const_args", ()))
+    in_avals_ = self._lowering.compile_args["global_in_avals"][nr_const_args:]
     kept_var_idx = self._lowering.compile_args["kept_var_idx"]
-    non_dce_avals = self._lowering.compile_args["all_args_info"].in_avals
+    non_dce_avals = (
+        self._lowering.compile_args["all_args_info"].in_avals[nr_const_args:])
     if self.in_tree.num_leaves > len(in_avals_):
       iter_in_avals = iter(in_avals_)
       in_avals_ = [
-          next(iter_in_avals) if i in kept_var_idx
+          next(iter_in_avals) if i + nr_const_args in kept_var_idx
           else a for i, a in zip(range(self.in_tree.num_leaves), non_dce_avals)]
     return self.in_tree.unflatten(in_avals_)
 
