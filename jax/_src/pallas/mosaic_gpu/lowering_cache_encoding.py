@@ -94,14 +94,23 @@ class _PrimitiveHolders:
     seal = sealing.seal()
     holders: dict[int, list[tuple[str, str, jax_core.Primitive]]] = {}
     for module_name, module in list(sys.modules.items()):
+      if module is None:
+        continue
+      # A module's primitives first: one holding none adds no holder whatever
+      # the seal says of its file, and the seal's reads of a file (its path
+      # resolved, a stat) are most of a scan over every loaded module (row
+      # 13752: ~4,100 a scan, each handing the GIL to a tracing thread).
+      held = [(attribute, value) for attribute, value in list(vars(module).items())
+              if isinstance(value, jax_core.Primitive)]
+      if not held:
+        continue
       file = getattr(module, "__file__", None)
       sealed = (module_name.partition(".")[0] in sealing.SEALED_MODULE_ROOTS
-                and module is not None and seal.holds(file))
-      if not sealed and (module is None or seal.source(file) is None):
+                and seal.holds(file))
+      if not sealed and seal.source(file) is None:
         continue
-      for attribute, value in list(vars(module).items()):
-        if isinstance(value, jax_core.Primitive):
-          holders.setdefault(id(value), []).append((module_name, attribute, value))
+      for attribute, value in held:
+        holders.setdefault(id(value), []).append((module_name, attribute, value))
     self._by_id = {
         i: min(held, key=lambda h: (not h[0].startswith("jax._src"), h[0], h[1]))
         for i, held in holders.items()

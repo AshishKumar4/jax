@@ -145,5 +145,45 @@ class DeclaredTest(harness.LoweringCacheTestCase):
     })
 
 
+class PrimitiveHoldersTest(harness.LoweringCacheTestCase):
+
+  def test_the_seal_is_asked_of_modules_holding_a_primitive_alone(self):
+    # A module holding no primitive adds no holder whatever the seal says of
+    # its file, so the scan asks the seal of none (row 13752: each of ~4,100
+    # files a scan read resolved or stat'ed); one holding a primitive under a
+    # declared source is its holder.
+    import types  # pylint: disable=g-import-not-at-top
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+
+    from jax._src import core as jax_core  # pylint: disable=g-import-not-at-top
+    from jax._src.pallas.mosaic_gpu import lowering_cache_encoding as cache_encoding  # pylint: disable=g-import-not-at-top
+    from jax._src.pallas.mosaic_gpu import lowering_cache_seal as sealing  # pylint: disable=g-import-not-at-top
+
+    asked = []
+
+    class Seal:
+
+      def holds(self, file):
+        asked.append(file)
+        return False
+
+      def source(self, file):
+        asked.append(file)
+        return "a declared package" if file == "/declared/held.py" else None
+
+    empty = types.ModuleType("dew_test_holds_none")
+    empty.__file__ = "/declared/empty.py"
+    empty.value = 1
+    held = types.ModuleType("dew_test_holds_one")
+    held.__file__ = "/declared/held.py"
+    held.made_p = jax_core.Primitive("dew_test_made")
+    with mock.patch.dict(sys.modules, {empty.__name__: empty, held.__name__: held}), \
+        mock.patch.object(sealing, "seal", lambda: Seal()):
+      holders = cache_encoding._PrimitiveHolders()  # pylint: disable=protected-access
+      self.assertEqual(holders.identity(held.made_p), (held.__name__, "made_p"))
+    self.assertNotIn(empty.__file__, asked)
+    self.assertIn(held.__file__, asked)
+
+
 if __name__ == "__main__":
   absltest.main()
