@@ -1,0 +1,78 @@
+diff --git a/xla/service/gpu/gpu_executable.cc b/xla/service/gpu/gpu_executable.cc
+index 229612406aa..f2b369c5d5f 100644
+--- a/xla/service/gpu/gpu_executable.cc
++++ b/xla/service/gpu/gpu_executable.cc
+@@ -2019,7 +2019,20 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
+       params.executable_abi_version,
+       se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
+ 
+-  return CreateImpl(std::move(params), std::move(module_config_metadata));
++  ABSL_ASSIGN_OR_RETURN(
++      std::unique_ptr<GpuExecutable> executable,
++      CreateImpl(std::move(params), std::move(module_config_metadata)));
++  // An executable compiled with its debug info states its buffer assignment
++  // through Executable's (`GpuCompiler::RunBackend`), which a client's
++  // CompiledMemoryStats read; one loaded from its proto states the assignment
++  // it was serialized with alike, its module beside it.
++  if (executable->has_module()) {
++    auto hlo_proto = std::make_unique<HloProto>();
++    *hlo_proto->mutable_buffer_assignment() =
++        executable->buffer_assignment_proto();
++    executable->set_hlo_proto(std::move(hlo_proto));
++  }
++  return executable;
+ }
+ 
+ static absl::StatusOr<ExecutableBuildOptionsProto>
+diff --git a/xla/service/gpu/gpu_executable_test.cc b/xla/service/gpu/gpu_executable_test.cc
+index 3cd380c6703..415f29e41d2 100644
+--- a/xla/service/gpu/gpu_executable_test.cc
++++ b/xla/service/gpu/gpu_executable_test.cc
+@@ -885,6 +885,47 @@ TEST_F(GpuExecutableTest, ProtoConversion) {
+             4);
+ }
+ 
++TEST_F(GpuExecutableTest, FromProtoStatesItsBufferAssignmentAsExecutable) {
++  se::DeviceDescription device_description;
++  device_description.set_gpu_compute_capability(
++      se::GpuComputeCapability{se::CudaComputeCapability::Volta()});
++  device_description.set_driver_version({12, 3, 0});
++  device_description.set_runtime_version({12, 3, 0});
++
++  HloComputation::Builder builder("test_computation");
++  HloInstruction* root = builder.AddInstruction(
++      HloInstruction::CreateConstant(LiteralUtil::CreateR0(1)));
++  auto hlo_module =
++      std::make_unique<HloModule>("test_module", HloModuleConfig());
++  hlo_module->AddEntryComputation(builder.Build(/*root_instruction=*/root));
++
++  GpuExecutable::Params params;
++  params.executable = std::make_unique<ThunkExecutor>(ThunkSequence());
++  params.device_description = device_description;
++  params.module_name = "test_module";
++  params.debug_module = std::move(hlo_module);
++  params.enable_debug_info_manager = false;
++  params.allocations = {BufferAllocation(0, 1024, 0)};
++  SetDummyBufferAssignment(params);
++  params.buffer_assignment_proto.add_buffer_allocations()->set_size(1024);
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<GpuExecutable> reference_executable,
++                       GpuExecutable::Create(std::move(params)));
++  ASSERT_OK_AND_ASSIGN(GpuExecutableProto proto,
++                       reference_executable->ToProto());
++
++  ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<GpuExecutable> reconstructed_executable,
++      GpuExecutable::FromProto(proto, device_description, "TEST_PLATFORM",
++                               GetDebugOptionsFromFlags()));
++  // Read as Executable's, as a PjRt client's CompiledMemoryStats read it.
++  const Executable& executable = *reconstructed_executable;
++  ASSERT_NE(executable.buffer_assignment_proto(), nullptr);
++  EXPECT_EQ(executable.buffer_assignment_proto()->buffer_allocations_size(), 1);
++  EXPECT_EQ(
++      executable.buffer_assignment_proto()->buffer_allocations(0).size(),
++      1024);
++}
++
+ TEST_F(GpuExecutableTest, FromProtoWithoutGpuTopology) {
+   se::DeviceDescription device_description;
+   device_description.set_gpu_compute_capability(
