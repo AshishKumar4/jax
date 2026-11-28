@@ -172,6 +172,7 @@ archive_override(
         # stopped compile to its cache.
         "//third_party:xla/memory_limit_canonical.patch",
         "//third_party:xla/cpu_drops_gpu_target_options.patch",
+        "//third_party:xla/cpu_buffer_memory_space.patch",
     ],
     strip_prefix = "xla-97b8433b3ed82b78b742f751d2c7f510e5d78d25",
     urls = ["https://github.com/openxla/xla/archive/97b8433b3ed82b78b742f751d2c7f510e5d78d25.tar.gz"],
