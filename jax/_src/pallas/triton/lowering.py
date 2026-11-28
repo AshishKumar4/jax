@@ -1377,6 +1377,20 @@ for prim, fn in _JAX_TO_TRITON_SIGNED_BINARY.items():
   triton_lowering_rules[prim] = signed_rule
 
 
+@register_lowering(lax.fmuladd_p)
+def _fmuladd_lowering_rule(ctx: LoweringRuleContext, a, b, c):
+  # A multiply-add whose fusion is the implementation's to choose (lax.fmuladd):
+  # a multiply then an add in the input dtype, as Mosaic TPU lowers it, which
+  # Triton's compiler contracts where it fuses (lax.polynomial's evaluation,
+  # erf_inv's, lowers through it from jax 0.12.1).
+  a, b = _bcast(a, b, *ctx.avals_in[:2], *ctx.avals_out)
+  product = _mul(a, b)
+  product, c = _bcast(
+      product, c, ctx.avals_out[0], ctx.avals_in[2], *ctx.avals_out
+  )
+  return _add(product, c)
+
+
 @register_lowering(debugging.debug_print_p)
 def debug_print_lowering_rule(
     ctx: LoweringRuleContext,
